@@ -6,6 +6,11 @@ import { resolve } from "node:path";
 // Tauri expects a fixed port and to fail if it's not available
 const host = process.env.TAURI_DEV_HOST;
 
+// Vite resolves `$lib` to `src/lib` for us (matches the SvelteKit
+// convention even though this isn't a SvelteKit project). Components and
+// stores import via `$lib/components/...` and `$lib/stores/...`.
+const LIB_ALIAS = { $lib: resolve(__dirname, "src/lib") };
+
 export default defineConfig(async () => ({
   plugins: [tailwindcss(), svelte()],
 
@@ -17,6 +22,9 @@ export default defineConfig(async () => ({
   // input to match the file name. Svelte/Tauri apps can use either pattern;
   // this lets us keep app.html under src/ as the spec requires.
   root: "src",
+  resolve: {
+    alias: LIB_ALIAS,
+  },
   build: {
     outDir: "../dist",
     emptyOutDir: true,

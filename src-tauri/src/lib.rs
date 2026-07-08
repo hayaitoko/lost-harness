@@ -15,12 +15,12 @@
 
 mod agent; // M1: agent loop, §7 gate, tool dispatch
 mod trm; // M1: TRM engine, classification, logging
-mod models; // M4: Model manager (local + cloud)
-mod tools; // M3: Tool registry + implementations
-mod platform; // M5: cross-platform computer use (cfg'd submodules)
 mod audio; // M6: Audio engine, VAD, TTS pipeline
-mod storage; // M1+: SQLite, sqlite-vec, sled/redb
 mod ipc; // M1: Tauri command handlers
+mod models; // M4: Model manager (local + cloud)
+mod platform; // M5: cross-platform computer use (cfg'd submodules)
+mod storage; // M1+: SQLite, sqlite-vec, sled/redb
+mod tools; // M3: Tool registry + implementations
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -40,6 +40,13 @@ pub fn run() {
             tracing::info!("Tauri app initialized; frontend should be loading");
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            ipc::get_app_version,
+            ipc::get_active_profile,
+            ipc::list_profiles,
+            ipc::send_message,
+            ipc::stream_token,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Lost Harness");
 }
