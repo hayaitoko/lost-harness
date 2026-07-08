@@ -10,13 +10,13 @@
 
 This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The Electron app was a prototype to validate UX decisions; it's now a read-only reference. All new work goes in the Tauri project.
 
-**Current milestone**: M1 (vertical slice) — nearly complete. The agent loop, privacy gate, model manager, storage, and IPC are built. One more round (frontend rewiring) connects the Svelte UI to the real backend.
+**Current milestone**: M1 (vertical slice) — frontend wired to the real backend, reviewed, fixed, committed (`c8ee16a`). The Svelte UI now calls the real IPC (send_message, providers, conversations, messages) with the browser fallback preserved. `cargo test` 82 pass · `svelte-check` 0 errors · `npm run build` ✓. **Remaining for M1 exit: one live `tauri dev` smoke test** (blocked on the arm64 CLI pin — see "How to run").
 
 **Next directions (per Lukas)**:
-1. Finish M1 frontend rewiring (prompt written, ready to fire)
-2. Lukas wants to "float an idea" — unclear what, wait for it
-3. UI review round — test the app, identify issues
-4. Agent loop structuring — proper tool-calling architecture (spec §9, §10, §12)
+1. ~~Finish M1 frontend rewiring~~ ✅ done + committed (see "Session log 2026-07-07")
+2. Lukas's idea — the optional **Server Companion** ("second brain"). Design captured in [`docs/server-companion.md`](docs/server-companion.md). Not built; it shapes M3 (tool registry) and the §9 loop.
+3. UI review round — test the app, identify issues. Also port the 15 banked Electron UI notes (onboarding, session folders/tags/colors/tiling, provider logos, input-bar glow).
+4. Agent loop structuring — proper tool-calling architecture (spec §9, §10, §12), with the environment-agnostic tool registry from `docs/server-companion.md` baked in.
 
 ---
 
@@ -108,11 +108,13 @@ lost-harness-product/
 
 ---
 
-## What M1 still needs
+## M1 status + what's left
 
-The frontend was built against the OLD IPC stubs. The Rust backend now has real commands with different signatures. One more round of work rewrites `tauri.ts`, `chat.ts`, and `providers.svelte.ts` to call the real IPC. The prompt for this is written and ready to fire.
+The frontend rewiring landed and was reviewed (14 findings, adversarially verified) and fixed — commit `c8ee16a`. `tauri.ts`, `chat.ts`, `providers.svelte.ts`, and the components now call the real IPC. Fixes P1–P8 (see "Session log 2026-07-07"). All automated checks green.
 
-After that, M1 exit criteria are met: user types a message → TRM classifies → routes → model streams response → persisted to SQLite.
+**M1 exit criteria are met on paper** (type a message → TRM classifies → routes → model streams → persisted to SQLite) **but not yet proven end-to-end in the real Tauri shell** — the P1 IPC-contract fix is verified statically, not by a live run. Do one `tauri dev` smoke test to close M1 (needs the arm64 CLI pin fixed first).
+
+**Deferred (flagged, not a correctness gap):** the "ideal" P7 backend fix — have `AgentLoop::process_message` return the real assistant message id (and the actual `routing_decision`) instead of `ipc::send_message` re-deriving it via a "last assistant row" query, and persist the user's message even on a gate-Block so a blocked turn survives reload. The current frontend guard + P8 rowid-ordering fully eliminate the id-collision corruption, so this is cleanup for a later pass.
 
 ---
 
@@ -152,15 +154,28 @@ npm run build              # Frontend compile check
 # .github/workflows/build.yml — mac/win/linux matrix
 ```
 
-**Known environment issue**: This MacBook has both x64 (`/usr/local/bin/node`) and arm64 (`/opt/homebrew/bin/node`) Node. `npm run tauri dev` may fail with native binding errors. Workaround: `npm run build` + `cargo build` separately, or use `npx tauri dev` with explicit node path. CI on fresh runners works fine.
+**Known environment issue — arm64/x64 native bindings (needs a real fix in `package.json`)**: `package.json` pins the **x64** native bindings (`@rolldown/binding-darwin-x64`, `@tauri-apps/cli-darwin-x64`) but the active Node on this Mac is **arm64**, so `npm run build`/`svelte-check`/`tauri dev` fail with `Cannot find native binding` for rolldown, lightningcss, `@tailwindcss/oxide`, and esbuild. Current workaround (2026-07-07): the matching **arm64** binaries were fetched via `npm pack` and dropped into `node_modules` (gitignored) — `npm run build` + `svelte-check` now pass. **Proper fix:** stop pinning x64-only; let npm resolve the platform binding (list both, or use `optionalDependencies` / drop the explicit pins). Until then, `tauri dev` still needs `@tauri-apps/cli-darwin-arm64` installed. CI on fresh runners is unaffected.
 
 ---
 
 ## Open items
 
-1. **Frontend rewiring** — prompt written, ready to fire. Connects Svelte stores to real IPC.
-2. **Lukas has an idea to float** — unknown, wait for it before planning further.
-3. **UI review** — test the app after rewiring, identify issues.
-4. **Agent loop structuring** — proper tool-calling architecture (spec §9, §10, §12). This is the next major milestone after M1 completes.
-5. **TRM model** — associate is actively training. When it arrives, swap `TrmEngine::load()` stub for real GGUF loading via llama-cpp-2.
-6. **The Electron app** at `/Users/hayai/Desktop/lost-harness-app/` has 15 banked UI notes from Lukas (onboarding refinements, session organization, tiling, provider logos, input bar glow) that should be ported to the Tauri frontend in future UI rounds.
+1. **Live M1 smoke test** — fix the arm64 CLI pin, run `tauri dev`, send a real message end-to-end. Closes M1.
+2. **Fix the arm64/x64 binding pins in `package.json`** (see "How to run") — real fix, not the node_modules workaround.
+3. **Server Companion design** — [`docs/server-companion.md`](docs/server-companion.md). Optional 24/7 add-on. Not built; bake the environment-agnostic tool registry into M3.
+4. **UI review + port 15 banked Electron notes** — onboarding (product key, model recommendations), stacked full-width panel buttons, session folders/tags/colors, tiling multiple sessions side-by-side, colored sessions (sidebar bg + input-bar glow), provider logos, model-picker popup next to the mic. Full detail lives in the `orchestrator 1` chat log (2026-07-07).
+5. **Agent loop structuring** — proper tool-calling architecture (spec §9, §10, §12). Next major milestone after M1.
+6. **Deferred P7 backend cleanup** — return the real assistant id from `process_message`; persist blocked turns (see "M1 status + what's left").
+7. **TRM model** — associate is actively training. When it arrives, swap `TrmEngine::load()` stub for real GGUF loading via llama-cpp-2.
+
+---
+
+## Session log — 2026-07-07 (orchestrator 2)
+
+Picked up from `orchestrator 1`'s handoff.
+
+- **Ground-truthed** both repos, the spec (`/Volumes/SSD-Nas/…/lost-harness-product/`), and the chat log. Confirmed: Tauri product is the live line; Electron app is abandoned reference.
+- **Fixed the local arm64 toolchain** so the frontend builds here (see "How to run").
+- **Reviewed the uncommitted M1 rewiring** (adversarial multi-agent pass): 14 findings confirmed, 1 refuted. Headline: every struct-arg IPC command was broken (missing Tauri `args:` wrapper + camelCase inner keys) — invisible to tests/build, masked by the browser mock.
+- **Fixed P1–P8** and committed (`c8ee16a`). All checks green. See "M1 status + what's left".
+- **Captured Lukas's Server Companion idea** as [`docs/server-companion.md`](docs/server-companion.md) (cron execution modes incl. "Local → Fallback Server", exactly-once run-ledger, durable outbox result queue).
