@@ -5,12 +5,21 @@
 // `$store` syntax. Mutations are exposed as plain functions (`sendMessage`,
 // `createConversation`) so call sites don't reach into the stores directly.
 //
-// Storage: the store is in-memory only for the M1 stub. The real M1 will
-// hydrate from SQLite (`storage::storage`) and persist on every mutation.
+// M1: hydrates from SQLite via the real IPC layer (`list_conversations`,
+// `get_messages`, `create_conversation`). Streaming tokens arrive via the
+// `stream:token` event; privacy-gate / routing / model failures arrive via
+// `stream:error` and are surfaced inline as the assistant message body.
 
 import { writable, derived, get, type Readable } from "svelte/store";
 import * as api from "../api/tauri";
-import type { SendMessageResponse, StreamTokenPayload } from "../api/tauri";
+import type {
+  SendMessageResponse,
+  StreamTokenPayload,
+  StreamErrorPayload,
+  ConversationInfo,
+  MessageInfo,
+} from "../api/tauri";
+import { getActiveProfileId } from "./profiles";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -25,15 +34,21 @@ export interface Message {
   created_at: number;
   /** While true, the assistant message is still being streamed. */
   streaming: boolean;
+  /** Set when a stream:error landed for this message. */
+  error?: string;
+  /** Source of the error: "gate" | "routing" | "model" | null. */
+  error_source?: string | null;
 }
 
 export interface Conversation {
   id: string;
   name: string;
   pinned: boolean;
-  /** Default sensitivity routing for this chat. Real M1: TRM + binding cycle. */
+  /** Default sensitivity routing for this chat. */
   binding: Binding;
   messages: Message[];
+  /** True after `hydrateMessages` has loaded the transcript from the backend. */
+  hydrated: boolean;
   created_at: number;
 }
 
@@ -82,11 +97,101 @@ function newId(): string {
   return "id-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-// ── Mutations ───────────────────────────────────────────────────────────────
+// ── Hydration from backend ──────────────────────────────────────────────────
 
 /**
- * Creates a new empty conversation, inserts it at the top of the list, and
- * marks it active. Returns the new conversation's id.
+ * Loads the conversation list from the backend (or browser fallback) into
+ * the store. Call once on app start. Idempotent — replaces the entire list.
+ */
+export async function hydrateConversations(): Promise<void> {
+  try {
+    const profile = getActiveProfileId();
+    const remote = await api.listConversations(profile);
+    const existing = get(conversations);
+    const byId = new Map(existing.map((c) => [c.id, c]));
+    // Merge, don't wipe: refresh metadata from the backend but carry over
+    // any messages/hydrated state already loaded locally (or an in-flight
+    // send). A wholesale replace here would blank out a transcript that
+    // hydrateMessages() had already populated for the active conversation.
+    const mapped: Conversation[] = remote.map((info) => {
+      const base = convFromInfo(info);
+      const prev = byId.get(info.id);
+      if (prev && (prev.hydrated || prev.messages.length > 0)) {
+        return { ...base, messages: prev.messages, hydrated: prev.hydrated };
+      }
+      return base;
+    });
+    // Preserve any locally-created conversations the backend doesn't know
+    // about yet (e.g. browser fallback where lists diverge).
+    const localOnly = existing.filter(
+      (c) => !remote.some((m) => m.id === c.id),
+    );
+    const next = [...localOnly, ...mapped];
+    conversations.set(next);
+
+    // Cold start: if nothing is selected yet, select the first conversation
+    // and load its transcript so the main panel doesn't render blank.
+    if (!get(activeConversationId) && next.length > 0) {
+      activeConversationId.set(next[0].id);
+      await hydrateMessages(next[0].id);
+    }
+  } catch (err) {
+    console.error("hydrateConversations failed", err);
+  }
+}
+
+/**
+ * Loads messages for a conversation from the backend if not already loaded.
+ * Call when the user switches to a conversation. No-op if already hydrated.
+ */
+export async function hydrateMessages(conversationId: string): Promise<void> {
+  const conv = get(conversations).find((c) => c.id === conversationId);
+  if (!conv?.hydrated) {
+    try {
+      const profile = getActiveProfileId();
+      const remote = await api.getMessages(conversationId, profile);
+      const messages = remote.map(msgFromInfo);
+      conversations.update((list) =>
+        list.map((c) =>
+          c.id === conversationId
+            ? { ...c, messages, hydrated: true }
+            : c,
+        ),
+      );
+    } catch (err) {
+      console.error("hydrateMessages failed", err);
+    }
+  }
+}
+
+/**
+ * Creates a conversation via the backend IPC and inserts it into the store.
+ * Returns the new conversation's id. Falls back to the local-only path in
+ * browser mode (where `api.createConversation` returns a mock ConversationInfo).
+ */
+export async function createConversationViaBackend(
+  name?: string,
+): Promise<string> {
+  const profile = getActiveProfileId();
+  const displayName = name ?? defaultName();
+  try {
+    const info = await api.createConversation(displayName, profile, "auto");
+    const conv: Conversation = convFromInfo(info);
+    conversations.update((list) => [conv, ...list]);
+    activeConversationId.set(conv.id);
+    return conv.id;
+  } catch (err) {
+    // Fall back to local-only creation.
+    console.error("createConversationViaBackend failed, using local fallback", err);
+    return createConversation(displayName);
+  }
+}
+
+// ── Local-only conversation creation (browser fallback / error path) ───────
+
+/**
+ * Creates a new empty conversation locally (no backend round-trip), inserts
+ * it at the top of the list, and marks it active. Returns the new id.
  */
 export function createConversation(name?: string): string {
   const id = newId();
@@ -96,6 +201,7 @@ export function createConversation(name?: string): string {
     pinned: false,
     binding: "auto",
     messages: [],
+    hydrated: true, // locally created — nothing to fetch from backend
     created_at: Date.now(),
   };
   conversations.update((list) => [conv, ...list]);
@@ -103,29 +209,52 @@ export function createConversation(name?: string): string {
   return id;
 }
 
+// ── Send message ────────────────────────────────────────────────────────────
+
 /**
  * Sends `content` from the user in the currently active conversation. The
  * flow:
  *   1. Append a user message and a pending (streaming) assistant message
  *      to the active conversation.
- *   2. Call the Rust `send_message` command (or browser fallback).
+ *   2. Call the Rust `send_message` command (or browser fallback), passing
+ *      the conversation's binding, the selected provider/model, and the
+ *      active profile.
  *   3. Listen for `stream:token` events, appending each to the assistant
- *      message's content.
+ *      message's content. Also listen for `stream:error` events and surface
+ *      them inline.
  *   4. When `send_message` resolves, mark the assistant message as done
  *      (and replace its content with the canonical final text from the
  *      response, in case any tokens were dropped).
  *
- * If there is no active conversation, this creates one first.
+ * If there is no active conversation, this creates one first (via the
+ * backend if available).
  */
-export async function sendMessage(content: string): Promise<void> {
+export async function sendMessage(
+  content: string,
+  providerId: string | null,
+  model: string | null,
+): Promise<void> {
   if (!content.trim()) return;
 
   // Ensure we have an active conversation.
   let activeId = get(activeConversationId);
   if (!activeId) {
-    activeId = createConversation();
+    activeId = await createConversationViaBackend();
   }
   const conversationId = activeId;
+
+  // Resolve the binding from the active conversation.
+  const conv = get(conversations).find((c) => c.id === conversationId);
+  const binding = conv?.binding ?? "auto";
+
+  // Resolve profile.
+  const profile = getActiveProfileId();
+
+  // Resolve provider/model — fall back to empty strings if unset. The
+  // backend will error and emit a stream:error if these are missing, which
+  // the UI will surface.
+  const providerIdArg = providerId ?? "";
+  const modelArg = model ?? "";
 
   // Append the user message + a pending assistant message.
   const userMsg: Message = {
@@ -135,9 +264,6 @@ export async function sendMessage(content: string): Promise<void> {
     created_at: Date.now(),
     streaming: false,
   };
-  // We don't yet know the server-assigned id; use a placeholder that we
-  // swap to the real one on the first token (or on the response, whichever
-  // arrives first). Tracking by index avoids needing a sync.
   const assistantId = newId();
   const assistantMsg: Message = {
     id: assistantId,
@@ -160,11 +286,13 @@ export async function sendMessage(content: string): Promise<void> {
     partial: "",
   });
 
-  // Subscribe to stream:token events for the duration of this send. We
-  // capture the assistant id in the closure so we can patch the right
-  // message even if the user switches conversations mid-stream.
+  // Subscribe to stream:token + stream:error events for the duration of
+  // this send. We capture the assistant id in the closure so we can patch
+  // the right message even if the user switches conversations mid-stream.
   let resolvedMessageId: string | null = null;
-  const unlisten = await api.onStreamToken((payload: StreamTokenPayload) => {
+  let streamError: { error: string; source: string } | null = null;
+
+  const unlistenToken = await api.onStreamToken((payload: StreamTokenPayload) => {
     if (payload.conversation_id !== conversationId) return;
     // The first token may carry the canonical server-assigned id. Adopt
     // it so subsequent appends land on the same message row.
@@ -190,31 +318,55 @@ export async function sendMessage(content: string): Promise<void> {
     appendToken(conversationId, resolvedMessageId, payload.token);
   });
 
+  const unlistenError = await api.onStreamError((payload: StreamErrorPayload) => {
+    if (payload.conversation_id !== conversationId) return;
+    streamError = { error: payload.error, source: payload.source };
+    // Surface the error immediately on the assistant message.
+    const targetId = resolvedMessageId ?? assistantId;
+    setErrorOnMessage(conversationId, targetId, payload.error, payload.source);
+  });
+
   try {
     const response: SendMessageResponse = await api.sendMessage(
       content.trim(),
       conversationId,
+      binding,
+      providerIdArg,
+      modelArg,
+      profile,
     );
-    // The Rust stub may not have sent any tokens (e.g. if the channel was
-    // closed before the first emit). In that case adopt the server id here.
-    if (!resolvedMessageId) {
-      resolvedMessageId = response.message_id;
-      conversations.update((list) =>
-        list.map((c) =>
-          c.id === conversationId
-            ? {
-                ...c,
-                messages: c.messages.map((m) =>
-                  m.id === assistantId ? { ...m, id: response.message_id } : m,
-                ),
-              }
-            : c,
-        ),
-      );
+    if (streamError) {
+      // A stream:error arrived while send_message still resolved Ok — this
+      // is the privacy-gate Block path. The backend persisted NO message row
+      // for this turn, so response.message_id points at an unrelated earlier
+      // assistant message (or a throwaway uuid). Do NOT adopt it — keep the
+      // local placeholder id to avoid a duplicate-key collision in the store.
+      const { error, source } = streamError;
+      const targetId = resolvedMessageId ?? assistantId;
+      finalizeMessage(conversationId, targetId, `⚠ ${error}`, error, source);
+    } else {
+      // Success path. If no token stream established the id yet (e.g. an
+      // empty completion), adopt the canonical server id now. Only reached
+      // when the backend actually persisted an assistant row.
+      if (!resolvedMessageId) {
+        resolvedMessageId = response.message_id;
+        conversations.update((list) =>
+          list.map((c) =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === assistantId ? { ...m, id: response.message_id } : m,
+                  ),
+                }
+              : c,
+          ),
+        );
+      }
+      // Clear streaming flag and (defensively) reconcile content to the
+      // canonical response text in case a token was lost.
+      finalizeMessage(conversationId, resolvedMessageId, response.content);
     }
-    // Finalize: clear streaming flag and (defensively) reconcile content
-    // to the canonical response content in case a token was lost.
-    finalizeMessage(conversationId, response.message_id, response.content);
   } catch (err) {
     // Surface the error inline rather than throwing — the chat panel
     // shows it as the assistant message body.
@@ -223,11 +375,46 @@ export async function sendMessage(content: string): Promise<void> {
       conversationId,
       resolvedMessageId ?? assistantId,
       `⚠ ${msg}`,
+      msg,
+      "model",
     );
   } finally {
-    await unlisten();
+    await unlistenToken();
+    await unlistenError();
     streamingMessage.set(null);
   }
+}
+
+// ── Internal helpers ────────────────────────────────────────────────────────
+
+function convFromInfo(info: ConversationInfo): Conversation {
+  return {
+    id: info.id,
+    name: info.name,
+    pinned: info.pinned,
+    binding: normalizeBinding(info.binding),
+    messages: [],
+    hydrated: false,
+    created_at: info.created_at * 1000, // backend is seconds, frontend is ms
+  };
+}
+
+function msgFromInfo(info: MessageInfo): Message {
+  const role: MessageRole = info.role === "assistant" ? "assistant" : "user";
+  return {
+    id: info.id,
+    role,
+    content: info.error ? `⚠ ${info.error}` : info.content,
+    created_at: info.created_at * 1000,
+    streaming: false,
+    error: info.error ?? undefined,
+    error_source: null,
+  };
+}
+
+function normalizeBinding(b: string): Binding {
+  if (b === "public" || b === "private") return b;
+  return "auto";
 }
 
 function appendToken(
@@ -254,10 +441,11 @@ function appendToken(
   );
 }
 
-function finalizeMessage(
+function setErrorOnMessage(
   conversationId: string,
   messageId: string,
-  finalContent: string,
+  error: string,
+  source: string,
 ): void {
   conversations.update((list) =>
     list.map((c) =>
@@ -266,7 +454,36 @@ function finalizeMessage(
             ...c,
             messages: c.messages.map((m) =>
               m.id === messageId
-                ? { ...m, content: finalContent, streaming: false }
+                ? { ...m, content: `⚠ ${error}`, error, error_source: source }
+                : m,
+            ),
+          }
+        : c,
+    ),
+  );
+}
+
+function finalizeMessage(
+  conversationId: string,
+  messageId: string,
+  finalContent: string,
+  error?: string,
+  errorSource?: string,
+): void {
+  conversations.update((list) =>
+    list.map((c) =>
+      c.id === conversationId
+        ? {
+            ...c,
+            messages: c.messages.map((m) =>
+              m.id === messageId
+                ? {
+                    ...m,
+                    content: finalContent,
+                    streaming: false,
+                    error: error ?? m.error,
+                    error_source: errorSource ?? m.error_source,
+                  }
                 : m,
             ),
           }

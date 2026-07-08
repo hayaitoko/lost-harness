@@ -307,10 +307,15 @@ impl ProfileDb {
 
     pub fn list_messages_by_conversation(&self, conversation_id: &str) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
+            // Tiebreak on rowid (insertion order), NOT id: `created_at` is
+            // second-granularity and `id` is a random UUID, so two messages
+            // written in the same second would otherwise sort by a random
+            // string. rowid preserves insertion order, which the transcript
+            // and send_message's "last assistant row" lookup rely on.
             "SELECT id, conversation_id, role, content, model, provider_id,
                     routing_decision, thinking_content, error, aborted, created_at
              FROM messages WHERE conversation_id = ?1
-             ORDER BY created_at ASC, id ASC",
+             ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt
             .query_map(params![conversation_id], row_to_message)?

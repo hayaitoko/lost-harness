@@ -70,6 +70,11 @@
   let form: FormState | null = $state(null);
   let showKey = $state(false);
   let confirmRemoveId: string | null = $state(null);
+  let saving = $state(false);
+
+  // Providers are hydrated once at app start (App.svelte). Re-hydrating on
+  // every modal open would clobber unsaved local edits (there is no
+  // update_provider IPC yet), so this component just reads the store.
 
   // Derived: name + URL required for save to be enabled.
   const canSave = $derived.by(() => {
@@ -112,19 +117,26 @@
     form = null;
   }
 
-  function save() {
-    if (!form || !canSave) return;
-    addProvider({
-      id: form.id ?? undefined,
-      name: form.name.trim(),
-      baseUrl: form.baseUrl.trim(),
-      apiKey: form.apiKey,
-      kind: form.kind,
-    });
-    form = null;
+  async function save() {
+    if (!form || !canSave || saving) return;
+    saving = true;
+    try {
+      await addProvider({
+        id: form.id ?? undefined,
+        name: form.name.trim(),
+        baseUrl: form.baseUrl.trim(),
+        apiKey: form.apiKey,
+        kind: form.kind,
+      });
+      form = null;
+    } catch (err) {
+      console.error("save provider failed", err);
+    } finally {
+      saving = false;
+    }
   }
 
-  function handleRemoveClick(id: string) {
+  async function handleRemoveClick(id: string) {
     // Two-click confirm: first click arms it, second click within 3s fires.
     if (confirmRemoveId !== id) {
       confirmRemoveId = id;
@@ -134,7 +146,7 @@
       return;
     }
     confirmRemoveId = null;
-    removeProvider(id);
+    await removeProvider(id);
   }
 
   function close() {
@@ -396,11 +408,11 @@
           </button>
           <button
             type="submit"
-            disabled={!canSave}
+            disabled={!canSave || saving}
             class="rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
             data-testid="provider-save"
           >
-            {form.id ? "Save changes" : "Add provider"}
+            {saving ? "Saving…" : form.id ? "Save changes" : "Add provider"}
           </button>
         </div>
       </form>

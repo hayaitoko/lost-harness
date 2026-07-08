@@ -10,8 +10,28 @@
 //   - `get_app_version() -> String`
 //   - `get_active_profile() -> String`
 //   - `list_profiles() -> Vec<String>`
-//   - `send_message(content, conversation_id) -> SendMessageResponse`
-//   - `stream_token` event: payload = { token, conversation_id, message_id }
+//   - `list_providers() -> Vec<ProviderInfo>`
+//   - `remove_provider(id) -> bool`
+//   - `send_message(args: { content, conversation_id, binding, provider_id, model, profile }) -> SendMessageResponse`
+//   - `add_provider(args: { name, base_url, api_key, kind }) -> ProviderInfo`
+//   - `list_models(args: { provider_id }) -> Vec<String>`
+//   - `list_conversations(args: { profile }) -> Vec<ConversationInfo>`
+//   - `create_conversation(args: { name, binding, profile }) -> ConversationInfo`
+//   - `get_messages(args: { profile, conversation_id }) -> Vec<MessageInfo>`
+//
+// IMPORTANT — Tauri v2 argument shape:
+//   Every Rust command above whose signature is `(..., args: SomeStruct)`
+//   receives its fields NESTED under the parameter name `args`. The JS call
+//   must therefore be `invoke("cmd", { args: { ...snake_case_fields } })`,
+//   NOT flat top-level fields. Tauri's camelCase→snake_case conversion only
+//   applies to the top-level command parameter names (e.g. `id`), never to
+//   fields inside a struct parameter — those are deserialized by serde with
+//   the struct's own (snake_case) field names. `remove_provider(id)` takes a
+//   bare scalar param, so it stays `{ id }` (no wrapper).
+//
+// Events:
+//   - `stream:token`  — payload: { token, conversation_id, message_id }
+//   - `stream:error`  — payload: { error, conversation_id, source }
 //
 // If you add or rename a command or event on the Rust side, update the
 // matching type, constant, or function below. The TypeScript types here
@@ -22,24 +42,80 @@ import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 
 // ── Shared types (mirror the Rust serde structs) ────────────────────────────
 
+/** Mirrors `SendMessageResponse` in ipc/mod.rs. */
 export interface SendMessageResponse {
   message_id: string;
   content: string;
   conversation_id: string;
-  /** Profile id that handled the message ("personal" until TRM is wired). */
+  /** Profile id that handled the message (e.g. "personal"). */
   profile: string;
+  /** "allow" | "route_local" — which branch of the gate served this message. */
+  routing_decision: string;
   /** Epoch ms the response was finalized. */
   completed_at: number;
 }
 
+/** Mirrors `ProviderInfo` in ipc/mod.rs. API key is omitted by the backend. */
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  base_url: string;
+  /** "local" | "cloud" | "custom" */
+  kind: string;
+  /** Whether the provider's endpoint is a private/LAN address. */
+  is_private: boolean;
+}
+
+/** Mirrors `ConversationInfo` in ipc/mod.rs. */
+export interface ConversationInfo {
+  id: string;
+  name: string;
+  pinned: boolean;
+  binding: string;
+  folder_id: string | null;
+  color: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/** Mirrors `MessageInfo` in ipc/mod.rs. */
+export interface MessageInfo {
+  id: string;
+  conversation_id: string;
+  /** "user" | "assistant" */
+  role: string;
+  content: string;
+  model: string | null;
+  provider_id: string | null;
+  routing_decision: string | null;
+  thinking_content: string | null;
+  error: string | null;
+  aborted: boolean;
+  created_at: number;
+}
+
+/** Payload of the `stream:token` event. Mirrors `StreamTokenPayload` in loop_mod.rs. */
 export interface StreamTokenPayload {
   token: string;
   conversation_id: string;
   message_id: string;
 }
 
+/**
+ * Payload of the `stream:error` event. Mirrors `StreamErrorPayload` in
+ * loop_mod.rs. `source` is one of `"gate"`, `"routing"`, `"model"`.
+ */
+export interface StreamErrorPayload {
+  error: string;
+  conversation_id: string;
+  source: string;
+}
+
 /** Callback shape for `onStreamToken`. */
 export type StreamTokenCallback = (payload: StreamTokenPayload) => void;
+
+/** Callback shape for `onStreamError`. */
+export type StreamErrorCallback = (payload: StreamErrorPayload) => void;
 
 // ── Tauri runtime detection ─────────────────────────────────────────────────
 //
@@ -57,18 +133,19 @@ declare global {
 const isTauri = (): boolean =>
   typeof window !== "undefined" && typeof window.__TAURI_INTERNALS__ !== "undefined";
 
-// ── Event channel name (must match Rust `app.emit("stream:token", ...)`) ────
+// ── Event channel names (must match Rust `app.emit(...)`) ───────────────────
 
 export const STREAM_TOKEN_EVENT = "stream:token";
+export const STREAM_ERROR_EVENT = "stream:error";
 
 // ── Command functions ───────────────────────────────────────────────────────
 
-/** Returns the app version string, e.g. "0.1.0-m0". */
+/** Returns the app version string, e.g. "0.1.0-m1". */
 export async function getAppVersion(): Promise<string> {
   if (isTauri()) {
     return tauriInvoke<string>("get_app_version");
   }
-  return "0.1.0-m0-browser";
+  return "0.1.0-m1-browser";
 }
 
 /** Returns the id of the currently active profile. */
@@ -89,6 +166,98 @@ export async function listProfiles(): Promise<string[]> {
   return ["personal", "work", "school", "developer"];
 }
 
+// ── Providers + models ──────────────────────────────────────────────────────
+
+/** Lists all configured providers. API keys are omitted by the backend. */
+export async function listProviders(): Promise<ProviderInfo[]> {
+  if (isTauri()) {
+    return tauriInvoke<ProviderInfo[]>("list_providers");
+  }
+  return browserListProviders();
+}
+
+/** Adds a new provider. Returns the created ProviderInfo (with server-assigned id). */
+export async function addProvider(
+  name: string,
+  baseUrl: string,
+  apiKey: string | null,
+  kind: string,
+): Promise<ProviderInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ProviderInfo>("add_provider", {
+      args: {
+        name,
+        base_url: baseUrl,
+        api_key: apiKey || null,
+        kind,
+      },
+    });
+  }
+  return browserAddProvider(name, baseUrl, apiKey, kind);
+}
+
+/** Removes a provider by id. */
+export async function removeProvider(id: string): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("remove_provider", { id });
+  }
+  return browserRemoveProvider(id);
+}
+
+/** Lists the models available for a given provider. */
+export async function listModels(providerId: string): Promise<string[]> {
+  if (isTauri()) {
+    return tauriInvoke<string[]>("list_models", { args: { provider_id: providerId } });
+  }
+  return browserListModels(providerId);
+}
+
+// ── Conversations + messages ────────────────────────────────────────────────
+
+/** Lists conversations for the given profile. */
+export async function listConversations(profile: string): Promise<ConversationInfo[]> {
+  if (isTauri()) {
+    return tauriInvoke<ConversationInfo[]>("list_conversations", { args: { profile } });
+  }
+  return browserListConversations();
+}
+
+/** Creates a new conversation. Returns the created ConversationInfo. */
+export async function createConversation(
+  name: string,
+  profile: string,
+  binding: string = "auto",
+): Promise<ConversationInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ConversationInfo>("create_conversation", {
+      args: {
+        name,
+        profile,
+        binding,
+      },
+    });
+  }
+  return browserCreateConversation(name, binding);
+}
+
+/** Lists messages in a conversation for the given profile. */
+export async function getMessages(
+  conversationId: string,
+  profile: string,
+): Promise<MessageInfo[]> {
+  if (isTauri()) {
+    return tauriInvoke<MessageInfo[]>("get_messages", {
+      args: {
+        profile,
+        conversation_id: conversationId,
+      },
+    });
+  }
+  return browserGetMessages(conversationId);
+}
+
+// ── send_message ────────────────────────────────────────────────────────────
+
 /**
  * Sends a user message to the agent and (in the Tauri path) receives a
  * stream of `stream:token` events as the model generates the response. The
@@ -100,20 +269,32 @@ export async function listProfiles(): Promise<string[]> {
 export async function sendMessage(
   content: string,
   conversationId: string,
+  binding: string,
+  providerId: string,
+  model: string,
+  profile: string,
 ): Promise<SendMessageResponse> {
   if (isTauri()) {
     return tauriInvoke<SendMessageResponse>("send_message", {
-      content,
-      conversationId,
+      args: {
+        content,
+        conversation_id: conversationId,
+        binding,
+        provider_id: providerId,
+        model,
+        profile,
+      },
     });
   }
   return browserSendMessage(content, conversationId);
 }
 
+// ── Event subscriptions ─────────────────────────────────────────────────────
+
 /**
  * Subscribes to `stream:token` events. Returns an unlisten function that
- * detaches the listener. In browser mode, this is a no-op subscription —
- * the mock `sendMessage` already drives the same callback path internally.
+ * detaches the listener. In browser mode, the mock `sendMessage` drives
+ * the registered callbacks internally.
  */
 export async function onStreamToken(
   callback: StreamTokenCallback,
@@ -132,13 +313,146 @@ export async function onStreamToken(
   };
 }
 
+/**
+ * Subscribes to `stream:error` events. These fire when the privacy gate
+ * blocks a message, a routing decision fails, or the model stream errors.
+ * Returns an unlisten function. In browser mode this is a no-op (the mock
+ * never emits errors).
+ */
+export async function onStreamError(
+  callback: StreamErrorCallback,
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<StreamErrorPayload>(STREAM_ERROR_EVENT, (event) => {
+      callback(event.payload);
+    });
+  }
+  // Browser fallback: register so a mock could drive it if needed.
+  browserErrorListeners.push(callback);
+  return () => {
+    const i = browserErrorListeners.indexOf(callback);
+    if (i >= 0) browserErrorListeners.splice(i, 1);
+  };
+}
+
 // ── Browser fallback (used when running outside Tauri) ──────────────────────
 
 const browserStreamListeners: StreamTokenCallback[] = [];
+const browserErrorListeners: StreamErrorCallback[] = [];
+
+// Distinct from the providers store's own key (`lh.providers.v1` in
+// providers.svelte.ts). The two layers persist DIFFERENT shapes
+// (snake_case ProviderInfo[] here vs camelCase Provider[] in the store);
+// sharing a key corrupts both in browser-dev mode.
+const BROWSER_PROVIDERS_KEY = "lh.providers.browser.v1";
+const BROWSER_CONVERSATIONS_KEY = "lh.conversations.v1";
 
 function emitBrowserToken(payload: StreamTokenPayload): void {
   for (const cb of browserStreamListeners) cb(payload);
 }
+
+function emitBrowserError(payload: StreamErrorPayload): void {
+  for (const cb of browserErrorListeners) cb(payload);
+}
+
+// ── Provider browser fallback ───────────────────────────────────────────────
+
+function browserListProviders(): ProviderInfo[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(BROWSER_PROVIDERS_KEY);
+    return raw ? (JSON.parse(raw) as ProviderInfo[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function browserPersistProviders(list: ProviderInfo[]): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(BROWSER_PROVIDERS_KEY, JSON.stringify(list));
+  } catch {
+    // non-fatal
+  }
+}
+
+function browserAddProvider(
+  name: string,
+  baseUrl: string,
+  _apiKey: string | null,
+  kind: string,
+): ProviderInfo {
+  const id = crypto.randomUUID();
+  const info: ProviderInfo = {
+    id,
+    name,
+    base_url: baseUrl,
+    kind,
+    is_private: kind === "local",
+  };
+  const list = browserListProviders();
+  list.push(info);
+  browserPersistProviders(list);
+  return info;
+}
+
+function browserRemoveProvider(id: string): boolean {
+  const list = browserListProviders();
+  const next = list.filter((p) => p.id !== id);
+  browserPersistProviders(next);
+  return next.length < list.length;
+}
+
+function browserListModels(_providerId: string): string[] {
+  // Browser fallback: return a minimal set so the picker isn't blank.
+  return ["default"];
+}
+
+// ── Conversation browser fallback ───────────────────────────────────────────
+
+function browserListConversations(): ConversationInfo[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(BROWSER_CONVERSATIONS_KEY);
+    return raw ? (JSON.parse(raw) as ConversationInfo[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function browserPersistConversations(list: ConversationInfo[]): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(BROWSER_CONVERSATIONS_KEY, JSON.stringify(list));
+  } catch {
+    // non-fatal
+  }
+}
+
+function browserCreateConversation(name: string, binding: string): ConversationInfo {
+  const now = Math.floor(Date.now() / 1000);
+  const conv: ConversationInfo = {
+    id: crypto.randomUUID(),
+    name,
+    pinned: false,
+    binding,
+    folder_id: null,
+    color: null,
+    created_at: now,
+    updated_at: now,
+  };
+  const list = browserListConversations();
+  list.unshift(conv);
+  browserPersistConversations(list);
+  return conv;
+}
+
+function browserGetMessages(_conversationId: string): MessageInfo[] {
+  // Browser fallback: no persisted messages in the stub.
+  return [];
+}
+
+// ── send_message browser fallback ───────────────────────────────────────────
 
 async function browserSendMessage(
   content: string,
@@ -146,7 +460,7 @@ async function browserSendMessage(
 ): Promise<SendMessageResponse> {
   // Match the Rust stub: 500ms think, then a few token chunks ~30ms apart.
   await sleep(500);
-  const replyBody = `Echo: "${content}". This is the M1 stub reply — the real agent loop, TRM classification, and model streaming land in subsequent milestones.`;
+  const replyBody = `Echo: "${content}". This is the M1 browser fallback — the real agent loop runs in the Tauri shell.`;
   const messageId = crypto.randomUUID();
   const tokens = chunkReply(replyBody);
   for (const token of tokens) {
@@ -158,6 +472,7 @@ async function browserSendMessage(
     content: replyBody,
     conversation_id: conversationId,
     profile: "personal",
+    routing_decision: "allow",
     completed_at: Date.now(),
   };
 }
@@ -185,3 +500,6 @@ function chunkReply(text: string): string[] {
   if (buf) out.push(buf);
   return out;
 }
+
+// Exported for tests / mock-driven scenarios.
+export { emitBrowserError };

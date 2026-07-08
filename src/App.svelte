@@ -24,6 +24,9 @@
   import ChatPanel from "$lib/components/ChatPanel.svelte";
   import ProviderSettings from "$lib/components/ProviderSettings.svelte";
   import { hydrate as hydrateProfiles } from "$lib/stores/profiles";
+  import { hydrateProviders } from "$lib/stores/providers.svelte";
+  import { hydrateConversations } from "$lib/stores/chat";
+  import { onStreamError, type StreamErrorPayload } from "$lib/api/tauri";
   import { applyTheme, theme } from "$lib/stores/settings";
 
   onMount(async () => {
@@ -34,6 +37,20 @@
 
     // Pull the profile list + active id from the backend.
     await hydrateProfiles();
+
+    // Hydrate providers and conversations from the backend.
+    await Promise.all([hydrateProviders(), hydrateConversations()]);
+
+    // Set up a global stream:error listener. Individual chat messages
+    // are handled in the chat store's send path, but this app-level
+    // listener can surface errors that arrive outside an active send
+    // (e.g. a delayed gate error after the user switched conversations).
+    // For now we just log — a toast UI can hook in here later.
+    await onStreamError((payload: StreamErrorPayload) => {
+      console.warn(
+        `[stream:error] source=${payload.source} conv=${payload.conversation_id}: ${payload.error}`,
+      );
+    });
   });
 
   let settingsOpen = $state(false);

@@ -22,6 +22,7 @@
     streamingMessage,
     type Message,
   } from "$lib/stores/chat";
+  import { providersStore } from "$lib/stores/providers.svelte";
   import { sendOnEnter } from "$lib/stores/settings";
   import PrivacyIndicator from "./PrivacyIndicator.svelte";
   import ModelPicker from "./ModelPicker.svelte";
@@ -31,8 +32,13 @@
   let isSending = $state(false);
   let textareaEl: HTMLTextAreaElement | null = $state(null);
 
-  // Derived: is the assistant currently streaming?
-  let isStreaming = $derived(streamingMessage !== null);
+  // Conversations are hydrated once at app start (App.svelte). This panel
+  // just reads the store.
+
+  // Derived: is the assistant currently streaming? `streamingMessage` is a
+  // store — read its value with the `$` prefix, not the store object itself
+  // (a store object is never null, which would pin this to `true`).
+  let isStreaming = $derived($streamingMessage !== null);
 
   // Privacy routing decision for the active conversation. Stub: derived
   // directly from the binding so the chip is never empty. The real M1
@@ -64,7 +70,11 @@
     draft = "";
     autoresize();
     try {
-      await sendChatMessage(content);
+      await sendChatMessage(
+        content,
+        providersStore.activeProviderId,
+        providersStore.activeModel,
+      );
     } finally {
       isSending = false;
       // Refocus the input so the next message can be typed immediately.
@@ -131,11 +141,14 @@
       <div class="mx-auto flex max-w-3xl flex-col gap-4">
         {#each $activeConversation.messages as m (m.id)}
           {@const streaming = isStreamingMessage(m)}
+          {@const isError = !!m.error}
           <div
             class="msg flex"
             class:msg-user={m.role === "user"}
             class:msg-assistant={m.role === "assistant"}
+            class:msg-error={isError}
             data-role={m.role}
+            data-error={isError ? "true" : undefined}
           >
             <div
               class="msg-bubble whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm leading-relaxed"
@@ -215,6 +228,14 @@
     background: rgb(38 38 42);
     color: rgb(245 245 245);
     max-width: 85%;
+  }
+
+  /* Error messages (stream:error from privacy gate / routing / model). */
+  .msg-error .msg-bubble {
+    background: rgb(67 20 30);
+    border: 1px solid rgb(127 29 29 / 0.5);
+    color: rgb(252 165 165);
+    max-width: 90%;
   }
 
   /* Streaming indicator — three pulsing dots. */

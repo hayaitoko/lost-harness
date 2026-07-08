@@ -9,7 +9,8 @@
   import {
     conversations,
     activeConversationId,
-    createConversation,
+    createConversationViaBackend,
+    hydrateMessages,
   } from "$lib/stores/chat";
   import {
     activeProfile,
@@ -26,12 +27,18 @@
     profilePickerValue = $activeProfileId;
   });
 
-  function handleNewChat() {
-    createConversation();
+  // The conversation list is hydrated once at app start (App.svelte); this
+  // sidebar just reads the store and loads a transcript on selection.
+
+  async function handleNewChat() {
+    await createConversationViaBackend();
   }
 
-  function handleSelectConversation(id: string) {
+  async function handleSelectConversation(id: string) {
     activeConversationId.set(id);
+    // Load messages from the backend if this conversation hasn't been
+    // hydrated yet.
+    await hydrateMessages(id);
   }
 
   function handleProfileChange(e: Event) {
