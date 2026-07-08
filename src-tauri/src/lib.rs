@@ -15,6 +15,7 @@
 mod agent; // M1: agent loop, §7 gate, tool dispatch
 mod trm; // M1: TRM engine, classification, logging
 mod audio; // M6: Audio engine, VAD, TTS pipeline
+mod hooks; // M3: Hook chain — privacy filter + permission + sandbox + first-use
 mod ipc; // M1: Tauri command handlers
 mod models; // M4: Model manager (local + cloud)
 mod platform; // M5: cross-platform computer use (cfg'd submodules)

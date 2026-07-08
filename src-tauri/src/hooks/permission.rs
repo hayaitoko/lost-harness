@@ -1,0 +1,349 @@
+//! `PermissionHook` — tri-state per-tool mode (`allow`/`ask`/`deny`) plus
+//! pattern rules (e.g. `(shell_exec, "git commit:*", allow)`). Spec
+//! `docs/tooling-and-skills.md` §3.1 "Permission granularity" / §10,
+//! `docs/PLAN.md` §8 M3 item 3.
+//!
+//! Resolution order (spec §10 step 3.5): pattern rules first (deny > ask >
+//! allow, most-specific wins among matches), falling back to the whole-tool
+//! mode, falling back to `Continue` (unset) so `FirstUseConfirmHook`
+//! downstream can do its "ask once, remember" thing.
+//!
+//! Backed by a pluggable `PolicySource` trait so a future SQLite-backed
+//! `tool_rules`/`tool_profile_permissions` implementation can drop in
+//! without touching `PermissionHook` itself — the SQLite schema for those
+//! tables is explicitly *not* built in this milestone (PLAN.md M4), so
+//! `InMemoryPolicySource` is the only implementation today.
+
+use std::collections::HashMap;
+
+use crate::hooks::{EventContext, GatingHook, HookEvent, HookResult};
+
+// ── PermissionMode ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PermissionMode {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl PermissionMode {
+    /// Higher wins when two matching rules are equally specific.
+    fn priority(self) -> u8 {
+        match self {
+            PermissionMode::Deny => 2,
+            PermissionMode::Ask => 1,
+            PermissionMode::Allow => 0,
+        }
+    }
+}
+
+// ── ToolRule ─────────────────────────────────────────────────────────────
+
+/// A pattern-scoped rule: `(tool_name, pattern, action)`. `pattern` is
+/// matched against `EventContext::command_text` via a small glob matcher
+/// supporting `*` as a wildcard (e.g. `"git commit:*"`, `"rm -rf:*"`) —
+/// deliberately simple since these are user/profile-authored strings, not
+/// full regex.
+#[derive(Debug, Clone)]
+pub struct ToolRule {
+    pub tool_name: String,
+    pub pattern: String,
+    pub action: PermissionMode,
+}
+
+impl ToolRule {
+    pub fn new(
+        tool_name: impl Into<String>,
+        pattern: impl Into<String>,
+        action: PermissionMode,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            pattern: pattern.into(),
+            action,
+        }
+    }
+
+    /// Number of non-wildcard characters — the specificity heuristic used
+    /// to pick a winner among multiple matching rules (more literal
+    /// characters = more specific).
+    fn specificity(&self) -> usize {
+        self.pattern.chars().filter(|c| *c != '*').count()
+    }
+}
+
+/// Minimal glob matcher: `*` matches any run of characters (including
+/// none); everything else must match literally. Good enough for patterns
+/// like `"git commit:*"` or `"rm -rf:*"` without pulling in a regex/glob
+/// crate for a handful of profile-authored rules.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+
+    let starts_with_wild = pattern.starts_with('*');
+    let ends_with_wild = pattern.ends_with('*');
+    let segments: Vec<&str> = pattern.split('*').filter(|s| !s.is_empty()).collect();
+
+    if segments.is_empty() {
+        // Pattern is just "*" (or "**", ...) — matches anything.
+        return true;
+    }
+
+    let mut pos = 0usize;
+    for (i, seg) in segments.iter().enumerate() {
+        let is_first = i == 0;
+        let is_last = i == segments.len() - 1;
+
+        if is_first && !starts_with_wild {
+            if !text[pos..].starts_with(seg) {
+                return false;
+            }
+            pos += seg.len();
+        } else if is_last && !ends_with_wild {
+            if !text[pos..].ends_with(seg) {
+                return false;
+            }
+            // No need to advance pos — this is the final check.
+        } else {
+            match text[pos..].find(seg) {
+                Some(idx) => pos += idx + seg.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+// ── PolicySource ─────────────────────────────────────────────────────────
+
+/// Where `PermissionHook` gets its configuration from. `mode_for` returns
+/// `None` when the tool has no configured whole-tool mode at all — that's
+/// the signal to fall through to `FirstUseConfirmHook` rather than an
+/// implicit `Ask`.
+pub trait PolicySource: Send + Sync {
+    fn mode_for(&self, tool_name: &str) -> Option<PermissionMode>;
+    fn rules_for(&self, tool_name: &str) -> Vec<ToolRule>;
+}
+
+/// A simple in-memory `PolicySource`. Stands in for the future
+/// SQLite-backed `tool_profile_permissions`/`tool_rules` tables (PLAN.md
+/// M4) — same trait contract, no migration needed when that lands.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryPolicySource {
+    modes: HashMap<String, PermissionMode>,
+    rules: Vec<ToolRule>,
+}
+
+impl InMemoryPolicySource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_mode(&mut self, tool_name: impl Into<String>, mode: PermissionMode) -> &mut Self {
+        self.modes.insert(tool_name.into(), mode);
+        self
+    }
+
+    pub fn add_rule(
+        &mut self,
+        tool_name: impl Into<String>,
+        pattern: impl Into<String>,
+        action: PermissionMode,
+    ) -> &mut Self {
+        self.rules.push(ToolRule::new(tool_name, pattern, action));
+        self
+    }
+}
+
+impl PolicySource for InMemoryPolicySource {
+    fn mode_for(&self, tool_name: &str) -> Option<PermissionMode> {
+        self.modes.get(tool_name).copied()
+    }
+
+    fn rules_for(&self, tool_name: &str) -> Vec<ToolRule> {
+        self.rules
+            .iter()
+            .filter(|r| r.tool_name == tool_name)
+            .cloned()
+            .collect()
+    }
+}
+
+// ── PermissionHook ───────────────────────────────────────────────────────
+
+pub struct PermissionHook {
+    policy: Box<dyn PolicySource>,
+}
+
+impl PermissionHook {
+    pub fn new(policy: Box<dyn PolicySource>) -> Self {
+        Self { policy }
+    }
+
+    /// Resolve the effective mode for this call: most-specific matching
+    /// pattern rule wins (deny > ask > allow tiebreak among equally
+    /// specific matches), else the whole-tool mode, else `None`.
+    fn resolve(&self, ctx: &EventContext) -> Option<PermissionMode> {
+        let rules = self.policy.rules_for(&ctx.tool_name);
+        let matching = rules
+            .iter()
+            .filter(|r| glob_match(&r.pattern, &ctx.command_text));
+
+        let best = matching.max_by_key(|r| (r.specificity(), r.action.priority()));
+        if let Some(rule) = best {
+            return Some(rule.action);
+        }
+        self.policy.mode_for(&ctx.tool_name)
+    }
+}
+
+impl GatingHook for PermissionHook {
+    fn name(&self) -> &str {
+        "permission"
+    }
+
+    fn on_event(&self, ctx: &mut EventContext) -> HookResult {
+        if ctx.event != HookEvent::PreToolUse {
+            return HookResult::Continue;
+        }
+
+        match self.resolve(ctx) {
+            Some(PermissionMode::Allow) => HookResult::Continue,
+            Some(PermissionMode::Deny) => HookResult::Deny(format!(
+                "denied by permission policy for tool '{}'",
+                ctx.tool_name
+            )),
+            Some(PermissionMode::Ask) => HookResult::Ask(format!(
+                "tool '{}' requires confirmation",
+                ctx.tool_name
+            )),
+            // Unconfigured — defer to FirstUseConfirmHook.
+            None => HookResult::Continue,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_match_prefix_wildcard() {
+        assert!(glob_match("git commit:*", "git commit:-m fix"));
+        assert!(!glob_match("git commit:*", "git push:origin"));
+    }
+
+    #[test]
+    fn glob_match_exact() {
+        assert!(glob_match("git status", "git status"));
+        assert!(!glob_match("git status", "git status --short"));
+    }
+
+    #[test]
+    fn glob_match_bare_star_matches_anything() {
+        assert!(glob_match("*", "anything at all"));
+    }
+
+    #[test]
+    fn whole_tool_deny_denies() {
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("shell_exec", PermissionMode::Deny);
+        let hook = PermissionHook::new(Box::new(policy));
+        let mut ctx = EventContext::pre_tool_use("shell_exec").with_command_text("ls -la");
+        match hook.on_event(&mut ctx) {
+            HookResult::Deny(_) => {}
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whole_tool_allow_allows() {
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("shell_exec", PermissionMode::Allow);
+        let hook = PermissionHook::new(Box::new(policy));
+        let mut ctx = EventContext::pre_tool_use("shell_exec").with_command_text("ls -la");
+        assert_eq!(hook.on_event(&mut ctx), HookResult::Continue);
+    }
+
+    #[test]
+    fn unconfigured_tool_falls_through_as_continue() {
+        let policy = InMemoryPolicySource::new();
+        let hook = PermissionHook::new(Box::new(policy));
+        let mut ctx = EventContext::pre_tool_use("unknown_tool").with_command_text("whatever");
+        assert_eq!(
+            hook.on_event(&mut ctx),
+            HookResult::Continue,
+            "unconfigured tools must fall through to FirstUseConfirmHook, not implicitly Ask"
+        );
+    }
+
+    #[test]
+    fn pattern_rule_overrides_whole_tool_mode() {
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("shell_exec", PermissionMode::Ask);
+        policy.add_rule("shell_exec", "git commit:*", PermissionMode::Allow);
+        let hook = PermissionHook::new(Box::new(policy));
+
+        let mut allowed = EventContext::pre_tool_use("shell_exec")
+            .with_command_text("git commit:-m fix typo");
+        assert_eq!(hook.on_event(&mut allowed), HookResult::Continue);
+
+        // Doesn't match the pattern → falls back to the whole-tool Ask.
+        let mut asked =
+            EventContext::pre_tool_use("shell_exec").with_command_text("git push:origin");
+        match hook.on_event(&mut asked) {
+            HookResult::Ask(_) => {}
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn most_specific_matching_rule_wins() {
+        let mut policy = InMemoryPolicySource::new();
+        // Broad allow, narrower deny — the narrower/more-specific one
+        // (more literal characters) must win regardless of registration
+        // order.
+        policy.add_rule("shell_exec", "git *", PermissionMode::Allow);
+        policy.add_rule("shell_exec", "git push --force*", PermissionMode::Deny);
+        let hook = PermissionHook::new(Box::new(policy));
+
+        let mut ctx = EventContext::pre_tool_use("shell_exec")
+            .with_command_text("git push --force origin main");
+        match hook.on_event(&mut ctx) {
+            HookResult::Deny(_) => {}
+            other => panic!("expected Deny (most specific rule), got {other:?}"),
+        }
+
+        let mut ctx2 =
+            EventContext::pre_tool_use("shell_exec").with_command_text("git status");
+        assert_eq!(hook.on_event(&mut ctx2), HookResult::Continue);
+    }
+
+    #[test]
+    fn deny_wins_tiebreak_among_equally_specific_matches() {
+        let mut policy = InMemoryPolicySource::new();
+        // Two rules with identical specificity (same literal char count)
+        // that both match the same text — deny must win the tiebreak.
+        policy.add_rule("shell_exec", "rm -rf:*", PermissionMode::Deny);
+        policy.add_rule("shell_exec", "rm -rf:*", PermissionMode::Allow);
+        let hook = PermissionHook::new(Box::new(policy));
+        let mut ctx =
+            EventContext::pre_tool_use("shell_exec").with_command_text("rm -rf:/tmp/x");
+        match hook.on_event(&mut ctx) {
+            HookResult::Deny(_) => {}
+            other => panic!("expected Deny to win the tiebreak, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_pretooluse_event_is_ignored() {
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("shell_exec", PermissionMode::Deny);
+        let hook = PermissionHook::new(Box::new(policy));
+        let mut ctx = EventContext::pre_tool_use("shell_exec").with_command_text("ls");
+        ctx.event = HookEvent::PostToolUse;
+        assert_eq!(hook.on_event(&mut ctx), HookResult::Continue);
+    }
+}
