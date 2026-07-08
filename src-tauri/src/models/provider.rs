@@ -9,7 +9,14 @@ use serde::{Deserialize, Serialize};
 
 /// Where a model runs. Used by the model picker (§4) to group and label
 /// endpoints in the UI.
+///
+/// Serializes lowercase (`"local"`/`"cloud"`/`"custom"`) to match the
+/// frontend, which sends `kind` lowercase and compares `p.kind === "local"`
+/// (provider-catalog.ts, providers.svelte.ts, ProviderSettings.svelte,
+/// ModelPicker.svelte). Without this the IPC returns PascalCase `"Cloud"` and
+/// the frontend's kind checks silently fail in the real Tauri shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     /// On-device (llama.cpp, LM Studio, Ollama) — never egresses.
     Local,

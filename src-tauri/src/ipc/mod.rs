@@ -28,6 +28,9 @@
 //! synchronously. The agent loop carries its own internal `Mutex` for
 //! stream serialization.
 
+#[cfg(test)]
+mod contract_tests;
+
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
