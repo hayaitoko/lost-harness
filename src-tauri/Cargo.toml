@@ -36,6 +36,14 @@ parking_lot = "0.12"
 # TRM (privacy classifier) + privacy gate deps
 regex = "1"
 url = "2"
+# sha256 for the TRM message-hash audit log (spec §3: never log plaintext).
+sha2 = "0.10"
+
+[dev-dependencies]
+# tauri::test::{mock_app, mock_builder, MockRuntime} — only used by the
+# M1 agent-loop integration tests. Keeps the test-only symbol out of
+# release builds.
+tauri = { version = "2.11", features = ["test"] }
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!

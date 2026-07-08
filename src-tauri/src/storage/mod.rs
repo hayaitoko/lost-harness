@@ -39,6 +39,18 @@ pub struct Storage {
     inner: Arc<StorageInner>,
 }
 
+// SAFETY (M1): `Storage` is logically single-writer per profile (the
+// agent loop and IPC commands are serialized through a `Mutex<Storage>`
+// at the AppState boundary — see `ipc::AppState`). The internal
+// `rusqlite::Connection` is `!Sync` due to its use of `RefCell`, but
+// `Mutex<Storage>` guarantees no two threads touch it concurrently, so
+// the manual `Send + Sync` impls below are sound for the M1 usage.
+// If a future milestone introduces truly concurrent access paths,
+// replace this with proper `parking_lot::Mutex<Connection>` inside
+// `GlobalDb` / `ProfileDb` and remove the manual impls.
+unsafe impl Send for Storage {}
+unsafe impl Sync for Storage {}
+
 struct StorageInner {
     /// Absolute path of the storage root (e.g. `~/Documents/Lost-Harness/`).
     base_path: PathBuf,

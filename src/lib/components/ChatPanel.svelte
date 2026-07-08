@@ -7,12 +7,13 @@
   //
   // Layout:
   //   ┌───────────────────────────────┐
+  //   │ [PrivacyIndicator]             │  ← routing chip for the active chat
   //   │ message list (scrollable)      │
   //   │   …                            │
   //   │   [user]   hello              │
   //   │   [assist] hi there…           │   ← streaming indicator on last msg
   //   ├───────────────────────────────┤
-  //   │ [textarea]          [Send]     │
+  //   │ [textarea] [ModelPicker] [Send]│
   //   └───────────────────────────────┘
 
   import {
@@ -22,6 +23,8 @@
     type Message,
   } from "$lib/stores/chat";
   import { sendOnEnter } from "$lib/stores/settings";
+  import PrivacyIndicator from "./PrivacyIndicator.svelte";
+  import ModelPicker from "./ModelPicker.svelte";
 
   // Local component state. `let x = $state(...)` makes it reactive.
   let draft = $state("");
@@ -30,6 +33,21 @@
 
   // Derived: is the assistant currently streaming?
   let isStreaming = $derived(streamingMessage !== null);
+
+  // Privacy routing decision for the active conversation. Stub: derived
+  // directly from the binding so the chip is never empty. The real M1
+  // wires the §7 gate / TRM interface here and returns "allow" |
+  // "route_local" | "block" based on the message's sensitivity +
+  // provider reachability.
+  let privacyDecision = $derived.by<
+    null | "allow" | "route_local" | "block"
+  >(() => {
+    const conv = $activeConversation;
+    if (!conv) return null;
+    if (conv.binding === "private") return "route_local";
+    if (conv.binding === "public") return "allow";
+    return null; // auto: no decision yet
+  });
 
   // Auto-grow the textarea up to ~6 lines.
   function autoresize() {
@@ -94,6 +112,17 @@
       </div>
     </div>
   {:else}
+    <!-- Privacy routing chip, anchored above the message list. -->
+    <div
+      class="flex items-center justify-between border-b border-neutral-800/60 bg-neutral-950/40 px-4 py-2"
+      data-testid="chat-privacy-bar"
+    >
+      <PrivacyIndicator
+        binding={$activeConversation?.binding ?? "auto"}
+        decision={privacyDecision}
+      />
+    </div>
+
     <!-- Message list -->
     <div
       class="messages flex-1 overflow-y-auto px-4 py-6"
@@ -149,6 +178,7 @@
           aria-label="Message"
           class="flex-1 resize-none rounded-xl border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
         ></textarea>
+        <ModelPicker />
         <button
           type="submit"
           disabled={isSending || draft.trim().length === 0}

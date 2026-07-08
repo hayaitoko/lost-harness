@@ -136,6 +136,15 @@ pub struct ProfileDb {
     pub name: String,
 }
 
+// SAFETY (M1): see `Storage` for the full rationale. `ProfileDb` holds
+// a bare `rusqlite::Connection` (RefCell-backed, `!Sync`). The agent
+// loop's internal `stream_lock` and Tauri's command boundary together
+// guarantee no two threads touch a `ProfileDb` concurrently in the M1
+// wiring. If/when true concurrency is needed, wrap `conn` in a
+// `parking_lot::Mutex` and remove these manual impls.
+unsafe impl Send for ProfileDb {}
+unsafe impl Sync for ProfileDb {}
+
 impl ProfileDb {
     /// Open an existing profile DB (or create + migrate a fresh one).
     pub fn open(path: &std::path::Path, name: &str) -> Result<Self> {
