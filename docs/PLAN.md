@@ -352,6 +352,19 @@ One build-time tuning detail carries forward, not a real open decision: the
 exact size of the catch-up-buffer window (on the order of a few days) isn't
 fixed here — pick it during implementation from real usage.
 
+**Still open — flagged for Lukas, not yet decided:**
+
+- **Should memory be shared across all profiles, or walled off per
+  profile?** Two live options: **shared**, one coherent assistant that
+  remembers everything about you no matter which profile you're in; or
+  **walled**, where each profile (work, personal, ...) keeps its own
+  separate memory and nothing crosses over. Fable's reference spec picked a
+  middle path — memory is shared, but every fact is tagged with which
+  profile it came from, so a per-profile view is possible later without
+  building a hard wall today. That's a reasonable default but has not been
+  ratified as Lost Harness's answer — decide before the memory system
+  (§9) is built, since the storage schema depends on which way this goes.
+
 ---
 
 ## 8. Build order / milestones
@@ -487,6 +500,207 @@ this track depends on a secure, working, correctly-scoped connection:
       "download locally" pinning (§5) — this is its own real subsystem
       (the file-sync engine — decided as a custom send-what-changed push,
       see §5) and is explicitly not scoped before this point.
+
+---
+
+## 9. Memory system
+
+**Status: designed in full, not built.** `sqlite-vec` (the meaning-search
+engine, see below) is already wired and proven — see the build order (§8,
+M3). The rest — the actual hybrid search, the curated summary, the write
+triggers — is the memory milestone, not yet started.
+
+### Two tiers
+
+Memory has two distinct layers, each doing a different job:
+
+1. **The curated summary** — a small, bounded, *always-loaded* set of
+   durable facts about the user, like sticky notes always in view on a
+   desk. It's injected into every conversation automatically; there's no
+   separate "go look this up" step. It stays small on purpose — bounded
+   size keeps it sharp and cheap — so when it fills up, that forces a
+   tidy-up pass. Nothing is lost when that happens: whatever gets trimmed
+   out of the summary is still sitting in the archive, just no longer
+   pinned to the front page.
+2. **The archive** — a full, unbounded, *searchable* record of everything
+   the agent has ever saved, like a filing cabinet. It is not preloaded
+   into every conversation; it's searched on demand, mid-conversation,
+   whenever something relevant might be in there.
+
+### Storage
+
+SQLite — already the app's database — is the engine for both tiers. The
+human-facing side of memory (the curated summary and daily notes) is also
+kept as plain markdown files on disk, so the user can open and edit their
+own memory in any text editor, and could optionally point a tool like
+Obsidian at that folder if they want to — the product itself never depends
+on Obsidian or any other external app to function.
+
+Two things deliberately **not** in v1:
+
+- **No separate vector database.** No Qdrant, no external server —
+  `sqlite-vec` keeps the meaning-search index inside the same one embedded
+  SQLite file the rest of the app already uses. One file, no service to
+  run.
+- **No knowledge graph / linked notes.** Just simple tags — profile,
+  project, date. A real graph structure could come later if it ever proves
+  necessary, but it's not a v1 feature.
+
+### Search — hybrid, on demand
+
+Every search runs two kinds of matching together and merges the results:
+
+- **Keyword matching** — SQLite's bundled FTS5 full-text search.
+- **Meaning matching** — `sqlite-vec`, now wired and proven (§8, M3). This
+  is what lets a search for "that thing about the deploy key" find a fact
+  that was actually phrased completely differently, because it matches on
+  meaning, not exact words.
+
+Results from both are merged and ranked by a mix of relevance and
+recency, and only the top handful come back — never the whole archive
+dumped into context. The "meaning fingerprint" for each saved fact is
+computed by a small **local** model, so even the act of indexing memory
+never sends anything off the device.
+
+### When memory gets written
+
+This is the part worth getting right, because "detect when the
+conversation ended" is not a reliable signal to build on — conversations
+don't reliably announce their own end. Instead there are three separate
+triggers, layered so no single one has to be perfect:
+
+1. **Save-as-you-go (primary).** The moment a durable fact appears in
+   conversation, the agent saves it right then — it doesn't wait for
+   anything else to happen first.
+2. **Pre-compaction flush (safety net).** Right before a long
+   conversation gets trimmed down to fit in the model's context window,
+   a cheap pass sweeps whatever's about to be trimmed for anything
+   durable and saves it first. This is triggered by a concrete, real
+   signal — "context is filling up" — not a guess about intent.
+3. **New-chat nudge (backstop).** When a new conversation starts, a soft
+   nudge prompts a consolidation pass, catching anything the first two
+   missed.
+
+The one actual judgment call anywhere in this is "is this fact durable, or
+is it just chatter" — that's a call the model makes, and it's gated by
+whatever the profile's approval setting says (i.e., this is subject to the
+same permission system as everything else the agent does, not a special
+carve-out).
+
+### Timing and trust
+
+The curated summary is loaded once, at the start of a conversation, and
+deliberately **not** re-churned mid-conversation — this keeps prompt
+caching stable and keeps costs down. That does **not** mean the archive is
+unavailable mid-conversation: it's searchable at any time through an
+always-available, pinned search tool the agent can reach for whenever it
+suspects something relevant might be saved. A fact saved mid-conversation
+persists immediately and shows up in the curated summary starting next
+conversation — it just doesn't retroactively rewrite the summary that's
+already loaded into the current one.
+
+Anything recalled from memory is treated as **untrusted content**, the
+same guard-wrapping used for web pages and tool output (see §4) — a
+poisoned or tampered memory entry can't be mistaken for an instruction and
+hijack the agent. And memory obeys the privacy filter on **every** model
+call it's involved in, not just the visible chat reply — a work-profile
+memory genuinely cannot leak into a personal-context cloud call, because
+the same check runs regardless of which call triggered it.
+
+### The genuinely hard part
+
+Flagged honestly, not as a blocker: the hard part of memory isn't storage
+or search mechanics, it's **retrieval quality** — surfacing the *right*
+memory at the *right* moment, and the agent knowing *when* it should even
+bother searching. Two mitigations, not full solutions: the curated summary
+hints at what kinds of things exist in the archive (so the agent has a
+sense of what's worth searching for), and the agent is nudged to search
+whenever the context feels thin. This will need real usage to tune well —
+call it out explicitly when building it rather than assuming the hybrid
+search alone solves it.
+
+---
+
+## 10. Skills system
+
+**Status: designed in full, not built.** See `docs/tooling-and-skills.md`
+for the deeper claude-code-derived reasoning; this section is the decided
+shape.
+
+### What a skill is
+
+A **skill** is a reusable playbook — "here's how to do this recurring job
+well" — bundling a set of steps plus, optionally, reference files or
+scripts. It's a different thing from a **tool**: a tool is one single
+capability (read a file, browse the web); a skill is know-how that
+*combines* tools with judgment to handle a repeat task well, the same way
+a checklist is not itself a tool but tells you which tools to use and in
+what order.
+
+### Progressive disclosure
+
+A skill is expensive to keep fully loaded and cheap to keep as a pointer,
+so it's loaded in three stages: the name and one-line description are
+always cheap to see (so the agent always knows a skill exists without
+paying for its content); the full body loads only once the skill is
+actually triggered; any bundled scripts or reference files load only when
+the skill actually uses them. This is what lets the agent accumulate an
+unbounded number of playbooks over time without every conversation paying
+the cost of all of them.
+
+### Creation autonomy — a per-profile toggle
+
+Whether the agent can create new skills on its own is a **per-profile
+setting**, with two modes:
+
+- **Approve-first** (the **default**) — after finishing a task, the agent
+  may draft a new skill, but it's shown to the user to approve, edit, or
+  reject before it's ever used for real.
+- **Autonomous** — the agent teaches itself new skills and starts using
+  them without asking first.
+
+Default is approve-first because it's the secure choice; autonomous is an
+opt-in convenience for whichever profile the user trusts with it.
+**Manually authoring a skill yourself is always available**, in any
+profile, regardless of which mode that profile is in — the toggle only
+governs whether the *agent* can create skills unsupervised, never whether
+the user can.
+
+### Why "autonomous" is still safe
+
+Autonomous mode only removes the *human approval step for the playbook
+itself* — it does **not** expand what the agent is allowed to do. Every
+tool call a skill makes still passes through the same one-gate hook chain
+as everything else (privacy filter, danger blocklist, permissions — see
+§4), so a self-taught skill can never exceed whatever its profile is
+already permitted to do; it can only ever get better at doing things it
+could already do. On top of that, even autonomous skills:
+
+- get an automated "does it actually work" check (a curator test) before
+  being trusted,
+- are themselves treated as untrusted text (same guard-wrapping as
+  memory and tool output — see §9 and §4), and
+- appear in a reviewable "what I taught myself" feed the user can look
+  through and edit or delete at any time.
+
+### The learning loop
+
+The intended flywheel: the agent finishes a task → reflects on whether it
+was worth saving as a playbook → drafts a skill → (gated by the toggle
+above) becomes available for next time. On top of that baseline loop,
+**teacher-escalation**: when a small local model fails the same kind of
+task twice, a bigger model steps in, solves it, *and* writes a skill so
+the small local model can handle that exact kind of task itself next
+time — meaning the harness gets more capable the more it's actually used,
+not just when someone deliberately sits down to add a feature. A curator
+process also periodically re-tests existing skills to catch ones that
+have quietly stopped working (a "rot" check).
+
+### Seed skills — not yet decided
+
+Which handful of common recurring tasks should ship pre-loaded as
+built-in skills is intentionally **TBD** — a decision for when the skills
+system is actually being built, not a design question to resolve now.
 
 ---
 
