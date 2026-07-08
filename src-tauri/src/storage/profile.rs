@@ -148,6 +148,7 @@ unsafe impl Sync for ProfileDb {}
 impl ProfileDb {
     /// Open an existing profile DB (or create + migrate a fresh one).
     pub fn open(path: &std::path::Path, name: &str) -> Result<Self> {
+        crate::storage::ensure_sqlite_vec_registered();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating profile dir {}", parent.display()))?;
@@ -165,6 +166,7 @@ impl ProfileDb {
     /// cross-profile log lines look correct.
     #[cfg(test)]
     pub fn open_in_memory(name: &str) -> Result<Self> {
+        crate::storage::ensure_sqlite_vec_registered();
         let conn = Connection::open_in_memory()?;
         migrate_profile(&conn)?;
         Ok(Self {

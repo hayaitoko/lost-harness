@@ -23,13 +23,33 @@ pub mod schema;
 mod tests;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 
 pub use global::{GlobalDb, *};
 pub use profile::{ProfileDb, *};
+
+/// Register the `sqlite-vec` extension for every connection opened in this
+/// process. `sqlite3_auto_extension` applies to all *future* connections, so
+/// this must run before the first `Connection::open`; the `Once` makes it
+/// safe (and cheap) to call from every DB-open path. After this, `vec0`
+/// virtual tables + the KNN `MATCH` operator are available — the "by meaning"
+/// half of memory search (the keyword half is bundled SQLite's FTS5).
+pub(crate) fn ensure_sqlite_vec_registered() {
+    static VEC_INIT: Once = Once::new();
+    VEC_INIT.call_once(|| {
+        // SAFETY: the standard sqlite-vec + rusqlite registration. The init
+        // fn has the C extension-entry-point signature; `sqlite3_auto_extension`
+        // stores it for use on every subsequent connection open.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
 
 /// Top-level storage handle. Owns the global DB and a registry of
 /// open per-profile DBs. Cheap to clone (`Arc` inside) so it can be

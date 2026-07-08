@@ -585,3 +585,39 @@ impl Drop for TempDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sqlite-vec extension smoke test — proves the "by meaning" search engine
+// actually loads and does nearest-neighbour matching on this toolchain.
+// Opening any DB registers the extension (ensure_sqlite_vec_registered), so
+// the vec0 virtual table + KNN MATCH must work end-to-end here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn sqlite_vec_extension_loads_and_does_knn() {
+    let db = GlobalDb::open_in_memory().unwrap();
+    let conn = db.raw();
+
+    // vec0 virtual table = the semantic index. If the extension didn't
+    // register, this CREATE fails with "no such module: vec0".
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE vec_smoke USING vec0(embedding float[4]);
+         INSERT INTO vec_smoke(rowid, embedding) VALUES
+           (1, '[1.0, 2.0, 3.0, 4.0]'),
+           (2, '[9.0, 9.0, 9.0, 9.0]'),
+           (3, '[1.1, 2.1, 3.1, 4.1]');",
+    )
+    .expect("vec0 module must be available (sqlite-vec registered)");
+
+    // KNN: the two nearest vectors to [1,2,3,4] must be rows 1 then 3,
+    // never row 9-9-9-9. Proves the distance/MATCH operator works.
+    let nearest: Vec<i64> = conn
+        .prepare("SELECT rowid FROM vec_smoke WHERE embedding MATCH ?1 ORDER BY distance LIMIT 2")
+        .unwrap()
+        .query_map(rusqlite::params!["[1.0, 2.0, 3.0, 4.0]"], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<i64>>>()
+        .expect("KNN query must run");
+
+    assert_eq!(nearest, vec![1, 3], "nearest-match ordering must be 1 then 3");
+}

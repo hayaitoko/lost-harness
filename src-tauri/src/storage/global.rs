@@ -88,6 +88,7 @@ pub struct GlobalDb {
 impl GlobalDb {
     /// Open an existing global.db (or create + migrate a fresh one) at `path`.
     pub fn open(path: &std::path::Path) -> Result<Self> {
+        crate::storage::ensure_sqlite_vec_registered();
         let conn = Connection::open(path)
             .with_context(|| format!("opening global.db at {}", path.display()))?;
         migrate_global(&conn)?;
@@ -97,6 +98,7 @@ impl GlobalDb {
     /// In-memory variant for tests.
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
+        crate::storage::ensure_sqlite_vec_registered();
         let conn = Connection::open_in_memory()?;
         migrate_global(&conn)?;
         Ok(Self { conn })

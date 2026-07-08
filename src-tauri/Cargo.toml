@@ -26,6 +26,10 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Semantic ("by meaning") memory search — the vec0 virtual table + KNN.
+# Registered once at DB-open (see storage::ensure_sqlite_vec_registered).
+# Bundled SQLite already provides FTS5 for the keyword lane.
+sqlite-vec = "0.1.9"
 reqwest = { version = "0.12", features = ["stream", "json"] }
 tokio-stream = "0.1"
 # Used by storage + IPC (message_id generation, timestamps)
