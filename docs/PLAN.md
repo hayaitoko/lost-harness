@@ -19,9 +19,10 @@ fully, with no internet connection required. It can chat with you, use tools
 control your screen and talk out loud), and it knows the difference between
 things that are safe to send to a cloud AI model and things that should never
 leave your machine. If you later want more — a scheduler that keeps running
-while your laptop is asleep, an inbox that gets watched overnight — you can
-optionally connect a server you own, and the app gets more capable without
-ever becoming dependent on that server.
+while your laptop is asleep, an inbox that gets watched overnight, the same
+project followed across a laptop and a desktop — you can optionally connect
+a server you own, and the app gets more capable without ever becoming
+dependent on that server.
 
 **Non-negotiables:**
 
@@ -29,7 +30,7 @@ ever becoming dependent on that server.
   requirement. Every feature has to work with the server absent.
 - **Works fully offline.** No "please connect to the internet" wall for core
   functionality. Local models, local storage, local tools.
-- **The privacy gate is load-bearing, not cosmetic.** Every place the app
+- **The privacy filter is load-bearing, not cosmetic.** Every place the app
   calls out to a model — a chat reply, a background summary, a memory
   compaction pass, an embedding — is checked first. Sensitive content is
   routed to a local model or blocked from leaving the device; it is never
@@ -41,7 +42,7 @@ ever becoming dependent on that server.
 
 ## 2. Architecture at a glance
 
-There is **one Rust core** — the agent loop, the privacy gate, the tool
+There is **one Rust core** — the agent loop, the privacy filter, the tool
 registry, the storage layer, all of it. That core compiles into two bodies:
 
 - **The app** (Tauri 2 + Svelte 5, mac/win/linux) — the product. Has a
@@ -61,16 +62,42 @@ the two bodies is still being firmed up as the server design gets built out
 — treat the app-first, twin-not-daemon shape as locked, and the transport
 details as flexible.
 
-**The baton.** When both bodies are reachable, only one of them is ever
-allowed to write — that's the "baton." The app holds it while the app is
-open. When the app closes, the baton passes to the server, which keeps going
-on whatever it was doing (or picks up scheduled work). When the app comes
-back, the server finishes whatever single step it's mid-way through and
-hands the baton back. Both sides always know whether the other is online,
-reusing the same heartbeat mechanism already designed for cron fallback
-detection (see §5). Because there is never more than one writer at a time,
-**there is no merge-conflict problem to solve** in the common case — nothing
-needs to be reconciled, because nothing was ever written twice.
+**The baton.** Only one device is ever allowed to write to a given project
+at a time — that's the "baton." Every other linked device sees that project
+**read-only**, with a clear warning ("your desktop is working on this — open
+read-only, or ask it to hand over"). In the simplest case — just the app, no
+server — this is trivial: the app always holds its own baton. Once a server
+is connected, the baton is also what lets the app close without losing
+anything: it passes to the server, which keeps going on whatever it was
+doing (or picks up scheduled work), and hands it back the moment the app
+reopens and finishes whatever single step it's mid-way through. Because
+there is never more than one writer at a time, **there is no merge-conflict
+problem to solve** in the common case — nothing needs to be reconciled,
+because nothing was ever written twice.
+
+**Multi-device (decided: supported).** The baton generalizes the same way
+to more devices — it's really a **per-project lock that any linked device
+can hold, one at a time**. Laptop, desktop, and eventually phone all compete
+for the same lock the app and server always did; this is the baton grown
+up, not a new subsystem. Two consequences follow directly:
+
+- **Multi-device requires a connected server.** The server is the referee —
+  the one thing every linked device can always reach to arbitrate who holds
+  a project's lock. A single device with no server configured still works
+  fully offline, exactly as before; you just don't get multi-device without
+  a server to hand the baton around.
+- **Offline editing still works, for whichever device holds the lock.**
+  Whichever device grabbed a project's lock before going offline is the
+  only one that can edit it, so nothing else touches that project while
+  it's gone. An edit made *without* holding the lock is surfaced for the
+  user to resolve on reconnect — never silently merged.
+
+**Takeover.** A device that wants a held lock requests it; the current
+holder releases cleanly if it's online. If the holder is unreachable, the
+server times the lock out and grants it to the requester, flagged "taken
+over from an offline device" so nothing is quietly overwritten. Both sides
+always know whether the other is online, reusing the same heartbeat
+mechanism already designed for cron fallback detection (see §5).
 
 ---
 
@@ -90,20 +117,22 @@ parts natively in Rust.
 | Guard-wrapped untrusted content (web pages, email, tool output, OCR'd screen text) | Fable's reference spec | A real prompt-injection defense — content the agent didn't generate can never impersonate an instruction | Committed |
 | Capability registry that refuses instead of silently degrading | Fable's reference spec | If a model can't honor what's being asked of it (tools, structured output, vision), the app says so loudly instead of quietly mishandling the request | Committed |
 | Approval spine: layered deny-wins policy + a hardcoded blocklist nothing can override + pinned/locked approvals | Fable's reference spec | A composable "is this action allowed here" system, a floor that even a "just let it run" mode can't punch through, and protection against an approved action silently drifting into a different one at execution time | Committed |
+| Pairing-based mutual authentication (one-time code/QR/token exchange, then always-on end-to-end-encrypted, revocable trust — never dependent on the network it runs over) | Ours | Makes "the server is the same trust tier as local" actually true rather than true only on paper; Tailscale/LAN reachability becomes a convenience, not the security | Committed |
 | Usage ledger + budget governor (local = $0, unknown = a visible "flying blind" flag, never a silent guess) | Fable's reference spec | Real cost accounting — something the app has none of today — and a budget cap for unattended server work where nobody is watching the bill | Committed |
+| Per-profile opt-in server sync (only profiles the user opts in send cron definitions + the context those crons need to the server) | Ours | Respects both profile isolation and privacy — a personal profile can stay 100% local while a work profile uses the office server | Committed |
 | Durable sequenced event journal + replay | Fable's reference spec | A clean way for a reconnecting client to catch up on what happened while it was away, without re-deriving state by guesswork | Committed |
 | Durability trio: crash-recovery boot sequence, idempotency keys on every mutating action, loud-vs-silent failure handling | Fable's reference spec | A desktop app gets force-quit and restarted constantly — this makes that safe: no half-finished work left in a broken state, no duplicate sends from a double-click, no failure that vanishes because the window that triggered it reloaded | Committed |
 | Harness-delivered `HEARTBEAT_OK`/`[SILENT]` sentinel + one unified work queue | Fable's reference spec | Solves "don't spam the user with a wall of no-op notifications after a week away," and forces us to consolidate cron jobs, subagent dispatch, and server results into one queue model instead of three overlapping ones | Committed |
 | Risk-class taxonomy on every tool (safe / write / external / dangerous) | Fable's reference spec | One deterministic property drives approval prompts, memory scope, and UI badges instead of re-deriving "how risky is this" ad hoc each time | Proposed |
 | Memory/turn discipline: frozen per-session snapshot, pre-compaction flush, non-destructive session lineage, a single blocking "ask the user" tool | Fable's reference spec | Avoids stale self-knowledge, long-session amnesia, and a corrupted "waiting for input" state on restart | Proposed |
 | `Capability`/`Tool` trait + one shared registry | claude-code | One definition of "what can the agent do" that both bodies use, filtered per-environment instead of hand-coded per-platform | Committed |
-| Unified `Hook` gating chain (privacy gate + permissions + sandbox + first-use confirmation as one chain) | claude-code (mechanism) + ours (the four gates it unifies) | One place that answers "can this run, and if not, why" — today those four checks are scattered; a new rule becomes one addition instead of a four-file edit | Committed |
+| Unified `Hook` gating chain (privacy filter + permissions + sandbox + first-use confirmation as one chain) | claude-code (mechanism) + ours (the four gates it unifies) | One place that answers "can this run, and if not, why" — today those four checks are scattered; a new rule becomes one addition instead of a four-file edit | Committed |
 | Skill packaging + three-tier progressive disclosure (name/description always loaded, body loaded on trigger, scripts/resources loaded only on use) | claude-code | Lets the agent learn an unbounded number of playbooks without bloating every prompt with all of them | Committed |
 | Rule-granular permissions (`allow`/`ask`/`deny` per tool, plus pattern rules like "allow git commit, deny rm -rf") | claude-code | Finer control than today's whole-tool on/off switch, without a confirmation dialog for every single action | Committed |
 | Declarative agent types (named personas with a bounded toolbelt and a model "seat," not a hardcoded model name) | claude-code | Reusable specialists (a code reviewer, a research explorer) that can't accidentally use tools outside their job, and stay portable across whichever model is assigned to their seat | Committed |
 | Capability Packs (a bundle format for installing skill + tool config + agent type + cron template together, like a plugin) | claude-code | A single install unit for a whole new capability, usable by non-technical users without hand-editing config | Committed |
-| The baton (single-active-writer handoff between app and server) | Ours | Eliminates two-way merge conflicts by construction — there is never a second writer to conflict with | Committed |
-| Configurable-host privacy gate (on-device by default, or a designated trusted host) with per-profile cost + history tracking | Ours | Lets a household or small company point the privacy classifier at their own trusted machine instead of every device running its own, while keeping spend and history separated by profile | Committed |
+| The baton (single-active-writer handoff, generalized to a per-project lock any linked device can hold) | Ours | Eliminates merge conflicts by construction — there is never a second writer to conflict with, even as more devices join | Committed |
+| Configurable-host privacy filter (on-device by default, or a designated trusted host) with per-profile cost + history tracking | Ours | Lets a household or small company point the privacy classifier at their own trusted machine instead of every device running its own, while keeping spend and history separated by profile | Committed |
 | Hard "must-not-leave-this-host" routing enforcement | Ours (closes a gap Fable's spec left open) | A registry-level guarantee that a PII-flagged request literally cannot fail over to a cloud model under pressure — today's routing is a strong default, not a hard rule | Committed |
 
 ---
@@ -143,7 +172,7 @@ gating logic, which today is scattered across a few different files.
   asynchronously.
 - **Hooks** are checkpoints: before and after every tool call, and at
   lifecycle moments like a cron firing or the app launching, a chain of
-  checks runs. This is where the privacy gate, the permission system, the
+  checks runs. This is where the privacy filter, the permission system, the
   sandbox rules, and "confirm before first use" all combine into one
   ordered decision instead of four separate, hard-to-audit code paths. Any
   single check saying "no" wins.
@@ -173,13 +202,38 @@ optional and adds capability without creating a dependency: disconnect it
 and the app loses nothing, because local storage is always the source of
 truth for the app's own data.
 
-- **The baton handoff.** Described in §2. In practice: the app sends a
+- **Connecting a server: pairing, not passwords (decided).** The security
+  of the app↔server connection is built into the product, not borrowed from
+  whatever network it happens to run over — Tailscale, plain LAN, or the
+  open internet are all just transport, never the thing keeping the
+  connection safe. A one-time **pairing** step (the server shows a code /
+  QR / token, entered once in the app) establishes a shared cryptographic
+  trust both sides remember; no password is ever sent over the wire. Every
+  later connection proves that trust without re-sending the secret, over an
+  **always-on, end-to-end-encrypted** channel — there is no insecure mode.
+  The proof is **mutual**: the server also proves it's really the user's
+  server, so a look-alike on the network can't impersonate it. Pairing is
+  **revocable** — unpair a lost device at any time. This is what makes "the
+  server is the same trust tier as local" actually true, not just true on
+  paper.
+- **Per-profile opt-in (decided).** Each profile (personal, work, school,
+  developer, ...) has its own "let the server handle this profile? yes/no"
+  setting. Only opted-in profiles send their relevant data — cron
+  definitions and the context those crons need — to the server; a profile
+  left off never leaves the device. Within an opted-in profile, the
+  existing per-cron Local/Server/Fallback choice is the fine-grained
+  control underneath. This respects both the profile-isolation wall and
+  privacy — personal can stay 100% local while work runs on the office
+  server.
+- **The baton handoff.** Described in §2, now generalized to a per-project
+  lock any linked device can hold. In practice: each device sends a
   heartbeat every 30–60 seconds while open. A scheduled job is claimed by
   whichever side reaches it first and writes an acknowledgment under a
   `(job_id, scheduled_time)` key; the other side sees that ack and skips
-  it. No distributed lock is needed — with only two nodes and one of them
-  (the server) always up, a liveness check plus a claim-ledger is enough
-  for exactly-once execution.
+  it. No distributed lock is needed — the server is always up and acts as
+  the referee, so a liveness check plus a claim-ledger is enough for
+  exactly-once execution and for arbitrating project-lock takeover as more
+  devices join.
 - **Shared working directory + in-app file explorer.** Once a server is
   connected, agent working directories — memory and project files both —
   can live in a synced folder that shows up as a real explorer panel in
@@ -205,10 +259,27 @@ truth for the app's own data.
   double-applied and nothing is silently dropped. A long stretch offline
   gets rolled up into one summary ("...and 42 more while you were away")
   instead of a flood of individual notifications.
+- **Event history stays local (decided).** The event journal — every
+  conversation, memory update, and thing the agent did — lives in the
+  app's own local database; the app never needs the server to read or
+  write its own history, which is what keeps "works fully without the
+  server" true. Two different things share that journal: the *permanent
+  record* (kept in full, searchable, never silently dropped) and a
+  *catch-up buffer* — a bounded rolling window of the last few days whose
+  only job is letting a device that stepped away briefly replay what it
+  missed. A device gone longer than the buffer window just does a full
+  re-sync instead — nothing is ever lost, because retention only ever
+  applies to the throwaway catch-up buffer, never to the user's actual
+  data. The exact buffer window size is a build-time tuning detail, not a
+  design decision — pick it during implementation from real usage.
 
-The **file-sync engine** underneath the shared-directory feature is real,
-standalone engineering — its own subsystem, not a side effect of anything
-else in this plan. It is explicitly **not** in scope for M1–M4; see the
+**File sync — decided: we build our own.** The engine underneath the
+shared-directory feature is real, standalone engineering, but it doesn't
+need to be a heavyweight bidirectional sync tool: because the baton
+guarantees only one device is ever writing to a project at a time, sync is
+just "send what changed, when the lock moves" over our own authenticated
+app↔server channel — a simple, custom-built push, not a general-purpose
+file-sync product. It is explicitly **not** in scope for M1–M4; see the
 build order in §8.
 
 ---
@@ -264,29 +335,22 @@ actively works against them. These are ours to build, unassisted:
 
 ## 7. Open decisions
 
-These are named, understood, and deliberately **not** resolved yet:
+The five items formerly tracked here are now resolved — see §5 for each:
 
-1. **File-sync engine choice.** What actually keeps the shared working
-   directory in sync between app and server — the specific engine or
-   protocol — is unpicked. Real engineering decision, not a detail.
-2. **Event journal retention/limits.** How long the durable event log is
-   kept and how big it's allowed to grow before older entries roll off or
-   get summarized.
-3. **Whether true multi-device (more than two) sync ever happens.** The
-   baton model is designed and reasoned about as exactly two peers (app +
-   one server). Whether Lost Harness ever needs to support more than one
-   app instance or more than one server is an open product question, not
-   assumed either way.
+- File-sync engine choice → **we build our own** (a simple "send what
+  changed when the lock moves" push over our own authenticated channel).
+- Event journal retention → **it's all local**; retention only ever applies
+  to the throwaway catch-up buffer, never to the permanent record.
+- Multi-device → **supported**, via the server as hub/referee; the baton
+  generalizes to a per-project lock any linked device can hold.
+- Per-profile-scoped sync (e.g. cron definitions) → **per-profile opt-in**;
+  only profiles the user opts in send data to the server.
+- Authenticated app↔server channel → **product-owned pairing + mutual auth
+  + always-on encryption**, not dependent on Tailscale or any other network.
 
-Two narrower items from the tooling-spine review are also still open and
-gate the server-companion track specifically (see §8):
-
-4. **How a per-profile-scoped table (like scheduled jobs) syncs**, given
-   the sync design as written only describes syncing the shared/global
-   data, not per-profile data.
-5. **Requiring an authenticated, ideally Tailscale-only, channel between
-   app and server** before "the server is the same trust tier as local" is
-   actually true in practice, rather than just true on paper.
+One build-time tuning detail carries forward, not a real open decision: the
+exact size of the catch-up-buffer window (on the order of a few days) isn't
+fixed here — pick it during implementation from real usage.
 
 ---
 
@@ -321,7 +385,7 @@ of foundational weight. In dependency order:
    3. Today's four scattered gates — privacy, permissions, sandbox,
       first-use confirmation — re-expressed as one ordered hook chain.
       **The hard local-only routing enforcement (§6) is added to the
-      privacy gate here**, while it's already being touched.
+      privacy filter here**, while it's already being touched.
    4. The non-overridable dangerous-action floor (the hardline blocklist)
       and the sandbox config shape.
    5. MCP tools folded into the same registry, so an external tool server
@@ -373,7 +437,7 @@ reversible" for free.
 **M6 — Audio (voice).** The other flagship gap. Voice ships as a settings
 toggle, on-device by default per the locked decision — this is not an
 architecture fork, just a mode. Local STT/TTS, streaming playback,
-barge-in, and the privacy gate's audio-specific check (withhold sensitive
+barge-in, and the privacy filter's audio-specific check (withhold sensitive
 audio from cloud TTS without confirmation).
 
 **M7 — Per-profile isolation (email/calendar/tasks), plus the remaining
@@ -396,20 +460,24 @@ center integration) lands here too.
 **M10 — Beta release.**
 
 **Server-companion track — starts once M4 lands, runs in parallel with
-M5–M9, ships post-beta.** Gated on resolving the two sync-design decisions
-in §7 (items 4 and 5) before anything else in this track proceeds:
-   1. Authenticated, Tailscale-preferred app↔server channel (hard
-      prerequisite — "server = local trust tier" isn't true until this
-      exists).
-   2. Resolve how per-profile-scoped data (like cron definitions) crosses
-      the sync boundary.
-   3. The baton protocol itself: heartbeat reuse, claim-ledger, handoff.
+M5–M9, ships post-beta.** The two prerequisites below are decided (§5), not
+open — but the build order still starts with them, since everything else in
+this track depends on a secure, working, correctly-scoped connection:
+   1. Product-owned pairing + mutual auth + always-on encryption (§5) — hard
+      prerequisite; "server = local trust tier" isn't true until this
+      exists. Tailscale/LAN reachability is convenience, not the security.
+   2. Wire up the per-profile opt-in sync path (§5) for cron definitions
+      and the context they need to cross the sync boundary.
+   3. The baton protocol itself: heartbeat reuse, claim-ledger, handoff,
+      and the per-project-lock takeover flow that makes multi-device work.
    4. The shutdown protocol (clean/unclean detection, conflict surfacing).
    5. The result queue / outbox, with the `HEARTBEAT_OK`/`[SILENT]`
       delivery-suppression sentinel and the "away for a while" rollup.
    6. The durable sequenced event journal + replay, applied specifically
       to the app↔server sync channel (not the in-process UI-to-core link,
-      which has no network and no reconnect problem to solve).
+      which has no network and no reconnect problem to solve). The journal
+      itself stays local per §5 — this item is about replay over the sync
+      channel, not about where the journal lives.
    7. `delegate target: local|server|auto` — dispatching a specialist agent
       to whichever body can actually run it, based on the tools it needs.
    8. Server-hosted always-on skills (a skill that just lives on the
@@ -417,8 +485,8 @@ in §7 (items 4 and 5) before anything else in this track proceeds:
       nightly" — approved once locally, then running unattended).
    9. The shared working directory, in-app file explorer, and offline
       "download locally" pinning (§5) — this is its own real subsystem
-      (the file-sync engine, §7 item 1) and is explicitly not scoped
-      before this point.
+      (the file-sync engine — decided as a custom send-what-changed push,
+      see §5) and is explicitly not scoped before this point.
 
 ---
 

@@ -7,7 +7,7 @@
 > (`agent/gate.rs`, `storage/schema.rs`, `tools/mod.rs`).
 >
 > **The spine is build-order items 1→3:** a shared `Capability`/`Tool` trait +
-> a native `Hook` chain that unifies the privacy gate (§7), permissions (§10),
+> a native `Hook` chain that unifies the privacy filter (§7), permissions (§10),
 > and sandbox (§11) into ONE decision chain, compiled into both bodies.
 > Everything else hangs off that spine — build it first, and it also cleans up
 > LH's own scattered gating logic (this is worth doing even if the server
@@ -24,6 +24,10 @@
 > per-profile→global sync path, and requiring an authenticated / Tailscale-only
 > local↔server channel before "server = local trust tier" holds. Both are
 > server-track (post-M4), not blockers for the M3 spine.
+>
+> **Superseded — see PLAN.md.** Both of the above are now decided: per-profile
+> data sync is opt-in per profile, and the auth requirement is product-owned
+> pairing + mutual auth + always-on encryption, not a Tailscale-only channel.
 
 ---
 
@@ -34,7 +38,7 @@
 
 ## 1. North star
 
-Lost Harness runs one Rust core that compiles into two bodies — the local Tauri desktop app and an optional always-on headless server companion — and every extensibility surface (tools, skills, agents, hooks, MCP) is expressed as **one shared trait plus one shared schema, gated by one shared decision chain, and differentiated only by an environment-specific `Capability` set and per-body default seed rows.** We borrow claude-code's genuinely good ideas — three-tier progressive disclosure for skills, per-argument permission rules, declarative agent personas, a typed hook decision protocol, and the plugin-as-distribution-unit — but re-implement each natively in Rust so it is cross-platform, privacy-gated by default, and safe to run unattended. Nothing gets a second "server implementation"; a capability that can't run headless simply reports `available() == false` on that body and the agent is told why.
+Lost Harness runs one Rust core that compiles into two bodies — the local Tauri desktop app and an optional always-on headless server companion — and every extensibility surface (tools, skills, agents, hooks, MCP) is expressed as **one shared trait plus one shared schema, gated by one shared decision chain, and differentiated only by an environment-specific `Capability` set and per-body default seed rows.** We borrow claude-code's genuinely good ideas — three-tier progressive disclosure for skills, per-argument permission rules, declarative agent personas, a typed hook decision protocol, and the plugin-as-distribution-unit — but re-implement each natively in Rust so it is cross-platform, privacy-filtered by default, and safe to run unattended. Nothing gets a second "server implementation"; a capability that can't run headless simply reports `available() == false` on that body and the agent is told why.
 
 ---
 
@@ -180,7 +184,7 @@ pub trait ObserverHook { fn on_event(&self, ctx: &EventContext); }              
 
 **What it unlocks:**
 
-- **Unify §7 + §10 + §11 + §12 into one PreToolUse chain:** `[PrivacyGateHook, PermissionHook, SandboxHook, FirstUseConfirmHook]`, first-`Deny`/`Ask` wins. Both binaries run the full chain against their own profile config — this is the concrete implementation of `server-companion.md`'s "the gate compiles into the server binary too." A future rule ("never let `computer_use` touch banking sites") becomes one new `Hook` impl, not a three-file edit, and the UI gets **one** place to explain *why* a call was blocked ("denied by: privacy gate — private tree, network tool").
+- **Unify §7 + §10 + §11 + §12 into one PreToolUse chain:** `[PrivacyGateHook, PermissionHook, SandboxHook, FirstUseConfirmHook]`, first-`Deny`/`Ask` wins. Both binaries run the full chain against their own profile config — this is the concrete implementation of `server-companion.md`'s "the privacy filter compiles into the server binary too." A future rule ("never let `computer_use` touch banking sites") becomes one new `Hook` impl, not a three-file edit, and the UI gets **one** place to explain *why* a call was blocked ("denied by: privacy filter — private tree, network tool").
 - **CronFired / CronCompleted as a Stop-hook pair** — this is the single highest-leverage adoption. The run-ledger/outbox "hard problem" in `server-companion.md` *is* "deterministically gate a lifecycle transition on external state." `CronFired` checks the ledger `(cron_id, scheduled_at)` + recent heartbeat ⇒ `Skip` (another node claimed it) or `Proceed` (claim + ack). `CronCompleted` ⇒ on success enqueues `outbound_events` (server) or writes SQLite directly (local); on failure blocks/requeues. One trait, two environment-specific impls — a ~30-line impl instead of a bespoke subsystem.
 - **Two lanes.** Gating lane runs sequentially and short-circuits (deny must win). Observer lane (telemetry, TRM logging per §3, notification emission) fires async, never adds tool-call latency. **On the server, observer handlers must write durably (SQLite/outbox row) before returning** — a container restart must not lose events, and a slow logging hook has no human to notice the latency.
 - **Notification hook → Notification Center / outbox drain.** `ask_human`, first-use confirmations, and "missed while offline" cron messages all route through one point; the "...and 42 more while you were away" rollup becomes one handler, not bespoke UI logic.
@@ -190,9 +194,9 @@ pub trait ObserverHook { fn on_event(&self, ctx: &EventContext); }              
 
 **Keep** existing `mcp_list`/`mcp_execute`/`mcp_health`. Add:
 
-- **Per-server trust tier at registration:** `Local` (spawned by / reachable only from this device — private-tree-equivalent) vs `Remote` (public-tree egress point — calls route through the §7 gate like any cloud endpoint). Without this, a "helpful" remote MCP server is a silent §7 bypass.
+- **Per-server trust tier at registration:** `Local` (spawned by / reachable only from this device — private-tree-equivalent) vs `Remote` (public-tree egress point — calls route through the privacy filter like any cloud endpoint). Without this, a "helpful" remote MCP server is a silent privacy-filter bypass.
 - **Fold MCP tools into the `Capability` registry contract** (concept gap worth closing now): MCP tools declare `Capability` requirements via config override, so `registry.available_tools()` filters them through the *same* mechanism as native tools. Otherwise a stdio MCP server driving a GUI registers on the server binary and fails confusingly at call-time instead of being filtered up front.
-- **stdio is inherently per-body** — each binary owns its own child processes; only *config* (command/args/capabilities) is shareable, each body independently decides whether to spawn. SSE/HTTP/WS config syncs local→server, but each body assigns trust tier and enforces its own §7 gate independently.
+- **stdio is inherently per-body** — each binary owns its own child processes; only *config* (command/args/capabilities) is shareable, each body independently decides whether to spawn. SSE/HTTP/WS config syncs local→server, but each body assigns trust tier and enforces its own privacy filter independently.
 
 **Capability Packs (plugin equivalent).** `pack.toml` at pack root: `name, version, author, description, requires = [Capability...]`, conventional subdirs `skills/`, `mcp.toml`, optional `cron-templates/`, `agent-types/`. No `commands/` dir (palette covers it), no shell `hooks/` (native `Hook` only, scoped to the pack's own tools, pure-function + timeout, no ambient shell). `${PACK_ROOT}` resolved by Rust core at load. The manifest's `requires` list is exactly what self-reports local/server/both compatibility.
 
@@ -212,7 +216,7 @@ The organizing invariant: **one trait/schema per layer, one gating chain, enviro
 | **Skills** | Originates + approves proposals (only body with chat UI + human). `search_skills` over global.db | Executes `approval_status='approved'` skills only, synced one-way local→server; capability-filtered per its `available()`. Never sees pending/rejected |
 | **Agents** | Delegates run locally; approve/author agent_types | Runs `tolerates_async` server-target delegates; results via `outbound_events`; same `tools_allowlist ∩ available()` enforcement |
 | **Hooks** | Full gating chain against local profile config; observer lane may fire-and-forget | Same chain against server profile config; observer handlers **write durably before returning** |
-| **MCP** | Owns its stdio children; Local-tier servers = private-tree | Owns its own stdio children; egress to Remote-tier servers still passes §7 gate |
+| **MCP** | Owns its stdio children; Local-tier servers = private-tree | Owns its own stdio children; egress to Remote-tier servers still passes the privacy filter |
 | **Sync** | Source of truth; pushes global.db (memory, profile meta, model config, **skill metadata+resources**, **agent_types**) | Receives one-way push; **never writes back** |
 
 **Server default-seed divergence** is the CC settings-hierarchy *structure* without its *actor*: same schema, a server-flavored profile ships deny-by-default seed rows for anything needing physical/interactive confirmation.
@@ -261,7 +265,14 @@ The organizing invariant: **one trait/schema per layer, one gating chain, enviro
 
 **⚠️ Blocking implementation gaps to resolve before M11:**
 - **`cron_jobs` lives in per-profile SQLite, not global.db** (confirmed in `schema.rs`), yet `server-companion.md` says cron defs sync local→server alongside global.db-shaped things. The one-way sync design names only global.db payloads — it does not define how a profile-scoped table crosses. **Decision needed (Lukas):** define the sync path for profile-scoped rows explicitly — e.g. a `synced_at` cursor per profile db pushed alongside the global.db payload. Don't assume cron defs "just ride" the global mechanism.
-- **"Server = same trust tier as local"** holds only for what §7 governs (model egress) *and* only while the sync channel is closed. **Hard prerequisite (Lukas decision):** require TLS + token auth on the WS/HTTP sync channel, strongly prefer Tailscale-only reachability (consistent with the existing friday/cerberus homelab pattern), before that claim is true in practice.
+  **Superseded — see PLAN.md.** Decided as per-profile opt-in: only a profile
+  the user has opted in sends its cron definitions (and the context those
+  crons need) to the server at all; a profile left off never leaves the
+  device.
+- **"Server = same trust tier as local"** holds only for what the privacy filter governs (model egress) *and* only while the sync channel is closed. **Hard prerequisite (Lukas decision):** require TLS + token auth on the WS/HTTP sync channel, strongly prefer Tailscale-only reachability (consistent with the existing friday/cerberus homelab pattern), before that claim is true in practice.
+  **Superseded — see PLAN.md.** Decided as product-owned pairing + mutual
+  auth + always-on encryption, not a Tailscale-only requirement — the
+  security doesn't depend on which network the connection runs over.
 
 ---
 
@@ -282,8 +293,8 @@ The organizing invariant: **one trait/schema per layer, one gating chain, enviro
 | 11 | `agent_types` table + editor + `tools_allowlist ∩ available()` intersection | 1, 6 | **M** |
 | 12 | Seat-based binding in agent_types + `resolve_seat(target)` | 11 | **S** |
 | 13 | Concurrent `delegate` fan-out semantics | 11 | **S** |
-| 14 | **[server]** Resolve cron per-profile→global sync gap *(Lukas decision)* | — | **S** |
-| 15 | **[server]** Authenticated/encrypted local↔server channel *(Lukas decision, hard prereq)* | — | **M** |
+| 14 | **[server]** Wire up per-profile-opt-in sync gap *(decided — see PLAN.md; was a Lukas decision)* | — | **S** |
+| 15 | **[server]** Product-owned pairing + mutual auth + always-on encryption *(decided — see PLAN.md; was a Lukas decision, hard prereq)* | — | **M** |
 | 16 | **[server]** CronFired/CronCompleted hook pair + run-ledger + outbox | 2, 14, 15 | **M** |
 | 17 | **[server]** `delegate target: local\|server\|auto` + `delegate_result` outbox delivery | 11, 16 | **L** |
 | 18 | **[server]** Server-hosted always-on skills (approved-only sync + capability filter) | 9, 16 | **M** |
@@ -294,6 +305,6 @@ The organizing invariant: **one trait/schema per layer, one gating chain, enviro
 | 23 | *(post-beta stretch, speculative)* Mid-task local→server delegate handoff + checkpoint format | 16, 17 | **M** |
 | 24 | *(v2)* OS-level sandbox enforcement (Seatbelt/bubblewrap/AppContainer) consuming §4 schema | 4 | **L** |
 
-**Critical path:** 1 → 2 → 3 is the spine; everything else hangs off it. Items 14 and 15 are **decision-gated on Lukas** and block the entire server track (16–18, 23). Ship 1–13 (local, M3–M4) before touching the server track.
+**Critical path:** 1 → 2 → 3 is the spine; everything else hangs off it. Items 14 and 15 were decision-gated on Lukas and block the entire server track (16–18, 23); both are now **decided — see PLAN.md** (per-profile opt-in sync; product-owned pairing + mutual auth), so they're implementation work, not open questions. Ship 1–13 (local, M3–M4) before touching the server track.
 
-**Decisions flagged for Lukas:** (a) cron per-profile→global sync mechanism [#14]; (b) authenticated/Tailscale-only sync channel as prerequisite for the "same trust tier" claim [#15]; (c) whether mid-task handoff [#23] is worth a checkpoint-format investment or should wait for usage data.
+**Decisions flagged for Lukas:** (a) cron per-profile→global sync mechanism [#14] — **superseded, decided as per-profile opt-in, see PLAN.md**; (b) authenticated/Tailscale-only sync channel as prerequisite for the "same trust tier" claim [#15] — **superseded, decided as product-owned pairing + mutual auth + always-on encryption, see PLAN.md**; (c) whether mid-task handoff [#23] is worth a checkpoint-format investment or should wait for usage data — still open.
