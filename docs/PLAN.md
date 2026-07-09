@@ -740,6 +740,53 @@ system is actually being built, not a design question to resolve now.
 
 ---
 
+## 11. The privacy-filter classifier (real model) + its UX
+
+**Status: the trained model arrived 2026-07-09 (external collaborator);
+not yet integrated.** It replaces the regex heuristic the privacy filter
+has used behind its `Classifier` interface until now. Full specs +
+integration path are in the delivered `pf-bundle` README; the essentials:
+
+- **What it is:** a layered egress guard — deterministic **rules**
+  (structured PII: SSN, Luhn card, keys, email, phone — guaranteed recall)
+  + a **two-encoder transformer ensemble** (bge-small + distilbert,
+  max-vote) for semantic PII (health, personal/proprietary context) +
+  **fusion** (any layer fires ⇒ private; uncertainty ⇒ private). It also
+  emits **span-level annotations** (which characters, which category) and
+  can **redact** — black out the sensitive spans and delegate the safe
+  remainder, reversibly (censor → send → rehydrate). Note: the "TRM"
+  recursive approach this project was originally named for was evaluated
+  and **dropped** — a plain fine-tuned small model beat it (drives the
+  rename below).
+- **Runs on-device, no GPU:** ~100 MB INT8 ONNX models, ~25–80 ms per
+  check on a laptop CPU.
+- **Integration (honors §2 "no Python in the shipped app"):** load the
+  ONNX models in the Rust core (ONNX Runtime), port the stdlib-only rules
+  to Rust, drop in behind the existing `Classifier` interface. Python stays
+  on the training side. This is its own build round, not yet scheduled.
+
+### Decided UX (2026-07-09)
+
+- **Redaction/partial delegation is adopted** (not all-or-nothing): when a
+  message is private, redact the sensitive spans and let the safe remainder
+  be delegated, rehydrating the reply.
+- **A dedicated classifier settings page.** Users can fine-tune behavior —
+  strictness/threshold (how paranoid), the uncertainty band, redaction
+  on/off, and the hard-block behavior for proprietary/health. Sensible
+  defaults ship; the page is for users who want to adjust (likely
+  per-profile, consistent with the rest of the product).
+- **Censorship is surfaced, never silent.** When the filter censors,
+  redacts, or blocks a message, the user gets a non-blocking **alert** —
+  not a silent swap.
+- **An annotated review view.** The alert carries a button that opens the
+  **right sidebar** showing the user's original message annotated with
+  exactly what tripped the filter — which spans, which category/rule,
+  which layer fired. The classifier already returns this (rules give exact
+  offsets + category; the NER tagger gives spans), so the data powering
+  this view already exists.
+
+---
+
 ## Appendix: naming note
 
 Fable's internal reference spec is referred to throughout as "Fable's

@@ -243,7 +243,7 @@ mod tests {
     };
     use crate::tools::fs::ReadFileTool;
     use crate::tools::{Capability, EchoTool, SyncFileTool, Tool};
-    use crate::trm::HeuristicClassifier;
+    use crate::classifier::HeuristicClassifier;
 
     fn ctx() -> ExecCtx {
         ExecCtx {

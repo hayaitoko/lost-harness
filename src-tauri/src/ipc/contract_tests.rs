@@ -39,7 +39,7 @@ use crate::agent::loop_mod::AgentLoop;
 use crate::ipc::{self, AppState};
 use crate::models::ModelManager;
 use crate::storage::Storage;
-use crate::trm::HeuristicClassifier;
+use crate::classifier::HeuristicClassifier;
 
 // ── Harness ─────────────────────────────────────────────────────────────
 

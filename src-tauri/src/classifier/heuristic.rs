@@ -2,7 +2,7 @@
 //!
 //! Direct port of the Electron app's `src/privacy/classifier.js` so the two
 //! trees agree on what "Auto" binding should treat as private until the real
-//! TRM model is delivered.
+//! trained classifier is delivered.
 //!
 //! Design goals (from the original file):
 //!  - Pure and synchronous — safe to call on every send.
@@ -126,7 +126,7 @@ impl Classifier for HeuristicClassifier {
 // --- Individual detectors ----------------------------------------------------
 // Each detector returns a human-readable reason string, or None if it didn't
 // match. Keeping them as small pure functions makes them independently
-// testable and easy to extend once the real TRM lands.
+// testable and easy to extend once the trained classifier lands.
 
 /// SSN: 3-2-4 with dashes.
 fn detect_ssn(text: &str) -> Option<&'static str> {

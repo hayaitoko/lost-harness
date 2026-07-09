@@ -1,19 +1,19 @@
 //! Lost Harness — Rust core (M1 surface)
 //!
-//! M1: TRM (heuristic) + privacy gate + agent loop + minimal chat via IPC.
+//! M1: classifier (heuristic) + privacy gate + agent loop + minimal chat via IPC.
 //! M0 was a stub; M1 boots the storage tree, loads persisted providers,
 //! and registers the full IPC surface for the Svelte frontend.
 //!
 //! Milestones (see `milestones.md` in the project vault):
 //!   M0: empty shell
-//!   M1: TRM + agent loop + minimal chat
+//!   M1: classifier + agent loop + minimal chat
 //!   M2: UI shell (tiling, profiles, command palette)
 //!   M3+: tool registry, models, computer use, audio, ...
 
 // ── Module declarations ──────────────────────────────────────────────────────
 
 mod agent; // M1: agent loop, §7 gate, tool dispatch
-mod trm; // M1: TRM engine, classification, logging
+mod classifier; // M1: privacy classifier (heuristic + trained model)
 mod audio; // M6: Audio engine, VAD, TTS pipeline
 mod hooks; // M3: Hook chain — privacy filter + permission + sandbox + first-use
 mod ipc; // M1: Tauri command handlers
@@ -34,7 +34,7 @@ use crate::ipc::AppState;
 use crate::models::{ModelManager, Provider, ProviderKind};
 use crate::storage::Storage;
 use crate::tools::ToolDispatcher;
-use crate::trm::HeuristicClassifier;
+use crate::classifier::HeuristicClassifier;
 
 /// Tauri entry point. Runs once on launch.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -63,10 +63,10 @@ pub fn run() {
             let model_manager = Arc::new(ModelManager::new());
             hydrate_providers_from_storage(&storage, &model_manager);
 
-            // Privacy classifier (heuristic fallback until the trained TRM
-            // lands — see trm/engine.rs). Shared between the message-level
+            // Privacy classifier (heuristic fallback until the trained model
+            // lands — see classifier/engine.rs). Shared between the message-level
             // §7 gate and the tool gating chain so both classify identically.
-            let classifier: Arc<dyn crate::trm::Classifier> =
+            let classifier: Arc<dyn crate::classifier::Classifier> =
                 Arc::new(HeuristicClassifier::new());
 
             // §7 Privacy Gate for message egress.
@@ -170,7 +170,7 @@ fn hydrate_providers_from_storage(
 /// through the approval spine rather than a blanket allow.
 fn build_tool_dispatcher(
     base_path: &std::path::Path,
-    classifier: Arc<dyn crate::trm::Classifier>,
+    classifier: Arc<dyn crate::classifier::Classifier>,
 ) -> ToolDispatcher {
     use crate::hooks::{build_pretooluse_chain_with_confirmed, InMemoryPolicySource, PermissionMode};
     use crate::tools::fs::{ListDirTool, ReadFileTool, SearchFilesTool};

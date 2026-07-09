@@ -12,7 +12,7 @@
 //! The gate is the single point that decides whether a message may go to a
 //! cloud endpoint. Three bindings:
 //!
-//!  - `Auto`    — the TRM (or its heuristic fallback) classifies the text.
+//!  - `Auto`    — the classifier (trained model, or heuristic fallback) labels the text.
 //!                 Private + cloud → `RouteLocal`. Public → `Allow`.
 //!                 Uncertain + cloud → `RouteLocal` (spec Risk 4:
 //!                 "when uncertain, route to private tree").
@@ -25,12 +25,12 @@
 
 use std::sync::Arc;
 
-use crate::trm::Classifier;
+use crate::classifier::Classifier;
 
 /// Per-conversation routing binding (spec §12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Binding {
-    /// TRM (or fallback) decides per-message.
+    /// The classifier (or fallback) decides per-message.
     Auto,
     /// User override: every message may go to any endpoint.
     Public,
@@ -50,8 +50,8 @@ pub enum GateDecision {
     RouteLocal,
 }
 
-/// The §7 privacy gate. Owns a `Box<dyn Classifier>` so the real TRM and the
-/// heuristic fallback are interchangeable at the call site.
+/// The §7 privacy gate. Owns a `Box<dyn Classifier>` so the trained classifier
+/// and the heuristic fallback are interchangeable at the call site.
 pub struct PrivacyGate {
     classifier: Arc<dyn Classifier>,
 }
@@ -63,7 +63,7 @@ impl std::fmt::Debug for PrivacyGate {
 }
 
 impl PrivacyGate {
-    /// Build a gate around the given classifier (TRM or heuristic).
+    /// Build a gate around the given classifier (trained or heuristic).
     pub fn new(classifier: Arc<dyn Classifier>) -> Self {
         Self { classifier }
     }
@@ -99,14 +99,14 @@ impl PrivacyGate {
                 }
             }
 
-            // TRM (or fallback) decides. The endpoint's cloud-ness only
+            // The classifier (or fallback) decides. The endpoint's cloud-ness only
             // matters when the label is Private or Uncertain — Public text
             // is always safe to send.
             Binding::Auto => {
                 let classification = self.classifier.classify(text);
                 match classification.label {
-                    crate::trm::Label::Public => GateDecision::Allow,
-                    crate::trm::Label::Private | crate::trm::Label::Uncertain => {
+                    crate::classifier::Label::Public => GateDecision::Allow,
+                    crate::classifier::Label::Private | crate::classifier::Label::Uncertain => {
                         if is_cloud_endpoint {
                             GateDecision::RouteLocal
                         } else {
@@ -135,7 +135,7 @@ impl PrivacyGate {
             GateDecision::RouteLocal => "route_local",
         };
         tracing::info!(
-            target: "lhp::trm",
+            target: "lhp::classifier",
             decision = decision_str,
             text_hash = %text_hash,
             conversation_id = %conversation_id,

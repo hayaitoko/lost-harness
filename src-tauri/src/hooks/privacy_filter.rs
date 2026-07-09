@@ -57,7 +57,7 @@ mod tests {
 
     use super::*;
     use crate::agent::gate::Binding;
-    use crate::trm::HeuristicClassifier;
+    use crate::classifier::HeuristicClassifier;
 
     fn hook() -> PrivacyFilterHook {
         PrivacyFilterHook::new(PrivacyGate::new(Arc::new(HeuristicClassifier::new())))

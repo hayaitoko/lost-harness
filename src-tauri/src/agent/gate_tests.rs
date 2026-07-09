@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
-use crate::trm::{Classifier, HeuristicClassifier, Label};
+use crate::classifier::{Classifier, HeuristicClassifier, Label};
 
 fn gate() -> PrivacyGate {
     PrivacyGate::new(Arc::new(HeuristicClassifier::new()))

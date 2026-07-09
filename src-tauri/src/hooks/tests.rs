@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::*;
 use crate::agent::gate::{Binding, PrivacyGate};
 use crate::models::{Provider, ProviderKind};
-use crate::trm::HeuristicClassifier;
+use crate::classifier::HeuristicClassifier;
 
 // ── test-only hooks for ordering/short-circuit assertions ───────────────
 

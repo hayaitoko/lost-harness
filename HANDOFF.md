@@ -107,7 +107,9 @@ Full write-up in [`docs/PLAN.md`](docs/PLAN.md) §7 and §9. **This unblocks the
 
 ## Pending cleanup (tracked, not urgent)
 
-The **code** still uses the old names `§7` and `PrivacyGate` in a few places (module doc comments, struct names). The **docs** have all been renamed to "the privacy filter" for clarity, but the code rename was deliberately deferred — do it in a later pass, ideally at the same time the privacy filter gets wired into live tool dispatch (item 1 above), so it's one coherent touch of that code instead of a separate rename-only pass.
+The `trm/` module was renamed to `classifier/` on 2026-07-09 (the "TRM" Tiny-Recursive-Model approach was evaluated and dropped by the classifier author — see PLAN §11). The `trm_logs` **audit table** kept its name deliberately (renaming a persisted table needs a migration — not worth it).
+
+Still pending: the **code** uses the old names `§7` and `PrivacyGate` in a few places (`agent/gate.rs`, `GateDecision`, doc comments), while the docs say "privacy filter." This rename was deferred to the **classifier-integration round** — that round rewrites `gate.rs`/`engine.rs` to run the real ONNX classifier anyway, so it's one coherent touch of that code rather than a separate rename-only pass.
 
 ---
 
@@ -126,9 +128,9 @@ lost-harness-product/
 │       │   ├── egress.rs   # is_private_endpoint() — detects private-network destinations
 │       │   ├── loop_mod.rs # AgentLoop — message→classify→gate→model→stream→[tool loop]→persist
 │       │   └── *_tests.rs
-│       ├── trm/            # the classifier that labels a message Private/Public/Uncertain
+│       ├── classifier/     # labels a message Private/Public/Uncertain (was "trm/")
 │       │   ├── heuristic.rs # regex-based PII detector (SSN, credit card, API keys, health, etc.) — active today
-│       │   └── engine.rs   # stub for the real trained classifier model, not built yet
+│       │   └── engine.rs   # EnsembleClassifier — stub for the real trained model (bge+distilbert ONNX), not wired
 │       ├── models/         # model manager — OpenAI-compatible HTTP client, provider config, SSE streaming
 │       ├── storage/        # SQLite: global.db (shared) + one profiles/<name>.db per profile
 │       │   ├── schema.rs   # every table definition, incl. memory_facts / memory_vectors (still a raw-BLOB placeholder) / skills
@@ -210,3 +212,5 @@ Ratified the memory-toggle decision (committed `docs:` on `main`), then ran **M3
 - **Tests:** 151 → **171** (+20: dialect, guard-wrap, fs path-safety, gated dispatch incl. "a sandbox-denied call never runs the tool"). Clippy: no new real issues; frontend clean.
 - **Decision made (not blocking):** read-only workspace-confined tools are pre-trusted (no first-use prompt); state-changing tools will require the approval spine (next round).
 - Ran an adversarial multi-agent review over the round-1 diff before committing (security + correctness lenses, each finding verified).
+
+**Later the same day — the real privacy classifier arrived** (external collaborator; bundle at `~/Desktop/Classifier Model + Install Guide for Claude/`). It's a rules + bge-small + distilbert ONNX ensemble, CPU-only (~25–80 ms, ~100 MB), explicitly built for our Tauri/Rust/ONNX stack (Python stays training-side). It unblocks the `engine.rs` stub. Recorded the full assessment + integration path in PLAN §11 and the [[lost-harness-privacy-classifier]] memory. Lukas decided its UX (§11): adopt span redaction/partial delegation, a dedicated classifier settings page, and a non-blocking "message censored" alert with a button that opens the right sidebar showing the original text annotated by what tripped the filter. Also renamed `trm/` → `classifier/` (TRM approach was dropped). Integration itself is a future round, not yet scheduled.

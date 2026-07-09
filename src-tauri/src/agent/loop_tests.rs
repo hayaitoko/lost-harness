@@ -21,7 +21,7 @@ use crate::agent::loop_mod::{sha256_hex, StreamErrorPayload, StreamTokenPayload}
 use crate::models::sse::{SseEvent, SseStream};
 use crate::models::{ChatMessage, Provider, ProviderKind};
 use crate::storage::{Message, Storage, TrmLog};
-use crate::trm::HeuristicClassifier;
+use crate::classifier::HeuristicClassifier;
 
 // ── Fake model streamer ──────────────────────────────────────────────────
 
