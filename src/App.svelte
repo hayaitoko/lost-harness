@@ -23,6 +23,7 @@
   import Sidebar from "$lib/components/Sidebar.svelte";
   import ChatPanel from "$lib/components/ChatPanel.svelte";
   import ProviderSettings from "$lib/components/ProviderSettings.svelte";
+  import ApprovalDialog from "$lib/components/ApprovalDialog.svelte";
   import { hydrate as hydrateProfiles } from "$lib/stores/profiles";
   import { hydrateProviders } from "$lib/stores/providers.svelte";
   import { hydrateConversations } from "$lib/stores/chat";
@@ -108,6 +109,9 @@
 {#if settingsOpen}
   <ProviderSettings modal={true} onclose={closeSettings} />
 {/if}
+
+<!-- Always mounted; renders only when the backend raises an approval prompt. -->
+<ApprovalDialog />
 
 <style>
   /* Make sure the app fills the viewport. The host <body> is already

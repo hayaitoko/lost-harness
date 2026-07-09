@@ -117,6 +117,29 @@ export type StreamTokenCallback = (payload: StreamTokenPayload) => void;
 /** Callback shape for `onStreamError`. */
 export type StreamErrorCallback = (payload: StreamErrorPayload) => void;
 
+/**
+ * Payload of the `tool:approval_request` event. Mirrors
+ * `ToolApprovalRequestPayload` in `ipc/approval.rs`. Raised when a tool call
+ * needs the user's confirmation; answer with `resolveToolApproval(id, ...)`.
+ */
+export interface ToolApprovalRequest {
+  id: string;
+  conversation_id: string;
+  tool_name: string;
+  prompt: string;
+  /** Which hook raised it: "permission" | "first_use_confirm". */
+  by: string;
+  fingerprint: string;
+}
+
+/** Callback shape for `onToolApprovalRequest`. */
+export type ToolApprovalCallback = (payload: ToolApprovalRequest) => void;
+
+/** How long a granted approval lasts. */
+export type ApprovalScope = "once" | "session" | "always";
+/** What an approval covers: this exact call, or any call to the tool. */
+export type ApprovalTarget = "action" | "tool";
+
 // ── Tauri runtime detection ─────────────────────────────────────────────────
 //
 // `window.__TAURI_INTERNALS__` is injected by the Tauri webview before any
@@ -137,6 +160,7 @@ const isTauri = (): boolean =>
 
 export const STREAM_TOKEN_EVENT = "stream:token";
 export const STREAM_ERROR_EVENT = "stream:error";
+export const TOOL_APPROVAL_REQUEST_EVENT = "tool:approval_request";
 
 // ── Command functions ───────────────────────────────────────────────────────
 
@@ -333,6 +357,44 @@ export async function onStreamError(
     const i = browserErrorListeners.indexOf(callback);
     if (i >= 0) browserErrorListeners.splice(i, 1);
   };
+}
+
+// ── Tool approval ───────────────────────────────────────────────────────────
+
+/**
+ * Subscribes to `tool:approval_request` events — raised when a tool call needs
+ * the user's confirmation. Answer with `resolveToolApproval(id, ...)`. Returns
+ * an unlisten function. In browser mode this is a no-op (the mock backend has
+ * no gated tools to approve).
+ */
+export async function onToolApprovalRequest(
+  callback: ToolApprovalCallback,
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<ToolApprovalRequest>(TOOL_APPROVAL_REQUEST_EVENT, (event) => {
+      callback(event.payload);
+    });
+  }
+  return () => {};
+}
+
+/**
+ * Answers a pending tool-approval prompt. `decision` is "approve" or "deny";
+ * `scope` / `target` only matter for an approval. Returns false if the request
+ * id is unknown — already answered, or it timed out and denied by default.
+ */
+export async function resolveToolApproval(
+  id: string,
+  decision: "approve" | "deny",
+  scope: ApprovalScope = "once",
+  target: ApprovalTarget = "action",
+): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("resolve_tool_approval", {
+      args: { id, decision, scope, target },
+    });
+  }
+  return true;
 }
 
 // ── Browser fallback (used when running outside Tauri) ──────────────────────
