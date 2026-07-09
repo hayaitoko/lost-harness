@@ -363,11 +363,33 @@ pub fn build_pretooluse_chain(
     gate: crate::agent::gate::PrivacyGate,
     policy: Box<dyn PolicySource>,
 ) -> HookChain {
+    build_pretooluse_chain_with_confirmed(gate, policy, &[])
+}
+
+/// Same ordered chain as [`build_pretooluse_chain`], but with `confirmed`
+/// tools pre-marked in the `FirstUseConfirmHook` so they don't trigger a
+/// first-use prompt.
+///
+/// This is how a body pre-trusts tools it ships as safe-by-default (e.g. the
+/// app's read-only, workspace-confined filesystem tools): an explicit
+/// whole-tool `Allow` in the policy expresses "always permit," so a
+/// first-use confirmation on top of it would be redundant. Tools that can
+/// change state are deliberately *not* pre-confirmed — they route through
+/// the real approval flow (a later M3 round) instead.
+pub fn build_pretooluse_chain_with_confirmed(
+    gate: crate::agent::gate::PrivacyGate,
+    policy: Box<dyn PolicySource>,
+    confirmed: &[&str],
+) -> HookChain {
     let mut chain = HookChain::new();
     chain.register_gating(Box::new(PrivacyFilterHook::new(gate)));
     chain.register_gating(Box::new(SandboxHook));
     chain.register_gating(Box::new(PermissionHook::new(policy)));
-    chain.register_gating(Box::new(FirstUseConfirmHook::new()));
+    let first_use = FirstUseConfirmHook::new();
+    for tool in confirmed {
+        first_use.mark_confirmed(tool);
+    }
+    chain.register_gating(Box::new(first_use));
     chain
 }
 

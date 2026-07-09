@@ -423,6 +423,22 @@ of foundational weight. In dependency order:
        search, headless browser, delegate, ask-human, system status,
        cron management, session search).
 
+   **Round-1 status (2026-07-09) — the spine is now load-bearing.** Done:
+   items 1–4 (registry, hook chain, four gates as one chain, danger floor);
+   item 6 (fenced tool-call dialect + the parse-only-your-own-output rule);
+   item 7 (guard-wrapped tool output); the dispatch wiring that item 1's
+   "real tool dispatch" implied; and the read-only slice of item 10
+   (`read_file`/`list_dir`/`search_files`, workspace-confined). Read-only
+   tools ship pre-trusted (no first-use prompt) since there's no interactive
+   approval UX yet. **Remaining in M3:** item 5 (MCP into the registry),
+   item 8 (durability trio), item 9 (the approval spine — which also adds
+   the interactive confirmation path that lets `Ask`/first-use actually be
+   resolved), and the state-changing tools in item 10 (write/edit/delete,
+   browser, delegate, ask-human, system status, cron, session search) —
+   each gated behind that approval spine. Also pending: having the agentic
+   loop consult `RoutingRequirement`/`enforce_local_routing` to pick the
+   endpoint for a tool-triggered follow-up turn.
+
 **M4 — Model manager, running alongside the rest of the tooling spine.**
 Two independent tracks that both depend on M3's registry but not on each
 other, so they can proceed in parallel:

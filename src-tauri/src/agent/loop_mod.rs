@@ -43,6 +43,7 @@ use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
 use crate::models::{ChatMessage, ModelClient, ModelManager, Provider};
 use crate::storage::{Message, ProfileDb, Storage, TrmLog};
+use crate::tools::{ExecCtx, ToolDispatcher};
 
 // ── Event payloads ────────────────────────────────────────────────────────
 
@@ -112,6 +113,9 @@ pub struct AgentLoop {
     gate: PrivacyGate,
     model_manager: Arc<ModelManager>,
     storage: Arc<Storage>,
+    /// The tool spine: registry + gating chain + body capabilities. Every
+    /// tool call the agent makes goes through this (§3.3 `tools::dispatch`).
+    tools: Arc<ToolDispatcher>,
     stream_lock: tokio::sync::Mutex<()>,
 }
 
@@ -126,11 +130,13 @@ impl AgentLoop {
         gate: PrivacyGate,
         model_manager: Arc<ModelManager>,
         storage: Arc<Storage>,
+        tools: Arc<ToolDispatcher>,
     ) -> Self {
         Self {
             gate,
             model_manager,
             storage,
+            tools,
             stream_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -198,6 +204,7 @@ impl AgentLoop {
                 let local = self.find_local_provider().ok_or_else(|| {
                     anyhow!("gate routed to local model, but no local provider is registered")
                 })?;
+                let local_is_cloud = !is_private_endpoint(&local.base_url);
                 return self
                     .stream_to_provider(
                         local,
@@ -206,6 +213,8 @@ impl AgentLoop {
                         conversation_id,
                         profile,
                         "route_local",
+                        binding,
+                        local_is_cloud,
                         app,
                     )
                     .await;
@@ -219,6 +228,8 @@ impl AgentLoop {
                         conversation_id,
                         profile,
                         "allow",
+                        binding,
+                        is_cloud,
                         app,
                     )
                     .await;
@@ -237,10 +248,16 @@ impl AgentLoop {
             .find(|p| p.is_local() && p.is_private())
     }
 
-    /// Persist the user message, run the stream, emit `stream:token` per
-    /// delta, persist the final assistant message, and return the
-    /// assembled text. `routing_decision` is stamped on the assistant
-    /// message for the audit log.
+    /// Persist the user message, then run the agentic loop: stream a turn,
+    /// execute any tool calls the model made **in its own output**, feed the
+    /// (guard-wrapped) results back, and repeat until the model answers
+    /// without calling a tool — bounded by `MAX_TOOL_ROUNDS`. `routing_decision`
+    /// is stamped on every persisted message for the audit log.
+    ///
+    /// `binding` / `is_cloud` describe the endpoint this turn talks to; they
+    /// flow into the tool gating chain so a tool call is evaluated against
+    /// the same privacy posture as the conversation.
+    #[allow(clippy::too_many_arguments)]
     async fn stream_to_provider(
         &self,
         provider: Provider,
@@ -249,6 +266,8 @@ impl AgentLoop {
         conversation_id: String,
         profile: String,
         routing_decision: &'static str,
+        binding: Binding,
+        is_cloud: bool,
         app: AppHandle,
     ) -> Result<String> {
         let client = self
@@ -256,12 +275,13 @@ impl AgentLoop {
             .get_client(&provider.id)
             .ok_or_else(|| anyhow!("provider {} has no client", provider.id))?;
 
+        let profile_db = self.storage.open_profile(&profile)?;
+
         // Persist the user message first so the transcript is consistent
         // even if the model call fails.
-        let user_msg_id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         let user_message = Message {
-            id: user_msg_id,
+            id: Uuid::new_v4().to_string(),
             conversation_id: conversation_id.clone(),
             role: "user".to_string(),
             content: content.clone(),
@@ -273,83 +293,142 @@ impl AgentLoop {
             aborted: false,
             created_at: now,
         };
-        let profile_db = self.storage.open_profile(&profile)?;
         profile_db
             .add_message(&user_message)
             .context("persist user message")?;
 
-        // Build the chat request: prior history + the new user message.
-        let mut history = profile_db
+        // Build the working chat history: an optional system message that
+        // teaches the fenced tool dialect and lists the tools available in
+        // this environment, then the prior turns. Tool-result rows are
+        // persisted with role "tool" for transcript fidelity but replayed to
+        // the model as "user" — the fenced dialect carries tool results as
+        // plain text, so we avoid the native "tool" role that OpenAI-compatible
+        // servers reject without a matching tool_call_id.
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let catalog = self.tools.catalog();
+        if !catalog.is_empty() {
+            history.push(ChatMessage::system(catalog));
+        }
+        for m in profile_db
             .list_messages_by_conversation(&conversation_id)
             .context("load conversation history")?
-            .into_iter()
-            .map(|m| ChatMessage {
-                role: m.role,
-                content: m.content,
-            })
-            .collect::<Vec<_>>();
-        // Replace the just-persisted user message's role/content from the
-        // live `content` argument (the historical copy may have been
-        // written by the frontend with whitespace differences).
-        if let Some(last) = history.last_mut() {
-            if last.role == "user" {
-                last.content = content.clone();
-            }
+        {
+            let role = if m.role == "tool" {
+                "user".to_string()
+            } else {
+                m.role
+            };
+            history.push(ChatMessage { role, content: m.content });
         }
-        if history.is_empty() {
+        // The persisted copy of the current user message may differ from the
+        // live `content` by whitespace; make the last user turn authoritative.
+        if let Some(last_user) = history.iter_mut().rev().find(|m| m.role == "user") {
+            last_user.content = content.clone();
+        } else {
             history.push(ChatMessage::user(content.clone()));
         }
 
-        let mut sse = client
-            .stream_chat(&model, history)
-            .await
-            .with_context(|| format!("stream_chat to provider {}", provider.id))?;
+        let exec_ctx = ExecCtx {
+            conversation_id: conversation_id.clone(),
+            profile: profile.clone(),
+        };
 
-        // Stream + accumulate.
-        let assistant_id = Uuid::new_v4().to_string();
-        let mut assembled = String::new();
-        while let Some(event) = sse.next_event().await {
-            match event {
-                crate::models::sse::SseEvent::Delta(delta) => {
-                    assembled.push_str(&delta);
-                    let payload = StreamTokenPayload {
-                        token: delta,
-                        conversation_id: conversation_id.clone(),
-                        message_id: assistant_id.clone(),
-                    };
-                    if let Err(e) = app.emit("stream:token", payload) {
-                        tracing::warn!(error = %e, "failed to emit stream:token");
+        // Bound the tool loop so a model that keeps calling tools can't run
+        // away. MAX_TOOL_ROUNDS tool rounds + one final answer turn.
+        const MAX_TOOL_ROUNDS: usize = 6;
+        let mut final_text = String::new();
+
+        for round in 0..=MAX_TOOL_ROUNDS {
+            let assistant_id = Uuid::new_v4().to_string();
+            let mut sse = client
+                .stream_chat(&model, history.clone())
+                .await
+                .with_context(|| format!("stream_chat to provider {}", provider.id))?;
+
+            let mut assembled = String::new();
+            while let Some(event) = sse.next_event().await {
+                match event {
+                    crate::models::sse::SseEvent::Delta(delta) => {
+                        assembled.push_str(&delta);
+                        let payload = StreamTokenPayload {
+                            token: delta,
+                            conversation_id: conversation_id.clone(),
+                            message_id: assistant_id.clone(),
+                        };
+                        if let Err(e) = app.emit("stream:token", payload) {
+                            tracing::warn!(error = %e, "failed to emit stream:token");
+                        }
                     }
+                    crate::models::sse::SseEvent::Error(msg) => {
+                        emit_error(&app, &conversation_id, msg.clone(), "model");
+                        anyhow::bail!("model stream error: {msg}");
+                    }
+                    crate::models::sse::SseEvent::Done
+                    | crate::models::sse::SseEvent::KeepAlive => {}
                 }
-                crate::models::sse::SseEvent::Error(msg) => {
-                    emit_error(&app, &conversation_id, msg.clone(), "model");
-                    anyhow::bail!("model stream error: {msg}");
+            }
+
+            // Persist this assistant turn.
+            let assistant_message = Message {
+                id: assistant_id,
+                conversation_id: conversation_id.clone(),
+                role: "assistant".to_string(),
+                content: assembled.clone(),
+                model: Some(model.clone()),
+                provider_id: Some(provider.id.clone()),
+                routing_decision: Some(routing_decision.to_string()),
+                thinking_content: None,
+                error: None,
+                aborted: false,
+                created_at: chrono::Utc::now().timestamp(),
+            };
+            profile_db
+                .add_message(&assistant_message)
+                .context("persist assistant message")?;
+            final_text = assembled.clone();
+
+            // On the last permitted round, stop without dispatching more tools.
+            if round == MAX_TOOL_ROUNDS {
+                break;
+            }
+
+            // Run any tool calls the model made in ITS OWN output. Passing
+            // only `assembled` here (never a tool result or prior turn) is
+            // the "parse only your own current output" safety rule.
+            match self
+                .tools
+                .run_turn(&assembled, &exec_ctx, binding, is_cloud)
+                .await
+            {
+                Some(tool_feedback) => {
+                    // Persist the tool feedback (role "tool" for the transcript).
+                    let tool_message = Message {
+                        id: Uuid::new_v4().to_string(),
+                        conversation_id: conversation_id.clone(),
+                        role: "tool".to_string(),
+                        content: tool_feedback.content.clone(),
+                        model: Some(model.clone()),
+                        provider_id: Some(provider.id.clone()),
+                        routing_decision: Some(routing_decision.to_string()),
+                        thinking_content: None,
+                        error: None,
+                        aborted: false,
+                        created_at: chrono::Utc::now().timestamp(),
+                    };
+                    profile_db
+                        .add_message(&tool_message)
+                        .context("persist tool message")?;
+
+                    // Extend the working history and loop for another round.
+                    history.push(ChatMessage::assistant(assembled));
+                    history.push(tool_feedback);
                 }
-                crate::models::sse::SseEvent::Done | crate::models::sse::SseEvent::KeepAlive => {
-                    // Done = end of stream. KeepAlive = no-op.
-                }
+                // No tool calls — this turn is the final answer.
+                None => break,
             }
         }
 
-        // Persist the assistant message.
-        let assistant_message = Message {
-            id: assistant_id.clone(),
-            conversation_id: conversation_id.clone(),
-            role: "assistant".to_string(),
-            content: assembled.clone(),
-            model: Some(model.clone()),
-            provider_id: Some(provider.id.clone()),
-            routing_decision: Some(routing_decision.to_string()),
-            thinking_content: None,
-            error: None,
-            aborted: false,
-            created_at: chrono::Utc::now().timestamp(),
-        };
-        profile_db
-            .add_message(&assistant_message)
-            .context("persist assistant message")?;
-
-        Ok(assembled)
+        Ok(final_text)
     }
 
     /// Insert a row into `trm_logs` for the given gate decision. The

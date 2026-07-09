@@ -20,6 +20,13 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
+pub mod calling;
+pub mod dispatch;
+pub mod fs;
+
+pub use calling::ToolCall;
+pub use dispatch::ToolDispatcher;
+
 // ── Capability ───────────────────────────────────────────────────────────
 
 /// A single thing a tool might need from its running environment.
@@ -165,6 +172,14 @@ pub struct ExecCtx {
 pub trait Tool: Send + Sync {
     /// Stable identifier, e.g. `"read_file"`.
     fn name(&self) -> &str;
+
+    /// One-line human-readable description, shown to the model in the tool
+    /// catalog (`calling::render_tool_catalog`). Default empty — the catalog
+    /// then lists the tool by name only. Real tools should override with a
+    /// short "what it does + args" line.
+    fn description(&self) -> &str {
+        ""
+    }
 
     /// The capabilities this tool needs from its running environment.
     fn requires(&self) -> &[Capability];

@@ -68,6 +68,9 @@ fn test_app() -> App<MockRuntime> {
         gate,
         Arc::clone(&model_manager),
         Arc::clone(&storage),
+        // `send_message` (the only command that uses the dispatcher) isn't
+        // registered in this harness, so an inert dispatcher is enough.
+        Arc::new(crate::tools::ToolDispatcher::empty()),
     ));
 
     let state = AppState {
