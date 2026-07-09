@@ -18,8 +18,15 @@
 //! feedback message to hand back to the model — with tool *output* (which
 //! the agent did not author) guard-wrapped as untrusted.
 
+use std::sync::Arc;
+
+use uuid::Uuid;
+
 use crate::agent::gate::Binding;
-use crate::hooks::{EventContext, HookChain, HookResult, RoutingRequirement};
+use crate::hooks::{
+    ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter, ApprovalRequest,
+    EventContext, HookChain, HookResult, RoutingRequirement,
+};
 use crate::models::ChatMessage;
 use crate::tools::calling::{
     guard_wrap, neutralize_untrusted, parse_tool_calls, render_tool_catalog, ParsedToolCall,
@@ -55,6 +62,14 @@ pub struct ToolDispatcher {
     registry: ToolRegistry,
     chain: HookChain,
     env: BodyEnv,
+    /// Interactive-approval grants. Shared (same `Arc`) with the ask-capable
+    /// hooks in `chain` so a grant recorded here is visible to them on the
+    /// re-run. A default empty ledger when no approver is wired.
+    ledger: Arc<ApprovalLedger>,
+    /// How to ask the human. `None` = no interactive prompt: an `Ask` from the
+    /// chain is surfaced to the model as "not granted this round" (headless /
+    /// round-1 fallback). `Some` = pause, prompt, and resume on the answer.
+    approver: Option<Arc<dyn ApprovalPrompter>>,
 }
 
 impl ToolDispatcher {
@@ -63,7 +78,22 @@ impl ToolDispatcher {
             registry,
             chain,
             env,
+            ledger: Arc::new(ApprovalLedger::new()),
+            approver: None,
         }
+    }
+
+    /// Wire interactive approval: the shared ledger (must be the SAME `Arc`
+    /// passed to `build_pretooluse_chain_full`) and the prompter that asks the
+    /// human. Without this, `dispatch` keeps round-1 behavior (surface `Ask`).
+    pub fn with_approval(
+        mut self,
+        ledger: Arc<ApprovalLedger>,
+        approver: Option<Arc<dyn ApprovalPrompter>>,
+    ) -> Self {
+        self.ledger = ledger;
+        self.approver = approver;
+        self
     }
 
     /// An inert dispatcher: no tools, no gating hooks. Used where a real one
@@ -103,55 +133,110 @@ impl ToolDispatcher {
         // A canonical, greppable form of the call for the pattern-matching
         // hooks (Sandbox denylist, Permission rules).
         let canonical = format!("{} {}", call.name, call.args);
-        let mut ev = EventContext::pre_tool_use(call.name.as_str())
-            .with_input(ToolInput::new(call.args.clone()))
-            .with_content(canonical)
-            .with_binding(binding)
-            .with_cloud(is_cloud)
-            .with_conversation_id(ctx.conversation_id.as_str());
+        // The pin: this exact action (tool + args). A "just this action" grant
+        // binds to it, so it can't drift to a different call.
+        let fingerprint = ActionFingerprint::of(&call.name, &call.args);
 
-        match self.chain.run_gating(&mut ev) {
-            (HookResult::Continue | HookResult::Allow, _) => {
-                // The privacy filter doesn't *deny* a must-stay-local call — it
-                // lets the chain continue but annotates `routing = LocalRequired`.
-                // Honor that here: if the endpoint this conversation talks to is
-                // a cloud endpoint, running the tool would feed its result to the
-                // cloud on the next turn, so refuse (fail loud) rather than let
-                // the annotation be a silent no-op. Round 1 fails closed;
-                // rerouting the loop to a local endpoint is a later enhancement.
-                if ev.routing.is_local_required() && is_cloud {
-                    let reason = match &ev.routing {
-                        RoutingRequirement::LocalRequired { reason } => reason.clone(),
-                        RoutingRequirement::Unconstrained => "must stay on-device".to_string(),
-                    };
-                    return ToolOutcome::Denied {
-                        by: "privacy-filter".to_string(),
-                        reason: format!(
-                            "this call must stay on-device ({reason}), but the conversation is on \
-                             a cloud model — switch to a local model or set the conversation \
-                             binding to Private to run it"
-                        ),
+        // An `Ask` may be answered "approve", which records a grant and lets us
+        // re-run the whole chain (so the non-overridable Sandbox floor is
+        // re-checked every time). Bound the loop: one grant covers every
+        // ask-capable hook via the shared ledger, so this settles in 2 passes;
+        // the cap is a backstop against a misbehaving prompter.
+        const MAX_APPROVAL_ROUNDS: usize = 4;
+        for _ in 0..MAX_APPROVAL_ROUNDS {
+            // Rebuild the context each pass — `routing` is re-derived by the
+            // privacy filter deterministically, so a fresh context is cleanest.
+            let mut ev = EventContext::pre_tool_use(call.name.as_str())
+                .with_input(ToolInput::new(call.args.clone()))
+                .with_content(canonical.clone())
+                .with_binding(binding)
+                .with_cloud(is_cloud)
+                .with_conversation_id(ctx.conversation_id.as_str());
+
+            match self.chain.run_gating(&mut ev) {
+                (HookResult::Continue | HookResult::Allow, _) => {
+                    // The privacy filter doesn't *deny* a must-stay-local call —
+                    // it annotates `routing = LocalRequired`. Honor it here: on a
+                    // cloud endpoint, running the tool would feed its result to
+                    // the cloud next turn, so refuse (fail loud) rather than let
+                    // the annotation be a silent no-op.
+                    if ev.routing.is_local_required() && is_cloud {
+                        let reason = match &ev.routing {
+                            RoutingRequirement::LocalRequired { reason } => reason.clone(),
+                            RoutingRequirement::Unconstrained => "must stay on-device".to_string(),
+                        };
+                        return ToolOutcome::Denied {
+                            by: "privacy-filter".to_string(),
+                            reason: format!(
+                                "this call must stay on-device ({reason}), but the conversation is \
+                                 on a cloud model — switch to a local model or set the conversation \
+                                 binding to Private to run it"
+                            ),
+                        };
+                    }
+                    // A one-time grant covers exactly this execution and no more.
+                    self.ledger.consume_once(&fingerprint);
+                    return match tool.run(ev.input.clone(), ctx).await {
+                        ToolResult::Ok(v) => ToolOutcome::Ok(v),
+                        ToolResult::Err(e) => ToolOutcome::Err(e),
                     };
                 }
-                // Use the (possibly hook-modified) input.
-                match tool.run(ev.input.clone(), ctx).await {
-                    ToolResult::Ok(v) => ToolOutcome::Ok(v),
-                    ToolResult::Err(e) => ToolOutcome::Err(e),
+                (HookResult::Deny(reason), by) => {
+                    return ToolOutcome::Denied {
+                        by: by.unwrap_or("gate").to_string(),
+                        reason,
+                    };
+                }
+                (HookResult::Ask(prompt), by) => {
+                    let by = by.unwrap_or("gate").to_string();
+                    let Some(approver) = &self.approver else {
+                        // No interactive prompter (headless / round-1 fallback).
+                        return ToolOutcome::Ask { by, prompt };
+                    };
+                    let req = ApprovalRequest {
+                        id: Uuid::new_v4().to_string(),
+                        conversation_id: ctx.conversation_id.clone(),
+                        tool_name: call.name.clone(),
+                        fingerprint: fingerprint.clone(),
+                        prompt,
+                        by,
+                    };
+                    match approver.request(req).await {
+                        ApprovalDecision::Approve(scope, target) => {
+                            self.ledger.grant(target, scope);
+                            // Re-run the FULL chain: the grant now lets the
+                            // asking hook(s) pass; Sandbox/Privacy re-checked.
+                            continue;
+                        }
+                        ApprovalDecision::Deny => {
+                            return ToolOutcome::Denied {
+                                by: "user".to_string(),
+                                reason: "you declined this tool call".to_string(),
+                            };
+                        }
+                        ApprovalDecision::Timeout => {
+                            return ToolOutcome::Denied {
+                                by: "approval".to_string(),
+                                reason: "no response in time — denied by default".to_string(),
+                            };
+                        }
+                    }
+                }
+                // `Modify` is consumed inside `run_gating` (it rewrites ctx.input
+                // and continues), so it can never be the terminal result.
+                (HookResult::Modify(_), _) => {
+                    return ToolOutcome::Err(
+                        "internal: gating chain returned Modify as a terminal result".to_string(),
+                    );
                 }
             }
-            (HookResult::Deny(reason), by) => ToolOutcome::Denied {
-                by: by.unwrap_or("gate").to_string(),
-                reason,
-            },
-            (HookResult::Ask(prompt), by) => ToolOutcome::Ask {
-                by: by.unwrap_or("gate").to_string(),
-                prompt,
-            },
-            // `Modify` is consumed inside `run_gating` (it rewrites ctx.input
-            // and continues), so it can never be the terminal result.
-            (HookResult::Modify(_), _) => ToolOutcome::Err(
-                "internal: gating chain returned Modify as a terminal result".to_string(),
-            ),
+        }
+
+        // Exhausted the loop without settling — a grant should always let the
+        // next pass through, so this means something is wrong; fail closed.
+        ToolOutcome::Denied {
+            by: "approval".to_string(),
+            reason: "too many confirmation rounds for one call".to_string(),
         }
     }
 
@@ -231,15 +316,17 @@ fn format_outcome(name: &str, outcome: ToolOutcome) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use super::*;
     use crate::agent::gate::PrivacyGate;
     use crate::hooks::{
-        build_pretooluse_chain, build_pretooluse_chain_with_confirmed, InMemoryPolicySource,
-        PermissionMode,
+        build_pretooluse_chain, build_pretooluse_chain_full, build_pretooluse_chain_with_confirmed,
+        GrantScope, GrantTarget, InMemoryPolicySource, PermissionMode,
     };
     use crate::tools::fs::ReadFileTool;
     use crate::tools::{Capability, EchoTool, SyncFileTool, Tool};
@@ -472,6 +559,137 @@ mod tests {
             parse_tool_calls(&feedback.content).is_empty(),
             "a fence smuggled via the tool name must not survive into replayed feedback: {}",
             feedback.content
+        );
+    }
+
+    // ── interactive approval (pause/resume) ──────────────────────────────
+
+    #[derive(Clone, Copy)]
+    enum MockResponse {
+        ApproveOnceAction,
+        ApproveSessionTool,
+        Deny,
+        Timeout,
+    }
+
+    /// A prompter that answers with a preset decision and counts how many
+    /// times it was asked.
+    struct MockPrompter {
+        response: MockResponse,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ApprovalPrompter for MockPrompter {
+        fn request<'a>(
+            &'a self,
+            req: ApprovalRequest,
+        ) -> Pin<Box<dyn Future<Output = ApprovalDecision> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let decision = match self.response {
+                MockResponse::ApproveOnceAction => {
+                    ApprovalDecision::Approve(GrantScope::Once, GrantTarget::Fingerprint(req.fingerprint))
+                }
+                MockResponse::ApproveSessionTool => {
+                    ApprovalDecision::Approve(GrantScope::Session, GrantTarget::Tool(req.tool_name))
+                }
+                MockResponse::Deny => ApprovalDecision::Deny,
+                MockResponse::Timeout => ApprovalDecision::Timeout,
+            };
+            Box::pin(async move { decision })
+        }
+    }
+
+    /// Dispatcher whose only tool ("shell_exec", the SpyTool) is in Ask mode,
+    /// wired to a `MockPrompter`. Returns (dispatcher, ran-flag, ask-count).
+    fn ask_mode_dispatcher(
+        response: MockResponse,
+    ) -> (ToolDispatcher, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SpyTool { ran: ran.clone() }));
+
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("shell_exec", PermissionMode::Ask);
+        let chain =
+            build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger));
+
+        let prompter = Arc::new(MockPrompter { response, calls: calls.clone() });
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
+            .with_approval(ledger, Some(prompter));
+        (dispatcher, ran, calls)
+    }
+
+    #[tokio::test]
+    async fn approving_once_runs_the_tool() {
+        let (dispatcher, ran, calls) = ask_mode_dispatcher(MockResponse::ApproveOnceAction);
+        let outcome = dispatcher
+            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(outcome, ToolOutcome::Ok(_)), "approve → runs, got {outcome:?}");
+        assert!(ran.load(Ordering::SeqCst), "an approved call must run");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "asked exactly once");
+    }
+
+    #[tokio::test]
+    async fn declining_blocks_the_tool() {
+        let (dispatcher, ran, _calls) = ask_mode_dispatcher(MockResponse::Deny);
+        let outcome = dispatcher
+            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .await;
+        match outcome {
+            ToolOutcome::Denied { by, .. } => assert_eq!(by, "user"),
+            other => panic!("decline → Denied by user, got {other:?}"),
+        }
+        assert!(!ran.load(Ordering::SeqCst), "a declined call must never run");
+    }
+
+    #[tokio::test]
+    async fn timing_out_denies_by_default() {
+        let (dispatcher, ran, _calls) = ask_mode_dispatcher(MockResponse::Timeout);
+        let outcome = dispatcher
+            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .await;
+        match outcome {
+            ToolOutcome::Denied { by, .. } => assert_eq!(by, "approval"),
+            other => panic!("timeout → Denied by approval, got {other:?}"),
+        }
+        assert!(!ran.load(Ordering::SeqCst), "a timed-out call must never run");
+    }
+
+    #[tokio::test]
+    async fn a_session_tool_grant_is_not_re_prompted() {
+        let (dispatcher, ran, calls) = ask_mode_dispatcher(MockResponse::ApproveSessionTool);
+        // First call prompts and approves the whole tool for the session.
+        let o1 = dispatcher
+            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(o1, ToolOutcome::Ok(_)), "first call should run, got {o1:?}");
+        // Second call with DIFFERENT args is covered by the session-tool grant.
+        let o2 = dispatcher
+            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "pwd"})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(o2, ToolOutcome::Ok(_)), "second call should run, got {o2:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a session grant must not re-prompt");
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn no_approver_falls_back_to_surfacing_ask() {
+        // Ask-mode tool but NO prompter wired → round-1 behavior (surface Ask).
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SpyTool { ran: Arc::new(AtomicBool::new(false)) }));
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("shell_exec", PermissionMode::Ask);
+        let chain = build_pretooluse_chain(gate(), Box::new(policy));
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty());
+        let outcome = dispatcher
+            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::Ask { .. }),
+            "no approver → surface Ask, got {outcome:?}"
         );
     }
 }

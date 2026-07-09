@@ -15,7 +15,9 @@
 //! `InMemoryPolicySource` is the only implementation today.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::hooks::approval::{ActionFingerprint, ApprovalLedger};
 use crate::hooks::{EventContext, GatingHook, HookEvent, HookResult};
 
 // ── PermissionMode ───────────────────────────────────────────────────────
@@ -175,11 +177,26 @@ impl PolicySource for InMemoryPolicySource {
 
 pub struct PermissionHook {
     policy: Box<dyn PolicySource>,
+    /// Interactive-approval grants recorded by `ToolDispatcher`. A grant that
+    /// covers this call turns a policy `Ask` into `Continue` on the re-run.
+    /// Defaults to an empty, standalone ledger (so `Ask` behaves as a plain
+    /// `Ask` where no interactive approver is wired).
+    ledger: Arc<ApprovalLedger>,
 }
 
 impl PermissionHook {
     pub fn new(policy: Box<dyn PolicySource>) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            ledger: Arc::new(ApprovalLedger::new()),
+        }
+    }
+
+    /// Share the dispatcher's approval ledger so recorded grants are visible
+    /// here (see `crate::hooks::build_pretooluse_chain_full`).
+    pub fn with_ledger(mut self, ledger: Arc<ApprovalLedger>) -> Self {
+        self.ledger = ledger;
+        self
     }
 
     /// Resolve the effective mode for this call: most-specific matching
@@ -215,10 +232,16 @@ impl GatingHook for PermissionHook {
                 "denied by permission policy for tool '{}'",
                 ctx.tool_name
             )),
-            Some(PermissionMode::Ask) => HookResult::Ask(format!(
-                "tool '{}' requires confirmation",
-                ctx.tool_name
-            )),
+            Some(PermissionMode::Ask) => {
+                // A prior interactive approval may already cover this exact
+                // action (or this whole tool). If so, don't ask again.
+                let fp = ActionFingerprint::from_ctx(ctx);
+                if self.ledger.covers(&ctx.tool_name, &fp) {
+                    HookResult::Continue
+                } else {
+                    HookResult::Ask(format!("tool '{}' requires confirmation", ctx.tool_name))
+                }
+            }
             // Unconfigured — defer to FirstUseConfirmHook.
             None => HookResult::Continue,
         }
@@ -345,5 +368,38 @@ mod tests {
         let mut ctx = EventContext::pre_tool_use("shell_exec").with_command_text("ls");
         ctx.event = HookEvent::PostToolUse;
         assert_eq!(hook.on_event(&mut ctx), HookResult::Continue);
+    }
+
+    #[test]
+    fn ask_becomes_continue_when_the_ledger_covers_the_action() {
+        use crate::hooks::approval::{GrantScope, GrantTarget};
+        use crate::tools::ToolInput;
+
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("write_file", PermissionMode::Ask);
+        let ledger = Arc::new(ApprovalLedger::new());
+        let hook = PermissionHook::new(Box::new(policy)).with_ledger(Arc::clone(&ledger));
+
+        let mut ctx = EventContext::pre_tool_use("write_file")
+            .with_input(ToolInput::new(serde_json::json!({"path": "a.txt"})));
+
+        // No grant yet → Ask.
+        match hook.on_event(&mut ctx) {
+            HookResult::Ask(_) => {}
+            other => panic!("expected Ask before any grant, got {other:?}"),
+        }
+
+        // Grant exactly this action → Continue on the re-run.
+        let fp = ActionFingerprint::from_ctx(&ctx);
+        ledger.grant(GrantTarget::Fingerprint(fp), GrantScope::Session);
+        assert_eq!(hook.on_event(&mut ctx), HookResult::Continue);
+
+        // A different action (different args) is NOT covered — no drift.
+        let mut other = EventContext::pre_tool_use("write_file")
+            .with_input(ToolInput::new(serde_json::json!({"path": "b.txt"})));
+        match hook.on_event(&mut other) {
+            HookResult::Ask(_) => {}
+            o => panic!("a grant must not drift to a different action, got {o:?}"),
+        }
     }
 }

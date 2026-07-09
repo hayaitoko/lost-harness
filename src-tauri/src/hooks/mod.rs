@@ -49,16 +49,22 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::agent::gate::Binding;
 use crate::tools::ToolInput;
 
+pub mod approval;
 pub mod first_use;
 pub mod permission;
 pub mod privacy_filter;
 pub mod routing;
 pub mod sandbox;
 
+pub use approval::{
+    ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter, ApprovalRequest,
+    GrantScope, GrantTarget,
+};
 pub use first_use::FirstUseConfirmHook;
 pub use permission::{
     InMemoryPolicySource, PermissionHook, PermissionMode, PolicySource, ToolRule,
@@ -386,6 +392,35 @@ pub fn build_pretooluse_chain_with_confirmed(
     chain.register_gating(Box::new(SandboxHook));
     chain.register_gating(Box::new(PermissionHook::new(policy)));
     let first_use = FirstUseConfirmHook::new();
+    for tool in confirmed {
+        first_use.mark_confirmed(tool);
+    }
+    chain.register_gating(Box::new(first_use));
+    chain
+}
+
+/// Same ordered chain as [`build_pretooluse_chain_with_confirmed`], but with a
+/// shared [`ApprovalLedger`] threaded into the ask-capable hooks
+/// (`PermissionHook`, `FirstUseConfirmHook`). An interactive approval recorded
+/// by `ToolDispatcher` (see `ToolDispatcher::with_approval`) turns their `Ask`
+/// into `Continue` on the re-run — a single grant satisfies every ask-capable
+/// hook because they all consult the same ledger by fingerprint/tool.
+///
+/// The dispatcher MUST hold the same `Arc<ApprovalLedger>` for grants to be
+/// visible here — pass one `Arc`, clone it into both.
+pub fn build_pretooluse_chain_full(
+    gate: crate::agent::gate::PrivacyGate,
+    policy: Box<dyn PolicySource>,
+    confirmed: &[&str],
+    ledger: Arc<ApprovalLedger>,
+) -> HookChain {
+    let mut chain = HookChain::new();
+    chain.register_gating(Box::new(PrivacyFilterHook::new(gate)));
+    chain.register_gating(Box::new(SandboxHook));
+    chain.register_gating(Box::new(
+        PermissionHook::new(policy).with_ledger(Arc::clone(&ledger)),
+    ));
+    let first_use = FirstUseConfirmHook::new().with_ledger(Arc::clone(&ledger));
     for tool in confirmed {
         first_use.mark_confirmed(tool);
     }
