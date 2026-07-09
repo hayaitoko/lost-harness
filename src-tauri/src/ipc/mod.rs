@@ -31,6 +31,8 @@
 #[cfg(test)]
 mod contract_tests;
 
+pub mod approval;
+
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,8 @@ use uuid::Uuid;
 
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
+use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget};
+use crate::ipc::approval::ApprovalRegistry;
 use crate::models::{ModelManager, Provider, ProviderKind};
 use crate::storage::{Conversation, Message, Storage};
 
@@ -52,6 +56,9 @@ pub struct AppState {
     pub agent_loop: Arc<AgentLoop>,
     pub model_manager: Arc<ModelManager>,
     pub storage: Arc<Storage>,
+    /// In-flight tool-approval prompts (§3.5). The dispatcher parks a request
+    /// here and awaits it; `resolve_tool_approval` answers by id.
+    pub approvals: Arc<ApprovalRegistry>,
 }
 
 // ── Response types ───────────────────────────────────────────────────────
@@ -407,6 +414,56 @@ pub async fn send_message(
         routing_decision: "allow".to_string(),
         completed_at: chrono::Utc::now().timestamp_millis().max(started),
     })
+}
+
+// ── tool approval ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveApprovalArgs {
+    pub id: String,
+    /// "approve" | "deny". Anything that isn't "approve" is treated as a
+    /// denial (fail closed).
+    pub decision: String,
+    /// "once" | "session" | "always" — how long the approval lasts. Defaults
+    /// to "once". Ignored for a denial.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// "action" (pin to this exact call) | "tool" (any call to this tool).
+    /// Defaults to "action", the safer/narrower grant.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// Answer a pending tool-approval prompt raised via `tool:approval_request`.
+/// Returns `false` if the id is unknown — already answered, or it timed out
+/// and denied by default. Touches only the approval registry (never the agent
+/// loop's stream lock), so it can safely resolve a dispatch that is parked
+/// waiting on it.
+#[tauri::command]
+pub fn resolve_tool_approval(
+    state: State<'_, AppState>,
+    args: ResolveApprovalArgs,
+) -> Result<bool, String> {
+    let approve = args.decision.eq_ignore_ascii_case("approve");
+    let scope = match args.scope.as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("session") => GrantScope::Session,
+        Some("always") => GrantScope::Always,
+        _ => GrantScope::Once,
+    };
+    let want_tool = matches!(args.target.as_deref(), Some(t) if t.eq_ignore_ascii_case("tool"));
+
+    let answered = state.approvals.answer(&args.id, |fingerprint, tool_name| {
+        if !approve {
+            return ApprovalDecision::Deny;
+        }
+        let target = if want_tool {
+            GrantTarget::Tool(tool_name.to_string())
+        } else {
+            GrantTarget::Fingerprint(fingerprint.to_string())
+        };
+        ApprovalDecision::Approve(scope, target)
+    });
+    Ok(answered)
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────

@@ -77,6 +77,7 @@ fn test_app() -> App<MockRuntime> {
         agent_loop,
         model_manager,
         storage,
+        approvals: Arc::new(crate::ipc::approval::ApprovalRegistry::new()),
     };
 
     let app = mock_builder()

@@ -76,9 +76,29 @@ pub fn run() {
             // §7 Privacy Gate for message egress.
             let gate = PrivacyGate::new(Arc::clone(&classifier));
 
+            // §3.5 approval spine: the shared grant ledger, the pending-prompt
+            // registry, and the Tauri prompter that raises an in-app
+            // confirmation and waits (deny-by-default after 5 min) for the
+            // answer. The dispatcher and the gating chain share one ledger.
+            let ledger = Arc::new(crate::hooks::ApprovalLedger::new());
+            let approvals = Arc::new(crate::ipc::approval::ApprovalRegistry::new());
+            let prompter: Arc<dyn crate::hooks::ApprovalPrompter> =
+                Arc::new(crate::ipc::approval::TauriApprovalPrompter::new(
+                    app.handle().clone(),
+                    Arc::clone(&approvals),
+                    std::time::Duration::from_secs(300),
+                ));
+
             // §3 tool spine: workspace-confined read-only tools behind the
             // unified pretooluse hook chain, filtered by this body's caps.
-            let tools = Arc::new(build_tool_dispatcher(&base_path, Arc::clone(&classifier)));
+            // State-changing tools (a later round) route through the approval
+            // spine wired here.
+            let tools = Arc::new(build_tool_dispatcher(
+                &base_path,
+                Arc::clone(&classifier),
+                Arc::clone(&ledger),
+                Some(Arc::clone(&prompter)),
+            ));
 
             let agent_loop = Arc::new(AgentLoop::new(
                 gate,
@@ -91,6 +111,7 @@ pub fn run() {
                 agent_loop,
                 model_manager,
                 storage,
+                approvals,
             };
             app.manage(state);
 
@@ -109,6 +130,7 @@ pub fn run() {
             ipc::remove_provider,
             ipc::list_models,
             ipc::send_message,
+            ipc::resolve_tool_approval,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lost Harness");
@@ -175,8 +197,10 @@ fn hydrate_providers_from_storage(
 fn build_tool_dispatcher(
     base_path: &std::path::Path,
     classifier: Arc<dyn crate::classifier::Classifier>,
+    ledger: Arc<crate::hooks::ApprovalLedger>,
+    approver: Option<Arc<dyn crate::hooks::ApprovalPrompter>>,
 ) -> ToolDispatcher {
-    use crate::hooks::{build_pretooluse_chain_with_confirmed, InMemoryPolicySource, PermissionMode};
+    use crate::hooks::{build_pretooluse_chain_full, InMemoryPolicySource, PermissionMode};
     use crate::tools::fs::{ListDirTool, ReadFileTool, SearchFilesTool};
     use crate::tools::{BodyEnv, ToolRegistry};
 
@@ -201,10 +225,11 @@ fn build_tool_dispatcher(
 
     // These are read-only and workspace-confined, so ship them pre-trusted
     // (no first-use prompt). State-changing tools won't get this treatment.
-    let chain = build_pretooluse_chain_with_confirmed(
+    let chain = build_pretooluse_chain_full(
         PrivacyGate::new(classifier),
         Box::new(policy),
         &["read_file", "list_dir", "search_files"],
+        Arc::clone(&ledger),
     );
-    ToolDispatcher::new(registry, chain, BodyEnv::app_default())
+    ToolDispatcher::new(registry, chain, BodyEnv::app_default()).with_approval(ledger, approver)
 }
