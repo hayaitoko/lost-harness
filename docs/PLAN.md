@@ -335,7 +335,8 @@ actively works against them. These are ours to build, unassisted:
 
 ## 7. Open decisions
 
-The five items formerly tracked here are now resolved — see §5 for each:
+All items formerly tracked here are now resolved — see §5 for the server
+ones, and the last bullet below for memory:
 
 - File-sync engine choice → **we build our own** (a simple "send what
   changed when the lock moves" push over our own authenticated channel).
@@ -347,23 +348,27 @@ The five items formerly tracked here are now resolved — see §5 for each:
   only profiles the user opts in send data to the server.
 - Authenticated app↔server channel → **product-owned pairing + mutual auth
   + always-on encryption**, not dependent on Tailscale or any other network.
+- **Memory sharing across profiles → a per-profile toggle; a walled
+  profile gets its own separate memory database (decided 2026-07-08).**
+  Default is **shared**: facts live in `global.db`, each tagged with the
+  profile it came from, so one coherent assistant remembers you across
+  every profile. A per-profile **"keep this profile's memory private"**
+  toggle turns that profile into a **full island** — its memory lives in
+  its own separate, profile-scoped database, physically apart from the
+  shared pool; it reads nothing from shared memory and writes nothing back.
+  The separation is **physical, not a query filter**, specifically so that
+  switching the toggle off later (or a bug) can never retroactively spill
+  what was written while the profile was private — that data was never in
+  the shared pool to begin with. This is the version a genuinely
+  locked-down / regulated user requires, whose need runs **both**
+  directions (no work facts leak out, no personal context leaks in). A
+  one-way variant (a walled profile may *read* shared memory but never
+  write back) is noted as a possible finer setting later, not the v1
+  default. See §9 for how this lands in storage.
 
 One build-time tuning detail carries forward, not a real open decision: the
 exact size of the catch-up-buffer window (on the order of a few days) isn't
 fixed here — pick it during implementation from real usage.
-
-**Still open — flagged for Lukas, not yet decided:**
-
-- **Should memory be shared across all profiles, or walled off per
-  profile?** Two live options: **shared**, one coherent assistant that
-  remembers everything about you no matter which profile you're in; or
-  **walled**, where each profile (work, personal, ...) keeps its own
-  separate memory and nothing crosses over. Fable's reference spec picked a
-  middle path — memory is shared, but every fact is tagged with which
-  profile it came from, so a per-profile view is possible later without
-  building a hard wall today. That's a reasonable default but has not been
-  ratified as Lost Harness's answer — decide before the memory system
-  (§9) is built, since the storage schema depends on which way this goes.
 
 ---
 
@@ -535,6 +540,21 @@ kept as plain markdown files on disk, so the user can open and edit their
 own memory in any text editor, and could optionally point a tool like
 Obsidian at that folder if they want to — the product itself never depends
 on Obsidian or any other external app to function.
+
+**Where a fact physically lives depends on the profile's privacy toggle
+(decided, see §7).** By default a profile is **shared**: its memory facts
+live in the shared `global.db`, each tagged with the profile it came from,
+so the assistant carries one coherent memory of you across profiles. A
+profile with its **"keep memory private"** toggle on is a **full island**:
+its facts live in a **separate, profile-scoped memory database** instead of
+`global.db`, physically apart from the shared pool — it neither reads shared
+facts nor writes into them. Physical separation (a distinct database, not a
+filtered view of one shared table) is the whole point: the wall then holds
+even if the toggle is later switched off, which is exactly what a
+locked-down/regulated profile requires. This means the storage schema
+branches on the toggle — the shared path writes tagged rows into
+`global.db`; the walled path provisions and targets that profile's own
+memory DB.
 
 Two things deliberately **not** in v1:
 

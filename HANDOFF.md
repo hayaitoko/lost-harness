@@ -79,15 +79,16 @@ cd /Users/hayai/Desktop/lost-harness-product && npm run check               # sv
 
 ---
 
-## Open decision flagged for Lukas (not yet decided)
+## Memory-sharing decision — DECIDED 2026-07-08
 
-**Should memory be shared across all profiles, or walled off per profile?**
+The last open product decision ("shared vs. walled memory across profiles?") is now settled: **a per-profile toggle, and a walled profile gets its own separate memory database.** There are no product decisions left waiting on Lukas.
 
-Two options:
-- **Shared** — one coherent assistant that remembers everything about you across every profile (work, personal, etc.).
-- **Walled** — each profile has its own separate memory, so a work profile and a personal profile never bleed into each other.
+- **Default: shared.** Facts live in `global.db`, each tagged with the profile it came from — one coherent assistant that remembers you across every profile.
+- **Per-profile "keep this profile's memory private" toggle → full island.** When on, that profile's memory lives in its **own separate, profile-scoped database**, physically apart from the shared pool. It reads nothing from shared memory and writes nothing back.
+- **Why a separate database and not a query filter:** the separation must be physical so that switching the toggle off later — or a bug — can never retroactively spill what was written while the profile was private. A filter would leave that data sitting in the shared pool; a separate DB never puts it there. This is the version a genuinely locked-down/regulated user requires, whose need runs **both** directions (no work facts out, no personal context in).
+- A one-way variant (a walled profile may *read* shared memory but never write back) is a possible finer setting later, not v1.
 
-Fable's reference spec (one of the two projects this design borrows mechanisms from) chose a middle path: memory is shared, but every fact is tagged with which profile it came from, so it *could* be filtered per-profile later without being a hard wall today. That's a reasonable default, but it has not been ratified as Lost Harness's answer — flag it to Lukas before the memory system gets built, since the storage schema will differ depending on which way this goes.
+Full write-up in [`docs/PLAN.md`](docs/PLAN.md) §7 and §9. **This unblocks the memory milestone's storage schema** — the schema branches on the toggle (shared → tagged rows in `global.db`; walled → the profile's own memory DB).
 
 ---
 
@@ -182,3 +183,4 @@ Picked up from the 2026-07-07 handoff (M1 frontend rewiring landed and committed
 - **Consolidated the docs and renamed "privacy gate/§7" to "the privacy filter"** throughout the prose docs (the code still uses the old names — see "Pending cleanup," above).
 - **Designed the memory system and the skills system in depth**, in conversation — now folded into `docs/PLAN.md` as full sections (see this repo's PLAN.md for the complete design).
 - **Resolved the remaining server/privacy open decisions**: the baton/multi-device model, per-profile opt-in server sync, and product-owned pairing/authentication (not dependent on Tailscale or any specific network) — all captured in PLAN.md §2, §5, §7.
+- **Resolved the last open product decision — memory sharing across profiles.** A per-profile toggle: shared by default (tagged rows in `global.db`), and a walled profile gets its **own separate memory database** (full island, physical separation) rather than a filtered view — so switching the toggle off can never retroactively leak. The memory milestone's storage schema is now unblocked; it branches on the toggle. See PLAN §7/§9 and the decision section above.
