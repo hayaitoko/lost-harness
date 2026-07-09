@@ -48,16 +48,22 @@ impl EnsembleClassifier {
 }
 
 impl Classifier for EnsembleClassifier {
-    /// Stub. A real implementation will run `text` through the two ONNX
-    /// encoders (sliding 128-token windows, max private-probability), fuse
-    /// with the rules layer, and map the result to a [`Label`] + confidence.
-    /// For now, return `Uncertain` at 0.0 so the gate conservatively routes
-    /// to local — the same outcome a missing classifier would produce.
+    /// Stub. A real implementation will run `super::rules::detect(text)`
+    /// FIRST, unconditionally, as the deterministic layer-0 pre-filter: any
+    /// span found there should short-circuit straight to `Label::Private` at
+    /// confidence 1.0 (and populate `Classification::spans`) without paying
+    /// for transformer inference. Only when layer 0 finds nothing should the
+    /// two ONNX encoders (sliding 128-token windows, max private-probability)
+    /// run, to cover the categories layer 0 structurally can't see
+    /// (PII_NAME, HEALTH, LOCATION, PII_ORG, PERSONAL_CONTEXT). For now,
+    /// return `Uncertain` at 0.0 so the gate conservatively routes to local —
+    /// the same outcome a missing classifier would produce.
     fn classify(&self, _text: &str) -> Classification {
         Classification {
             label: Label::Uncertain,
             confidence: 0.0,
             raw_output: Vec::new(),
+            spans: Vec::new(),
         }
     }
 }

@@ -70,6 +70,7 @@ impl Classifier for HeuristicClassifier {
                 label: Label::Public,
                 confidence: 1.0,
                 raw_output: vec![0.0; 8],
+                spans: Vec::new(),
             };
         }
 
@@ -93,6 +94,7 @@ impl Classifier for HeuristicClassifier {
                 label: Label::Public,
                 confidence: 1.0,
                 raw_output,
+                spans: Vec::new(),
             };
         }
 
@@ -112,12 +114,14 @@ impl Classifier for HeuristicClassifier {
                 label: Label::Private,
                 confidence: HARD_CONFIDENCE,
                 raw_output,
+                spans: Vec::new(),
             }
         } else {
             Classification {
                 label: Label::Uncertain,
                 confidence: SOFT_CONFIDENCE,
                 raw_output,
+                spans: Vec::new(),
             }
         }
     }
@@ -223,7 +227,12 @@ fn detect_phone_number(text: &str) -> Option<&'static str> {
 }
 
 /// Health term + first-person context on the same message.
-fn detect_health_info(text: &str) -> Option<&'static str> {
+///
+/// `pub(crate)`: reused directly by [`super::rules::RulesClassifier`] as a
+/// stopgap for the HEALTH category, which the deterministic rules layer
+/// (`rules.py`/`rules.rs`) intentionally doesn't attempt — see that module's
+/// docs. Drop this back to private once the ONNX ensemble covers HEALTH.
+pub(crate) fn detect_health_info(text: &str) -> Option<&'static str> {
     static HEALTH: OnceLock<Regex> = OnceLock::new();
     static FIRST: OnceLock<Regex> = OnceLock::new();
     let health_re = HEALTH.get_or_init(|| {
@@ -253,7 +262,11 @@ fn detect_financial_account(text: &str) -> Option<&'static str> {
 }
 
 /// "<number> <word> <street|st|ave|...>" — coarse, but rare false positives.
-fn detect_home_address(text: &str) -> Option<&'static str> {
+///
+/// `pub(crate)`: reused directly by [`super::rules::RulesClassifier`] as a
+/// stopgap for the LOCATION category — see [`detect_health_info`]'s doc
+/// comment for why.
+pub(crate) fn detect_home_address(text: &str) -> Option<&'static str> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         Regex::new(r"(?i)\b\d+\s+\w+\s+(street|st|ave|avenue|road|rd|drive|dr|lane|ln|blvd)\b")

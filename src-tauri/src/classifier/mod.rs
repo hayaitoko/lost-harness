@@ -11,9 +11,11 @@
 
 pub mod engine;
 pub mod heuristic;
+pub mod rules;
 
 pub use engine::EnsembleClassifier;
 pub use heuristic::HeuristicClassifier;
+pub use rules::{RuleCategory, RulesClassifier, Span};
 
 // `Classifier` (the trait) is declared `pub` in this module below and is
 // reachable as `crate::classifier::Classifier` without re-export.
@@ -40,6 +42,11 @@ pub struct Classification {
     /// of per-detector scores; for the trained ensemble it will be the
     /// per-model private-probabilities.
     pub raw_output: Vec<f32>,
+    /// Exact spans backing the decision — populated by [`rules::RulesClassifier`]
+    /// (and, once wired, the ensemble's fused rules layer) for the
+    /// annotated-redaction UI. Empty for classifiers that only produce a
+    /// coarse label (`HeuristicClassifier`, the `EnsembleClassifier` stub).
+    pub spans: Vec<rules::Span>,
 }
 
 /// Anything that can decide whether a message is private, public, or uncertain.

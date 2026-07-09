@@ -742,10 +742,15 @@ system is actually being built, not a design question to resolve now.
 
 ## 11. The privacy-filter classifier (real model) + its UX
 
-**Status: the trained model arrived 2026-07-09 (external collaborator);
-not yet integrated.** It replaces the regex heuristic the privacy filter
-has used behind its `Classifier` interface until now. Full specs +
-integration path are in the delivered `pf-bundle` README; the essentials:
+**Status: integration started 2026-07-09.** The deterministic **rules
+layer (layer 0) is ported to Rust and is now the active classifier**
+(`classifier/rules.rs` — structured PII + confidentiality cues, recall-biased,
+with span offsets; `RulesClassifier` wired in `lib.rs`, superseding the old
+low-false-positive heuristic). The trained ONNX **ensemble (layer 1) is not
+yet wired** — blocked on the exported ONNX artifacts (the bundle ships the
+PyTorch weights + `export_onnx.py`, not the `.onnx` files themselves). Full
+specs + integration path are in the delivered `pf-bundle` README; the
+essentials:
 
 - **What it is:** a layered egress guard — deterministic **rules**
   (structured PII: SSN, Luhn card, keys, email, phone — guaranteed recall)

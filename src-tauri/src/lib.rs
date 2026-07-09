@@ -34,7 +34,7 @@ use crate::ipc::AppState;
 use crate::models::{ModelManager, Provider, ProviderKind};
 use crate::storage::Storage;
 use crate::tools::ToolDispatcher;
-use crate::classifier::HeuristicClassifier;
+use crate::classifier::RulesClassifier;
 
 /// Tauri entry point. Runs once on launch.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -63,11 +63,15 @@ pub fn run() {
             let model_manager = Arc::new(ModelManager::new());
             hydrate_providers_from_storage(&storage, &model_manager);
 
-            // Privacy classifier (heuristic fallback until the trained model
-            // lands — see classifier/engine.rs). Shared between the message-level
-            // §7 gate and the tool gating chain so both classify identically.
+            // Privacy classifier. Now the ported deterministic rules layer
+            // (classifier/rules.rs — layer 0: structured PII + confidentiality
+            // cues, recall-biased, with span offsets). Supersedes the old
+            // low-false-positive heuristic; the trained ONNX ensemble
+            // (EnsembleClassifier) layers on top once its models are wired.
+            // Shared between the message-level §7 gate and the tool gating
+            // chain so both classify identically.
             let classifier: Arc<dyn crate::classifier::Classifier> =
-                Arc::new(HeuristicClassifier::new());
+                Arc::new(RulesClassifier::new());
 
             // §7 Privacy Gate for message egress.
             let gate = PrivacyGate::new(Arc::clone(&classifier));
