@@ -155,6 +155,12 @@ impl ToolDispatcher {
 
             match self.chain.run_gating(&mut ev) {
                 (HookResult::Continue | HookResult::Allow, _) => {
+                    // The gating chain passed. A one-time grant is now SPENT
+                    // regardless of what happens next — consume it up front, so
+                    // a Once grant that the routing floor blocks below can't
+                    // stay armed and silently authorize a later identical call.
+                    self.ledger.consume_once(&fingerprint);
+
                     // The privacy filter doesn't *deny* a must-stay-local call —
                     // it annotates `routing = LocalRequired`. Honor it here: on a
                     // cloud endpoint, running the tool would feed its result to
@@ -174,8 +180,6 @@ impl ToolDispatcher {
                             ),
                         };
                     }
-                    // A one-time grant covers exactly this execution and no more.
-                    self.ledger.consume_once(&fingerprint);
                     return match tool.run(ev.input.clone(), ctx).await {
                         ToolResult::Ok(v) => ToolOutcome::Ok(v),
                         ToolResult::Err(e) => ToolOutcome::Err(e),
@@ -198,9 +202,19 @@ impl ToolDispatcher {
                         conversation_id: ctx.conversation_id.clone(),
                         tool_name: call.name.clone(),
                         fingerprint: fingerprint.clone(),
+                        // The canonical `name {args}` so the user can vet what
+                        // they're approving, not just which tool.
+                        command: canonical.clone(),
                         prompt,
                         by,
                     };
+                    // NOTE (known, deferred): `process_message` holds the agent
+                    // loop's stream lock across this await, so while a prompt is
+                    // outstanding the app is single-in-flight — a second send
+                    // blocks until the user answers or the timeout fires. Not a
+                    // deadlock (resolve_tool_approval never touches that lock).
+                    // Releasing the lock while parked (+ a cancel command) is a
+                    // concurrency-model refactor deferred past this round.
                     match approver.request(req).await {
                         ApprovalDecision::Approve(scope, target) => {
                             self.ledger.grant(target, scope);

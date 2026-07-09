@@ -50,7 +50,12 @@
     if (!current || resolving) return;
     resolving = true;
     try {
-      await resolveToolApproval(current.id, decision, scope, target);
+      const delivered = await resolveToolApproval(current.id, decision, scope, target);
+      if (!delivered) {
+        // The backend had no such pending request — it was already answered or
+        // it timed out and denied by default. The card is stale; just drop it.
+        console.info("[approval] request already resolved or expired:", current.id);
+      }
     } catch (e) {
       console.warn("[approval] resolve failed", e);
     } finally {
@@ -97,11 +102,16 @@
         </h2>
       </div>
 
-      <p class="mb-1 text-sm text-neutral-300">
+      <p class="mb-2 text-sm text-neutral-300">
         The agent wants to use
         <code class="rounded bg-neutral-900 px-1 py-0.5 text-neutral-100">{current.tool_name}</code
-        >.
+        >:
       </p>
+      <!-- The exact call, so the user can vet it. Untrusted, display-only:
+           Svelte escapes it and it is never executed. -->
+      <pre
+        class="mb-3 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-neutral-900 p-2 text-[11px] leading-snug text-neutral-300"
+        data-testid="approval-command">{current.command}</pre>
       <p class="mb-4 text-xs text-neutral-500">{current.prompt}</p>
 
       <div class="flex flex-wrap justify-end gap-2">
@@ -114,23 +124,26 @@
         >
           Deny
         </button>
-        <button
-          type="button"
-          onclick={() => answer("approve", "once", "action")}
-          disabled={resolving}
-          class="rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-200 transition hover:bg-neutral-900 disabled:opacity-50"
-          data-testid="approval-once"
-        >
-          Allow once
-        </button>
+        <!-- Secondary (broadest): allow every call to this tool this session. -->
         <button
           type="button"
           onclick={() => answer("approve", "session", "tool")}
           disabled={resolving}
-          class="rounded-md bg-neutral-200 px-3 py-1.5 text-xs font-medium text-neutral-900 transition hover:bg-white disabled:opacity-50"
+          class="rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-300 transition hover:bg-neutral-900 disabled:opacity-50"
           data-testid="approval-session"
         >
           Allow for this session
+        </button>
+        <!-- Primary (narrowest): just this one call. The default, so a hurried
+             click grants the least. -->
+        <button
+          type="button"
+          onclick={() => answer("approve", "once", "action")}
+          disabled={resolving}
+          class="rounded-md bg-neutral-200 px-3 py-1.5 text-xs font-medium text-neutral-900 transition hover:bg-white disabled:opacity-50"
+          data-testid="approval-once"
+        >
+          Allow once
         </button>
       </div>
 

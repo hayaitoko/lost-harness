@@ -450,7 +450,11 @@ pub fn resolve_tool_approval(
         Some("always") => GrantScope::Always,
         _ => GrantScope::Once,
     };
-    let want_tool = matches!(args.target.as_deref(), Some(t) if t.eq_ignore_ascii_case("tool"));
+    // A one-time grant is per-action, never whole-tool: force `action` for
+    // `Once` so a "just this once" answer can't widen to every call of the
+    // tool (defense in depth with `ApprovalLedger::grant`).
+    let want_tool = !matches!(scope, GrantScope::Once)
+        && matches!(args.target.as_deref(), Some(t) if t.eq_ignore_ascii_case("tool"));
 
     let answered = state.approvals.answer(&args.id, |fingerprint, tool_name| {
         if !approve {

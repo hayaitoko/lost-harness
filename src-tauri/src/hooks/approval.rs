@@ -151,14 +151,18 @@ impl ApprovalLedger {
             (GrantScope::Once, GrantTarget::Fingerprint(fp)) => {
                 self.once_fps.lock().unwrap().insert(fp);
             }
-            // A one-time grant for a whole tool doesn't make sense; treat it
-            // as a session-tool grant (the closest safe interpretation).
-            (GrantScope::Once, GrantTarget::Tool(t))
-            | (GrantScope::Session | GrantScope::Always, GrantTarget::Tool(t)) => {
-                self.session_tools.lock().unwrap().insert(t);
-            }
+            // A one-time grant is inherently per-ACTION. It must never widen
+            // into a session-length, whole-tool grant — a `Once` + `Tool`
+            // request has no fingerprint to pin, so it grants NOTHING (the
+            // next call re-prompts). `resolve_tool_approval` also forces
+            // `Once => action`, so this arm shouldn't be reached in practice;
+            // it's the defensive floor.
+            (GrantScope::Once, GrantTarget::Tool(_)) => {}
             (GrantScope::Session | GrantScope::Always, GrantTarget::Fingerprint(fp)) => {
                 self.session_fps.lock().unwrap().insert(fp);
+            }
+            (GrantScope::Session | GrantScope::Always, GrantTarget::Tool(t)) => {
+                self.session_tools.lock().unwrap().insert(t);
             }
         }
     }
@@ -179,6 +183,10 @@ pub struct ApprovalRequest {
     pub conversation_id: String,
     pub tool_name: String,
     pub fingerprint: String,
+    /// The canonical `name {args}` form of the call, so the human can vet
+    /// exactly what they're approving (not just which tool). Untrusted —
+    /// display-only.
+    pub command: String,
     /// The hook-supplied prompt (e.g. "first use of tool 'write_file'…").
     pub prompt: String,
     /// Which hook raised the Ask ("permission" | "first_use_confirm").
@@ -251,5 +259,17 @@ mod tests {
         led.grant(GrantTarget::Tool("write_file".into()), GrantScope::Session);
         assert!(led.covers("write_file", "any-fp"));
         assert!(!led.covers("delete_file", "any-fp"), "tool grant must not cover a different tool");
+    }
+
+    #[test]
+    fn a_once_grant_for_a_whole_tool_grants_nothing() {
+        // "Once" is per-action; it must never silently widen into a
+        // session-length, whole-tool grant.
+        let led = ApprovalLedger::new();
+        led.grant(GrantTarget::Tool("write_file".into()), GrantScope::Once);
+        assert!(
+            !led.covers("write_file", "any-fp"),
+            "a Once+Tool grant must record nothing (re-prompt next time)"
+        );
     }
 }

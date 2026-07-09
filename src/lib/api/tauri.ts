@@ -126,6 +126,8 @@ export interface ToolApprovalRequest {
   id: string;
   conversation_id: string;
   tool_name: string;
+  /** Canonical `name {args}` — what the user is approving. Display-only. */
+  command: string;
   prompt: string;
   /** Which hook raised it: "permission" | "first_use_confirm". */
   by: string;

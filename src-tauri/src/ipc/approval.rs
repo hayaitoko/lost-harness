@@ -34,6 +34,9 @@ pub struct ToolApprovalRequestPayload {
     pub id: String,
     pub conversation_id: String,
     pub tool_name: String,
+    /// The canonical `name {args}` the user is being asked to approve.
+    /// Untrusted — the UI must render it as display text, never execute it.
+    pub command: String,
     pub prompt: String,
     /// Which hook raised it ("permission" | "first_use_confirm").
     pub by: String,
@@ -144,6 +147,7 @@ impl ApprovalPrompter for TauriApprovalPrompter {
                 id: req.id.clone(),
                 conversation_id: req.conversation_id,
                 tool_name: req.tool_name,
+                command: req.command,
                 prompt: req.prompt,
                 by: req.by,
                 fingerprint: req.fingerprint,
@@ -162,6 +166,16 @@ impl ApprovalPrompter for TauriApprovalPrompter {
                 _ => ApprovalDecision::Timeout,
             };
             // Clean up the parked entry (no-op if `answer` already took it).
+            //
+            // Known, accepted race (fail-closed): in a nanosecond window
+            // between `timeout` electing Timeout and this `take`, a concurrent
+            // `answer` can still find the entry and `send` a decision this side
+            // will never read — so `resolve_tool_approval` may briefly report
+            // `true` for a decision the dispatch already denied. The security
+            // outcome stays correct (the call is denied); only the frontend's
+            // "delivered" signal can be momentarily wrong. With a 300s human
+            // timeout this needs a sub-nanosecond coincidence, so it is
+            // documented rather than closed with a heavier claim/ack protocol.
             registry.take(&id);
             decision
         })
