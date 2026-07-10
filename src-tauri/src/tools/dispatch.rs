@@ -706,4 +706,44 @@ mod tests {
             "no approver → surface Ask, got {outcome:?}"
         );
     }
+
+    #[tokio::test]
+    async fn an_approved_write_tool_actually_writes_the_file() {
+        // End-to-end: a real state-changing tool, gated at Ask (as the
+        // risk-derived policy wires it), prompts once, and on approval its
+        // side effect actually happens.
+        use crate::tools::fs::WriteFileTool;
+        let root = std::env::temp_dir().join(format!("lhp-approve-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteFileTool::new(&root)));
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("write_file", PermissionMode::Ask);
+        let chain = build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prompter = Arc::new(MockPrompter {
+            response: MockResponse::ApproveOnceAction,
+            calls: calls.clone(),
+        });
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::new([Capability::Filesystem]))
+            .with_approval(ledger, Some(prompter));
+
+        let outcome = dispatcher
+            .dispatch(
+                &call("write_file", serde_json::json!({"path": "note.txt", "content": "hi"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(matches!(outcome, ToolOutcome::Ok(_)), "approved write should run, got {outcome:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "should have prompted exactly once");
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "hi",
+            "the file must actually exist with the written content"
+        );
+    }
 }

@@ -187,13 +187,14 @@ fn hydrate_providers_from_storage(
 
 /// Build the M3 tool dispatcher for the desktop app body.
 ///
-/// The read-only filesystem tools are confined to a `workspace/` directory
-/// under the storage root, registered into the capability-filtered registry
-/// (`BodyEnv::app_default`), and placed behind the standard pretooluse
-/// gating chain: privacy filter → non-overridable sandbox floor →
-/// permissions → first-use confirm. These read-only tools are whole-tool
-/// `Allow`ed; write/delete tools (a later M3 round) will instead route
-/// through the approval spine rather than a blanket allow.
+/// The filesystem tools are confined to a `workspace/` directory under the
+/// storage root, registered into the capability-filtered registry
+/// (`BodyEnv::app_default`), and placed behind the standard pretooluse gating
+/// chain: privacy filter → non-overridable sandbox floor → permissions →
+/// first-use confirm. Gating is derived from each tool's `RiskClass`:
+/// read-only tools (read/list/search) are whole-tool `Allow`ed + pre-trusted,
+/// while state-changing tools (write/edit/delete) are `Ask` and route through
+/// the approval spine (the confirmation dialog).
 fn build_tool_dispatcher(
     base_path: &std::path::Path,
     classifier: Arc<dyn crate::classifier::Classifier>,
@@ -201,8 +202,10 @@ fn build_tool_dispatcher(
     approver: Option<Arc<dyn crate::hooks::ApprovalPrompter>>,
 ) -> ToolDispatcher {
     use crate::hooks::{build_pretooluse_chain_full, InMemoryPolicySource, PermissionMode};
-    use crate::tools::fs::{ListDirTool, ReadFileTool, SearchFilesTool};
-    use crate::tools::{BodyEnv, ToolRegistry};
+    use crate::tools::fs::{
+        DeleteFileTool, EditFileTool, ListDirTool, ReadFileTool, SearchFilesTool, WriteFileTool,
+    };
+    use crate::tools::{BodyEnv, RiskClass, ToolRegistry};
 
     let workspace = base_path.join("workspace");
     if let Err(e) = std::fs::create_dir_all(&workspace) {
@@ -216,20 +219,37 @@ fn build_tool_dispatcher(
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFileTool::new(workspace.clone())));
     registry.register(Box::new(ListDirTool::new(workspace.clone())));
-    registry.register(Box::new(SearchFilesTool::new(workspace)));
+    registry.register(Box::new(SearchFilesTool::new(workspace.clone())));
+    registry.register(Box::new(WriteFileTool::new(workspace.clone())));
+    registry.register(Box::new(EditFileTool::new(workspace.clone())));
+    registry.register(Box::new(DeleteFileTool::new(workspace)));
 
+    // Policy DERIVED from each tool's RiskClass, so adding a tool can't
+    // accidentally skip the gate: read-only (Safe) tools are whole-tool
+    // `Allow`ed AND pre-trusted (no prompt); every state-changing tool is
+    // `Ask`, so it routes through the approval spine (the confirmation dialog)
+    // and is deliberately NOT pre-confirmed.
+    let env = BodyEnv::app_default();
     let mut policy = InMemoryPolicySource::new();
-    policy.set_mode("read_file", PermissionMode::Allow);
-    policy.set_mode("list_dir", PermissionMode::Allow);
-    policy.set_mode("search_files", PermissionMode::Allow);
+    let mut pre_trusted: Vec<String> = Vec::new();
+    for tool in registry.available_tools(&env) {
+        match tool.risk() {
+            RiskClass::Safe => {
+                policy.set_mode(tool.name(), PermissionMode::Allow);
+                pre_trusted.push(tool.name().to_string());
+            }
+            RiskClass::Write | RiskClass::External | RiskClass::Dangerous => {
+                policy.set_mode(tool.name(), PermissionMode::Ask);
+            }
+        }
+    }
+    let pre_trusted_refs: Vec<&str> = pre_trusted.iter().map(String::as_str).collect();
 
-    // These are read-only and workspace-confined, so ship them pre-trusted
-    // (no first-use prompt). State-changing tools won't get this treatment.
     let chain = build_pretooluse_chain_full(
         PrivacyGate::new(classifier),
         Box::new(policy),
-        &["read_file", "list_dir", "search_files"],
+        &pre_trusted_refs,
         Arc::clone(&ledger),
     );
-    ToolDispatcher::new(registry, chain, BodyEnv::app_default()).with_approval(ledger, approver)
+    ToolDispatcher::new(registry, chain, env).with_approval(ledger, approver)
 }

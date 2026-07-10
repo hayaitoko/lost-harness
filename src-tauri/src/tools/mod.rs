@@ -162,6 +162,24 @@ pub struct ExecCtx {
     pub profile: String,
 }
 
+// ── RiskClass ──────────────────────────────────────────────────────────────
+
+/// How much a tool call can do — one deterministic property that drives its
+/// default gating (`lib::build_tool_dispatcher` pre-trusts `Safe` tools and
+/// routes everything else through the approval spine) and, later, UI badges
+/// and memory scope (PLAN §3, the risk taxonomy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskClass {
+    /// Read-only, no side effects (read_file, list_dir, search_files).
+    Safe,
+    /// Mutates local state the user owns (write/edit/delete files).
+    Write,
+    /// Reaches beyond this machine (network egress, email). Reserved.
+    External,
+    /// Irreversible or high-blast-radius. Reserved.
+    Dangerous,
+}
+
 // ── Tool trait ───────────────────────────────────────────────────────────
 
 /// Something the agent can invoke. `run()` returns a boxed future so the
@@ -179,6 +197,16 @@ pub trait Tool: Send + Sync {
     /// short "what it does + args" line.
     fn description(&self) -> &str {
         ""
+    }
+
+    /// How risky this tool is. Drives its default gating: `Safe` (read-only)
+    /// tools are pre-trusted; anything state-changing routes through the
+    /// approval spine. Defaults to `Safe`, so a state-changing tool MUST
+    /// override it (forgetting to would only ever make a tool *more* trusted
+    /// than intended — so the default is the safe direction only for reads;
+    /// every mutating tool sets this explicitly).
+    fn risk(&self) -> RiskClass {
+        RiskClass::Safe
     }
 
     /// The capabilities this tool needs from its running environment.
