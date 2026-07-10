@@ -792,6 +792,59 @@ essentials:
 
 ---
 
+## 12. Claude Code parity check (2026-07-10)
+
+A dimension-by-dimension comparison of the built spine against Claude
+Code's actual design (tool-calling, permissions, hooks, file-tool safety,
+subagents/skills/MCP), verified by a fan-out that read our code and CC's
+docs. **Verdict: faithful in the bones.** Tool trait + registry, tri-state
+allow/ask/deny + pattern rules, the unified gating chain, first-use confirm,
+the approval ledger + `ActionFingerprint` pinning, `edit_file`'s unique-match
+rule, atomic writes, path confinement, subagent tool-allowlist intersection,
+seat binding, and progressive-disclosure skills all match CC's design. The
+divergences — the fenced dialect, native-Rust hooks vs CC's shell/JSON hooks,
+on-demand skill search vs an always-loaded catalog — are deliberate and
+appropriate for local-first.
+
+**Real gaps to close, prioritized:**
+
+1. **Native tool-use when the endpoint supports it (high, M4).** The model
+   client is text-only, so we use the fenced dialect for *every* model —
+   even ones (cloud Claude/GPT, capable local models) that support the API's
+   native structured tool-use, losing schema conformance and the structural
+   prompt-injection safety native `tool_use` gives for free. Add
+   per-endpoint capability detection + a native `tool_use` path in the model
+   client and agent loop; keep the fenced dialect as the graceful fallback
+   for models that lack it (log which mode was used). The Tool trait,
+   registry, hooks, and approval spine are unchanged — only the parse/emit
+   layer gains a second implementation.
+2. **Read-before-write (high, next).** CC refuses to `Write`/`Edit` a file
+   it hasn't `Read` this session; we let the agent blind-clobber a file it
+   never looked at. Add a per-conversation "files read" set — `read_file`
+   records into it; `write_file`/`edit_file` require the target to be new or
+   previously read (needs a session-scoped handle threaded through
+   `ExecCtx`).
+3. **Protected-paths always-prompt floor (medium).** CC always prompts for
+   `.git`/`.claude`/etc. regardless of an Allow rule. Add a small hardcoded
+   always-Ask path list — defense beyond the `workspace/` confinement.
+4. **Permission modes + precedence (medium, M4+).** A plan/read-only mode
+   and an accept-edits mode; deny-first evaluation across settings scopes
+   once persisted rules land; re-check permission output against the sandbox
+   once M5 lands.
+5. **`UserPromptSubmit` hook event (medium).** CC can gate/annotate the user
+   message before processing; wiring the privacy filter as a
+   `UserPromptSubmit` hook (in addition to `PreToolUse`) is the natural home.
+   `PostToolUse` (durable logging) is a lower-priority companion.
+6. **Shell-tool guardrails (when `shell_exec` ships, M3).** Keep the
+   hardline denylist as the non-overridable floor and add CC's guardrails:
+   a command timeout (~2 min) and output caps.
+
+Not gaps, just roadmap: subagents, skills, and MCP are designed-not-built
+(§4, §10) — their "high" findings are "not wired yet," which is expected and
+already sequenced in §8.
+
+---
+
 ## Appendix: naming note
 
 Fable's internal reference spec is referred to throughout as "Fable's
