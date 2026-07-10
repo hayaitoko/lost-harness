@@ -356,7 +356,20 @@ fn resolve_within_new(root: &Path, rel: &str) -> Result<PathBuf, String> {
     if !canon_parent.starts_with(&canon_root) {
         return Err(format!("path escapes the workspace: {rel}"));
     }
-    Ok(canon_parent.join(file_name))
+    let resolved = canon_parent.join(file_name);
+    // Refuse to write through/over a symlink. `rename` would replace the link
+    // itself (silently orphaning whatever it pointed at) rather than write
+    // through it, and following it could aim outside the workspace. If the
+    // caller really means to replace it, they can delete the link first.
+    // `symlink_metadata` is an lstat — it does NOT follow the link.
+    if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "'{rel}' is a symlink — refusing to write through it (delete it first to replace it)"
+            ));
+        }
+    }
+    Ok(resolved)
 }
 
 /// Write `content` to `target` atomically: write a temp file in the same
@@ -374,9 +387,14 @@ fn atomic_write(target: &Path, content: &str) -> Result<(), String> {
             .unwrap_or_else(|| "write".to_string()),
         uuid::Uuid::new_v4()
     ));
-    std::fs::write(&tmp, content.as_bytes()).map_err(|e| format!("write temp file: {e}"))?;
+    // On ANY failure — the temp write itself (e.g. disk full) or the rename —
+    // clean up the temp file, so a failed write leaves the workspace exactly
+    // as it was (no orphaned `.tmp` residue for list_dir/search_files to find).
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write temp file: {e}"));
+    }
     std::fs::rename(&tmp, target).map_err(|e| {
-        // Best-effort cleanup of the temp file on failure.
         let _ = std::fs::remove_file(&tmp);
         format!("finalize write: {e}")
     })
@@ -783,6 +801,32 @@ mod tests {
         let dir = tool.run(ToolInput::new(json!({"path": "sub"})), &ctx()).await;
         assert!(matches!(dir, ToolResult::Err(_)), "deleting a directory must be refused");
         assert!(root.join("sub").exists(), "the directory must survive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_refuses_a_symlink_leaf() {
+        // A pre-existing in-workspace symlink must not be silently clobbered
+        // (nor written through). Refuse, leaving both the link and its target
+        // exactly as they were.
+        let root = workspace();
+        std::fs::write(root.join("real.txt"), "original").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+        let tool = WriteFileTool::new(&root);
+        let out = tool
+            .run(ToolInput::new(json!({"path": "link.txt", "content": "new stuff"})), &ctx())
+            .await;
+        assert!(
+            matches!(out, ToolResult::Err(ref e) if e.contains("symlink")),
+            "writing through a symlink must be refused, got {out:?}"
+        );
+        // The real file is untouched and the link is still a link.
+        assert_eq!(std::fs::read_to_string(root.join("real.txt")).unwrap(), "original");
+        assert!(
+            std::fs::symlink_metadata(root.join("link.txt")).unwrap().file_type().is_symlink(),
+            "the symlink must survive"
+        );
     }
 
     #[test]
