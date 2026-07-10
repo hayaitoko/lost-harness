@@ -13,6 +13,7 @@
     "windows": [
       {
         "title": "Lost Harness",
+        "url": "app.html",
         "width": 1280,
         "height": 800,
         "minWidth": 800,
