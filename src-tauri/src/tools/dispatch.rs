@@ -31,7 +31,7 @@ use crate::models::ChatMessage;
 use crate::tools::calling::{
     guard_wrap, neutralize_untrusted, parse_tool_calls, render_tool_catalog, ParsedToolCall,
 };
-use crate::tools::{BodyEnv, ExecCtx, ToolCall, ToolInput, ToolRegistry, ToolResult};
+use crate::tools::{BodyEnv, ConversationReads, ExecCtx, ToolCall, ToolInput, ToolRegistry, ToolResult};
 
 /// The result of dispatching one tool call. Every non-`Ok` variant is a
 /// distinct, explainable reason the tool did *not* run — the agent is told
@@ -70,6 +70,11 @@ pub struct ToolDispatcher {
     /// chain is surfaced to the model as "not granted this round" (headless /
     /// round-1 fallback). `Some` = pause, prompt, and resume on the answer.
     approver: Option<Arc<dyn ApprovalPrompter>>,
+    /// Per-conversation read-tracking behind the read-before-write guard.
+    /// Owned here (one handle for the dispatcher's whole life, so a read on an
+    /// early turn is still visible to a write many turns later) and injected
+    /// into each tool's `ExecCtx` at the `Tool::run` call site below.
+    reads: Arc<ConversationReads>,
 }
 
 impl ToolDispatcher {
@@ -80,6 +85,7 @@ impl ToolDispatcher {
             env,
             ledger: Arc::new(ApprovalLedger::new()),
             approver: None,
+            reads: Arc::new(ConversationReads::new()),
         }
     }
 
@@ -180,7 +186,14 @@ impl ToolDispatcher {
                             ),
                         };
                     }
-                    return match tool.run(ev.input.clone(), ctx).await {
+                    // Inject the shared read-tracking handle so the fs tools'
+                    // read-before-write guard sees reads recorded on earlier
+                    // turns of this same conversation.
+                    let run_ctx = ExecCtx {
+                        reads: Some(Arc::clone(&self.reads)),
+                        ..ctx.clone()
+                    };
+                    return match tool.run(ev.input.clone(), &run_ctx).await {
                         ToolResult::Ok(v) => ToolOutcome::Ok(v),
                         ToolResult::Err(e) => ToolOutcome::Err(e),
                     };
@@ -350,6 +363,7 @@ mod tests {
         ExecCtx {
             conversation_id: "conv-1".to_string(),
             profile: "personal".to_string(),
+            reads: None,
         }
     }
 
@@ -745,5 +759,68 @@ mod tests {
             "hi",
             "the file must actually exist with the written content"
         );
+    }
+
+    #[tokio::test]
+    async fn read_before_write_guard_persists_across_dispatch_calls() {
+        // Proves the real injection path: the dispatcher owns the shared
+        // read-set and threads it into each tool's ctx, so a read on one
+        // dispatch call is visible to a write on a later one.
+        use crate::tools::fs::{ReadFileTool, WriteFileTool};
+        let root = std::env::temp_dir().join(format!("lhp-rbw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("doc.txt"), "original").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadFileTool::new(&root)));
+        registry.register(Box::new(WriteFileTool::new(&root)));
+        // Both whole-tool allowed AND pre-confirmed, so gating passes and this
+        // test isolates the read-before-write guard (not the approval spine).
+        let chain = build_pretooluse_chain_with_confirmed(
+            gate(),
+            Box::new(allow_policy(&["read_file", "write_file"])),
+            &["read_file", "write_file"],
+        );
+        let dispatcher =
+            ToolDispatcher::new(registry, chain, BodyEnv::new([Capability::Filesystem]));
+
+        // 1) Blind overwrite of an existing file → refused by the guard.
+        let blind = dispatcher
+            .dispatch(
+                &call("write_file", serde_json::json!({"path": "doc.txt", "content": "x"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(blind, ToolOutcome::Err(ref e) if e.contains("read_file it first")),
+            "blind overwrite must be refused, got {blind:?}"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("doc.txt")).unwrap(), "original");
+
+        // 2) Read it (records into the dispatcher's shared read-set)…
+        let _ = dispatcher
+            .dispatch(
+                &call("read_file", serde_json::json!({"path": "doc.txt"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        // 3) …now the write on a LATER dispatch call is allowed.
+        let ok = dispatcher
+            .dispatch(
+                &call("write_file", serde_json::json!({"path": "doc.txt", "content": "rewritten"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(ok, ToolOutcome::Ok(_)),
+            "read→write across calls must be allowed, got {ok:?}"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("doc.txt")).unwrap(), "rewritten");
     }
 }

@@ -18,9 +18,12 @@ use serde_json::json;
 
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
-/// Cap on a single file read, so a giant file can't blow up the context
-/// window or memory. 256 KiB is generous for text/config/code.
-const MAX_READ_BYTES: u64 = 256 * 1024;
+/// Cap on a single file read. Kept in lockstep with `MAX_WRITE_BYTES` so there
+/// is no "writable but unreadable" dead zone: any file small enough to overwrite
+/// is small enough to read in full, so the read-before-write guard can always be
+/// satisfied. (Was 256 KiB, which trapped 256 KiB–1 MiB files — overwritable but
+/// never readable, so the guard refused them forever. Flagged in review.)
+const MAX_READ_BYTES: u64 = MAX_WRITE_BYTES as u64;
 
 /// Bounds for `search_files`, so a deep or huge tree can't hang the agent.
 const SEARCH_MAX_DEPTH: usize = 8;
@@ -93,7 +96,7 @@ impl Tool for ReadFileTool {
     fn run<'a>(
         &'a self,
         input: ToolInput,
-        _ctx: &'a ExecCtx,
+        ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(path) = arg_str(&input, "path") else {
@@ -117,11 +120,20 @@ impl Tool for ReadFileTool {
                 ));
             }
             match std::fs::read_to_string(&resolved) {
-                Ok(content) => ToolResult::Ok(json!({
-                    "path": path,
-                    "bytes": content.len(),
-                    "content": content,
-                })),
+                Ok(content) => {
+                    // Read-before-write: remember we've seen this file (by its
+                    // canonical path) so a later write_file/edit_file in the
+                    // same conversation is allowed to touch it. No-op unless the
+                    // dispatcher wired a read-set into the context.
+                    if let Some(reads) = &ctx.reads {
+                        reads.record(&ctx.conversation_id, resolved.clone());
+                    }
+                    ToolResult::Ok(json!({
+                        "path": path,
+                        "bytes": content.len(),
+                        "content": content,
+                    }))
+                }
                 Err(e) => ToolResult::Err(format!("read '{path}': {e} (not UTF-8 text?)")),
             }
         })
@@ -434,7 +446,7 @@ impl Tool for WriteFileTool {
     fn run<'a>(
         &'a self,
         input: ToolInput,
-        _ctx: &'a ExecCtx,
+        ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(path) = arg_str(&input, "path") else {
@@ -460,12 +472,45 @@ impl Tool for WriteFileTool {
                 return ToolResult::Err(format!("'{path}' is a directory"));
             }
             let existed = resolved.exists();
+            // Read-before-write: refuse to overwrite an EXISTING file the agent
+            // hasn't read this conversation, so it can't clobber blind (matches
+            // Claude Code). A brand-new file is exempt — nothing to lose. No-op
+            // unless the dispatcher wired a read-set into the context.
+            if existed {
+                if let Some(reads) = &ctx.reads {
+                    // Match read_file's recorded key: it records the FULLY
+                    // canonicalized path (leaf case/normalization corrected to
+                    // the on-disk form). `resolved` here keeps the RAW requested
+                    // leaf (resolve_within_new only canonicalizes the parent),
+                    // which differs on case-insensitive / Unicode-normalizing
+                    // filesystems (macOS/Windows) — so canonicalize the existing
+                    // target before the membership check, or a real read→write
+                    // is falsely refused.
+                    let key = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+                    if !reads.contains(&ctx.conversation_id, &key) {
+                        return ToolResult::Err(format!(
+                            "refusing to write '{path}': read_file it first so you're not overwriting blind"
+                        ));
+                    }
+                }
+            }
             match atomic_write(&resolved, content) {
-                Ok(()) => ToolResult::Ok(json!({
-                    "path": path,
-                    "bytes_written": content.len(),
-                    "created": !existed,
-                })),
+                Ok(()) => {
+                    // The agent authored this content, so it isn't "blind" to
+                    // the file — record it (by canonical path, now that it
+                    // exists) so a later overwrite/edit this conversation isn't
+                    // refused. Covers the create-then-overwrite case.
+                    if let Some(reads) = &ctx.reads {
+                        let key =
+                            std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+                        reads.record(&ctx.conversation_id, key);
+                    }
+                    ToolResult::Ok(json!({
+                        "path": path,
+                        "bytes_written": content.len(),
+                        "created": !existed,
+                    }))
+                }
                 Err(e) => ToolResult::Err(format!("write '{path}': {e}")),
             }
         })
@@ -507,7 +552,7 @@ impl Tool for EditFileTool {
     fn run<'a>(
         &'a self,
         input: ToolInput,
-        _ctx: &'a ExecCtx,
+        ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(path) = arg_str(&input, "path") else {
@@ -527,6 +572,16 @@ impl Tool for EditFileTool {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
+            // Read-before-write: an edit rewrites the file, so require it was
+            // read this conversation first (a blind-edit guard). No-op unless
+            // the dispatcher wired a read-set into the context.
+            if let Some(reads) = &ctx.reads {
+                if !reads.contains(&ctx.conversation_id, &resolved) {
+                    return ToolResult::Err(format!(
+                        "refusing to edit '{path}': read_file it first so you're not editing blind"
+                    ));
+                }
+            }
             let content = match std::fs::read_to_string(&resolved) {
                 Ok(c) => c,
                 Err(e) => return ToolResult::Err(format!("read '{path}': {e} (not UTF-8 text?)")),
@@ -618,6 +673,8 @@ impl Tool for DeleteFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ConversationReads;
+    use std::sync::Arc;
 
     /// Build a throwaway workspace with a few files. Mirrors the tempdir
     /// pattern used across the crate's tests (no `tempfile` dependency).
@@ -632,6 +689,18 @@ mod tests {
 
     fn ctx() -> ExecCtx {
         ExecCtx::default()
+    }
+
+    /// A context WITH read-tracking wired, as the dispatcher supplies in
+    /// production — so the read-before-write guard is active. Reusing one
+    /// `tracked_ctx()` across calls shares its read-set (they hold the same
+    /// `Arc`), which is how a read on one call is seen by a write on the next.
+    fn tracked_ctx() -> ExecCtx {
+        ExecCtx {
+            conversation_id: "conv-1".to_string(),
+            profile: "personal".to_string(),
+            reads: Some(Arc::new(ConversationReads::new())),
+        }
     }
 
     #[tokio::test]
@@ -836,5 +905,194 @@ mod tests {
         assert_eq!(EditFileTool::new(&root).risk(), RiskClass::Write);
         assert_eq!(DeleteFileTool::new(&root).risk(), RiskClass::Write);
         assert_eq!(ReadFileTool::new(&root).risk(), RiskClass::Safe);
+    }
+
+    // ── read-before-write guard ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_over_existing_unread_file_is_refused() {
+        let root = workspace();
+        let ctx = tracked_ctx();
+        // hello.txt exists and has NOT been read this conversation.
+        let out = WriteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "hello.txt", "content": "clobber"})), &ctx)
+            .await;
+        assert!(
+            matches!(out, ToolResult::Err(ref e) if e.contains("read_file it first")),
+            "overwriting an unread existing file must be refused, got {out:?}"
+        );
+        // The file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+            "hello world\nsecond line\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_then_write_is_allowed() {
+        let root = workspace();
+        let ctx = tracked_ctx(); // one ctx → one shared read-set across both calls
+        let _ = ReadFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "hello.txt"})), &ctx)
+            .await;
+        let out = WriteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "hello.txt", "content": "updated"})), &ctx)
+            .await;
+        assert!(matches!(out, ToolResult::Ok(_)), "read→write must be allowed, got {out:?}");
+        assert_eq!(std::fs::read_to_string(root.join("hello.txt")).unwrap(), "updated");
+    }
+
+    #[tokio::test]
+    async fn writing_a_brand_new_file_needs_no_prior_read() {
+        let root = workspace();
+        let ctx = tracked_ctx();
+        // brand_new.txt does not exist → exempt from the guard.
+        let out = WriteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "brand_new.txt", "content": "hi"})), &ctx)
+            .await;
+        assert!(
+            matches!(out, ToolResult::Ok(ref v) if v["created"] == true),
+            "a new file is exempt from read-before-write, got {out:?}"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("brand_new.txt")).unwrap(), "hi");
+    }
+
+    #[tokio::test]
+    async fn edit_without_read_is_refused_then_allowed_after_read() {
+        let root = workspace();
+        let ctx = tracked_ctx();
+        let edit = EditFileTool::new(&root);
+
+        // Blind edit → refused, file untouched.
+        let refused = edit
+            .run(ToolInput::new(json!({"path": "hello.txt", "old": "second line", "new": "X"})), &ctx)
+            .await;
+        assert!(
+            matches!(refused, ToolResult::Err(ref e) if e.contains("read_file it first")),
+            "editing an unread file must be refused, got {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+            "hello world\nsecond line\n"
+        );
+
+        // After a read, the same edit goes through.
+        let _ = ReadFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "hello.txt"})), &ctx)
+            .await;
+        let ok = edit
+            .run(ToolInput::new(json!({"path": "hello.txt", "old": "second line", "new": "X"})), &ctx)
+            .await;
+        assert!(matches!(ok, ToolResult::Ok(_)), "read→edit must be allowed, got {ok:?}");
+        assert_eq!(std::fs::read_to_string(root.join("hello.txt")).unwrap(), "hello world\nX\n");
+    }
+
+    #[tokio::test]
+    async fn guard_is_inert_without_a_reads_handle() {
+        // No read-set wired (ExecCtx::default → reads=None): the guard is off,
+        // so an isolated tool or an unwired dispatcher overwrites freely. This
+        // is why the other fs tests using ctx() aren't affected by the guard.
+        let root = workspace();
+        let out = WriteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "hello.txt", "content": "z"})), &ctx())
+            .await;
+        assert!(matches!(out, ToolResult::Ok(_)), "no read-set → guard inert, got {out:?}");
+    }
+
+    // ── read-before-write: review regressions ────────────────────────────
+
+    /// Best-effort probe: is the workspace filesystem case-insensitive
+    /// (macOS/Windows default)? Create a mixed-case file, see if the lowercased
+    /// name resolves to it.
+    fn fs_is_case_insensitive(root: &std::path::Path) -> bool {
+        let upper = root.join("CaseProbe.tmp");
+        if std::fs::write(&upper, "x").is_err() {
+            return false;
+        }
+        let insensitive = root.join("caseprobe.tmp").exists();
+        let _ = std::fs::remove_file(&upper);
+        insensitive
+    }
+
+    #[tokio::test]
+    async fn read_then_write_matches_despite_leaf_casing() {
+        // Regression: read_file records the canonicalized (on-disk-cased) path,
+        // write_file must check the same, or a real read→write of one file is
+        // falsely refused on a case-insensitive FS. Only reproducible there.
+        let root = workspace();
+        if !fs_is_case_insensitive(&root) {
+            return;
+        }
+        std::fs::write(root.join("Report.txt"), "orig").unwrap();
+        let ctx = tracked_ctx();
+        let read = ReadFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "report.txt"})), &ctx)
+            .await;
+        assert!(matches!(read, ToolResult::Ok(_)), "lowercase read should succeed here, got {read:?}");
+        let write = WriteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "report.txt", "content": "new"})), &ctx)
+            .await;
+        assert!(
+            matches!(write, ToolResult::Ok(_)),
+            "a real read→write of the same file must not be refused over leaf casing, got {write:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_new_file_then_overwrite_is_allowed() {
+        // Regression: a freshly-created file must be recorded, so overwriting it
+        // in the same conversation isn't falsely refused as "blind".
+        let root = workspace();
+        let ctx = tracked_ctx();
+        let tool = WriteFileTool::new(&root);
+        let first = tool
+            .run(ToolInput::new(json!({"path": "fresh.txt", "content": "a"})), &ctx)
+            .await;
+        assert!(matches!(first, ToolResult::Ok(ref v) if v["created"] == true), "create, got {first:?}");
+        let second = tool
+            .run(ToolInput::new(json!({"path": "fresh.txt", "content": "b"})), &ctx)
+            .await;
+        assert!(
+            matches!(second, ToolResult::Ok(_)),
+            "overwriting a just-created file must be allowed, got {second:?}"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("fresh.txt")).unwrap(), "b");
+    }
+
+    #[tokio::test]
+    async fn read_then_write_in_subdir_is_allowed() {
+        // Regression: exercise the parent != root path (the crux equivalence was
+        // only tested at the workspace root before).
+        let root = workspace(); // seeded with sub/notes.md
+        let ctx = tracked_ctx();
+        let _ = ReadFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "sub/notes.md"})), &ctx)
+            .await;
+        let out = WriteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "sub/notes.md", "content": "rewritten"})), &ctx)
+            .await;
+        assert!(matches!(out, ToolResult::Ok(_)), "read→write in a subdir must be allowed, got {out:?}");
+        assert_eq!(std::fs::read_to_string(root.join("sub/notes.md")).unwrap(), "rewritten");
+    }
+
+    #[tokio::test]
+    async fn a_large_but_writable_file_can_be_read_then_written() {
+        // Regression: no "writable but unreadable" dead zone. 300 KiB is over the
+        // OLD 256 KiB read cap but under the 1 MiB write cap.
+        let root = workspace();
+        let ctx = tracked_ctx();
+        let big = "x".repeat(300 * 1024);
+        std::fs::write(root.join("big.txt"), &big).unwrap();
+        let read = ReadFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "big.txt"})), &ctx)
+            .await;
+        assert!(matches!(read, ToolResult::Ok(_)), "a <=1MiB file must be readable, got {read:?}");
+        let write = WriteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "big.txt", "content": "small"})), &ctx)
+            .await;
+        assert!(
+            matches!(write, ToolResult::Ok(_)),
+            "after reading, a large writable file must be overwritable, got {write:?}"
+        );
     }
 }

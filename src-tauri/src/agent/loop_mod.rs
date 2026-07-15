@@ -328,9 +328,12 @@ impl AgentLoop {
             history.push(ChatMessage::user(content.clone()));
         }
 
+        // `reads` is injected by the dispatcher (which owns the shared handle),
+        // so the loop leaves it `None` here.
         let exec_ctx = ExecCtx {
             conversation_id: conversation_id.clone(),
             profile: profile.clone(),
+            reads: None,
         };
 
         // Bound the tool loop so a model that keeps calling tools can't run

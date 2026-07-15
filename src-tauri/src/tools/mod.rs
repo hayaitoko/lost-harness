@@ -16,9 +16,11 @@
 //! registry + a couple of trivial example tools so the spine compiles and
 //! is exercised by unit tests.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 pub mod calling;
 pub mod dispatch;
@@ -152,14 +154,50 @@ pub enum ToolResult {
     Err(String),
 }
 
-/// Execution context handed to a tool alongside its input. Minimal for
-/// now — conversation/profile scoping is enough for the trivial example
-/// tools; real tools will likely need a handle back into storage/model
-/// manager, added when they're built.
+/// Per-conversation record of which files the agent has `read_file`'d this
+/// session, keyed by conversation id. Drives the **read-before-write guard**:
+/// `write_file` (on an existing file) and `edit_file` refuse to touch a path
+/// that isn't in this set, so the agent can't blind-clobber a file it never
+/// looked at — the same rule Claude Code enforces.
+///
+/// Keys are **canonical** paths (post-`canonicalize`), so a read and a later
+/// write agree on identity regardless of how the path was spelled. Interior
+/// mutability (a `Mutex`) lets the dispatcher share one handle across turns
+/// through `&ExecCtx` without threading `&mut` everywhere.
+#[derive(Debug, Default)]
+pub struct ConversationReads {
+    inner: Mutex<HashMap<String, HashSet<PathBuf>>>,
+}
+
+impl ConversationReads {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `path` (already canonicalized) was read in `conversation`.
+    pub fn record(&self, conversation: &str, path: PathBuf) {
+        let mut guard = self.inner.lock().expect("ConversationReads mutex poisoned");
+        guard.entry(conversation.to_string()).or_default().insert(path);
+    }
+
+    /// Has `path` been read in `conversation` this session?
+    pub fn contains(&self, conversation: &str, path: &Path) -> bool {
+        let guard = self.inner.lock().expect("ConversationReads mutex poisoned");
+        guard.get(conversation).is_some_and(|set| set.contains(path))
+    }
+}
+
+/// Execution context handed to a tool alongside its input. Carries the
+/// conversation/profile scope and — when wired by the dispatcher — the shared
+/// read-tracking handle behind the read-before-write guard. `reads` is `None`
+/// in isolated tool tests (guard inert); the dispatcher injects the shared
+/// handle in production. Real tools will likely also need a handle back into
+/// storage/model manager, added when they're built.
 #[derive(Debug, Clone, Default)]
 pub struct ExecCtx {
     pub conversation_id: String,
     pub profile: String,
+    pub reads: Option<Arc<ConversationReads>>,
 }
 
 // ── RiskClass ──────────────────────────────────────────────────────────────
