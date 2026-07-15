@@ -1,91 +1,215 @@
 # Frontend (Svelte 5)
 
-- **Purpose** — The Tauri webview UI: chat shell, provider/model configuration, profile switching, privacy-routing indicator, and the tool-approval prompt. It is a thin presentation layer over the Rust core; all backend access is funneled through one IPC bridge module.
+- **Purpose** — The Tauri webview UI. As of 2026-07-15 the real UI is the ported design
+  system under `src/lib/design/` (chat shell, section screens, settings), rendered by
+  `App.svelte` from a screen-router store. The old flat `src/lib/components/*` UI
+  (`ChatPanel`/`Sidebar`/`ModelPicker`/`PrivacyIndicator`/`ProviderSettings`) is **superseded**
+  and no longer imported by `App.svelte` — see "Superseded old UI" below. It is still a thin
+  presentation layer over the Rust core; all backend access is funneled through one IPC
+  bridge module.
 
-## Files
+## The design system (`src/lib/design/`)
+
+Ported from the React component library at `~/Desktop/lost-harness-ui` (commit `a22855e`,
+2026-07-15). Decision (Lukas): keep Tailwind — translate the design's plain CSS into
+Tailwind utility classes rather than importing it, porting the whole design system in one
+pass rather than screen-by-screen. Porting rules live in `src/lib/design/CONVENTIONS.md`
+(Svelte 5 runes patterns for props/children/state/events, which utilities to use, when a
+small scoped `<style>` is allowed for irreducible CSS) — read it before touching any file
+under `design/`.
+
+Shape (list the shape, not every file — see the directory for the full list):
 
 | Path | Role |
 |---|---|
-| `src/app.html` | Vite entry HTML. Vite's `root` is `src/` (see `vite.config.ts:24`), so this is the real index, not `index.html` at repo root. Loads `./main.ts` as a module. |
-| `src/main.ts` | Mounts `App.svelte` into `#app` using Svelte 5's `mount()` API (not the old `new App()` constructor). |
-| `src/app.css` | Global stylesheet (Tailwind v4 via `@tailwindcss/vite`), not reviewed in depth here. |
-| `src/App.svelte` | Top-level shell: two-column layout (`Sidebar` + main column with topbar + `ChatPanel`), owns the settings-modal open/close state, does one-time hydration on mount, and mounts the always-present `ApprovalDialog`. |
-| `src/lib/api/tauri.ts` | **The only place that calls `invoke`/`listen`.** Defines the full IPC contract (commands, event names, payload types) and a parallel browser-mock implementation for `vite dev` without the Tauri shell. |
-| `src/lib/stores/chat.ts` | Conversation list, active conversation, streaming-message state, and the `sendMessage` orchestration (create msg rows → call IPC → listen for stream events → finalize). |
-| `src/lib/stores/providers.svelte.ts` | Provider list + active provider/model selection. Svelte 5 runes store (`.svelte.ts` file, uses `$state` at module scope) rather than a classic `writable`. |
-| `src/lib/stores/provider-catalog.ts` | Static baked-in model lists per known provider id (`KNOWN_MODELS`), used by `ModelPicker`. Not fetched from backend yet. |
-| `src/lib/stores/profiles.ts` | The four fixed profiles (personal/work/school/developer), active profile id, hydration + switch. |
-| `src/lib/stores/settings.ts` | Theme (`dark`/`light`/`system`) and `sendOnEnter` preference; persists to `localStorage`, applies `data-theme` to `<html>`. |
-| `src/lib/components/ChatPanel.svelte` | Message list + input area + `ModelPicker` + `PrivacyIndicator`. Drives `sendMessage` from the chat store. |
-| `src/lib/components/Sidebar.svelte` | New-chat button, conversation list, profile `<select>`. No rename/pin/delete UI yet. |
-| `src/lib/components/ModelPicker.svelte` | Upward-opening popup grouped by provider, filtered by search text. Dispatches a `select` CustomEvent in addition to updating the store directly. |
-| `src/lib/components/PrivacyIndicator.svelte` | Traffic-light chip (`allow`/`route_local`/`block` decision, or falls back to the conversation's `binding`). Pure presentational, props-driven. |
-| `src/lib/components/ProviderSettings.svelte` | Add/edit/remove provider modal (or inline via `modal=false`). Quick-add presets for common providers. |
-| `src/lib/components/ApprovalDialog.svelte` | Always-mounted overlay that renders only when a `tool:approval_request` event arrives; queues bursts; answers via `resolveToolApproval`. |
-| `vite.config.ts` | Vite/Tauri wiring: fixed port 1420 (Tauri requires it), `root: "src"`, `$lib` alias → `src/lib`, ignores `src-tauri/` in the watcher, `safari15`/`chrome108` build targets for Svelte 5 destructuring support. |
+| `src/lib/design/components/` | 37 `.svelte` components ported 1:1 from the React lib (`Button`, `Sidebar`, `ChatMessage`, `RoutingBadge`, `RouteDot`, `Toggle`, `SegmentedControl`, `Select`, `Knot`, `ModelPicker`, `SettingRow`, etc.) plus `knot-geometry.ts` (the idle-animation math, ported as-is). |
+| `src/lib/design/screens/` | 9 top-level screens (`MainScreen`, `EmptyState`, `Email`, `Whiteboard`, `Files`, `ScheduledJobs`, `Editor`, `Settings`, `Onboarding`) plus `shell-data.ts` (sample data for the still-visual-only screens). Each screen is self-contained — it renders its own `Sidebar`, mirroring the React lib's `Prototype.tsx` pattern rather than a shared app shell. |
+| `src/lib/design/types.ts` | Shared vocabulary ported from the React lib's `types.ts`: `Route` (`"local"\|"cloud"\|"blocked"` — what actually happened to a turn, the core meaning-color signal), `Binding` (`"auto"\|"public"\|"private"` — the user's routing *intent*), `ScreenId` + `SCREEN_IDS` (the 9 screen names above). Comments note these mirror the Rust core's `agent::gate::Binding`/`GateDecision` vocabulary. |
+| `src/lib/design/nav.svelte.ts` | The screen-router store — a runes class (`Nav`, `current = $state<ScreenId>(...)`) with `nav.go(id)`. Also syncs `window.location.hash` (`#/main`, `#/settings`, …) both ways, so deep-links and back/forward work. Svelte equivalent of the React lib's `nav.tsx` (hash-router + context). |
+| `src/lib/design/CONVENTIONS.md` | The porting rulebook: React→Svelte 5 mapping (`useState`→`$state`, `export let`→`$props()`, `on:click`→`onclick`, etc.), which Tailwind utilities map to which design tokens, and the "do NOT" list for this pass (no backend wiring, no new deps, don't import from the old `$lib/components/*`). |
 
-## Key types / functions
+## Token → Tailwind system (`src/app.css`)
 
-- `SendMessageResponse`, `ProviderInfo`, `ConversationInfo`, `MessageInfo`, `StreamTokenPayload`, `StreamErrorPayload`, `ToolApprovalRequest` — `src/lib/api/tauri.ts:46-135`. These mirror Rust serde structs in `src-tauri/src/ipc/mod.rs` and `ipc/approval.rs`; comments call out which Rust file each mirrors. If the Rust shape changes, these must be hand-updated (no codegen).
-- `isTauri()` — `tauri.ts:158` — `typeof window.__TAURI_INTERNALS__ !== "undefined"`. This is the single runtime switch between real IPC and the in-file browser mock. Every exported command function branches on it.
-- `sendMessage(content, conversationId, binding, providerId, model, profile)` — `tauri.ts:295-316` — invokes `send_message` with nested `args`; in browser mode calls `browserSendMessage` which fakes a 500ms think + token-chunked echo over the same `stream:token` channel.
-- `onStreamToken` / `onStreamError` / `onToolApprovalRequest` — `tauri.ts:325-381` — each returns an `UnlistenFn`; in browser mode `onStreamToken`/`onStreamError` push into module-level listener arrays (`browserStreamListeners`/`browserErrorListeners`) instead of subscribing to a real Tauri event; `onToolApprovalRequest` is a true no-op in browser mode (mock backend never gates anything).
-- `resolveToolApproval(id, decision, scope, target)` — `tauri.ts:388-400` — `decision: "approve"|"deny"`, `scope: "once"|"session"|"always"` (UI only offers once/session — see gotcha below), `target: "action"|"tool"`. Browser mode just returns `true`.
-- `sendMessage()` (store) — `src/lib/stores/chat.ts:232-386` — the orchestration: appends optimistic user+assistant rows, subscribes to token/error events scoped to `conversationId`, adopts the server-assigned message id from the first token, and reconciles/finalizes on completion or error. Read this function fully before touching streaming behavior — it has several ordering subtleties (see Gotchas).
-- `hydrateConversations()` — `chat.ts:106-141` — merge-not-replace: preserves any locally-hydrated messages/hydrated flag for conversations that already exist in the store, and preserves local-only conversations the backend doesn't know about. Also auto-selects + hydrates the first conversation on cold start.
-- `providersStore` — `src/lib/stores/providers.svelte.ts:70-76` — a `$state({...})` object exported directly from a `.svelte.ts` module (Svelte 5 runes-in-module pattern). Components read `providersStore.providers` etc. directly (no `$` prefix — it's not a store contract, it's a reactive object).
-- `addProvider()` (store) — `providers.svelte.ts:181-248` — dual path: if `p.id` matches an existing provider, updates locally only (there's no `update_provider` IPC command yet — comment at line 188 flags this); otherwise round-trips through `add_provider` IPC, and falls back to a locally-generated id on IPC failure.
-- `modelsForProvider(provider)` — `provider-catalog.ts:78-85` — static catalog lookup by `provider.id` (which is a UUID from the backend for non-preset providers, but happens to match the human-readable preset id like `"openai"` for quick-added providers since `ProviderSettings` doesn't override the id on quick-add — see Gotchas).
+Design tokens (verbatim from `~/Desktop/lost-harness-ui/src/styles/tokens.css`) live as CSS
+custom properties on `:root`, with a `:root[data-theme="light"]` override block — the same
+theme-reactive pattern the old UI used, now carrying the full design palette (surfaces,
+text, accent, and the meaning-colors `local`/`cloud`/`blocked`/`warn`).
 
-## Data flow / how it fits
+A `@theme inline` block maps **colors only** into Tailwind v4's namespace (`--color-surface`,
+`--color-local`, `--color-accent-soft`, etc.), so utilities like `bg-surface`, `text-local`,
+`border-border-strong` work directly and stay theme-reactive — `inline` makes Tailwind emit
+`var(--…)` in the generated utility instead of snapshotting the value at build time.
 
-1. `main.ts` mounts `App.svelte`.
-2. `App.svelte` `onMount`: applies theme → `hydrateProfiles()` → `Promise.all([hydrateProviders(), hydrateConversations()])` → subscribes a global `onStreamError` logger (currently just `console.warn`, no toast UI yet).
-3. Every store function that needs the backend imports `* as api from "../api/tauri"` and calls the corresponding exported function; it never calls `invoke`/`listen` directly.
-4. `tauri.ts` branches on `isTauri()`:
-   - Tauri path → `tauriInvoke("cmd", { args: {...snake_case} })` matching `src-tauri/src/ipc/mod.rs` command signatures (verified against the Rust source: `list_conversations`, `create_conversation`, `get_messages`, `add_provider`, `list_models`, `send_message` all take a `State` plus one `args: SomeArgsStruct` parameter, confirming the "everything nests under `args`" contract in the file's header comment; `remove_provider(state, id: String)` is the one bare-scalar exception).
-   - Browser path → reads/writes `localStorage` under browser-only keys (`lh.providers.browser.v1`, `lh.conversations.v1`) and fakes async delays/streaming with `setTimeout`.
-5. Components subscribe to stores (`$conversations`, `$activeConversation`, `providersStore.*`) and call store mutator functions on user action (`sendChatMessage`, `createConversationViaBackend`, `switchProfile`, `addProvider`/`removeProvider`).
-6. Streaming: `stream:token` events are scoped by `conversation_id` inside `chat.ts`'s `sendMessage`; the closure captures the placeholder assistant message id and swaps in the server-assigned id from the first token payload.
-7. Tool approval is orthogonal to the chat send flow: `ApprovalDialog` is mounted once at the `App.svelte` level (line 114) and listens globally for `tool:approval_request`, independent of which conversation triggered it — the payload carries `conversation_id` but the dialog doesn't currently filter or display it.
+**Radii and shadows are deliberately NOT mapped into `@theme`** — mapping `--r` would collide
+with Tailwind's built-in `rounded-r` (right-side border radius) utility. Instead, use arbitrary
+values against the raw tokens: `rounded-[var(--r-sm)]` (4px), `rounded-[var(--r)]` (6px),
+`rounded-[var(--r-lg)]` (8px), `shadow-[var(--shadow)]`, `shadow-[var(--shadow-pop)]`. This is
+called out explicitly in both `app.css`'s comment block and `CONVENTIONS.md` — don't try to
+"clean this up" by adding a `--radius-r` mapping.
+
+**Global `.lh-range` slider rule** — the range-input track/thumb styling (used by the `Slider`
+component) lives in `app.css` as a plain global rule, not in the component's scoped
+`<style>`. Reason: the vendor pseudo-element selectors it needs
+(`::-webkit-slider-thumb`, `::-moz-range-thumb`, `::-moz-range-track`) trip up
+`svelte2tsx`'s scoped-style parser when written inside a component's `<style>` block. Keep
+it global; don't try to move it into `Slider.svelte`.
+
+Meaning-color rule carried over from the design source: saturated color
+(`local`/`cloud`/`blocked`/`warn`/accent) is reserved for the privacy/routing signal — all
+chrome uses grayscale (`surface*`/`text*`/`border*`).
+
+## `App.svelte` — the screen renderer
+
+`App.svelte` no longer owns a two-column chat layout. It:
+
+1. Renders whichever screen `nav.current` points at via a `SCREENS` lookup map
+   (`{ main: MainScreen, empty: EmptyState, email: Email, whiteboard: Whiteboard, files: Files,
+   "scheduled-jobs": ScheduledJobs, editor: Editor, settings: Settings, onboarding: Onboarding }`)
+   and a `$derived` `Current` component — `<Current />` is the entire top-level markup for the
+   app surface. Each screen is self-contained (renders its own `Sidebar`), so there is no shared
+   app-shell component to edit for chrome that should appear everywhere.
+2. On mount: applies the theme (to avoid a flash), then hydrates the backend-backed stores the
+   wired screens read — `hydrateProfiles()` → `Promise.all([hydrateProviders(), hydrateConversations()])`
+   — and subscribes a global `onStreamError` logger.
+3. Renders a **DEV floating screen-switcher + theme toggle** fixed bottom-right (a `<select>`
+   over `SCREEN_LIST` calling `nav.go(...)`, plus a light/dark toggle). This is a QA aid to
+   reach every screen while the in-app section-nav cross-links are still sample data — **remove
+   it once screens are cross-linked for real**, don't treat it as permanent chrome.
+4. Still mounts `ApprovalDialog` unconditionally at the top level (backend-driven, renders only
+   when a `tool:approval_request` event arrives) — unchanged behavior from before the port.
+
+**Entry point is `src/app.html`, loaded as `/app.html`, not `/`.** Vite's `root` is `src/`
+(see `vite.config.ts`) and the build's `rollupOptions.input` points at `src/app.html`
+explicitly, so `app.html` is the real index — this was true before the port and remains true.
+`main.ts` is unchanged: `mount(App, { target: document.getElementById("app")! })`.
+
+## Which screens are wired vs. still visual
+
+Backend wiring landed in commit `55ad9d5` (2026-07-15), but only for three surfaces:
+
+| Screen / component | Status | What's wired |
+|---|---|---|
+| `design/components/Sidebar.svelte` | **Wired** | Real `$conversations` list + row selection (`activeConversationId.set` + `hydrateMessages`), new-chat via `createConversation()`, profile switcher wired to `$profiles`/`switchProfile`. Renders inside every full-app screen. |
+| `design/screens/MainScreen.svelte` | **Wired** | The real chat loop: messages come from `$activeConversation`, sending goes through `chat.ts`'s `sendMessage` (with streaming), the composer's Auto/Public/Private binding pill feeds `sendMessage` as a per-send override, the model picker is built from `providersStore` (via `fetchModels` per provider), and each assistant message's `RoutingBadge` is driven by the **real** gate decision (`Message.routing_decision`/`error_source`) — this un-stubs the old client-side-only `PrivacyIndicator`. |
+| `design/screens/Settings.svelte` | **Partially wired** | The **Models** tab is wired to `providersStore` (list/add/remove/select provider+model, quick-add presets, the same name+URL validation as the old `ProviderSettings`). The **Appearance** tab's theme segmented-control is wired to the `settings.ts` theme store. The **Routing**, **Privacy guard**, and **Memory** tabs still use local `$state` sample data (no backend yet). |
+| `design/screens/Email.svelte`, `Whiteboard.svelte`, `Files.svelte`, `ScheduledJobs.svelte`, `Editor.svelte`, `Onboarding.svelte`, `EmptyState.svelte` | **Visual only** | Reachable via the section nav / dev switcher, render with sample data (`shell-data.ts` or inline), no backend calls. Don't assume any of these reflect real state. |
+
+`src/lib/stores/chat.ts` was extended **additively** to support the wired screens, not rewritten:
+
+- `Message` gained three optional fields — `routing_decision?: string | null`, `model?: string
+  | null`, `provider_id?: string | null` — that were previously dropped by `msgFromInfo`.
+  `MainScreen.svelte` cross-references `provider_id` against `providersStore` (via
+  `getProvider`) to tell a `route_local`/`allow` decision apart from an actual local-vs-cloud
+  provider kind, since a plain `"allow"` decision alone doesn't say which endpoint was hit.
+- `sendMessage(content, providerId, model, bindingOverride?)` gained an optional 4th
+  parameter, `bindingOverride?: Binding` — an explicit per-send binding (from `MainScreen`'s
+  binding pill) that wins over the conversation's stored default when present. **This is
+  backward-compatible**: the old 3-arg call (`sendMessage(content, providerId, model)`) still
+  works unchanged, so nothing in the superseded `ChatPanel.svelte` needed to change for this
+  to land.
+
+## Superseded old UI (`src/lib/components/*`)
+
+`src/lib/components/{Sidebar,ChatPanel,ModelPicker,PrivacyIndicator,ProviderSettings}.svelte`
+are **superseded and unused** — `App.svelte` no longer imports any of them. They're left in
+place for reference but should not be edited or extended; treat `design/components/Sidebar.svelte`,
+`design/screens/MainScreen.svelte`, and `design/screens/Settings.svelte` as their replacements.
+Delete the superseded files in a later cleanup pass (not done yet — don't do it unprompted, a
+future agent may still want to diff against them).
+
+`src/lib/components/ApprovalDialog.svelte` is the one exception — it is **still used**,
+mounted directly by `App.svelte`, and is backend-driven (renders only on a real
+`tool:approval_request` event). Its "Esc denies, never approves" and display-only `command`
+rendering invariants (below) still apply.
 
 ## Invariants (do NOT break)
 
-- **`tauri.ts` is the only IPC touchpoint.** Nothing outside this file may call `invoke`/`listen` — this is stated in the file's own header comment (`tauri.ts:1-7`) and is the boundary that makes the browser-mock fallback possible. A future agent adding a new backend call must add a wrapper function here, not call `invoke` from a store or component.
-- **Args-wrapping contract**: any Rust command with an `args: SomeStruct` parameter must be invoked as `invoke("cmd", { args: { ...snake_case_fields } })` — never flattened. Bare-scalar params (currently only `remove_provider`'s `id`) are the sole exception (`tauri.ts:22-30`). Getting this wrong produces a serde deserialization error at the Rust boundary, not a TS type error, since the args object is typed as `unknown` by `invoke`.
-- **Field casing**: JS-side objects passed to `invoke` must use snake_case keys matching the Rust struct's serde field names (Tauri's camelCase conversion only applies to top-level command parameter names, not to fields nested in a struct). All wrapper functions already do this correctly — mirror the existing pattern, don't "clean it up" to camelCase.
-- **API keys never round-trip back from the backend.** `ProviderInfo` (Rust → JS) has no `api_key` field; `providers.svelte.ts:123` explicitly sets `apiKey: ""` on hydrate and comments "user must re-enter to edit." Do not add a field or code path that fetches/displays a previously-saved key.
-- **The approval dialog's `command` field is display-only and must stay unexecuted.** `ApprovalDialog.svelte:110-114` renders `current.command` inside a `<pre>` — Svelte auto-escapes interpolated text, so this is safe as long as it stays a plain `{current.command}` text interpolation. Do not switch this to `{@html ...}`.
-- **Esc denies, never approves**, in both the settings modal and the approval dialog — `ApprovalDialog.svelte:66-73` (`onKeydown` → `answer("deny")`) and `App.svelte:69-74` (Esc closes settings, not a data-mutating default). Keep the fail-closed default when extending either.
-- **Two-layer localStorage separation is deliberate**, not an accident to "consolidate": `providers.svelte.ts` uses `lh.providers.v1` (camelCase `Provider[]`) while `tauri.ts`'s browser fallback uses `lh.providers.browser.v1` (snake_case `ProviderInfo[]`) — comment at `tauri.ts:407-410` explains sharing a key would corrupt both. Same idea applies to conversations (`lh.conversations.v1` is only used by the `tauri.ts` mock, not by `chat.ts`, which has no persistent local store of its own — it re-hydrates from `api.listConversations` every time).
-- **`hydrateConversations()` must merge, not replace** (`chat.ts:106-141`) — overwriting the whole list would wipe out a transcript already loaded by `hydrateMessages()` for the active conversation. Any future refactor of the hydrate path needs to preserve this merge behavior.
-- **The privacy-gate error path in `sendMessage()` must not adopt the server's `message_id`** when a `stream:error` already landed (`chat.ts:338-346`, comment explains: on Block, the backend persisted no message row, so `response.message_id` is unrelated/throwaway — adopting it risks a duplicate-key collision in the Svelte `{#each ... (m.id)}` keyed block).
+- **`src/lib/api/tauri.ts` is the only IPC touchpoint.** Nothing outside this file may call
+  `invoke`/`listen` — stated in the file's own header comment and unchanged by the design-system
+  port. Both the old and new UI layers call into stores, which call into `tauri.ts`; no component
+  under `design/` calls `invoke` directly. A future agent adding a new backend call must add a
+  wrapper function here, not call `invoke` from a store or component.
+- **Args-wrapping contract**: any Rust command with an `args: SomeStruct` parameter must be
+  invoked as `invoke("cmd", { args: { ...snake_case_fields } })` — never flattened. Bare-scalar
+  params (currently only `remove_provider`'s `id`) are the sole exception. Getting this wrong
+  produces a serde deserialization error at the Rust boundary, not a TS type error, since the
+  args object is typed as `unknown` by `invoke`.
+- **Field casing**: JS-side objects passed to `invoke` must use snake_case keys matching the
+  Rust struct's serde field names (Tauri's camelCase conversion only applies to top-level
+  command parameter names, not to fields nested in a struct). All wrapper functions already do
+  this correctly — mirror the existing pattern, don't "clean it up" to camelCase.
+- **API keys never round-trip back from the backend.** `ProviderInfo` (Rust → JS) has no
+  `api_key` field; the providers store explicitly sets `apiKey: ""` on hydrate. Do not add a
+  field or code path that fetches/displays a previously-saved key. `design/screens/Settings.svelte`'s
+  provider-edit form placeholder text ("saved — leave blank to keep") depends on this staying true.
+- **The approval dialog's `command` field is display-only and must stay unescaped-safe.**
+  `ApprovalDialog.svelte` renders `current.command` inside a `<pre>` via plain text
+  interpolation (Svelte auto-escapes) — do not switch this to `{@html ...}`.
+- **Esc denies, never approves** in the approval dialog. Keep the fail-closed default when
+  extending it.
+- **`hydrateConversations()` must merge, not replace`** — overwriting the whole list would wipe
+  out a transcript already loaded by `hydrateMessages()` for the active conversation. This is
+  unchanged by the port; `design/components/Sidebar.svelte` relies on the merged list for its
+  conversation rows.
+- **A `Block` gate decision never adopts the server's `message_id`** in `sendMessage()`'s error
+  path — on Block, the backend persisted no message row, so `response.message_id` is
+  unrelated/throwaway; adopting it risks a duplicate-key collision in a Svelte keyed `{#each}`
+  block. `MainScreen.svelte`'s message list (`{#each ... as m (m.id)}`) depends on ids staying
+  unique.
 
-## Gotchas / watch-items
+## Known gaps / watch-items (surfaced 2026-07-15)
 
-- **GUI still needs a design pass.** Per the user: Lukas is actively speccing the visual design; a separate React component library at `~/Desktop/lost-harness-ui` (synced into a Claude Design project) is the design source of truth for future visual work, ported to Svelte later. Treat the current Tailwind utility-class styling in these components as a functional placeholder, not a target to preserve pixel-for-pixel.
-- **No frontend test suite exists.** `grep`/`find` for `*.test.*`/`*.spec.*` under this repo returned nothing, and `package.json` has no `vitest`/`playwright`/testing deps — only `svelte-check` (type-checking) is wired as `npm run check`. See Tests section below.
-- **`streamingMessage.update((s) => (s ? null : s))` in `finalizeMessage`** (`chat.ts:493`) looks like a no-op bug at first glance (if `s` is truthy it returns `null`, but the function is also called at every finalize regardless of whether this message is the one currently streaming) — it unconditionally clears `streamingMessage` whenever *any* message finalizes, not just the currently-tracked one. In practice `sendMessage`'s `finally` block also does `streamingMessage.set(null)` unconditionally (`chat.ts:384`), so this line is redundant/dead in the current single-send-at-a-time flow, but it's a landmine if concurrent sends are ever supported.
-- **`ApprovalScope` type includes `"always"`** (`tauri.ts:141`) but `ApprovalDialog.svelte` only ever calls `answer(..., "once")` or `answer(..., "session")` — the "always" (persist-across-restart) scope is intentionally withheld from the UI per the comment at `ApprovalDialog.svelte:12-15`, pending the M4 persistent policy store. Don't wire an "Always allow" button without confirming that store exists.
-- **`modelsForProvider` keys off `provider.id`**, and for quick-added providers in `ProviderSettings.svelte` (`QUICK_PRESETS`, lines 31-52) the preset's `id` (e.g. `"openai"`, `"lmstudio"`) is passed through as the *desired* id to `addProvider()` — but the real backend (`add_provider` Rust command) always mints a fresh UUID (`src-tauri/src/ipc/mod.rs` `add_provider`, `let id = Uuid::new_v4()`) and ignores any client-supplied id. So in Tauri mode, a quick-added "OpenAI" provider ends up with a UUID id, and `provider-catalog.ts`'s `KNOWN_MODELS["openai"]` lookup **will not match** — `modelsForProvider` falls through to kind-based fallback (`FALLBACK` for local/custom, empty array for cloud). This means the model picker shows **no baked-in models for quick-added cloud providers** in real Tauri runs, only in the browser-mock path (where `addProvider`'s local-update branch at `providers.svelte.ts:184-202` can preserve a client id if editing, but new-provider add still goes through the IPC add path too). Worth flagging to whoever wires model list-fetching for real — this is likely why `list_models` (real backend call) exists as a separate fetch path (`fetchModels()` in `providers.svelte.ts:167-178`) rather than relying on the static catalog.
-- **`sendOnEnter` semantics are inverted from what the name suggests at first read**: when `false`, the comment says "Enter inserts a newline" (`settings.ts:49-53`), but `ChatPanel.svelte:86-89`'s `handleKeydown` only special-cases the `sendOnEnter === false` branch by *returning early* (doing nothing) rather than explicitly allowing the newline — it relies on the browser's default textarea behavior for Enter to produce the newline. That's correct behavior, but easy to "fix" incorrectly by adding an explicit newline-insert that would then double up with the browser default.
-- **`Message.created_at` mixing:** frontend-generated messages use `Date.now()` (ms) but backend-hydrated messages via `msgFromInfo` multiply by 1000 (`chat.ts:408`) because "backend is seconds, frontend is ms" (also see `convFromInfo` at `chat.ts:398`). If you add a new timestamp field from Rust, remember the unit mismatch.
-- **`ChatPanel.svelte`'s `privacyDecision`** (lines 48-56) is explicitly a stub — it derives a decision purely from the conversation's `binding` (client-side, no gate call) rather than reflecting what the actual privacy gate (`src-tauri`) decided for the *last sent message*. The comment says "the real M1 wires the §7 gate / TRM interface here." The gate's real decision (`routing_decision` on `SendMessageResponse`, and `stream:error`'s `source: "gate"`) currently only surfaces as inline error text on the assistant message, not through `PrivacyIndicator`. This is a known half-wired path — don't assume the indicator reflects live gate state.
-- **Toolchain**: Vite 8 + `@sveltejs/vite-plugin-svelte` 7 + Svelte 5.56 + Tailwind v4 (`@tailwindcss/vite` plugin, no `tailwind.config.js` — v4 is CSS-first config, check `src/app.css` for `@theme`/`@import` directives if changing design tokens). Build targets `safari15`/`chrome108` specifically because Svelte 5's destructuring patterns need a modern esbuild target (`vite.config.ts:34-39`) — don't lower the target without checking Svelte 5 compiles.
-- **Fixed dev port 1420 / HMR port 1421** (`vite.config.ts:47-53`) are required by Tauri's `devUrl` in `src-tauri/tauri.conf.json` (`"devUrl": "http://localhost:1420"`) — changing the Vite port without updating `tauri.conf.json` breaks `tauri dev`.
-- **`providers.svelte.ts` is a `.svelte.ts` file**, which is what makes top-level `$state()`/`$derived()` runes legal outside a `.svelte` component (Svelte 5's module-rune extension) — renaming it to plain `.ts` will break compilation.
+- **`ipc::send_message` returns `routing_decision: "allow"` hardcoded** (`src-tauri/src/ipc/mod.rs`,
+  the `SendMessageResponse` construction) — a live send can never surface a `route_local` badge
+  from the immediate response, even though the real decision *is* persisted and later shows up
+  correctly on hydration. `MainScreen.svelte`'s `hasRoutingSignal`/`messageRoute` logic is
+  written defensively around this, but a small backend fix (return the true decision instead of
+  the literal string) is needed before a fresh in-session `route_local` turn shows the honest
+  badge without a reload.
+- **`ModelPicker` uses a flat model-name namespace.** `MainScreen.svelte` builds its
+  `ModelOption[]` by fetching each provider's models and flattening them into one list keyed by
+  model name (`modelOwner: Map<string, string>` — name → provider id); two providers exposing an
+  identically-named model collide and only the last-registered one is addressable from the picker.
+- **The DEV screen-switcher in `App.svelte` is temporary** — remove it once the section-nav
+  cross-links (Sidebar → Email/Whiteboard/Files/Scheduled-jobs, Settings → main, etc.) are wired
+  for real navigation instead of being reachable only through the dev `<select>`.
+- **Visual-only screens keep stale-looking sample data on purpose** — `Email`, `Files`,
+  `Whiteboard`, `ScheduledJobs`, `Editor`, `Onboarding`, `EmptyState` render fixed sample content
+  (`shell-data.ts` or inline literals). Don't "fix" what looks like a data bug in these screens
+  without checking whether it's just unwired sample data.
+- **No frontend test suite exists.** No `*.test.*`/`*.spec.*` files anywhere in the repo, and
+  `package.json` has no test runner dependency — only `svelte-check` (`npm run check`) is wired.
+- **Toolchain unchanged by the port**: Vite + `@sveltejs/vite-plugin-svelte` + Svelte 5 +
+  Tailwind v4 (`@tailwindcss/vite`, CSS-first config — no `tailwind.config.js`, check
+  `src/app.css`'s `@theme`/`:root` blocks for design tokens). Fixed dev port 1420 / HMR port
+  1421 (`vite.config.ts`) are required by Tauri's `devUrl` in `src-tauri/tauri.conf.json` —
+  don't change the Vite port without updating `tauri.conf.json` too.
 
 ## How to extend
 
-- **Add a new backend command**: (1) implement it in `src-tauri/src/ipc/mod.rs` and register it in the Tauri command handler list; (2) add a wrapper function + type in `src/lib/api/tauri.ts` following the existing `isTauri() ? tauriInvoke(...) : browserXxx(...)` pattern, updating the header-comment contract listing at the top of the file; (3) call the wrapper only from a store, never directly from a component.
-- **Add a new event channel**: define the payload type and an `EVENT` name constant near the existing `STREAM_TOKEN_EVENT`/`STREAM_ERROR_EVENT`/`TOOL_APPROVAL_REQUEST_EVENT` constants (`tauri.ts:163-165`), add an `onXxx` subscription wrapper with a Tauri-mode `tauriListen` branch and a browser-mode fallback (even if it's a no-op), and mirror the Rust `app.emit(...)` payload shape exactly (comment noting where the Rust struct lives).
-- **Add a new store**: follow `providers.svelte.ts` (runes, `.svelte.ts` file) for state that needs fine-grained reactivity on nested mutation, or the classic `writable`/`derived` pattern (`chat.ts`, `profiles.ts`, `settings.ts`) for simpler list/scalar state. Both patterns coexist intentionally in this codebase — don't force one style onto the other file.
-- **Add a new component**: put it under `src/lib/components/`, import stores from `$lib/stores/...` (never `../../stores/...` — the `$lib` alias is configured in `vite.config.ts:12,26`), and keep the "components import from stores, stores import from `tauri.ts`" layering intact.
-- **Visual/design changes**: coordinate with the React design-source library at `~/Desktop/lost-harness-ui` before hand-editing Tailwind classes here — Lukas is actively speccing the design there; large-scale restyling should port from that source rather than diverging further.
+- **Add a new backend command**: (1) implement it in `src-tauri/src/ipc/mod.rs` and register it
+  in the Tauri command handler list; (2) add a wrapper function + type in `src/lib/api/tauri.ts`
+  following the existing `isTauri() ? tauriInvoke(...) : browserXxx(...)` pattern; (3) call the
+  wrapper only from a store, never directly from a `design/` component.
+- **Wire another visual-only screen**: follow the `MainScreen`/`Sidebar`/`Settings` pattern —
+  import the relevant store(s) from `$lib/stores/...`, replace the screen's local sample
+  `$state` with store reads, and keep the component's existing Tailwind/markup structure intact
+  (don't restyle while wiring — those are separate concerns per `CONVENTIONS.md`).
+- **Add or change a design-system component/screen**: read `src/lib/design/CONVENTIONS.md`
+  first. Match the React source at `~/Desktop/lost-harness-ui` for markup/behavior, translate its
+  CSS into the token-backed Tailwind utilities listed there (never hardcode hex or use Tailwind's
+  default `neutral-*` palette), and only fall back to a small scoped `<style>` for what utilities
+  genuinely can't express (documented list in `CONVENTIONS.md`: caller-authored typography via
+  `:global()`, `@keyframes`, `::-webkit-scrollbar`, `::selection`, tooltip attribute selectors).
+- **Add a new store**: follow `providers.svelte.ts` (runes, `.svelte.ts` file) for state that
+  needs fine-grained reactivity on nested mutation, or the classic `writable`/`derived` pattern
+  (`chat.ts`, `profiles.ts`, `settings.ts`) for simpler list/scalar state.
 
 ## Tests
 
-- **None exist for this subsystem.** No `*.test.*`/`*.spec.*` files were found anywhere in the repo (checked with `find`), and `package.json` has no test runner dependency.
-- The only automated check available is `npm run check` (`svelte-check --tsconfig ./tsconfig.json`) — type-checks `.svelte`/`.ts` files but does not exercise runtime behavior.
-- Rust-side tests exist under `src-tauri/src/ipc/mod.rs` (e.g. `list_profiles_has_four_entries`, line ~505) but only cover the Rust command implementations, not the frontend bridge.
-- If you add frontend logic worth testing (e.g. `chunkReply`, `normalizeBinding`, the merge logic in `hydrateConversations`), there is no existing harness to slot into — you'd be introducing the first one (likely Vitest, given the Vite-based toolchain).
+- **None exist for this subsystem.** No `*.test.*`/`*.spec.*` files were found anywhere in the
+  repo, and `package.json` has no test runner dependency.
+- The only automated check available is `npm run check` (`svelte-check --tsconfig ./tsconfig.json`)
+  — type-checks `.svelte`/`.ts` files but does not exercise runtime behavior.
+- Rust-side tests exist under `src-tauri/src/ipc/mod.rs` and elsewhere but only cover the Rust
+  command implementations, not the frontend bridge or the design-system components.

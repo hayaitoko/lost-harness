@@ -394,7 +394,9 @@ is an optional cleanup, not a blocker.
 **M2 — UI shell.** Tiling, profiles, command palette. This is also where
 native-app UX work (§6) starts — proper window behavior, per-profile UI
 isolation — with tray/menu-bar/OS-notification polish following later in
-M8/M9.
+M8/M9. *(2026-07-15: the frontend is now the ported design system,
+`src/lib/design/` — Svelte 5 port of the `lost-harness-ui` React source,
+wired to real chat/sidebar/settings backends; see its `CONVENTIONS.md`.)*
 
 **M3 — Tool registry + the spine.** The single biggest milestone in terms
 of foundational weight. In dependency order:
@@ -818,12 +820,24 @@ appropriate for local-first.
    for models that lack it (log which mode was used). The Tool trait,
    registry, hooks, and approval spine are unchanged — only the parse/emit
    layer gains a second implementation.
-2. **Read-before-write (high, next).** CC refuses to `Write`/`Edit` a file
-   it hasn't `Read` this session; we let the agent blind-clobber a file it
-   never looked at. Add a per-conversation "files read" set — `read_file`
-   records into it; `write_file`/`edit_file` require the target to be new or
-   previously read (needs a session-scoped handle threaded through
-   `ExecCtx`).
+2. **Read-before-write — DONE (2026-07-15, commit `5724f73`).** CC refuses
+   to `Write`/`Edit` a file it hasn't `Read` this session; we now do the
+   same. A conversation-scoped read-set, `ConversationReads`
+   (`Mutex<HashMap<conv_id, HashSet<PathBuf>>>`, `tools/mod.rs`), is owned
+   by `ToolDispatcher` and injected into `ExecCtx.reads` at the `tool.run`
+   call site. In `tools/fs.rs`: `read_file` records the canonical resolved
+   path on success; `write_file` (only when the target already exists) and
+   `edit_file` refuse if the path isn't in the read-set; a new file and
+   `delete_file` are exempt; a successful write self-records. Adversarially
+   reviewed (multi-agent) → 4 fixes: write_file canonicalizes the existing
+   target for the membership check (closing a macOS case-insensitive/
+   Unicode path mismatch that could falsely refuse a real read→write);
+   `MAX_READ_BYTES` raised to equal `MAX_WRITE_BYTES` (1 MiB), killing the
+   "writable but unreadable" 256KiB–1MiB dead zone; write self-records so
+   create-then-overwrite isn't refused; added case-insensitive/subdir/
+   large-file/cross-dispatch regression tests. `cargo test --lib`: 226
+   passing, 0 failed. With this closed, **native tool-use (item 1, M4) is
+   now the top remaining parity gap.**
 3. **Protected-paths always-prompt floor (medium).** CC always prompts for
    `.git`/`.claude`/etc. regardless of an Allow rule. Add a small hardcoded
    always-Ask path list — defense beyond the `workspace/` confinement.

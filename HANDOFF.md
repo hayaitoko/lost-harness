@@ -16,7 +16,7 @@
 
 This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The Electron app was a prototype to validate UX decisions; it's now a read-only reference. All new work goes in the Tauri project.
 
-**Current milestone:** in M3, **round 1 landed** (the tool spine is now load-bearing). M0 and M1 are done and verified. Everything below is committed to `main` — there is nothing uncommitted or in-progress to pick up.
+**Current milestone:** in M3, **round 1 landed** (the tool spine is now load-bearing) and **read-before-write shipped** (2026-07-15, commit `5724f73`). The **frontend was also reskinned to the ported design system and wired to the backend** for chat/sidebar/providers, same day (commits `a22855e`, `55ad9d5`). M0 and M1 are done and verified. Everything below is committed to `main` — there is nothing uncommitted or in-progress to pick up.
 
 | Subsystem | Status |
 |---|---|
@@ -24,11 +24,13 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | M1 — the core loop end-to-end (message → privacy-filter classification → route → model → stream → save) | Done + verified at the real Tauri IPC boundary by a contract-test suite |
 | M3 spine — tool registry (filtered per body) + the unified "one-gate" hook chain | Built |
 | **M3 round 1 — the spine is now LOAD-BEARING** | **Done.** A live conversation can call a tool: fenced tool-call dialect + "parse only your own output" rule, untrusted-output guard-wrapping, a `ToolDispatcher` that runs every call through the hook chain before executing, three read-only workspace-confined filesystem tools (`read_file`/`list_dir`/`search_files`), and the agentic tool loop wired into `AgentLoop`. |
+| M3 — read-before-write guard (blind-clobber protection) | **Done** (2026-07-15). `write_file`/`edit_file` refuse an *existing* file the conversation hasn't `read_file`'d yet; a conversation-scoped read-set (`ConversationReads`) is owned by `ToolDispatcher`. Adversarially reviewed → 4 fixes (canonicalization mismatch, MAX_READ_BYTES/MAX_WRITE_BYTES parity, write self-recording, regression tests). |
+| Frontend — design-system port + backend wiring | **Done** (2026-07-15). The React design source (`lost-harness-ui`) was ported to Svelte 5 under `src/lib/design/` (Tailwind-translated, not imported). Sidebar, MainScreen (chat loop + routing badge), and Settings (Models/Appearance) are wired to the real backend; Email/Files/Whiteboard/Scheduled-jobs/Editor/Onboarding/EmptyState are still visual-only sample data. |
 | sqlite-vec (semantic memory search engine) | Wired + proven — registered on every DB open, a smoke test does a real nearest-neighbour query |
 | Memory system (hybrid keyword+meaning search, curated summary + archive) | **Designed in full, not built.** See PLAN.md §"Memory system." |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **171 passing**, 0 failed. (+20 from round 1.) Frontend `npm run build` + `npm run check` clean.
+**Tests:** `cargo test --lib` → **226 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean.
 
 ---
 
@@ -70,7 +72,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 171 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 226 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -79,22 +81,22 @@ cd /Users/hayai/Desktop/lost-harness-product && npm run check               # sv
 
 ## What's next (in order)
 
-1. **Finish M3 — the rest of the tools.** Round 1 wired the spine + read-only tools; since then the **approval spine** (interactive confirm + pin/lock), the **write/edit/delete tools**, and a policy-driving **`RiskClass`** all shipped (done ✓). Remaining, in order:
-   - **NEXT — read-before-write (agreed with Lukas, 2026-07-10).** Match Claude Code's rule: refuse to `write_file`/`edit_file` an *existing* file the agent hasn't `read_file`'d this conversation — a blind-clobber guard. **Spec:**
-     - A conversation-scoped read-set. Simplest: the dispatcher owns an `Arc<Mutex<HashMap<conversation_id, HashSet<PathBuf>>>>` of canonical paths; hand the fs tools a clone at construction in `build_tool_dispatcher` (or add a handle to `ExecCtx`). Key by `ctx.conversation_id`.
-     - `read_file` records the canonical resolved path into that conversation's set on a successful read.
-     - `write_file` (only when the target *already exists*) and `edit_file` check membership; if absent → `ToolResult::Err("refusing to write '{path}': read_file it first so you're not overwriting blind")`. A *new* file (doesn't exist) is exempt. `delete_file` stays exempt for now (CC doesn't gate delete on read).
-     - Use the canonical path as the key so read and write agree (`read_file`'s `resolve_within` is canonical; `write_file`'s `resolve_within_new` yields the canonical path for an existing non-symlink target).
-     - Tests: read→write allowed; write-without-read on an existing file rejected; new-file write allowed without a read; edit-without-read rejected.
+1. **Finish M3 — the rest of the tools.** Round 1 wired the spine + read-only tools; since then the **approval spine** (interactive confirm + pin/lock), the **write/edit/delete tools**, a policy-driving **`RiskClass`**, and **read-before-write** (2026-07-15, commit `5724f73` — see the session log below) all shipped (done ✓). Remaining, in order:
    - **The remaining core tools** — headless browser, delegate-to-subagent, ask-human, system status, cron management, session search — each a small impl on the same `Tool` trait + gating (shell_exec, when it ships, gets the denylist floor + a ~2-min timeout + output caps per PLAN §12).
    - **The durability trio**: crash-recovery on startup, idempotency keys (no double-run on double-click/restart), loud-vs-silent failure split.
    - **Reroute (don't just block) for tool-triggered local-required calls** — today the dispatcher fails closed; better UX is to switch the loop to a local endpoint (`enforce_local_routing`) for the rest of the turn. Needs mid-loop re-selection of `client`/`provider`/`is_cloud`.
    - **MCP tools folded into the same registry** (filtered by capability like a built-in).
-   - **The other Claude Code parity gaps (PLAN §12):** protected-paths always-Ask floor; permission modes (plan / accept-edits) + deny-first precedence; a `UserPromptSubmit` hook event (run the privacy filter on the user message, not just PreToolUse); and — M4, bigger — **native tool-use when the endpoint supports it** (the fenced dialect stays the fallback).
-2. **Build the memory system.** Full design is in `docs/PLAN.md` under "Memory system" — the short version: a small always-loaded "curated summary" plus a full searchable "archive," combining keyword search (already-bundled FTS5) and meaning search (sqlite-vec, already wired) into one hybrid search.
-3. **Build the skills system.** Full design in `docs/PLAN.md` under "Skills system" — reusable playbooks, with a per-profile toggle for whether the agent can teach itself new ones or has to ask first.
-4. **The remaining from-scratch gaps** (things with no equivalent in the reference material we studied, ours to build unassisted): computer/screen control (M5), voice (M6), and local-model lifecycle — detecting the user's hardware, offering a curated model catalog, downloading/verifying models (M8).
-5. **The server-companion track** — the optional always-on "second brain" add-on. Starts once M4 lands; design is fully resolved (see `docs/PLAN.md` §5), nothing left to decide, just to build.
+   - **The other Claude Code parity gaps (PLAN §12):** protected-paths always-Ask floor; permission modes (plan / accept-edits) + deny-first precedence; a `UserPromptSubmit` hook event (run the privacy filter on the user message, not just PreToolUse); and — **M4, bigger — native tool-use when the endpoint supports it** (the fenced dialect stays the fallback).
+2. **Finish wiring the ported frontend.** The design-system port (2026-07-15, commits `a22855e`/`55ad9d5`) is visually complete and wired for chat/sidebar/providers; near-term cleanup and gaps surfaced by that work:
+   - **NEXT — un-hardcode `routing_decision` in `ipc::send_message`** (`src-tauri/src/ipc/mod.rs`, currently returns the literal `"allow"`). The real gate decision is already persisted, just not returned — a small backend fix makes the per-message `RoutingBadge` (e.g. `route_local`) honest on a live send instead of only on reload.
+   - **Delete the superseded old components** — `src/lib/components/{Sidebar,ChatPanel,ModelPicker,PrivacyIndicator,ProviderSettings}.svelte` are unused now that `App.svelte` renders from `src/lib/design/`. `ApprovalDialog.svelte` in the same folder is still used (backend-driven) — keep it.
+   - **Remove the dev floating screen-switcher + theme toggle** in `src/App.svelte` — it's a QA aid, meant to go once real nav cross-links between screens are wired.
+   - **Fix the `ModelPicker` flat model-name namespace** — two providers exposing an identically-named model collide today (only the last-registered is addressable).
+   - **Wire the remaining visual-only screens** (Email, Files, Whiteboard, Scheduled-jobs, Editor, Onboarding, EmptyState) to real backends as those subsystems land — they currently render sample data only.
+3. **Build the memory system.** Full design is in `docs/PLAN.md` under "Memory system" — the short version: a small always-loaded "curated summary" plus a full searchable "archive," combining keyword search (already-bundled FTS5) and meaning search (sqlite-vec, already wired) into one hybrid search.
+4. **Build the skills system.** Full design in `docs/PLAN.md` under "Skills system" — reusable playbooks, with a per-profile toggle for whether the agent can teach itself new ones or has to ask first.
+5. **The remaining from-scratch gaps** (things with no equivalent in the reference material we studied, ours to build unassisted): computer/screen control (M5), voice (M6), and local-model lifecycle — detecting the user's hardware, offering a curated model catalog, downloading/verifying models (M8).
+6. **The server-companion track** — the optional always-on "second brain" add-on. Starts once M4 lands; design is fully resolved (see `docs/PLAN.md` §5), nothing left to decide, just to build.
 
 ---
 
@@ -147,7 +149,18 @@ lost-harness-product/
 │       ├── ipc/            # Tauri command handlers + AppState
 │       ├── platform/       # computer-use stubs, one submodule per OS (M5, not built)
 │       └── audio/          # voice stub (M6, not built)
-├── src/                    # Svelte 5 frontend (chat UI, sidebar, privacy indicator, model picker, settings)
+├── src/                    # Svelte 5 frontend — app entry is /app.html (NOT /)
+│   ├── App.svelte          # renders the current screen from the nav store; hydrates profiles→providers+conversations on mount; DEV floating screen-switcher + theme toggle (QA aid, remove later)
+│   ├── lib/
+│   │   ├── design/         # PORTED design system (2026-07-15) — Svelte 5, Tailwind-translated from ~/Desktop/lost-harness-ui; this is the current frontend
+│   │   │   ├── components/ # 37 .svelte components (Sidebar, MainScreen's chat bits, RoutingBadge, etc.) + knot-geometry.ts
+│   │   │   ├── screens/    # 9 .svelte screens + shell-data.ts — MainScreen/Settings wired to backend; Email/Files/Whiteboard/ScheduledJobs/Editor/Onboarding/EmptyState still sample data
+│   │   │   ├── types.ts    # Route/Binding/ScreenId
+│   │   │   ├── nav.svelte.ts # runes-based screen-router store
+│   │   │   └── CONVENTIONS.md # the porting rules (Tailwind translation, not a CSS import)
+│   │   ├── stores/         # chat.ts (extended for routing_decision/model/provider_id + bindingOverride), providers.svelte.ts, profiles.ts, settings.ts — real backend-backed stores
+│   │   └── components/     # SUPERSEDED old hand-built UI (Sidebar/ChatPanel/ModelPicker/PrivacyIndicator/ProviderSettings.svelte) — unused, no longer imported, pending deletion; ApprovalDialog.svelte here is still used (backend-driven)
+│   └── app.css              # Tailwind v4 @theme inline — design tokens mapped in (colors only; radii/shadows use arbitrary values), + global .lh-range slider CSS
 ├── docs/
 │   ├── PLAN.md              # SOURCE OF TRUTH — read this
 │   ├── server-companion.md  # deep design reasoning for the optional server
@@ -174,7 +187,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 151 tests
+cd src-tauri && cargo test --lib   # 226 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
@@ -234,3 +247,13 @@ Ratified the memory-toggle decision (committed `docs:` on `main`), then ran **M3
 **Update 2026-07-10 — write tools SHIPPED + reviewed.** `write_file`/`edit_file`/`delete_file` are built, workspace-confined, and gated by a `RiskClass` that *derives* the policy (Safe→pre-trusted, Write→Ask through the approval spine); an end-to-end test proves an approved write actually writes. So the approval dialog now fires for real. Adversarially reviewed → 2 correctness findings fixed (silent symlink clobber; temp-file leak on disk-full). Also fixed a **blank-GUI bug** the first real `npm run tauri dev` surfaced: the window loaded `/` (404) instead of the app's `app.html` entry — fixed via `windows[0].url = "app.html"` (the M1 "eyeball the GUI" gap). GUI needs a real design pass — **Lukas is actively speccing the frontend mockup (2026-07-10); UI work waits for that spec — don't freelance the interface.**
 
 **Next, per the Claude Code parity check (PLAN §12):** (1) **read-before-write** (high, next — refuse to write/edit a file not read this session); (2) **native tool-use when the endpoint supports it** (high, M4 — fenced dialect stays the fallback); (3) protected-paths always-prompt floor; (4) permission modes + `UserPromptSubmit` hook. Then the remaining core tools (browser/delegate/ask-human/system-status/cron/session-search), the durability trio, reroute-to-local, and MCP-into-registry. A **visual QA pass on the approval dialog** (live `npm run tauri dev`) is worthwhile once a model is configured to trigger a write.
+
+## Session log — 2026-07-15
+
+Three commits landed on `main`: read-before-write (backend), then a full frontend design-system port, then backend wiring for that port.
+
+- **Read-before-write SHIPPED** (`5724f73`) — the item flagged "NEXT" in the previous session log. A conversation-scoped read-set, `ConversationReads` (`Mutex<HashMap<conv_id, HashSet<PathBuf>>>`, `src-tauri/src/tools/mod.rs`), is owned by `ToolDispatcher` (`src-tauri/src/tools/dispatch.rs`) and injected into `ExecCtx.reads` at the `tool.run` call site (`AgentLoop` leaves it `None`). In `src-tauri/src/tools/fs.rs`: `read_file` records the canonical resolved path on success; `write_file` (only when the target already *exists*) and `edit_file` refuse if the path isn't in the conversation's read-set; a *new* file and `delete_file` stay exempt; a successful write self-records. **Adversarially reviewed → 4 fixes:** (a) `write_file` now canonicalizes the existing target for the membership check — `resolve_within` (read, canonical leaf) vs. `resolve_within_new` (write, raw leaf) could otherwise disagree on a macOS case-insensitive/Unicode path and falsely refuse a real read→write; (b) `MAX_READ_BYTES` raised to equal `MAX_WRITE_BYTES` (1 MiB), killing a 256 KiB–1 MiB "writable but unreadable" dead zone; (c) write self-records so create-then-overwrite isn't refused; (d) added case-insensitive/subdir/large-file/cross-dispatch regression tests. **Tests: 208 → 226**, 0 failed.
+- **UI PORT SHIPPED** (`a22855e`) — the React design source at `~/Desktop/lost-harness-ui` was ported to Svelte 5 under `src/lib/design/`: `components/` (37 `.svelte` + `knot-geometry.ts`), `screens/` (9 `.svelte` + `shell-data.ts`), `types.ts` (`Route`/`Binding`/`ScreenId`), `nav.svelte.ts` (a runes screen-router store), and `CONVENTIONS.md` (the porting rules). **Decision (Lukas):** keep Tailwind — translate the design's plain CSS into Tailwind utility classes rather than importing it; port the whole design system in one pass. Design tokens are mapped into Tailwind v4 `@theme inline` in `src/app.css` (colors only; radii/shadows use arbitrary values like `rounded-[var(--r)]`/`shadow-[var(--shadow-pop)]` to dodge the built-in `rounded-r` collision), staying theme-reactive via `:root` + `:root[data-theme="light"]`. The global `.lh-range` slider CSS also lives in `app.css` (vendor pseudo-elements trip `svelte2tsx` in a scoped `<style>`). `App.svelte` was rewired to render the current screen from the nav store (each screen is self-contained, including its own Sidebar), plus a DEV floating screen-switcher + theme toggle (a QA aid, remove later). **App entry is `/app.html`, not `/`.**
+- **BACKEND WIRING SHIPPED** (`55ad9d5`), for the screens that have a backend: `Sidebar.svelte` → real `$conversations` + new-chat (`createConversation`) + profile switcher (`$profiles`/`switchProfile`); `MainScreen.svelte` → the real chat loop (messages from `$activeConversation`, send via `sendMessage`, streaming, model picker from `providersStore`, an Auto/Public/Private binding pill feeding `sendMessage`, and a per-message `RoutingBadge` driven by the real gate decision — un-stubs the old client-side privacy indicator); `Settings.svelte` → Models tab wired to `providersStore` (list/add/remove/select model), Appearance tab wired to the theme store. `src/App.svelte` hydrates profiles→providers+conversations on mount. `src/lib/stores/chat.ts` extended additively: `Message` gained optional `routing_decision`/`model`/`provider_id` (were previously dropped by `msgFromInfo`); `sendMessage` gained an optional 4th `bindingOverride` param — backward-compatible, the old 3-arg `ChatPanel` call still works.
+- **Known gaps surfaced, not yet fixed** (see "What's next" above): `ipc::send_message` returns `routing_decision: "allow"` **hardcoded**, so a live send can't yet surface a `route_local` badge from the response (the real decision is persisted, just not returned). `ModelPicker` uses a flat model-name namespace — two providers with an identically-named model collide. The old `src/lib/components/{Sidebar,ChatPanel,ModelPicker,PrivacyIndicator,ProviderSettings}.svelte` are now superseded and unused (`App` no longer imports them) — `ApprovalDialog.svelte` is still used and kept. The dev screen-switcher in `App.svelte` is a QA aid pending removal. **Still visual only, no backend:** Email, Files, Whiteboard, Scheduled-jobs, Editor, Onboarding, EmptyState screens.
+- **Tests:** `cargo test --lib` → 226 passing, 0 failed (unchanged by the two UI commits). Frontend `npm run build` + `npm run check` clean.

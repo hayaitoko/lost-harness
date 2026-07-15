@@ -13,8 +13,14 @@ shell with a **Svelte 5** frontend. Its defining feature is a **privacy filter**
 every call out to a model is classified and routed (kept local, sent to cloud, or
 blocked) *before* it can leave the machine. Milestones M0–M1 (core loop) and the
 bulk of M3 (tool spine + approval spine + first state-changing tools) are done and
-tested; the classifier's deterministic rules layer is live, its trained ONNX layer
-is a stub. See HANDOFF for the precise line.
+tested — including a conversation-scoped **read-before-write** guard (`write_file`
+on an existing target, and `edit_file`, both refuse unless that path was read first
+in the same conversation); the classifier's deterministic rules layer is live, its
+trained ONNX layer is a stub. The frontend was reskinned onto the ported
+`src/lib/design/` design system (Svelte port of the React design source) and
+partially wired to the real backend (chat, sidebar, models/appearance settings);
+several screens (Email, Files, Whiteboard, Scheduled-jobs, Editor, Onboarding,
+EmptyState) are still visual-only with sample data. See HANDOFF for the precise line.
 
 ## The request flow (the spine)
 
@@ -43,7 +49,7 @@ user message
 | [models.md](models.md) | `ModelManager`, providers, the OpenAI-compatible HTTP client + SSE (text-only, no native tool_use yet) |
 | [storage.md](storage.md) | Two-DB SQLite (global + per-profile), schema/migrations, sqlite-vec + FTS5, `trm_logs` audit |
 | [ipc-and-app-wiring.md](ipc-and-app-wiring.md) | Tauri command surface + `AppState`, the approval IPC round-trip, `lib.rs::run` wiring |
-| [frontend-svelte.md](frontend-svelte.md) | The Svelte 5 shell, `tauri.ts` (the only IPC bridge), stores, components |
+| [frontend-svelte.md](frontend-svelte.md) | The Svelte 5 shell, `tauri.ts` (the only IPC bridge), stores, components — now including the ported `src/lib/design/` design system (components/screens reskinned from the React source at lost-harness-ui, partially wired to real backend stores) |
 
 ## Load-bearing invariants (do NOT break these)
 
@@ -72,7 +78,7 @@ its own are enforced; the cross-cutting ones:
 
 ```bash
 # from the repo root
-cd src-tauri && cargo test --lib      # Rust unit/contract tests (216 as of 2026-07-10)
+cd src-tauri && cargo test --lib      # Rust unit/contract tests (226 as of 2026-07-15)
 cd src-tauri && cargo build           # Rust core
 npm run tauri dev                     # full app (native window) — see gotcha below
 npm run build && npm run check        # frontend build + svelte-check
@@ -102,7 +108,10 @@ Flagged here so they're not rediscovered the hard way — details in the subsyst
   wires `RulesClassifier`.
 - **`ipc::send_message` returns `routing_decision: "allow"` hardcoded** regardless of
   the real decision — the true decision is in the persisted `Message`/`trm_logs`, not
-  the response.
+  the response. This now has a visible frontend cost: `MainScreen.svelte`'s per-message
+  `RoutingBadge` reads `routing_decision` off the send response, so a live send can never
+  surface an honest `route_local` badge (it shows correctly only after a reload re-fetches
+  the persisted decision). Fixing the backend to return the true decision fixes both.
 - **`EnsembleClassifier` is a stub** (`load()` always errs); the ONNX layer isn't
   wired (no `ort` dep; blocked on exported `.onnx` artifacts).
 - **`loop_tests.rs` tests a reimplementation** (`TestLoop`), not the real `AgentLoop` —
