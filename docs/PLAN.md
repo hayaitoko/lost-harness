@@ -645,6 +645,49 @@ call it's involved in, not just the visible chat reply — a work-profile
 memory genuinely cannot leak into a personal-context cloud call, because
 the same check runs regardless of which call triggered it.
 
+### Refinements — decided 2026-07-15 (with Lukas)
+
+Three decisions that firm up the soft edges above.
+
+**Sensitivity buckets — shared / private-local / never-persist.** The privacy
+filter doesn't just *block* a sensitive write — it **classifies and routes** it,
+so useful context isn't thrown away. Every fact the agent goes to save is labeled
+(reusing the same classifier that gates messages, §11) into one of three buckets:
+
+- **Shared** — ordinary facts; may inform any turn, including cloud.
+- **Private (local-only)** — sensitive-but-durable facts (home address, health
+  conditions — the genuinely useful stuff). Saved, but **only a local model can
+  ever read it.** The private store is *structurally excluded* from any cloud-bound
+  context: a **local** turn's context assembly may read shared + private; a
+  **cloud** turn's assembly **never even queries** the private store. It is a
+  separate store, not a filtered view (the same physical-separation principle as
+  the §7 profile wall), so a bug can't leak it.
+- **Never-persist** — truly ephemeral secrets (a one-time code, a password typed
+  once). Not saved anywhere, even locally.
+
+This is a **different axis** from the §7 per-profile shared-vs-walled wall (which
+walls a *whole profile*); the two compose — sensitivity routing happens *within*
+whichever store the profile toggle already chose. It also pairs with the
+classifier's redaction/partial-delegation (§11): send the safe parts to cloud,
+tuck the sensitive detail into private memory for the local model.
+
+**Retrieval is relevance-gated and budget-capped — never an every-message dump.**
+Only the small curated summary is always-loaded (fixed, bounded cost). The archive
+is surfaced two ways, both cheap: (1) an **automatic, relevance-gated injection** —
+a cheap hybrid search runs on the user's message and injects **only if** a match
+clears a relevance bar, and then **at most 1–3 short snippets** (most turns inject
+nothing); and (2) the **pinned search tool** for deeper, explicit digs. Path (1)
+removes the "did the model remember to search?" failure without the context bloat
+of pulling notes every turn. This refines "Search — on demand" and "Timing and
+trust" above: the pinned tool is no longer the *only* retrieval path, but automatic
+retrieval stays gated + capped.
+
+**Memory is non-silent.** Consistent with the rest of Lost Harness: every **save,
+update, or recall** leaves a visible, inspectable trace, in the same event-bar
+language the privacy signal uses ("remembered: your heater repair date" / "recalled
+2 notes for this answer"), each clickable into the detail and undoable. Nothing
+about your memory changes without you being able to see that it happened.
+
 ### The genuinely hard part
 
 Flagged honestly, not as a blocker: the hard part of memory isn't storage
