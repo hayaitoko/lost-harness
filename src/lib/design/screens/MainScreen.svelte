@@ -11,11 +11,24 @@
   import RoutingBadge from "../components/RoutingBadge.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import AppStatusBar from "../components/AppStatusBar.svelte";
-  import { MODELS } from "./shell-data";
   import { nav } from "$lib/design/nav.svelte";
-  import type { Binding } from "$lib/design/types";
+  import type { Binding, Route } from "$lib/design/types";
+  import {
+    activeConversation,
+    streamingMessage,
+    sendMessage as sendChatMessage,
+    type Message,
+  } from "$lib/stores/chat";
+  import {
+    providersStore,
+    setActiveModel,
+    getProvider,
+    fetchModels,
+  } from "$lib/stores/providers.svelte";
+  import { sendOnEnter } from "$lib/stores/settings";
 
   type PanelTab = "routing" | "files" | "tasks" | "agents" | "terminal";
+  type ModelOption = { name: string; kind: "local" | "cloud"; group: string };
 
   const BINDING_LABEL: Record<Binding, string> = {
     auto: "Auto",
@@ -41,11 +54,17 @@
     { id: "terminal", label: "Terminal" },
   ];
 
+  // This screen's per-send binding override (Auto/Public/Private) — feeds
+  // sendMessage() directly (see chat.ts's bindingOverride param) rather than
+  // mutating the conversation's stored default.
   let binding = $state<Binding>("auto");
   let whyOpen = $state(false);
   let panelTab = $state<PanelTab>("routing");
-  let model = $state("Qwen3-14B");
-  let typing = $state(false);
+
+  // Composer draft. Send on click or (respecting sendOnEnter) on Enter.
+  let draft = $state("");
+  let isSending = $state(false);
+  let textareaEl: HTMLTextAreaElement | null = $state(null);
 
   const cycleBinding = () => (binding = NEXT_BINDING[binding]);
   const toggleWhy = () => (whyOpen = !whyOpen);
@@ -54,16 +73,118 @@
     panelTab = t;
   };
 
+  // ── Model picker: build the design's flat ModelOption[] from the real
+  // provider list, fetching each provider's models (cached by the store).
+  let modelOptions = $state<ModelOption[]>([]);
+  let modelOwner = new Map<string, string>(); // model name -> provider id
+
+  $effect(() => {
+    const provs = providersStore.providers;
+    let cancelled = false;
+    (async () => {
+      const perProvider = await Promise.all(
+        provs.map(async (p) => ({ provider: p, models: await fetchModels(p.id) })),
+      );
+      if (cancelled) return;
+      const opts: ModelOption[] = [];
+      const owner = new Map<string, string>();
+      for (const { provider, models } of perProvider) {
+        for (const name of models) {
+          opts.push({
+            name,
+            kind: provider.kind === "cloud" ? "cloud" : "local",
+            group: provider.name,
+          });
+          owner.set(name, provider.id);
+        }
+      }
+      modelOptions = opts;
+      modelOwner = owner;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  function handleModelChange(name: string) {
+    const providerId = modelOwner.get(name) ?? providersStore.activeProviderId;
+    if (providerId) setActiveModel(providerId, name);
+  }
+
+  // ── Routing: map a real message's gate outcome to the design's Route.
+  // "allow" means the gate let the request go to whichever endpoint was
+  // targeted — local or cloud depends on that provider's kind, so allow
+  // alone doesn't tell us the route; cross-reference providersStore.
+  function messageRoute(m: Message): Route {
+    if (m.error_source === "gate" || m.routing_decision === "block") return "blocked";
+    if (m.routing_decision === "route_local") return "local";
+    if (m.routing_decision === "allow") {
+      const provider = getProvider(m.provider_id ?? null);
+      if (provider) return provider.kind === "cloud" ? "cloud" : "local";
+    }
+    return "local";
+  }
+
+  function routeLabel(m: Message): string {
+    const route = messageRoute(m);
+    const prefix = route === "local" ? "Local" : route === "cloud" ? "Cloud" : "Held";
+    return m.model ? `${prefix} · ${m.model}` : prefix;
+  }
+
+  // Only show a routing badge once a real decision exists — never on a
+  // still-streaming turn, and never fabricated for a plain model/network
+  // error (those aren't a privacy/routing outcome).
+  function hasRoutingSignal(m: Message): boolean {
+    return !m.streaming && (m.routing_decision != null || m.error_source === "gate");
+  }
+
+  // Split into paragraphs on blank lines; each <p> keeps internal newlines
+  // via CSS (whitespace-pre-wrap) rather than injecting HTML.
+  function paragraphs(content: string): string[] {
+    const parts = content.split(/\n{2,}/).filter((p) => p.length > 0);
+    return parts.length > 0 ? parts : [content];
+  }
+
+  // ── Composer ─────────────────────────────────────────────────────────────
+  function autoresize() {
+    if (!textareaEl) return;
+    textareaEl.style.height = "auto";
+    textareaEl.style.height = Math.min(textareaEl.scrollHeight, 150) + "px";
+  }
+
+  async function handleSend() {
+    const content = draft.trim();
+    if (!content || isSending) return;
+    isSending = true;
+    draft = "";
+    autoresize();
+    try {
+      await sendChatMessage(
+        content,
+        providersStore.activeProviderId,
+        providersStore.activeModel,
+        binding,
+      );
+    } finally {
+      isSending = false;
+      textareaEl?.focus();
+    }
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key !== "Enter") return;
+    if (!$sendOnEnter) return; // Enter inserts a newline; no explicit Send action here
+    if (e.shiftKey) return; // Shift+Enter always inserts a newline
+    e.preventDefault();
+    handleSend();
+  }
+
   // Reusable chrome recipes (mirror the React inline styles).
   const panelBtn =
     "text-left px-[11px] py-[9px] rounded-[var(--r)] border border-border-strong bg-surface-2 text-text-2 text-[11.5px] font-semibold cursor-pointer";
   const card =
     "px-3 py-[10px] bg-surface border border-border rounded-[var(--r-lg)]";
 </script>
-
-{#snippet routingBadge()}
-  <RoutingBadge route="local" label="Local · Qwen3-14B" onclick={toggleWhy} />
-{/snippet}
 
 {#snippet dot(cls: string)}
   <span class="h-[7px] w-[7px] shrink-0 rounded-full {cls}"></span>
@@ -104,14 +225,14 @@
     ? 'grid-cols-[260px_1fr_350px]'
     : 'grid-cols-[260px_1fr_0px]'}"
 >
-  <Sidebar activeConv="Reply to landlord" engineState="local" />
+  <Sidebar activeConv={$activeConversation?.name ?? "New chat"} engineState="local" />
 
   <main class="flex min-h-0 min-w-0 flex-col">
     <div
       class="flex h-12 flex-shrink-0 items-center gap-3 border-b border-border pl-[18px] pr-[14px]"
     >
       <div class="min-w-0 truncate text-[13.5px] font-semibold">
-        Reply to landlord
+        {$activeConversation?.name ?? "New chat"}
       </div>
 
       <button
@@ -163,66 +284,44 @@
 
     <div class="lh-messages flex-1 overflow-y-auto px-5 py-[26px]">
       <div class="mx-auto flex max-w-[700px] flex-col gap-5">
-        <ChatMessage role="user">
-          Help me write a firm but polite reply to my landlord about the broken
-          heater at
-          <span
-            class="cursor-help rounded-[2px] border-b border-dashed border-[color-mix(in_srgb,var(--warn)_65%,transparent)] bg-warn-soft px-px"
-            title="Detected: home address"
-          >
-            123 Oak Street, Apt 4B
-          </span>. My lease renews next month.
-        </ChatMessage>
+        {#each $activeConversation?.messages ?? [] as m (m.id)}
+          {#if m.role === "user"}
+            <ChatMessage role="user">
+              <span class="whitespace-pre-wrap">{m.content}</span>
+            </ChatMessage>
+          {:else}
+            {#if m.routing_decision === "route_local"}
+              <PrivacyEventBar kind="kept" title="Kept on your machine">
+                This turn was routed to a local model — the content looked
+                sensitive, or a cloud endpoint wasn't reachable.
+              </PrivacyEventBar>
+            {:else if m.error_source === "gate"}
+              <PrivacyEventBar kind="stop" title="Held from leaving this machine">
+                {m.error ?? "The privacy gate held this message back."}
+              </PrivacyEventBar>
+            {/if}
 
-        <PrivacyEventBar
-          kind="kept"
-          title="2 personal details kept on your machine"
-        >
-          Your <b>home address</b> and <b>lease terms</b> were detected, so this was
-          answered by your <b>local model</b>.
-          {#snippet links()}
-            <button
-              type="button"
-              class="cursor-pointer font-semibold text-text-2 underline underline-offset-2 hover:text-text"
-            >
-              What tripped it
-            </button>
-            <button
-              type="button"
-              class="cursor-pointer font-semibold text-text-2 underline underline-offset-2 hover:text-text"
-            >
-              Send the safe parts to a stronger model?
-            </button>
-          {/snippet}
-        </PrivacyEventBar>
+            {#snippet msgBadge()}
+              <RoutingBadge
+                route={messageRoute(m)}
+                label={routeLabel(m)}
+                onclick={toggleWhy}
+              />
+            {/snippet}
 
-        <ChatMessage role="assistant" badge={routingBadge}>
-          <p>
-            Here's a draft that's firm on the timeline without burning the
-            relationship:
-          </p>
-          <p>
-            "Hi [Landlord], I'm following up on the heater in my unit, out for
-            several days now. As it gets colder I'd like it repaired this week.
-            Since my lease renews next month, I'd appreciate a repair date
-            before we discuss renewal."
-          </p>
-          <p>Want it warmer, or a firm deadline added?</p>
-        </ChatMessage>
-
-        <ChatMessage role="user">
-          Add a firm deadline — end of this week.
-        </ChatMessage>
-
-        <ChatMessage role="assistant" badge={routingBadge}>
-          <p>Updated the closing line:</p>
-          <p>
-            "If the repair can't be scheduled by <b>Friday the 17th</b>, I'd
-            like to discuss a rent adjustment for the affected days before we
-            talk renewal."
-          </p>
-          <p>Still polite, but there's now a date attached to it.</p>
-        </ChatMessage>
+            <ChatMessage role="assistant" badge={hasRoutingSignal(m) ? msgBadge : undefined}>
+              {#if m.streaming && m.content.length === 0}
+                <p class="lh-thinking m-0 flex items-center gap-[3px] text-text-3">
+                  <span class="lh-dot"></span><span class="lh-dot"></span><span class="lh-dot"></span>
+                </p>
+              {:else}
+                {#each paragraphs(m.content) as para}
+                  <p class="whitespace-pre-wrap {m.error ? 'text-blocked' : ''}">{para}</p>
+                {/each}
+              {/if}
+            </ChatMessage>
+          {/if}
+        {/each}
       </div>
     </div>
 
@@ -241,16 +340,19 @@
             </svg>
           </button>
           <textarea
+            bind:this={textareaEl}
+            bind:value={draft}
             rows="1"
             placeholder="Message Lost Harness…"
-            oninput={(e) => (typing = e.currentTarget.value.length > 0)}
+            onkeydown={handleKeydown}
+            oninput={autoresize}
             class="max-h-[150px] min-w-0 flex-1 resize-none border-0 bg-transparent py-[5px] text-[14px] leading-[1.55] text-text outline-none placeholder:text-text-3"
           ></textarea>
           <span class="flex-shrink-0 whitespace-nowrap">
             <ModelPicker
-              models={MODELS}
-              value={model}
-              onchange={(m) => (model = m)}
+              models={modelOptions}
+              value={providersStore.activeModel ?? "Select model"}
+              onchange={handleModelChange}
             />
           </span>
           <button
@@ -266,6 +368,7 @@
           <button
             type="button"
             aria-label="Send"
+            onclick={handleSend}
             class="grid h-[30px] w-[30px] flex-shrink-0 place-items-center self-end rounded-[var(--r)] border-0 bg-accent text-on-accent transition duration-100 hover:brightness-[1.06]"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -520,6 +623,36 @@
   @keyframes lhblink {
     50% {
       opacity: 0;
+    }
+  }
+
+  /* Streaming "thinking" indicator on an in-progress assistant turn with no
+     tokens yet — three pulsing dots, no library component for this. */
+  .lh-dot {
+    display: inline-block;
+    width: 4px;
+    height: 4px;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0.35;
+    animation: lhdotpulse 1.2s infinite ease-in-out;
+  }
+  .lh-dot:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .lh-dot:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+  @keyframes lhdotpulse {
+    0%,
+    80%,
+    100% {
+      opacity: 0.3;
+      transform: translateY(0);
+    }
+    40% {
+      opacity: 1;
+      transform: translateY(-2px);
     }
   }
 </style>

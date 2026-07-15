@@ -7,6 +7,10 @@
   import { onMount } from "svelte";
   import { nav } from "$lib/design/nav.svelte";
   import { theme, applyTheme } from "$lib/stores/settings";
+  import { hydrate as hydrateProfiles } from "$lib/stores/profiles";
+  import { hydrateProviders } from "$lib/stores/providers.svelte";
+  import { hydrateConversations } from "$lib/stores/chat";
+  import { onStreamError, type StreamErrorPayload } from "$lib/api/tauri";
   import type { ScreenId } from "$lib/design/types";
 
   import MainScreen from "$lib/design/screens/MainScreen.svelte";
@@ -46,7 +50,19 @@
 
   const Current = $derived(SCREENS[nav.current]);
 
-  onMount(() => applyTheme($theme));
+  onMount(async () => {
+    // Apply theme first to avoid a flash, then hydrate the backend-backed
+    // stores the wired screens read (profiles → providers + conversations).
+    applyTheme($theme);
+    await hydrateProfiles();
+    await Promise.all([hydrateProviders(), hydrateConversations()]);
+    // App-level catch for gate/stream errors that land outside an active send.
+    await onStreamError((payload: StreamErrorPayload) => {
+      console.warn(
+        `[stream:error] source=${payload.source} conv=${payload.conversation_id}: ${payload.error}`,
+      );
+    });
+  });
 
   function toggleTheme() {
     const next = $theme === "light" ? "dark" : "light";

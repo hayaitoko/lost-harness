@@ -8,10 +8,22 @@
   import ChatMessage from "../components/ChatMessage.svelte";
   import IconButton from "../components/IconButton.svelte";
   import SegmentedControl from "../components/SegmentedControl.svelte";
+  import Select from "../components/Select.svelte";
   import SettingRow from "../components/SettingRow.svelte";
   import Toggle from "../components/Toggle.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import AppStatusBar from "../components/AppStatusBar.svelte";
+  import {
+    providersStore,
+    addProvider,
+    removeProvider,
+    setActiveModel,
+    fetchModels,
+    type Provider,
+    type ProviderKind,
+  } from "$lib/stores/providers.svelte";
+  import { modelsForProvider } from "$lib/stores/provider-catalog";
+  import { theme, applyTheme, type Theme } from "$lib/stores/settings";
 
   type Section = "routing" | "privacy" | "models" | "memory" | "appearance";
   const SECTIONS: [Section, string][] = [
@@ -40,6 +52,40 @@
 
   const ACCENTS = ["#5f74e0", "#3fa87d", "#4a97cf", "#c49a55", "#b06fc2", "#d0685f", "#5fb8b0", "#8a8a93"];
 
+  // models — quick-add presets mirror the old (already-wired) ProviderSettings
+  // component's PROVIDER_CATALOG entries.
+  interface ProviderFormState {
+    id: string | null;
+    name: string;
+    baseUrl: string;
+    apiKey: string;
+    kind: ProviderKind;
+  }
+  const EMPTY_PROVIDER_FORM: ProviderFormState = {
+    id: null,
+    name: "",
+    baseUrl: "",
+    apiKey: "",
+    kind: "cloud",
+  };
+  const QUICK_PROVIDER_PRESETS: Array<{
+    id: string;
+    name: string;
+    baseUrl: string;
+    kind: ProviderKind;
+  }> = [
+    { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", kind: "cloud" },
+    { id: "anthropic", name: "Anthropic", baseUrl: "https://api.anthropic.com/v1", kind: "cloud" },
+    { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", kind: "cloud" },
+    { id: "lmstudio", name: "LM Studio", baseUrl: "http://localhost:1234/v1", kind: "local" },
+    { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434/v1", kind: "local" },
+  ];
+  const PROVIDER_KIND_OPTIONS = [
+    { value: "cloud", label: "Cloud (public endpoint)" },
+    { value: "local", label: "Local (loopback / LAN / tailnet)" },
+    { value: "custom", label: "Custom (other)" },
+  ];
+
   const goMain = () => nav.go("main");
   let section = $state<Section>("routing");
 
@@ -49,6 +95,13 @@
   let redaction = $state(false);
   // privacy
   let guard = $state(true);
+  // models
+  let providerForm = $state<ProviderFormState | null>(null);
+  let showProviderKey = $state(false);
+  let confirmRemoveProviderId = $state<string | null>(null);
+  let savingProvider = $state(false);
+  // Fetched model lists per provider id (populated lazily below).
+  let modelsByProvider = $state<Record<string, string[]>>({});
   // memory
   let memoryMode = $state("walled");
   let memProfile = $state("Personal");
@@ -57,7 +110,6 @@
   let editingMem = $state<number | null>(null);
   let cancelEdit = false;
   // appearance
-  let themeSel = $state("dark");
   let accent = $state("#5f74e0");
   let tone = $state("neutral");
   let density = $state("cozy");
@@ -66,6 +118,97 @@
 
   let mems = $derived(memories[memProfile] ?? []);
   let activeLabel = $derived(SECTIONS.find(([id]) => id === section)![1]);
+
+  // Name + URL required for save to be enabled (mirrors ProviderSettings.svelte).
+  const canSaveProvider = $derived.by(() => {
+    if (!providerForm) return false;
+    const name = providerForm.name.trim();
+    const url = providerForm.baseUrl.trim();
+    if (!name || !url) return false;
+    if (!/^https?:\/\//.test(url)) return false;
+    return true;
+  });
+
+  // Lazily fetch each provider's model list once. Falls back to the baked-in
+  // catalog (provider-catalog.ts) if the IPC call comes back empty — e.g. no
+  // Tauri shell in browser dev mode, or a provider the catalog doesn't know
+  // about yet whose /models call hasn't resolved.
+  $effect(() => {
+    for (const p of providersStore.providers) {
+      if (p.id in modelsByProvider) continue;
+      fetchModels(p.id).then((models) => {
+        modelsByProvider = { ...modelsByProvider, [p.id]: models };
+      });
+    }
+  });
+
+  function modelsFor(p: Provider): string[] {
+    const fetched = modelsByProvider[p.id];
+    if (fetched && fetched.length > 0) return fetched;
+    return modelsForProvider(p).map((m) => m.name);
+  }
+
+  function providerDotColor(kind: ProviderKind): string {
+    if (kind === "local") return "var(--local)";
+    if (kind === "cloud") return "var(--cloud)";
+    return "var(--text-3)";
+  }
+
+  function startAddProvider() {
+    providerForm = { ...EMPTY_PROVIDER_FORM };
+    showProviderKey = false;
+  }
+  function startAddProviderFromPreset(preset: (typeof QUICK_PROVIDER_PRESETS)[number]) {
+    providerForm = { id: null, name: preset.name, baseUrl: preset.baseUrl, apiKey: "", kind: preset.kind };
+    showProviderKey = false;
+  }
+  function startEditProvider(p: Provider) {
+    if (providerForm?.id === p.id) {
+      providerForm = null;
+      return;
+    }
+    providerForm = { id: p.id, name: p.name, baseUrl: p.baseUrl, apiKey: "", kind: p.kind };
+    showProviderKey = false;
+  }
+  function cancelProviderForm() {
+    providerForm = null;
+  }
+  async function saveProvider() {
+    if (!providerForm || !canSaveProvider || savingProvider) return;
+    savingProvider = true;
+    try {
+      await addProvider({
+        id: providerForm.id ?? undefined,
+        name: providerForm.name.trim(),
+        baseUrl: providerForm.baseUrl.trim(),
+        apiKey: providerForm.apiKey,
+        kind: providerForm.kind,
+      });
+      providerForm = null;
+    } catch (err) {
+      console.error("save provider failed", err);
+    } finally {
+      savingProvider = false;
+    }
+  }
+  async function handleRemoveProvider(id: string) {
+    // Two-click confirm: first click arms it, second click within 3s fires.
+    if (confirmRemoveProviderId !== id) {
+      confirmRemoveProviderId = id;
+      setTimeout(() => {
+        if (confirmRemoveProviderId === id) confirmRemoveProviderId = null;
+      }, 3000);
+      return;
+    }
+    confirmRemoveProviderId = null;
+    await removeProvider(id);
+  }
+
+  function setTheme(v: string) {
+    const t = v as Theme;
+    theme.set(t);
+    applyTheme(t);
+  }
 
   function updateMems(fn: (arr: Memory[]) => Memory[]) {
     memories = { ...memories, [memProfile]: fn(memories[memProfile] ?? []) };
@@ -91,11 +234,6 @@
     });
     editingMem = null;
   }
-  function applyTheme(v: string) {
-    themeSel = v;
-    document.documentElement.dataset.theme = v === "light" ? "light" : "dark";
-  }
-
   function autofocus(node: HTMLInputElement) {
     node.focus();
     node.select();
@@ -240,45 +378,164 @@
               <Button variant="ghost">Add category…</Button>
             </div>
           {:else if section === "models"}
-            <SettingRow
-              title="Qwen3-14B"
-              desc="Local · tadashi"
-              dotColor="var(--local)"
-              tag={{ label: "online", bg: "var(--local-soft)", color: "var(--local)" }}
-            />
-            <SettingRow
-              title="Llama 3.3 8B"
-              desc="Local · on this Mac"
-              dotColor="var(--local)"
-              tag={{ label: "ready", bg: "var(--surface-2)", color: "var(--text-3)" }}
-            />
-            <SettingRow
-              title="Anthropic"
-              desc="Cloud · Opus 4.8, Sonnet 5"
-              dotColor="var(--cloud)"
-              tag={{ label: "connected", bg: "var(--cloud-soft)", color: "var(--cloud)" }}
-            >
-              {#snippet control()}
-                <Button variant="ghost">Manage…</Button>
-              {/snippet}
-            </SettingRow>
-            <button
-              type="button"
-              class="mt-3 flex w-full cursor-pointer items-center gap-[11px] rounded-[var(--r-lg)] border border-dashed
-                border-border-strong bg-transparent px-[13px] py-[11px] text-left text-text-2"
-            >
-              <span class="grid h-[22px] w-[22px] flex-shrink-0 place-items-center rounded-full bg-surface-2">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M12 5v14M5 12h14" />
-                </svg>
-              </span>
-              <span class="min-w-0">
-                <span class="block text-[12.5px] font-[550] text-text">Add an endpoint</span>
-                <span class="block text-[11.5px] text-text-3">
-                  OpenAI-compatible or Ollama — models are discovered automatically
+            {#if providersStore.loading && providersStore.providers.length === 0}
+              <p
+                class="rounded-[var(--r-lg)] border border-dashed border-border-strong px-3 py-6 text-center text-[12.5px] text-text-3"
+              >
+                Loading providers…
+              </p>
+            {:else if providersStore.providers.length > 0}
+              {#each providersStore.providers as p (p.id)}
+                {@const models = modelsFor(p)}
+                {@const isActive = p.id === providersStore.activeProviderId}
+                <SettingRow
+                  title={p.name}
+                  desc={`${p.kind === "local" ? "Local" : p.kind === "cloud" ? "Cloud" : "Custom"} · ${p.baseUrl}`}
+                  dotColor={providerDotColor(p.kind)}
+                  tag={isActive
+                    ? { label: "active", bg: "var(--accent-soft)", color: "var(--accent)" }
+                    : undefined}
+                >
+                  {#snippet control()}
+                    <div class="flex flex-shrink-0 items-center gap-1.5">
+                      <Select
+                        items={models.map((m) => ({ value: m, label: m }))}
+                        value={isActive ? (providersStore.activeModel ?? "") : ""}
+                        onchange={(v) => setActiveModel(p.id, v)}
+                        placeholder={models.length > 0 ? "Select model" : "No models"}
+                        disabled={models.length === 0}
+                      />
+                      <Button variant="ghost" onclick={() => startEditProvider(p)}>
+                        {providerForm?.id === p.id ? "Cancel" : "Edit"}
+                      </Button>
+                      <Button variant="ghost" onclick={() => handleRemoveProvider(p.id)}>
+                        {confirmRemoveProviderId === p.id ? "Confirm?" : "Remove"}
+                      </Button>
+                    </div>
+                  {/snippet}
+                </SettingRow>
+              {/each}
+            {:else}
+              <p
+                class="rounded-[var(--r-lg)] border border-dashed border-border-strong px-3 py-6 text-center text-[12.5px] text-text-3"
+              >
+                No providers configured yet. Add one below.
+              </p>
+            {/if}
+
+            <div class="mt-4">
+              <div class="{label} pb-1.5">Quick add</div>
+              <div class="flex flex-wrap gap-1.5">
+                {#each QUICK_PROVIDER_PRESETS as preset (preset.id)}
+                  <button
+                    type="button"
+                    onclick={() => startAddProviderFromPreset(preset)}
+                    class="cursor-pointer rounded-[var(--r)] border border-border bg-surface px-2.5 py-1 text-[11.5px] font-medium
+                      text-text-2 transition hover:border-border-strong hover:bg-surface-hover hover:text-text"
+                  >
+                    {preset.name}
+                  </button>
+                {/each}
+              </div>
+            </div>
+
+            {#if providerForm}
+              <form
+                class="mt-3 space-y-2.5 rounded-[var(--r-lg)] border border-border bg-surface px-[13px] py-[13px]"
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  saveProvider();
+                }}
+              >
+                <div>
+                  <label class="{label} mb-1 block" for="prov-name">Name</label>
+                  <input
+                    id="prov-name"
+                    type="text"
+                    class="w-full rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12.5px]
+                      text-text outline-none placeholder:text-text-3 focus:border-accent"
+                    placeholder="My OpenAI"
+                    value={providerForm.name}
+                    oninput={(e) =>
+                      (providerForm = {
+                        ...providerForm!,
+                        name: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                </div>
+                <div>
+                  <label class="{label} mb-1 block" for="prov-url">Base URL</label>
+                  <input
+                    id="prov-url"
+                    type="text"
+                    class="w-full rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12.5px]
+                      text-text outline-none placeholder:text-text-3 focus:border-accent"
+                    placeholder="https://api.openai.com/v1"
+                    value={providerForm.baseUrl}
+                    oninput={(e) =>
+                      (providerForm = {
+                        ...providerForm!,
+                        baseUrl: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                </div>
+                <div>
+                  <label class="{label} mb-1 block" for="prov-key">API key</label>
+                  <div class="flex gap-1.5">
+                    <input
+                      id="prov-key"
+                      type={showProviderKey ? "text" : "password"}
+                      class="min-w-0 flex-1 rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12.5px]
+                        text-text outline-none placeholder:text-text-3 focus:border-accent"
+                      placeholder={providerForm.id ? "••• saved — leave blank to keep" : "sk-…"}
+                      value={providerForm.apiKey}
+                      oninput={(e) =>
+                        (providerForm = {
+                          ...providerForm!,
+                          apiKey: (e.currentTarget as HTMLInputElement).value,
+                        })}
+                    />
+                    <Button variant="ghost" onclick={() => (showProviderKey = !showProviderKey)}>
+                      {showProviderKey ? "Hide" : "Show"}
+                    </Button>
+                  </div>
+                </div>
+                <div>
+                  <div class="{label} mb-1">Kind</div>
+                  <Select
+                    items={PROVIDER_KIND_OPTIONS}
+                    value={providerForm.kind}
+                    onchange={(v) =>
+                      (providerForm = { ...providerForm!, kind: v as ProviderKind })}
+                  />
+                </div>
+                <div class="flex items-center justify-end gap-2 pt-1">
+                  <Button variant="ghost" onclick={cancelProviderForm}>Cancel</Button>
+                  <Button variant="primary" type="submit" disabled={!canSaveProvider || savingProvider}>
+                    {savingProvider ? "Saving…" : providerForm.id ? "Save changes" : "Add provider"}
+                  </Button>
+                </div>
+              </form>
+            {:else}
+              <button
+                type="button"
+                onclick={startAddProvider}
+                class="mt-3 flex w-full cursor-pointer items-center gap-[11px] rounded-[var(--r-lg)] border border-dashed
+                  border-border-strong bg-transparent px-[13px] py-[11px] text-left text-text-2"
+              >
+                <span class="grid h-[22px] w-[22px] flex-shrink-0 place-items-center rounded-full bg-surface-2">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
                 </span>
-              </span>
-            </button>
+                <span class="min-w-0">
+                  <span class="block text-[12.5px] font-[550] text-text">Add an endpoint</span>
+                  <span class="block text-[11.5px] text-text-3">
+                    OpenAI-compatible or Ollama — models are discovered automatically
+                  </span>
+                </span>
+              </button>
+            {/if}
           {:else if section === "memory"}
             <SettingRow
               title="Memory privacy"
@@ -444,8 +701,8 @@
                     { value: "light", label: "Light" },
                     { value: "system", label: "System" },
                   ]}
-                  value={themeSel}
-                  onchange={applyTheme}
+                  value={$theme}
+                  onchange={setTheme}
                 />
               {/snippet}
             </SettingRow>

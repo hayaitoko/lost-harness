@@ -8,20 +8,33 @@
   import ConversationRow from "./ConversationRow.svelte";
   import ProfileSwitcher from "./ProfileSwitcher.svelte";
   import Knot, { type KnotState } from "./Knot.svelte";
-  import { PROFILES } from "../screens/shell-data";
+  import {
+    conversations,
+    activeConversationId,
+    createConversation,
+    hydrateMessages,
+    type Conversation,
+  } from "$lib/stores/chat";
+  import {
+    profiles,
+    activeProfile,
+    switchProfile,
+  } from "$lib/stores/profiles";
 
   interface Props {
     active?: ScreenId;
+    /**
+     * @deprecated no longer drives row highlighting — that now comes from
+     * `$activeConversationId`. Kept so existing call sites (MainScreen,
+     * Settings, …) that still pass a sample title don't break typecheck.
+     */
     activeConv?: string;
     onnewsession?: () => void;
     /** Agent status shown by the Knot in the local-engine card. */
     engineState?: KnotState;
   }
 
-  let { active, activeConv, onnewsession, engineState = "idle" }: Props =
-    $props();
-
-  let profile = $state("Personal");
+  let { active, onnewsession, engineState = "idle" }: Props = $props();
 
   const SECTIONS: { id: ScreenId; label: string }[] = [
     { id: "email", label: "Email" },
@@ -30,15 +43,53 @@
     { id: "scheduled-jobs", label: "Scheduled jobs" },
   ];
 
-  const PINNED: { title: string; route: Route | "auto"; meta: string }[] = [
-    { title: "Reply to landlord", route: "auto", meta: "2m" },
-    { title: "Blood panel summary", route: "blocked", meta: "1h" },
-  ];
-  const SESSIONS: { title: string; route: Route | "auto"; meta: string }[] = [
-    { title: "Rust retry helper", route: "cloud", meta: "3h" },
-    { title: "Trip planning — Kyoto", route: "auto", meta: "1d" },
-    { title: "Skills for tax season", route: "cloud", meta: "1d" },
-  ];
+  // `Conversation.binding` (chat.ts) is the user's routing *intent*
+  // ("auto" | "public" | "private") — there's no backend field yet for the
+  // actual per-turn disposition ("local" | "cloud" | "blocked") that
+  // RouteDot expects. Pass through if it ever does line up; default to the
+  // neutral "auto" dot otherwise.
+  function rowRoute(conv: Conversation): Route | "auto" {
+    const b = conv.binding as string;
+    return b === "local" || b === "cloud" || b === "blocked" ? b : "auto";
+  }
+
+  function relativeTime(epochMs: number): string {
+    const diffS = Math.floor((Date.now() - epochMs) / 1000);
+    if (diffS < 60) return "now";
+    const m = Math.floor(diffS / 60);
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h`;
+    return `${Math.floor(h / 24)}d`;
+  }
+
+  async function handleSelectConversation(id: string) {
+    activeConversationId.set(id);
+    await hydrateMessages(id);
+    nav.go("main");
+  }
+
+  function handleNewSession() {
+    if (onnewsession) {
+      onnewsession();
+      return;
+    }
+    createConversation();
+    nav.go("main");
+  }
+
+  // ProfileSwitcher works over its own light-weight `{ name, sub, avatar }`
+  // shape (ported as-is from the design lib) and its onswitch callback
+  // hands back `name`, not `id` — map the real profile list into that shape
+  // and resolve back to the store's `id` before calling `switchProfile`.
+  let switcherProfiles = $derived(
+    $profiles.map((p) => ({ name: p.name, sub: "", avatar: p.icon })),
+  );
+
+  function handleProfileSwitch(name: string) {
+    const match = $profiles.find((p) => p.name === name);
+    if (match) void switchProfile(match.id);
+  }
 
   const ENGINE_LABEL: Record<KnotState, string> = {
     idle: "local engine · idle",
@@ -161,28 +212,13 @@
 
   <div class="lh-conv-list flex-1 overflow-y-auto px-1.5 pb-2 pt-1">
     <div
-      class="px-2.5 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-[0.06em] text-text-3"
-    >
-      Pinned
-    </div>
-    {#each PINNED as c (c.title)}
-      <ConversationRow
-        title={c.title}
-        route={c.route}
-        meta={c.meta}
-        active={activeConv === c.title}
-        onclick={() => nav.go("main")}
-      />
-    {/each}
-
-    <div
       class="flex items-center justify-between px-2.5 pb-1 pr-2 pt-3 text-[10px] font-semibold uppercase tracking-[0.06em] text-text-3"
     >
       Sessions
       <button
         type="button"
         aria-label="New session"
-        onclick={() => (onnewsession ? onnewsession() : nav.go("empty"))}
+        onclick={handleNewSession}
         class="grid h-[18px] w-[18px] place-items-center rounded-[var(--r)] border-0 bg-transparent p-0 text-text-3 transition-colors duration-100 hover:bg-surface-hover hover:text-text"
       >
         <svg
@@ -197,15 +233,19 @@
         </svg>
       </button>
     </div>
-    {#each SESSIONS as c (c.title)}
-      <ConversationRow
-        title={c.title}
-        route={c.route}
-        meta={c.meta}
-        active={activeConv === c.title}
-        onclick={() => nav.go("main")}
-      />
-    {/each}
+    {#if $conversations.length === 0}
+      <p class="px-2.5 py-2 text-[12px] text-text-3">No sessions yet.</p>
+    {:else}
+      {#each $conversations as c (c.id)}
+        <ConversationRow
+          title={c.name}
+          route={rowRoute(c)}
+          meta={relativeTime(c.created_at)}
+          active={$activeConversationId === c.id}
+          onclick={() => handleSelectConversation(c.id)}
+        />
+      {/each}
+    {/if}
   </div>
 
   <div class="relative flex-shrink-0 border-t border-border px-2.5 pb-2.5 pt-2">
@@ -222,9 +262,9 @@
       </div>
     </div>
     <ProfileSwitcher
-      profiles={PROFILES}
-      active={profile}
-      onswitch={(name) => (profile = name)}
+      profiles={switcherProfiles}
+      active={$activeProfile?.name ?? ""}
+      onswitch={handleProfileSwitch}
     />
   </div>
 </aside>

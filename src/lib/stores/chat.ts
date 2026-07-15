@@ -38,6 +38,18 @@ export interface Message {
   error?: string;
   /** Source of the error: "gate" | "routing" | "model" | null. */
   error_source?: string | null;
+  /**
+   * The §7 gate's decision for this turn: "allow" | "route_local" | "block".
+   * `null`/undefined while a fresh send hasn't resolved yet. A `Block`
+   * decision never gets a persisted row (see loop_mod.rs), so this is only
+   * ever "block" on a message that's live in this session — hydrated
+   * history will show "allow" or "route_local".
+   */
+  routing_decision?: string | null;
+  /** Model name that served this turn, when known. */
+  model?: string | null;
+  /** Provider id that served this turn — cross-reference providersStore for its kind (local/cloud). */
+  provider_id?: string | null;
 }
 
 export interface Conversation {
@@ -233,6 +245,7 @@ export async function sendMessage(
   content: string,
   providerId: string | null,
   model: string | null,
+  bindingOverride?: Binding,
 ): Promise<void> {
   if (!content.trim()) return;
 
@@ -243,9 +256,10 @@ export async function sendMessage(
   }
   const conversationId = activeId;
 
-  // Resolve the binding from the active conversation.
+  // Resolve the binding: an explicit per-send override (e.g. a composer's
+  // Auto/Public/Private control) wins over the conversation's stored default.
   const conv = get(conversations).find((c) => c.id === conversationId);
-  const binding = conv?.binding ?? "auto";
+  const binding = bindingOverride ?? conv?.binding ?? "auto";
 
   // Resolve profile.
   const profile = getActiveProfileId();
@@ -271,6 +285,8 @@ export async function sendMessage(
     content: "",
     created_at: Date.now() + 1,
     streaming: true,
+    model: modelArg || null,
+    provider_id: providerIdArg || null,
   };
 
   conversations.update((list) =>
@@ -343,7 +359,17 @@ export async function sendMessage(
       // local placeholder id to avoid a duplicate-key collision in the store.
       const { error, source } = streamError;
       const targetId = resolvedMessageId ?? assistantId;
-      finalizeMessage(conversationId, targetId, `⚠ ${error}`, error, source);
+      // A gate-sourced stream:error IS the "block" decision — the backend
+      // never persists a routing_decision for it (no row is written), so
+      // this live flag is the only place that fact is ever recorded.
+      finalizeMessage(
+        conversationId,
+        targetId,
+        `⚠ ${error}`,
+        error,
+        source,
+        source === "gate" ? "block" : undefined,
+      );
     } else {
       // Success path. If no token stream established the id yet (e.g. an
       // empty completion), adopt the canonical server id now. Only reached
@@ -364,8 +390,16 @@ export async function sendMessage(
         );
       }
       // Clear streaming flag and (defensively) reconcile content to the
-      // canonical response text in case a token was lost.
-      finalizeMessage(conversationId, resolvedMessageId, response.content);
+      // canonical response text in case a token was lost. Also stamp the
+      // real routing_decision ("allow" | "route_local") the backend used.
+      finalizeMessage(
+        conversationId,
+        resolvedMessageId,
+        response.content,
+        undefined,
+        undefined,
+        response.routing_decision,
+      );
     }
   } catch (err) {
     // Surface the error inline rather than throwing — the chat panel
@@ -409,6 +443,9 @@ function msgFromInfo(info: MessageInfo): Message {
     streaming: false,
     error: info.error ?? undefined,
     error_source: null,
+    routing_decision: info.routing_decision,
+    model: info.model,
+    provider_id: info.provider_id,
   };
 }
 
@@ -469,6 +506,7 @@ function finalizeMessage(
   finalContent: string,
   error?: string,
   errorSource?: string,
+  routingDecision?: string,
 ): void {
   conversations.update((list) =>
     list.map((c) =>
@@ -483,6 +521,7 @@ function finalizeMessage(
                     streaming: false,
                     error: error ?? m.error,
                     error_source: errorSource ?? m.error_source,
+                    routing_decision: routingDecision ?? m.routing_decision,
                   }
                 : m,
             ),
