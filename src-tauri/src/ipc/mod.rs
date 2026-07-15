@@ -391,9 +391,13 @@ pub async fn send_message(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Look up the assistant message id we just persisted. We re-query
-    // the profile db (read-only) and pick the most recent assistant row.
-    let message_id = state
+    // Look up the assistant message we just persisted. We re-query the
+    // profile db (read-only) and pick the most recent assistant row —
+    // this gives us both the message id AND the real routing decision
+    // that process_message stamped on it (e.g. "allow", "route_local",
+    // "tool_reroute_local"), so the frontend's RoutingBadge is honest on
+    // a live send instead of only after a reload.
+    let assistant_row = state
         .storage
         .open_profile(&profile)
         .ok()
@@ -402,16 +406,25 @@ pub async fn send_message(
             rows.into_iter()
                 .rev()
                 .find(|m| m.role == "assistant")
-                .map(|m| m.id)
-        })
+        });
+
+    let message_id = assistant_row
+        .as_ref()
+        .map(|m| m.id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let routing_decision = assistant_row
+        .as_ref()
+        .and_then(|m| m.routing_decision.as_deref())
+        .unwrap_or("allow")
+        .to_string();
 
     Ok(SendMessageResponse {
         message_id,
         content,
         conversation_id,
         profile,
-        routing_decision: "allow".to_string(),
+        routing_decision,
         completed_at: chrono::Utc::now().timestamp_millis().max(started),
     })
 }
