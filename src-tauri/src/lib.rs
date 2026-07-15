@@ -58,6 +58,20 @@ pub fn run() {
                 .map_err(|e| format!("failed to open storage at {}: {e}", base_path.display()))?;
             let storage = Arc::new(storage);
 
+            // Crash-recovery boot pass (Q3 do-now item 4): terminalize any
+            // conversation left mid-tool-call by an unclean shutdown of the
+            // previous run, before the agent loop or any IPC command touches
+            // it. Deliberately NOT `?`-propagated — a reconciliation failure
+            // must not brick app boot.
+            match crate::agent::crash_recovery::run_boot_pass(&storage) {
+                Ok(report) if !report.interrupted.is_empty() => tracing::warn!(
+                    count = report.interrupted.len(),
+                    "crash-recovery: reconciled interrupted tool calls from a previous run"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "crash-recovery boot pass failed; continuing startup"),
+            }
+
             // Load persisted providers from global.db::endpoints and
             // hydrate the in-memory ModelManager.
             let model_manager = Arc::new(ModelManager::new());

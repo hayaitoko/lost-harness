@@ -1,0 +1,181 @@
+//! Crash-recovery boot pass (Q3, do-now item 4).
+//!
+//! On every core init, before any conversation can be touched, reconcile the
+//! one kind of state this codebase can actually leave dangling after an
+//! unclean shutdown — an `assistant` turn that opened a tool call whose
+//! result was never persisted — by writing a durable, transcript-visible
+//! "tool interrupted" message row.
+//!
+//! **Why this is a boot pass, not a per-turn check.** Detection requires
+//! comparing the last message of every conversation on disk to the "did
+//! the tool reply arrive" invariant. That scan is cheap, runs once at
+//! startup, and gets ahead of the agent loop so a user opening the app
+//! after a crash sees the explanation in the transcript immediately
+//! instead of only after sending a new message.
+//!
+//! **Why a `tool` role for the repair row, not a fresh `assistant`
+//! apology.** A `tool` row closes the dangling tool call — the
+//! conversation's last message is no longer an unanswered `assistant`
+//! turn asking for a tool to run. The next assistant reply (when the user
+//! sends a new prompt) sees a clean state: `user → assistant(tool
+//! call) → tool(interrupted) → user(new) → assistant(new)`. The agent
+//! loop treats a `role="tool"` row as a tool result it can summarize
+//! just like any other tool result.
+//!
+//! **Idempotent by construction, no extra flag needed.** The repair row
+//! has `role: "tool"`, so on a second boot pass the conversation's last
+//! message is `tool`, not `assistant` — it's skipped automatically. No
+//! "already_reconciled" marker to drift.
+//!
+//! **Two explicit non-goals** (per the build-plan Invariants): we do NOT
+//! touch (a) a conversation whose last message is `role: "user"` with
+//! no assistant reply, or (b) one whose last message is `role: "tool"`
+//! with no follow-up assistant reply. Both are normal states, not crash
+//! damage — the user is waiting on a reply / the model hasn't answered
+//! yet. The detection rule is narrowly: "assistant + open `tool` fence,
+//! nothing after."
+
+use anyhow::{Context, Result};
+use uuid::Uuid;
+
+use crate::storage::{Message, ProfileDb, Storage};
+use crate::tools::calling::contains_open_tool_fence;
+
+/// String tag persisted in `messages.error` for the repair row. Stable —
+/// UI or downstream tooling can branch on it without parsing content.
+pub const INTERRUPTED_ERROR_TAG: &str = "interrupted_by_crash";
+
+/// Routing-decision label written on the repair row. Distinguishes the
+/// row from a real tool result and from the model's own error rows.
+const REPAIR_ROUTING_DECISION: &str = "crash_recovery";
+
+/// Verbatim content the repair row puts in the transcript. Loud, plain
+/// English, no model-isms — the user has to read this without an LLM in
+/// the loop. The bracketed `[tool interrupted]` prefix lets the UI
+/// surface it as a distinct event without parsing free-form text.
+const REPAIR_CONTENT: &str = "[tool interrupted] The app closed or crashed before this tool call \
+                              could run or return a result. No tool ran and nothing changed. \
+                              Ask again if you still need this action.";
+
+/// Summary of one boot-pass run. Returned (and logged) so a future
+/// caller (CLI, IPC) can surface "reconciled N interrupted tool calls"
+/// without re-walking the DBs. `interrupted` is `(profile_name,
+/// conversation_id)`; `profile_errors` is `(profile_name, error)` for
+/// profiles that failed to open OR failed to reconcile — `run_boot_pass`
+/// never aborts the rest of the pass on a per-profile failure.
+#[derive(Debug, Default, Clone)]
+pub struct CrashRecoveryReport {
+    pub profiles_scanned: usize,
+    pub interrupted: Vec<(String, String)>,
+    pub profile_errors: Vec<(String, String)>,
+}
+
+/// Reconcile ONE already-open profile DB in a single transaction. Returns
+/// the ids of conversations that were terminalized. Exposed at this
+/// granularity so tests can drive it directly against
+/// `ProfileDb::open_in_memory` with no `Storage`/tempdir needed.
+///
+/// The transaction handle is held across `add_message` /
+/// `list_conversations` / `list_messages_by_conversation` — all three
+/// execute on `self.raw()` (the same `Connection`), so calling them
+/// while the `Transaction` handle is alive keeps them inside it. Same
+/// pattern as `storage::migrations::run_migrations`.
+pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
+    let tx = db
+        .raw()
+        .unchecked_transaction()
+        .context("crash-recovery: starting transaction")?;
+    let mut terminalized = Vec::new();
+
+    for conv in db
+        .list_conversations()
+        .context("crash-recovery: listing conversations")?
+    {
+        let msgs = db
+            .list_messages_by_conversation(&conv.id)
+            .context("crash-recovery: loading messages")?;
+        let Some(last) = msgs.last() else {
+            continue;
+        };
+        // Only an assistant message that opened a tool call and got no
+        // reply is "non-terminal" in this codebase. Plain-text final
+        // answers (no fence), already-completed tool rounds (last is
+        // role="tool"), and dangling user messages (last is role="user")
+        // are all normal states — see module docs.
+        if last.role != "assistant" || !contains_open_tool_fence(&last.content) {
+            continue;
+        }
+        let repair = Message {
+            id: Uuid::new_v4().to_string(),
+            conversation_id: conv.id.clone(),
+            role: "tool".to_string(),
+            content: REPAIR_CONTENT.to_string(),
+            model: None,
+            provider_id: None,
+            routing_decision: Some(REPAIR_ROUTING_DECISION.to_string()),
+            thinking_content: None,
+            error: Some(INTERRUPTED_ERROR_TAG.to_string()),
+            aborted: true,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        db.add_message(&repair)
+            .context("crash-recovery: persisting interrupted-tool event")?;
+        terminalized.push(conv.id.clone());
+
+        // TODO(item 5, once tool_audit exists): also insert an audit row
+        // here with outcome = "interrupted". Not required for this
+        // item's acceptance criteria — the message row above is already
+        // a durable, visibly-reported event on its own.
+    }
+
+    // Expire persisted pending-approval artifacts. No-op today:
+    // ApprovalLedger (hooks/approval.rs) and ApprovalRegistry
+    // (ipc/approval.rs) are in-memory only — see the "No half-durability"
+    // note in hooks/approval.rs's module doc — so there is nothing
+    // persisted to expire yet. Kept as an explicit, named step so this
+    // pass already has the right shape once a persisted artifact exists.
+
+    tx.commit().context("crash-recovery: committing transaction")?;
+    Ok(terminalized)
+}
+
+/// Run once at core init, across every profile on disk, before anything
+/// else touches storage. Never `?`-propagates from the caller — a boot
+/// pass failure must not brick app boot (see build-plan Invariants).
+pub fn run_boot_pass(storage: &Storage) -> Result<CrashRecoveryReport> {
+    let mut report = CrashRecoveryReport::default();
+    let names = storage
+        .list_profile_names()
+        .context("crash-recovery: listing profiles")?;
+    for name in names {
+        report.profiles_scanned += 1;
+        let db = match storage.open_profile(&name) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!(
+                    profile = %name,
+                    error = %e,
+                    "crash-recovery: could not open profile; skipping"
+                );
+                report.profile_errors.push((name, e.to_string()));
+                continue;
+            }
+        };
+        match reconcile_profile_db(&db) {
+            Ok(ids) => {
+                report
+                    .interrupted
+                    .extend(ids.into_iter().map(|id| (name.clone(), id)));
+            }
+            Err(e) => {
+                tracing::error!(
+                    profile = %name,
+                    error = %e,
+                    "crash-recovery: reconciliation failed; skipping profile"
+                );
+                report.profile_errors.push((name, e.to_string()));
+            }
+        }
+    }
+    Ok(report)
+}

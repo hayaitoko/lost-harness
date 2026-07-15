@@ -22,6 +22,23 @@
 //! persistent `PolicySource` (SQLite `tool_rules`, PLAN M4) — until that
 //! lands, `Always` is treated as `Session` here (works for the session, does
 //! not survive a restart); see [`ApprovalLedger::grant`].
+//!
+//! **No half-durability (Q3).** Never persist an approval/intent without
+//! also persisting the execution state machine it authorizes (a journal
+//! row written *before* the side effect, with an idempotency key; boot
+//! then reconciles "intent without effect" by re-confirming, never by
+//! re-running). A persisted grant plus volatile run state is exactly the
+//! double-execution bug — all-volatile, today's state, is safe. This is
+//! *why* `Once`/`Session` living only in this in-memory ledger is
+//! correct, not a gap: force-quit between "user clicked Allow" and
+//! `tool.run` executing loses the grant and the tool never ran — nothing
+//! to reconcile, the user re-asks and re-approves. `agent::crash_recovery`
+//! terminalizes the *turn* left hanging by that scenario, but has nothing
+//! to do for approvals specifically until a real persisted artifact
+//! exists. Keep it that way until the action journal lands (deferred to
+//! the first non-idempotent external-effect tool), and route
+//! `GrantScope::Always` through a rule table (Q8) rather than a "pending
+//! armed action" when that work starts.
 
 use std::collections::HashSet;
 use std::future::Future;

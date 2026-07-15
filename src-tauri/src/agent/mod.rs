@@ -8,10 +8,13 @@
 //!
 //! The tool registry comes in later milestones.
 
+pub mod crash_recovery;
 pub mod egress;
 pub mod gate;
 pub mod loop_mod;
 
+#[cfg(test)]
+mod crash_recovery_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]

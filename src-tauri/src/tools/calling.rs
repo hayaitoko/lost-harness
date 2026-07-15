@@ -52,7 +52,7 @@ pub enum ParsedToolCall {
 /// The opening fence, matched case-insensitively after trimming. Accepts
 /// ```` ```tool ```` only — not ```` ```json ```` or prose fences — so
 /// ordinary fenced code the model writes is never mistaken for a call.
-const FENCE_OPEN: &str = "```tool";
+pub(crate) const FENCE_OPEN: &str = "```tool";
 const FENCE_CLOSE: &str = "```";
 
 /// Extract every tool call from the model's **own current-turn output**.
@@ -148,6 +148,19 @@ pub fn render_tool_catalog(tools: &[&dyn Tool]) -> String {
         }
     }
     s
+}
+
+/// True if `text` contains an opening ```` ```tool ```` fence line — the
+/// same match rule `parse_tool_calls` uses (trimmed, case-insensitive
+/// whole-line match). Pure structural check: does not parse JSON, does
+/// not construct a `ToolCall`, and must never feed into dispatch. Safe
+/// to call on **stored/historical** message content (unlike
+/// `parse_tool_calls`, which is reserved for the model's own
+/// current-turn output — see that function's safety contract). Used by
+/// the crash-recovery boot pass to detect "this turn asked for a tool
+/// call" without touching the parse-and-dispatch path at all.
+pub(crate) fn contains_open_tool_fence(text: &str) -> bool {
+    text.lines().any(|l| l.trim().eq_ignore_ascii_case(FENCE_OPEN))
 }
 
 /// Neutralize the structural tokens untrusted or model-controlled text could
@@ -310,5 +323,59 @@ mod tests {
     #[test]
     fn render_catalog_is_empty_with_no_tools() {
         assert_eq!(render_tool_catalog(&[]), "");
+    }
+
+    // ── contains_open_tool_fence ──────────────────────────────────────────
+    // Pure structural check, used by the crash-recovery boot pass on
+    // stored/historical message content. Must never parse JSON or touch
+    // the dispatch path — these tests pin those guarantees.
+
+    #[test]
+    fn contains_open_tool_fence_matches_a_real_tool_fence_line() {
+        let text = "I'll check that for you.\n\
+                    ```tool\n\
+                    {\"name\": \"read_file\", \"args\": {\"path\": \"a.txt\"}}\n\
+                    ```\n";
+        assert!(
+            contains_open_tool_fence(text),
+            "a ```tool line in a fenced block must be detected"
+        );
+    }
+
+    #[test]
+    fn contains_open_tool_fence_matches_case_variants_and_trimming() {
+        // Case variant + leading whitespace.
+        assert!(contains_open_tool_fence("   ```Tool\n"));
+        // Upper case.
+        assert!(contains_open_tool_fence("```TOOL\n"));
+        // Trailing whitespace.
+        assert!(contains_open_tool_fence("```tool   \n"));
+        // No trailing newline (last line of input).
+        assert!(contains_open_tool_fence("```tool"));
+    }
+
+    #[test]
+    fn contains_open_tool_fence_does_not_match_a_json_fence() {
+        // ```json blocks are ordinary content, not tool calls.
+        let text = "Here is some JSON:\n```json\n{\"name\": \"read_file\"}\n```\n";
+        assert!(
+            !contains_open_tool_fence(text),
+            "a ```json fence must not be mistaken for a ```tool fence"
+        );
+    }
+
+    #[test]
+    fn contains_open_tool_fence_does_not_match_a_bare_fence_or_prose() {
+        // A bare ``` fence (closing fence only — no `tool` marker).
+        assert!(!contains_open_tool_fence("```"));
+        // Empty / plain prose.
+        assert!(!contains_open_tool_fence(""));
+        assert!(!contains_open_tool_fence("Just a normal answer with no fences."));
+        // `tool` mentioned in prose, NOT as a fence marker.
+        assert!(!contains_open_tool_fence(
+            "I considered using a tool here, but decided not to."
+        ));
+        // `tool` substring inside another fence name (e.g. `toolbox`).
+        assert!(!contains_open_tool_fence("```toolbox\n"));
     }
 }
