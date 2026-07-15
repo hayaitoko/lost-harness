@@ -18,7 +18,8 @@
 //! feedback message to hand back to the model — with tool *output* (which
 //! the agent did not author) guard-wrapped as untrusted.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -31,7 +32,39 @@ use crate::models::{ChatMessage, OwnOutput};
 use crate::tools::calling::{
     guard_wrap, neutralize_untrusted, parse_tool_calls, render_tool_catalog, ParsedToolCall,
 };
-use crate::tools::{BodyEnv, ConversationReads, ExecCtx, ToolCall, ToolInput, ToolRegistry, ToolResult};
+use crate::tools::{BodyEnv, ConversationReads, ExecCtx, RiskClass, ToolCall, ToolInput, ToolRegistry, ToolResult};
+
+// ── Q4 do-now budgets ──────────────────────────────────────────────────────
+//
+// Three pre-dispatch circuit breakers inside `run_turn`. All three deny the
+// call with `ToolOutcome::Denied` BEFORE `self.dispatch()` runs — the call
+// never reaches the hook chain or `Tool::run`. This mirrors the existing
+// `Unknown` / `Unavailable` precedent in `dispatch()` itself.
+
+// Q4 do-now: max tool calls (successful or not, malformed blocks count)
+// processed in a single model turn (one `run_turn` call). Excess calls in
+// that turn are denied without being attempted; the turn stops early.
+const PER_TURN_CALL_CEILING: usize = 8;
+// Max calls actually passed to `dispatch()` between one user message and
+// the next (one "run" = one `stream_to_provider` invocation, reset via
+// `begin_run`). The real runaway bound — turns can repeat many times.
+const PER_RUN_DISPATCH_CEILING: usize = 50;
+// An identical fingerprint reaching `dispatch()` this many times within
+// one run is denied on the Nth+ attempt instead of running again.
+const REPEAT_DETECTION_THRESHOLD: usize = 3;
+
+/// Run-scoped state held by `ToolDispatcher`. Persists across turns within
+/// one user message, reset only by `begin_run()`.
+#[derive(Debug, Default)]
+struct RunState {
+    /// Calls actually passed to `dispatch()` since the last `begin_run()`.
+    dispatch_count: usize,
+    /// Fingerprints of dispatched calls this run, in order, capped at
+    /// `PER_RUN_DISPATCH_CEILING` entries (a run can never exceed that many
+    /// real dispatches, so eviction is defensive, not load-bearing under
+    /// default config).
+    recent_fingerprints: VecDeque<String>,
+}
 
 /// The result of dispatching one tool call. Every non-`Ok` variant is a
 /// distinct, explainable reason the tool did *not* run — the agent is told
@@ -75,6 +108,13 @@ pub struct ToolDispatcher {
     /// early turn is still visible to a write many turns later) and injected
     /// into each tool's `ExecCtx` at the `Tool::run` call site below.
     reads: Arc<ConversationReads>,
+    /// Q4 do-now: per-run budget + repeat-detection state. Persists across
+    /// turns within one user message, reset only by `begin_run()`. Safe as a
+    /// single mutable slot because `AgentLoop::stream_lock` serializes
+    /// `process_message` (Q10 single-in-flight) — only one run is ever in
+    /// flight against a given dispatcher. If concurrent runs are ever
+    /// allowed, this must become per-conversation-keyed.
+    run_state: Mutex<RunState>,
 }
 
 impl ToolDispatcher {
@@ -86,6 +126,7 @@ impl ToolDispatcher {
             ledger: Arc::new(ApprovalLedger::new()),
             approver: None,
             reads: Arc::new(ConversationReads::new()),
+            run_state: Mutex::new(RunState::default()),
         }
     }
 
@@ -107,6 +148,20 @@ impl ToolDispatcher {
     /// tests, which don't drive `send_message`).
     pub fn empty() -> Self {
         Self::new(ToolRegistry::new(), HookChain::new(), BodyEnv::empty())
+    }
+
+    /// Start a fresh budget window: zero the per-run dispatch counter and
+    /// clear the repeat-detection ring. Call once per user message, before
+    /// the first `run_turn` of that run (`AgentLoop::stream_to_provider`).
+    ///
+    /// Safe as a single mutable slot because `AgentLoop::stream_lock`
+    /// serializes `process_message` calls (Q10 single-in-flight) — only one
+    /// run is ever in flight against a given dispatcher. If concurrent runs
+    /// are ever allowed, this must become per-conversation-keyed.
+    pub fn begin_run(&self) {
+        let mut state = self.run_state.lock().expect("run_state mutex poisoned");
+        state.dispatch_count = 0;
+        state.recent_fingerprints.clear();
     }
 
     /// The system-prompt fragment teaching the fenced dialect and listing
@@ -278,6 +333,22 @@ impl ToolDispatcher {
     /// `OwnOutput::from_stream_assembly` can produce one, and the agent
     /// loop calls it exactly once, right after the SSE-delta assembly
     /// loop.
+    ///
+    /// Pre-dispatch circuit breakers (Q4 do-now item 2), all enforced
+    /// BEFORE `self.dispatch()` is reached:
+    ///   1. Per-turn call ceiling (`PER_TURN_CALL_CEILING`) — every parsed
+    ///      item counts, malformed included; excess items are denied and
+    ///      the turn stops early.
+    ///   2. Per-run dispatch ceiling (`PER_RUN_DISPATCH_CEILING`) — only
+    ///      calls actually passed to `dispatch()` count. Resets on
+    ///      `begin_run()`.
+    ///   3. Identical-fingerprint repeat detection
+    ///      (`REPEAT_DETECTION_THRESHOLD`) — same call + same args
+    ///      dispatched ≥ 3 times in one run is denied.
+    ///   4. Deny-cascades-to-skip — an earlier `by:"user"` deny in this
+    ///      turn skips every not-yet-run non-`Safe` call without
+    ///      prompting. Policy/sandbox/privacy-filter denials do NOT trip
+    ///      the cascade.
     pub async fn run_turn(
         &self,
         own_output: &OwnOutput,
@@ -290,8 +361,30 @@ impl ToolDispatcher {
             return None;
         }
 
+        let total = parsed.len();
         let mut sections = Vec::new();
-        for item in parsed {
+        let mut turn_call_count: usize = 0;
+        let mut cascade_active = false;
+
+        for (idx, item) in parsed.into_iter().enumerate() {
+            // Per-turn ceiling: every item counts, malformed included.
+            if turn_call_count >= PER_TURN_CALL_CEILING {
+                let remaining = total - idx;
+                sections.push(format_outcome(
+                    "tool_call_budget",
+                    ToolOutcome::Denied {
+                        by: "budget".to_string(),
+                        reason: format!(
+                            "per-turn tool-call limit ({PER_TURN_CALL_CEILING}) reached this turn; \
+                             {remaining} further call(s) in this reply were not run — stop and \
+                             summarize what you've done so far."
+                        ),
+                    },
+                ));
+                break;
+            }
+            turn_call_count += 1;
+
             match item {
                 ParsedToolCall::Malformed { raw, error } => {
                     sections.push(format!(
@@ -301,7 +394,84 @@ impl ToolDispatcher {
                 }
                 ParsedToolCall::Call(call) => {
                     let name = call.name.clone();
+
+                    // Deny-cascades-to-skip: an earlier USER deny this turn skips
+                    // every not-yet-run non-Safe call without prompting. An
+                    // unresolvable (unknown) tool is treated as non-Safe (fail
+                    // closed). Safe reads still run.
+                    if cascade_active {
+                        let is_safe = self
+                            .registry
+                            .get(&call.name)
+                            .map(|t| t.risk() == RiskClass::Safe)
+                            .unwrap_or(false);
+                        if !is_safe {
+                            sections.push(format_outcome(
+                                &name,
+                                ToolOutcome::Denied {
+                                    by: "batch".to_string(),
+                                    reason: "an earlier call in this batch was denied"
+                                        .to_string(),
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
+                    // Per-run ceiling + repeat detection, checked before this
+                    // call is actually passed to `dispatch()`. Lock is block-
+                    // scoped so we never hold the guard across the await.
+                    let fingerprint = ActionFingerprint::of(&call.name, &call.args);
+                    let budget_denial: Option<(String, bool)> = {
+                        let mut state =
+                            self.run_state.lock().expect("run_state mutex poisoned");
+                        if state.dispatch_count >= PER_RUN_DISPATCH_CEILING {
+                            Some((
+                                format!(
+                                    "per-run tool-dispatch limit ({PER_RUN_DISPATCH_CEILING}) \
+                                     reached for this run — stop and summarize what you've \
+                                     done so far."
+                                ),
+                                true, // stop the rest of this turn too
+                            ))
+                        } else if state
+                            .recent_fingerprints
+                            .iter()
+                            .filter(|fp| **fp == fingerprint)
+                            .count()
+                            >= REPEAT_DETECTION_THRESHOLD - 1
+                        {
+                            Some((
+                                "repeat detected — same call, same args".to_string(),
+                                false,
+                            ))
+                        } else {
+                            state.dispatch_count += 1;
+                            if state.recent_fingerprints.len() >= PER_RUN_DISPATCH_CEILING {
+                                state.recent_fingerprints.pop_front();
+                            }
+                            state.recent_fingerprints.push_back(fingerprint.clone());
+                            None
+                        }
+                    };
+                    if let Some((reason, stop_turn)) = budget_denial {
+                        sections.push(format_outcome(
+                            &name,
+                            ToolOutcome::Denied {
+                                by: "budget".to_string(),
+                                reason,
+                            },
+                        ));
+                        if stop_turn {
+                            break;
+                        }
+                        continue;
+                    }
+
                     let outcome = self.dispatch(&call, ctx, binding, is_cloud).await;
+                    if matches!(&outcome, ToolOutcome::Denied { by, .. } if by == "user") {
+                        cascade_active = true;
+                    }
                     sections.push(format_outcome(&name, outcome));
                 }
             }
@@ -395,6 +565,36 @@ mod tests {
             // Named like a shell tool so the sandbox denylist can match on
             // its canonical command text.
             "shell_exec"
+        }
+        fn requires(&self) -> &[Capability] {
+            &[]
+        }
+        fn run<'a>(
+            &'a self,
+            input: ToolInput,
+            _ctx: &'a ExecCtx,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+            self.ran.store(true, Ordering::SeqCst);
+            Box::pin(async move { ToolResult::Ok(input.args) })
+        }
+    }
+
+    /// Sibling of `SpyTool` whose `name` and `risk` are configurable — used
+    /// to exercise the cascade-skip rule for a non-`Safe` tool (the
+    /// existing `SpyTool` hardcodes `name = "shell_exec"` and `risk = Safe`,
+    /// which would always be the safe-read carve-out under cascade).
+    struct TaggedSpyTool {
+        name: String,
+        risk: RiskClass,
+        ran: Arc<AtomicBool>,
+    }
+
+    impl Tool for TaggedSpyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn risk(&self) -> RiskClass {
+            self.risk
         }
         fn requires(&self) -> &[Capability] {
             &[]
@@ -832,5 +1032,496 @@ mod tests {
             "read→write across calls must be allowed, got {ok:?}"
         );
         assert_eq!(std::fs::read_to_string(root.join("doc.txt")).unwrap(), "rewritten");
+    }
+
+    // ── Q4 do-now item 2: per-turn + per-run budgets, repeat detection,
+    //    deny-cascades-to-skip ─────────────────────────────────────────
+
+    /// Build a model-output string with N ```tool ... ``` blocks, one per
+    /// element in `blocks` (each entry is the raw JSON body of one block).
+    fn model_output(blocks: &[&str]) -> String {
+        let mut s = String::new();
+        for b in blocks {
+            s.push_str("```tool\n");
+            s.push_str(b);
+            s.push_str("\n```\n");
+        }
+        s
+    }
+
+    /// Split the joined `run_turn` feedback back into its sections
+    /// (separated by the `\n\n` join `run_turn` uses). Used to count how
+    /// many calls actually got attempted in one turn.
+    fn split_sections(feedback: &str) -> Vec<&str> {
+        feedback.split("\n\n").collect()
+    }
+
+    /// Bare dispatchers used by the budget tests: just an `EchoTool` and no
+    /// gating chain (the budgets fire before the chain runs, so an empty
+    /// chain keeps the noise down — every Ok comes from the tool itself).
+    fn echo_dispatcher() -> ToolDispatcher {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty())
+    }
+
+    /// Dispatcher wired for cascade tests: two `TaggedSpyTool`s with
+    /// `RiskClass::Write` in `Ask` mode, plus a `Safe` `EchoTool` that's
+    /// pre-trusted. The shared `MockPrompter` answers every prompt with
+    /// `MockResponse::Deny`, so a Write-risk call that *does* reach the
+    /// prompter is denied — and we can count how many times the prompter
+    /// was actually asked to verify the cascade-skip fired.
+    fn cascade_dispatcher(
+        response: MockResponse,
+    ) -> (ToolDispatcher, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let ran_a = Arc::new(AtomicBool::new(false));
+        let ran_b = Arc::new(AtomicBool::new(false));
+        let ran_echo = Arc::new(AtomicBool::new(false));
+        let prompter_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaggedSpyTool {
+            name: "tool_a".to_string(),
+            risk: RiskClass::Write,
+            ran: ran_a.clone(),
+        }));
+        registry.register(Box::new(TaggedSpyTool {
+            name: "tool_b".to_string(),
+            risk: RiskClass::Write,
+            ran: ran_b.clone(),
+        }));
+        // A real EchoTool whose `ran` we can poll — except `EchoTool` is a
+        // unit struct. Track via the registered reference's outcome instead
+        // of the trait's `ran` (the dispatcher returns `Ok` only when the
+        // tool actually ran, so the Ok section is our signal).
+        let _ = ran_echo; // silence unused warning; see below for usage
+        registry.register(Box::new(EchoTool));
+
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("tool_a", PermissionMode::Ask);
+        policy.set_mode("tool_b", PermissionMode::Ask);
+        // echo is unconfigured + pre-confirmed → gating passes.
+        let chain = build_pretooluse_chain_full(
+            gate(),
+            Box::new(policy),
+            &["echo"],
+            Arc::clone(&ledger),
+        );
+
+        let prompter: Arc<dyn ApprovalPrompter> = Arc::new(MockPrompter {
+            response,
+            calls: prompter_calls.clone(),
+        });
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
+            .with_approval(ledger, Some(prompter));
+        (dispatcher, prompter_calls, ran_a, ran_b, ran_echo)
+    }
+
+    #[tokio::test]
+    async fn per_turn_ceiling_denies_the_ninth_call_and_stops_the_turn() {
+        // 10 distinct-arg echo blocks in one run_turn. Budget fires on the
+        // 9th item (index 8) and `break`s; the 9th and 10th never get their
+        // own section.
+        let dispatcher = echo_dispatcher();
+        let blocks: Vec<String> = (0..10)
+            .map(|i| format!(r#"{{"name": "echo", "args": {{"n": {i}}}}}"#))
+            .collect();
+        let block_refs: Vec<&str> = blocks.iter().map(String::as_str).collect();
+
+        let feedback = dispatcher
+            .run_turn(
+                &own(&model_output(&block_refs)),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await
+            .expect("a tool was called, so there must be feedback");
+
+        let sections = split_sections(&feedback.content);
+        assert_eq!(sections.len(), 9, "sections: {sections:?}");
+
+        let ok_sections = sections
+            .iter()
+            .filter(|s| s.starts_with("[tool echo → ok]"))
+            .count();
+        assert_eq!(ok_sections, 8, "expected 8 ok sections, got {ok_sections}");
+
+        let budget_sections = sections
+            .iter()
+            .filter(|s| s.contains("→ denied by budget"))
+            .count();
+        assert_eq!(budget_sections, 1, "expected 1 budget denial, got {budget_sections}");
+
+        // The budget denial must mention the limit and the suppressed tail.
+        let budget = sections
+            .iter()
+            .find(|s| s.contains("→ denied by budget"))
+            .expect("budget denial present");
+        assert!(budget.contains("per-turn tool-call limit (8)"), "reason: {budget}");
+        assert!(budget.contains("2 further call(s)"), "reason: {budget}");
+    }
+
+    #[tokio::test]
+    async fn malformed_blocks_count_toward_the_per_turn_ceiling() {
+        // 5 valid + 4 malformed = 9 items. The 9th is the budget denial —
+        // proves malformed items consume the per-turn counter the same
+        // way valid items do.
+        let dispatcher = echo_dispatcher();
+        let blocks = [
+            r#"{"name": "echo", "args": {"n": 0}}"#,
+            r#"{"name": "echo", "args": {"n": 1}}"#,
+            "{not valid json}",
+            r#"{"name": "echo", "args": {"n": 2}}"#,
+            "{also bad",
+            r#"{"name": "echo", "args": {"n": 3}}"#,
+            "{still bad",
+            r#"{"name": "echo", "args": {"n": 4}}"#,
+            "{final bad",
+        ];
+
+        let feedback = dispatcher
+            .run_turn(
+                &own(&model_output(&blocks)),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await
+            .expect("a tool was called, so there must be feedback");
+
+        let sections = split_sections(&feedback.content);
+        assert_eq!(sections.len(), 9, "sections: {sections:?}");
+
+        let ok = sections
+            .iter()
+            .filter(|s| s.starts_with("[tool echo → ok]"))
+            .count();
+        assert_eq!(ok, 5, "5 valid echos should run, got {ok}");
+
+        let malformed_sections = sections
+            .iter()
+            .filter(|s| s.starts_with("[tool call malformed:"))
+            .count();
+        assert_eq!(
+            malformed_sections, 3,
+            "only 3 malformed items reach the malformed arm (the 4th is the budget denial), got {malformed_sections}"
+        );
+
+        let budget_sections = sections
+            .iter()
+            .filter(|s| s.contains("→ denied by budget"))
+            .count();
+        assert_eq!(budget_sections, 1, "the 9th item is the budget denial");
+
+        // The budget denial is the LAST section — confirming the 9th item
+        // is the one that hits the ceiling (whichever type it was).
+        assert!(
+            sections.last().unwrap().contains("→ denied by budget"),
+            "the last section should be the budget denial, got: {:?}",
+            sections.last()
+        );
+    }
+
+    #[tokio::test]
+    async fn per_run_ceiling_denies_after_fifty_dispatches_across_turns() {
+        // 7 run_turn calls × 8 distinct-arg echo blocks each = 56 attempts
+        // on one dispatcher, with no begin_run() between. The 51st
+        // attempted dispatch (3rd item of the 7th turn) is denied; the
+        // first 50 are Ok.
+        let dispatcher = echo_dispatcher();
+
+        let mut total_ok = 0usize;
+        let mut total_budget = 0usize;
+        for turn in 0..7 {
+            let blocks: Vec<String> = (0..8)
+                .map(|i| {
+                    format!(
+                        r#"{{"name": "echo", "args": {{"n": {n}}}}}"#,
+                        n = turn * 8 + i
+                    )
+                })
+                .collect();
+            let block_refs: Vec<&str> = blocks.iter().map(String::as_str).collect();
+            let feedback = dispatcher
+                .run_turn(
+                    &own(&model_output(&block_refs)),
+                    &ctx(),
+                    Binding::Public,
+                    false,
+                )
+                .await
+                .expect("a tool was called, so there must be feedback");
+            let sections = split_sections(&feedback.content);
+            total_ok += sections
+                .iter()
+                .filter(|s| s.starts_with("[tool echo → ok]"))
+                .count();
+            total_budget += sections
+                .iter()
+                .filter(|s| s.contains("→ denied by budget"))
+                .count();
+        }
+
+        assert_eq!(total_ok, 50, "first 50 dispatches should run, got {total_ok}");
+        assert_eq!(
+            total_budget, 1,
+            "exactly one budget denial (the 51st), got {total_budget}"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_run_resets_the_per_run_ceiling() {
+        // Exhaust the 50-dispatch ceiling, then call begin_run() and
+        // dispatch one more — proves begin_run() clears the counter
+        // (and the repeat-detection ring, though repeat isn't exercised
+        // here).
+        let dispatcher = echo_dispatcher();
+
+        for i in 0..50 {
+            let block = format!(r#"{{"name": "echo", "args": {{"n": {i}}}}}"#);
+            let feedback = dispatcher
+                .run_turn(&own(&model_output(&[block.as_str()])), &ctx(), Binding::Public, false)
+                .await
+                .expect("a tool was called, so there must be feedback");
+            assert!(
+                feedback.content.contains("[tool echo → ok]"),
+                "dispatch {i} should succeed before the ceiling is hit, got: {}",
+                feedback.content
+            );
+        }
+
+        // 51st attempt without begin_run — must be denied.
+        let overflow_block = r#"{"name": "echo", "args": {"n": 99}}"#;
+        let overflow = dispatcher
+            .run_turn(
+                &own(&model_output(&[overflow_block])),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await
+            .expect("the model emitted a tool call, so there must be feedback");
+        assert!(
+            overflow.content.contains("→ denied by budget"),
+            "without begin_run(), the 51st dispatch is denied by budget, got: {}",
+            overflow.content
+        );
+
+        // Reset and try again — must succeed.
+        dispatcher.begin_run();
+        let reset_block = r#"{"name": "echo", "args": {"n": 100}}"#;
+        let after_reset = dispatcher
+            .run_turn(
+                &own(&model_output(&[reset_block])),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await
+            .expect("a tool was called, so there must be feedback");
+        assert!(
+            after_reset.content.contains("[tool echo → ok]"),
+            "after begin_run(), the next dispatch should run, got: {}",
+            after_reset.content
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_detection_denies_the_third_identical_call() {
+        // 3 run_turn calls each with one echo block at IDENTICAL args.
+        // The 3rd sees 2 prior identical fingerprints → repeat denial.
+        let dispatcher = echo_dispatcher();
+        let block = r#"{"name": "echo", "args": {"x": 1}}"#;
+
+        let r1 = dispatcher
+            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .await
+            .expect("a tool was called, so there must be feedback");
+        let r2 = dispatcher
+            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .await
+            .expect("a tool was called, so there must be feedback");
+        let r3 = dispatcher
+            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .await
+            .expect("a tool was called, so there must be feedback");
+
+        assert!(r1.content.contains("[tool echo → ok]"), "call 1: {}", r1.content);
+        assert!(r2.content.contains("[tool echo → ok]"), "call 2: {}", r2.content);
+
+        // Call 3 must be denied by budget with the exact repeat-detection
+        // reason string (quoted verbatim in docs/tool-system-decisions.md).
+        assert!(r3.content.contains("→ denied by budget"), "call 3: {}", r3.content);
+        assert!(
+            r3.content.contains("repeat detected — same call, same args"),
+            "call 3 reason: {}",
+            r3.content
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_detection_does_not_trip_on_different_args() {
+        // Same shape, but each call's args differ → no fingerprint
+        // accumulates against itself → all three are Ok.
+        let dispatcher = echo_dispatcher();
+
+        for i in 0..3 {
+            let block = format!(r#"{{"name": "echo", "args": {{"n": {i}}}}}"#);
+            let feedback = dispatcher
+                .run_turn(&own(&model_output(&[block.as_str()])), &ctx(), Binding::Public, false)
+                .await
+                .expect("a tool was called, so there must be feedback");
+            assert!(
+                feedback.content.contains("[tool echo → ok]"),
+                "call {i} with different args should run, got: {}",
+                feedback.content
+            );
+            assert!(
+                !feedback.content.contains("→ denied by budget"),
+                "no budget denial expected, got: {}",
+                feedback.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_deny_cascades_to_skip_non_safe_calls_in_the_same_turn() {
+        // One run_turn with three blocks:
+        //   1. tool_a (Write, Ask) → user denies → cascade_active
+        //   2. tool_b (Write, Ask) → cascade skip, prompter NEVER asked
+        //   3. echo (Safe, Allow) → still runs (Safe reads under cascade)
+        let (dispatcher, prompter_calls, ran_a, ran_b, _ran_echo) =
+            cascade_dispatcher(MockResponse::Deny);
+
+        let blocks = [
+            r#"{"name": "tool_a", "args": {"v": 1}}"#,
+            r#"{"name": "tool_b", "args": {"v": 2}}"#,
+            r#"{"name": "echo", "args": {"v": 3}}"#,
+        ];
+        let feedback = dispatcher
+            .run_turn(&own(&model_output(&blocks)), &ctx(), Binding::Public, false)
+            .await
+            .expect("a tool was called, so there must be feedback");
+
+        let sections = split_sections(&feedback.content);
+        assert_eq!(sections.len(), 3, "sections: {sections:?}");
+
+        // Section 1: tool_a denied by user.
+        assert!(
+            sections[0].contains("[tool tool_a → denied by user]"),
+            "section 1: {}",
+            sections[0]
+        );
+        assert!(
+            !ran_a.load(Ordering::SeqCst),
+            "tool_a must never run when the user denies"
+        );
+
+        // Section 2: tool_b cascade-skipped, prompter NOT called for it.
+        assert!(
+            sections[1].contains("[tool tool_b → denied by batch]"),
+            "section 2: {}",
+            sections[1]
+        );
+        assert!(
+            sections[1].contains("an earlier call in this batch was denied"),
+            "section 2 reason: {}",
+            sections[1]
+        );
+        assert!(
+            !ran_b.load(Ordering::SeqCst),
+            "tool_b must never run when cascade-skipped"
+        );
+        assert_eq!(
+            prompter_calls.load(Ordering::SeqCst),
+            1,
+            "prompter was asked exactly once (for tool_a); tool_b's cascade skip must not prompt"
+        );
+
+        // Section 3: echo (Safe) still runs.
+        assert!(
+            sections[2].starts_with("[tool echo → ok]"),
+            "section 3: {}",
+            sections[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_deny_does_not_cascade() {
+        // Same shape, but call 1 is denied by the SANDBOX (not the user).
+        // cascade_active must stay false, so the Write/Ask call 2 still
+        // reaches the prompter. (MockPrompter returns Deny here — what
+        // matters is that the prompter was asked.)
+        let ran_b = Arc::new(AtomicBool::new(false));
+        let prompter_calls = Arc::new(AtomicUsize::new(0));
+
+        // SpyTool (shell_exec) is what the existing sandbox tests use;
+        // a second TaggedSpyTool is the Write/Ask call we want to verify.
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SpyTool {
+            ran: Arc::new(AtomicBool::new(false)),
+        }));
+        registry.register(Box::new(TaggedSpyTool {
+            name: "tool_b".to_string(),
+            risk: RiskClass::Write,
+            ran: ran_b.clone(),
+        }));
+
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("shell_exec", PermissionMode::Allow); // sandbox will still deny
+        policy.set_mode("tool_b", PermissionMode::Ask);
+        let chain = build_pretooluse_chain_full(
+            gate(),
+            Box::new(policy),
+            &[],
+            Arc::clone(&ledger),
+        );
+
+        let prompter: Arc<dyn ApprovalPrompter> = Arc::new(MockPrompter {
+            response: MockResponse::Deny, // outcome for tool_b doesn't matter; the
+            // test asserts it was PROMPTED, not what it returned
+            calls: prompter_calls.clone(),
+        });
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
+            .with_approval(ledger, Some(prompter));
+
+        let blocks = [
+            r#"{"name": "shell_exec", "args": {"cmd": "rm -rf /"}}"#,
+            r#"{"name": "tool_b", "args": {"v": 2}}"#,
+        ];
+        let feedback = dispatcher
+            .run_turn(&own(&model_output(&blocks)), &ctx(), Binding::Public, false)
+            .await
+            .expect("a tool was called, so there must be feedback");
+
+        let sections = split_sections(&feedback.content);
+        assert_eq!(sections.len(), 2, "sections: {sections:?}");
+
+        // Section 1: sandbox deny — NOT a user deny, so no cascade.
+        assert!(
+            sections[0].contains("[tool shell_exec → denied by sandbox]"),
+            "section 1 (sandbox): {}",
+            sections[0]
+        );
+
+        // Section 2: tool_b STILL reached the prompter (call counter went
+        // up) and was then denied by user — confirming cascade stayed off.
+        assert!(
+            sections[1].contains("[tool tool_b → denied by user]"),
+            "section 2: {}",
+            sections[1]
+        );
+        assert_eq!(
+            prompter_calls.load(Ordering::SeqCst),
+            1,
+            "policy/sandbox deny must not cascade — tool_b must still be prompted"
+        );
+        assert!(
+            !ran_b.load(Ordering::SeqCst),
+            "tool_b was denied by the user, so it must never run"
+        );
     }
 }

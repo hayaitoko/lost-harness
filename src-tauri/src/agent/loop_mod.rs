@@ -341,6 +341,11 @@ impl AgentLoop {
         const MAX_TOOL_ROUNDS: usize = 6;
         let mut final_text = String::new();
 
+        // Q4 do-now item 2: reset the dispatcher's per-run budget + repeat
+        // detection ring at the start of every user message. The dispatcher
+        // then enforces ceilings and cascades inside `run_turn`.
+        self.tools.begin_run();
+
         for round in 0..=MAX_TOOL_ROUNDS {
             let assistant_id = Uuid::new_v4().to_string();
             let mut sse = client
