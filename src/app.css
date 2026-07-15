@@ -1,10 +1,111 @@
 @import "tailwindcss";
 
-/* Global styles for Lost Harness */
+/* ============================================================================
+   Lost Harness — design tokens (ported from the design system at
+   ~/Desktop/lost-harness-ui/src/styles/tokens.css, verbatim values).
+
+   Principle: chrome is grayscale; saturated color is reserved for MEANING —
+   the privacy/routing signal (local / cloud / blocked / flagged).
+
+   The raw tokens live as CSS custom properties in :root (+ a [data-theme=light]
+   override) so theme switching is a runtime attribute flip. `@theme inline`
+   below maps them into Tailwind's namespaces, so utilities like `bg-surface`,
+   `text-local`, `border-border`, `rounded-r` work AND stay theme-reactive
+   (inline = Tailwind emits `var(--…)` in the utility rather than snapshotting).
+   ========================================================================== */
+
 :root {
-  --bg: #0a0a0b;
-  --fg: #fafafa;
-  --accent: #6366f1;
+  --bg: #1b1b1e;
+  --sidebar-bg: #171719;
+  --surface: #212125;
+  --surface-2: #26262b;
+  --surface-hover: #2c2c32;
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --text: #e7e7ea;
+  --text-2: #9a9aa2;
+  --text-3: #85858f;
+  --accent: #5f74e0;
+  --on-accent: #fff;
+  --local: #3fa87d;
+  --cloud: #4a97cf;
+  --blocked: #d0685f;
+  --warn: #c49a55;
+  --knot-line: #75757f;
+  --pulse-idle: #d9d9e0;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --shadow-pop: 0 6px 24px rgba(0, 0, 0, 0.4);
+  --accent-soft: color-mix(in srgb, var(--accent) 15%, transparent);
+  --local-soft: color-mix(in srgb, var(--local) 14%, transparent);
+  --cloud-soft: color-mix(in srgb, var(--cloud) 14%, transparent);
+  --blocked-soft: color-mix(in srgb, var(--blocked) 14%, transparent);
+  --warn-soft: color-mix(in srgb, var(--warn) 16%, transparent);
+  --r-sm: 4px;
+  --r: 6px;
+  --r-lg: 8px;
+}
+
+:root[data-theme="light"] {
+  --bg: #f6f5f1;
+  --sidebar-bg: #efeee9;
+  --surface: #fff;
+  --surface-2: #f1f0ea;
+  --surface-hover: #e9e8e1;
+  --border: rgba(0, 0, 0, 0.09);
+  --border-strong: rgba(0, 0, 0, 0.15);
+  --text: #23221f;
+  --text-2: #605e56;
+  --text-3: #6f6c62;
+  --local: #2f8a64;
+  --cloud: #3778ad;
+  --blocked: #b8534a;
+  --warn: #a67c33;
+  --knot-line: #8b897d;
+  --pulse-idle: #34322b;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-pop: 0 6px 24px rgba(0, 0, 0, 0.14);
+}
+
+@theme inline {
+  /* surfaces / chrome */
+  --color-bg: var(--bg);
+  --color-sidebar: var(--sidebar-bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-hover: var(--surface-hover);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+
+  /* text */
+  --color-text: var(--text);
+  --color-text-2: var(--text-2);
+  --color-text-3: var(--text-3);
+
+  /* accent */
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-on-accent: var(--on-accent);
+
+  /* routing meaning-colors */
+  --color-local: var(--local);
+  --color-local-soft: var(--local-soft);
+  --color-cloud: var(--cloud);
+  --color-cloud-soft: var(--cloud-soft);
+  --color-blocked: var(--blocked);
+  --color-blocked-soft: var(--blocked-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+
+  /* Radii + shadows are intentionally NOT mapped here: `--radius-r` would
+     collide with Tailwind's built-in `rounded-r` (right-side radius). Use the
+     raw tokens via arbitrary values instead — `rounded-[var(--r)]`,
+     `rounded-[var(--r-sm)]`, `rounded-[var(--r-lg)]`, `shadow-[var(--shadow)]`,
+     `shadow-[var(--shadow-pop)]`. */
+}
+
+/* Base document styles (from the design's components.css preamble). */
+* {
+  box-sizing: border-box;
 }
 
 html,
@@ -12,9 +113,70 @@ body,
 #app {
   height: 100%;
   margin: 0;
+}
+
+body {
   background: var(--bg);
-  color: var(--fg);
+  color: var(--text);
   font-family:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
-    Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    sans-serif;
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+/* Range slider track + thumb (used by the Slider component). Kept global rather
+   than in the component's <style> — the vendor pseudo-elements trip svelte2tsx's
+   scoped-style parser. Mirrors components.css + slider.css. */
+.lh-range {
+  -webkit-appearance: none;
+  appearance: none;
+  display: block;
+  flex: 1;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  outline: none;
+}
+.lh-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  cursor: pointer;
+}
+.lh-range::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: none;
+}
+.lh-range::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  cursor: pointer;
+}
+.lh-range:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.lh-range:disabled,
+.lh-range:disabled::-webkit-slider-thumb,
+.lh-range:disabled::-moz-range-thumb {
+  cursor: not-allowed;
+}
+.lh-range:disabled::-webkit-slider-thumb,
+.lh-range:disabled::-moz-range-thumb {
+  background: var(--text-3);
 }

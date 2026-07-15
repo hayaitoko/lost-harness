@@ -1,124 +1,85 @@
 <script lang="ts">
-  // M1 bootstrap: full chat shell.
-  //
-  // Two-column flex layout:
-  //   ┌─────────┬───────────────────┐
-  //   │ Sidebar │   Top bar [⚙]     │
-  //   │         ├───────────────────┤
-  //   │         │   ChatPanel       │
-  //   │         │                   │
-  //   └─────────┴───────────────────┘
-  //
-  // On mount, hydrate the profile store from the backend (or browser
-  // fallback) and apply the persisted theme. The chat store starts empty
-  // — the first send or "New chat" click creates the initial conversation.
-  //
-  // The ⚙ gear in the top bar opens the ProviderSettings modal — a small
-  // overlay that drives the providers store. Keeping the modal at the
-  // App level (not inside Sidebar) means any future entry point (a
-  // keyboard shortcut, the command palette, etc.) just flips
-  // `settingsOpen = true`.
-
+  // Root shell for the ported design system. Each screen is self-contained
+  // (renders its own Sidebar), so the root just renders whichever screen the
+  // nav store points at — the React `Prototype.tsx` pattern. The floating
+  // switcher (bottom-right) is a DEV aid to reach every screen while the
+  // section-nav cross-links are still sample data; remove once screens are wired.
   import { onMount } from "svelte";
-  import Sidebar from "$lib/components/Sidebar.svelte";
-  import ChatPanel from "$lib/components/ChatPanel.svelte";
-  import ProviderSettings from "$lib/components/ProviderSettings.svelte";
+  import { nav } from "$lib/design/nav.svelte";
+  import { theme, applyTheme } from "$lib/stores/settings";
+  import type { ScreenId } from "$lib/design/types";
+
+  import MainScreen from "$lib/design/screens/MainScreen.svelte";
+  import EmptyState from "$lib/design/screens/EmptyState.svelte";
+  import Email from "$lib/design/screens/Email.svelte";
+  import Whiteboard from "$lib/design/screens/Whiteboard.svelte";
+  import Files from "$lib/design/screens/Files.svelte";
+  import ScheduledJobs from "$lib/design/screens/ScheduledJobs.svelte";
+  import Editor from "$lib/design/screens/Editor.svelte";
+  import Settings from "$lib/design/screens/Settings.svelte";
+  import Onboarding from "$lib/design/screens/Onboarding.svelte";
   import ApprovalDialog from "$lib/components/ApprovalDialog.svelte";
-  import { hydrate as hydrateProfiles } from "$lib/stores/profiles";
-  import { hydrateProviders } from "$lib/stores/providers.svelte";
-  import { hydrateConversations } from "$lib/stores/chat";
-  import { onStreamError, type StreamErrorPayload } from "$lib/api/tauri";
-  import { applyTheme, theme } from "$lib/stores/settings";
 
-  onMount(async () => {
-    // Apply theme as early as possible to avoid a flash. `applyTheme`
-    // is also wired to the store via subscribe, but doing it here
-    // catches the case where the store value was set before mount.
-    applyTheme($theme);
+  const SCREENS = {
+    main: MainScreen,
+    empty: EmptyState,
+    email: Email,
+    whiteboard: Whiteboard,
+    files: Files,
+    "scheduled-jobs": ScheduledJobs,
+    editor: Editor,
+    settings: Settings,
+    onboarding: Onboarding,
+  } as const;
 
-    // Pull the profile list + active id from the backend.
-    await hydrateProfiles();
+  const SCREEN_LIST: { id: ScreenId; label: string }[] = [
+    { id: "main", label: "Main screen" },
+    { id: "empty", label: "Empty state" },
+    { id: "email", label: "Email" },
+    { id: "whiteboard", label: "Whiteboard" },
+    { id: "files", label: "Files" },
+    { id: "scheduled-jobs", label: "Scheduled jobs" },
+    { id: "editor", label: "Editor" },
+    { id: "settings", label: "Settings" },
+    { id: "onboarding", label: "Onboarding" },
+  ];
 
-    // Hydrate providers and conversations from the backend.
-    await Promise.all([hydrateProviders(), hydrateConversations()]);
+  const Current = $derived(SCREENS[nav.current]);
 
-    // Set up a global stream:error listener. Individual chat messages
-    // are handled in the chat store's send path, but this app-level
-    // listener can surface errors that arrive outside an active send
-    // (e.g. a delayed gate error after the user switched conversations).
-    // For now we just log — a toast UI can hook in here later.
-    await onStreamError((payload: StreamErrorPayload) => {
-      console.warn(
-        `[stream:error] source=${payload.source} conv=${payload.conversation_id}: ${payload.error}`,
-      );
-    });
-  });
+  onMount(() => applyTheme($theme));
 
-  let settingsOpen = $state(false);
-
-  function openSettings() {
-    settingsOpen = true;
-  }
-
-  function closeSettings() {
-    settingsOpen = false;
-  }
-
-  // Allow Esc to close the modal — keep it local so it doesn't fight
-  // the PrivacyIndicator / other components' key handlers.
-  function onWindowKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape" && settingsOpen) {
-      e.preventDefault();
-      closeSettings();
-    }
+  function toggleTheme() {
+    const next = $theme === "light" ? "dark" : "light";
+    theme.set(next);
+    applyTheme(next);
   }
 </script>
 
-<svelte:window onkeydown={onWindowKeydown} />
+<Current />
 
-<div class="app-root flex h-full min-h-0">
-  <Sidebar />
-  <main class="flex min-h-0 flex-1 flex-col">
-    <!-- Top bar with settings gear. -->
-    <header
-      class="flex shrink-0 items-center justify-end border-b border-neutral-800/60 bg-neutral-950/40 px-4 py-1.5"
-      data-testid="app-topbar"
-    >
-      <button
-        type="button"
-        onclick={openSettings}
-        class="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-neutral-400 transition hover:bg-neutral-900 hover:text-neutral-200"
-        aria-label="Open provider settings"
-        title="Provider settings"
-        data-testid="open-provider-settings"
-      >
-        <svg class="h-3.5 w-3.5" viewBox="0 0 16 16" aria-hidden="true">
-          <path
-            d="M8 1.5 a1 1 0 0 1 1 1 v1.2 a4.6 4.6 0 0 1 1.3 0.55 l0.85 -0.85 a1 1 0 0 1 1.4 0 l0.85 0.85 a1 1 0 0 1 0 1.4 l-0.85 0.85 a4.6 4.6 0 0 1 0.55 1.3 h1.2 a1 1 0 0 1 1 1 v1.2 a1 1 0 0 1 -1 1 h-1.2 a4.6 4.6 0 0 1 -0.55 1.3 l0.85 0.85 a1 1 0 0 1 0 1.4 l-0.85 0.85 a1 1 0 0 1 -1.4 0 l-0.85 -0.85 a4.6 4.6 0 0 1 -1.3 0.55 v1.2 a1 1 0 0 1 -1 1 h-1.2 a1 1 0 0 1 -1 -1 v-1.2 a4.6 4.6 0 0 1 -1.3 -0.55 l-0.85 0.85 a1 1 0 0 1 -1.4 0 l-0.85 -0.85 a1 1 0 0 1 0 -1.4 l0.85 -0.85 a4.6 4.6 0 0 1 -0.55 -1.3 h-1.2 a1 1 0 0 1 -1 -1 v-1.2 a1 1 0 0 1 1 -1 h1.2 a4.6 4.6 0 0 1 0.55 -1.3 l-0.85 -0.85 a1 1 0 0 1 0 -1.4 l0.85 -0.85 a1 1 0 0 1 1.4 0 l0.85 0.85 a4.6 4.6 0 0 1 1.3 -0.55 v-1.2 a1 1 0 0 1 1 -1 z M8 6 a2 2 0 1 0 0 4 a2 2 0 0 0 0 -4 z"
-            fill="currentColor"
-            fill-rule="evenodd"
-          />
-        </svg>
-        <span>Settings</span>
-      </button>
-    </header>
-    <ChatPanel />
-  </main>
+<!-- DEV: floating screen switcher + theme toggle (mirrors the design prototype). -->
+<div
+  class="fixed bottom-4 right-4 z-[90] flex items-center gap-[11px] rounded-[var(--r-lg)] border border-border-strong bg-surface/90 px-[11px] py-[7px] shadow-[var(--shadow-pop)] backdrop-blur"
+>
+  <span class="text-[10px] font-semibold uppercase tracking-[0.05em] text-text-3">Screen</span>
+  <select
+    class="rounded-[var(--r-sm)] border border-border bg-surface-2 px-2 py-1 text-[12px] text-text outline-none"
+    value={nav.current}
+    onchange={(e) => nav.go(e.currentTarget.value as ScreenId)}
+  >
+    {#each SCREEN_LIST as s (s.id)}
+      <option value={s.id}>{s.label}</option>
+    {/each}
+  </select>
+  <span class="h-[18px] w-px bg-border-strong"></span>
+  <button
+    type="button"
+    onclick={toggleTheme}
+    class="rounded-[var(--r)] border border-border px-[10px] py-1 text-[11px] font-medium text-text-2 transition hover:bg-surface-hover hover:text-text"
+  >
+    {$theme === "light" ? "☾ Dark" : "☀ Light"}
+  </button>
 </div>
 
-{#if settingsOpen}
-  <ProviderSettings modal={true} onclose={closeSettings} />
-{/if}
-
-<!-- Always mounted; renders only when the backend raises an approval prompt. -->
+<!-- Backend-driven; renders only when the core raises a tool-approval prompt. -->
 <ApprovalDialog />
-
-<style>
-  /* Make sure the app fills the viewport. The host <body> is already
-   * height: 100% via app.css, so this is a belt-and-suspenders rule. */
-  :global(html),
-  :global(body),
-  :global(#app) {
-    height: 100%;
-  }
-</style>
