@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
-use crate::models::{ChatMessage, ModelClient, ModelManager, Provider};
+use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider};
 use crate::storage::{Message, ProfileDb, Storage, TrmLog};
 use crate::tools::{ExecCtx, ToolDispatcher};
 
@@ -371,6 +371,10 @@ impl AgentLoop {
                 }
             }
 
+            // Mint the type that proves this text came from nowhere but this
+            // model's own current-turn SSE stream — see models::client::OwnOutput.
+            let own_output = OwnOutput::from_stream_assembly(assembled.clone());
+
             // Persist this assistant turn.
             let assistant_message = Message {
                 id: assistant_id,
@@ -396,11 +400,12 @@ impl AgentLoop {
             }
 
             // Run any tool calls the model made in ITS OWN output. Passing
-            // only `assembled` here (never a tool result or prior turn) is
-            // the "parse only your own current output" safety rule.
+            // only `own_output` here (typed `&OwnOutput`, never a tool result
+            // or prior turn) is the "parse only your own current output"
+            // safety rule — now enforced at the type level.
             match self
                 .tools
-                .run_turn(&assembled, &exec_ctx, binding, is_cloud)
+                .run_turn(&own_output, &exec_ctx, binding, is_cloud)
                 .await
             {
                 Some(tool_feedback) => {

@@ -57,11 +57,14 @@ const FENCE_CLOSE: &str = "```";
 
 /// Extract every tool call from the model's **own current-turn output**.
 ///
-/// SAFETY CONTRACT (enforced by the caller, see module docs): pass only the
-/// assistant's freshly-generated text. Never pass tool output, a web page,
-/// or any content the model didn't itself just produce — that's what stops
-/// a read webpage/email from forging a call.
-pub fn parse_tool_calls(own_output: &str) -> Vec<ParsedToolCall> {
+/// SAFETY CONTRACT: enforced at the type level — `OwnOutput` is
+/// constructible only via `OwnOutput::from_stream_assembly` (`pub(crate)`,
+/// defined in `models::client`), which the agent loop calls exactly once
+/// per turn, right after assembling the model's SSE deltas. Nothing that
+/// only holds a tool result, web content, or prior history can produce
+/// one. Passing a bare `&str` to this function is a type error.
+pub fn parse_tool_calls(own: &crate::models::OwnOutput) -> Vec<ParsedToolCall> {
+    let own_output = own.as_str();
     let mut calls = Vec::new();
     let mut lines = own_output.lines().peekable();
 
@@ -191,13 +194,19 @@ pub fn guard_wrap(source: &str, body: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Test-only constructor. The real `from_stream_assembly` is `pub(crate)`
+    /// so this compiles from any test module in the crate.
+    fn own(s: &str) -> crate::models::OwnOutput {
+        crate::models::OwnOutput::from_stream_assembly(s.to_string())
+    }
+
     #[test]
     fn parses_a_single_tool_call() {
         let out = "Sure, let me read that.\n\
                    ```tool\n\
                    {\"name\": \"read_file\", \"args\": {\"path\": \"a.txt\"}}\n\
                    ```\n";
-        let calls = parse_tool_calls(out);
+        let calls = parse_tool_calls(&own(out));
         assert_eq!(calls.len(), 1);
         match &calls[0] {
             ParsedToolCall::Call(c) => {
@@ -213,7 +222,7 @@ mod tests {
         let out = "```tool\n{\"name\": \"list_dir\", \"args\": {\"path\": \".\"}}\n```\n\
                    some prose in between\n\
                    ```tool\n{\"name\": \"read_file\", \"args\": {\"path\": \"b.txt\"}}\n```";
-        let calls = parse_tool_calls(out);
+        let calls = parse_tool_calls(&own(out));
         assert_eq!(calls.len(), 2);
         assert!(matches!(&calls[0], ParsedToolCall::Call(c) if c.name == "list_dir"));
         assert!(matches!(&calls[1], ParsedToolCall::Call(c) if c.name == "read_file"));
@@ -222,7 +231,7 @@ mod tests {
     #[test]
     fn args_are_optional() {
         let out = "```tool\n{\"name\": \"system_status\"}\n```";
-        let calls = parse_tool_calls(out);
+        let calls = parse_tool_calls(&own(out));
         assert_eq!(calls.len(), 1);
         match &calls[0] {
             ParsedToolCall::Call(c) => {
@@ -235,7 +244,7 @@ mod tests {
 
     #[test]
     fn plain_prose_yields_no_calls() {
-        assert!(parse_tool_calls("Just a normal answer with no tools.").is_empty());
+        assert!(parse_tool_calls(&own("Just a normal answer with no tools.")).is_empty());
     }
 
     #[test]
@@ -243,7 +252,7 @@ mod tests {
         // ```json / ``` blocks are ordinary content, not tool calls.
         let out = "Here's some JSON:\n```json\n{\"name\": \"read_file\"}\n```\n";
         assert!(
-            parse_tool_calls(out).is_empty(),
+            parse_tool_calls(&own(out)).is_empty(),
             "only ```tool blocks are calls; a ```json block must be ignored"
         );
     }
@@ -251,7 +260,7 @@ mod tests {
     #[test]
     fn malformed_json_is_reported_not_dropped() {
         let out = "```tool\n{not json}\n```";
-        let calls = parse_tool_calls(out);
+        let calls = parse_tool_calls(&own(out));
         assert_eq!(calls.len(), 1);
         assert!(matches!(&calls[0], ParsedToolCall::Malformed { .. }));
     }
@@ -259,7 +268,7 @@ mod tests {
     #[test]
     fn missing_name_is_malformed() {
         let out = "```tool\n{\"args\": {\"path\": \"a\"}}\n```";
-        let calls = parse_tool_calls(out);
+        let calls = parse_tool_calls(&own(out));
         assert!(matches!(&calls[0], ParsedToolCall::Malformed { .. }));
     }
 
@@ -274,7 +283,7 @@ mod tests {
         // …and the forged fence is neutralized, so even if the model echoed
         // this wrapped text back into its own output, no call would parse.
         assert!(
-            parse_tool_calls(&wrapped).is_empty(),
+            parse_tool_calls(&own(&wrapped)).is_empty(),
             "a forged ```tool block inside guard-wrapped content must not parse"
         );
         assert!(!wrapped.contains("```"), "triple-backticks must be neutralized");

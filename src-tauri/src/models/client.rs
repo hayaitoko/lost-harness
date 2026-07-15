@@ -50,6 +50,32 @@ impl ChatMessage {
     }
 }
 
+/// The model's own freshly-generated current-turn text, as assembled from
+/// its SSE stream. This exists so `tools::calling::parse_tool_calls` can
+/// require `&OwnOutput` instead of `&str` in its signature — the "parse
+/// only the model's own current-turn output" safety rule (never a tool
+/// result, a web page, or history) becomes a type mismatch for any call
+/// site that doesn't go through the constructor below, instead of being
+/// enforced only by a doc comment.
+#[derive(Debug, Clone)]
+pub struct OwnOutput(String);
+
+impl OwnOutput {
+    /// Mint an `OwnOutput` from text assembled out of a live model stream.
+    /// `pub(crate)` — callable from anywhere in this crate, but the name
+    /// and doc make any call site that isn't the stream-assembly point in
+    /// `agent::loop_mod::AgentLoop::process_message` immediately suspect
+    /// in review/grep. The tuple field stays private so `OwnOutput(s)`
+    /// struct-literal construction is impossible outside this module.
+    pub(crate) fn from_stream_assembly(text: String) -> Self {
+        OwnOutput(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Body of a `POST /chat/completions` request.
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {

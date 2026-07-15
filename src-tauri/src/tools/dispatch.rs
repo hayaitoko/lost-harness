@@ -27,7 +27,7 @@ use crate::hooks::{
     ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter, ApprovalRequest,
     EventContext, HookChain, HookResult, RoutingRequirement,
 };
-use crate::models::ChatMessage;
+use crate::models::{ChatMessage, OwnOutput};
 use crate::tools::calling::{
     guard_wrap, neutralize_untrusted, parse_tool_calls, render_tool_catalog, ParsedToolCall,
 };
@@ -273,10 +273,14 @@ impl ToolDispatcher {
     ///
     /// The `own_output` MUST be the model's freshly-generated text and
     /// nothing else. That's the rule that stops content the model merely
-    /// *read* (a web page, a prior tool result) from forging a call.
+    /// *read* (a web page, a prior tool result) from forging a call. The
+    /// `&OwnOutput` parameter type makes this a compile-time check — only
+    /// `OwnOutput::from_stream_assembly` can produce one, and the agent
+    /// loop calls it exactly once, right after the SSE-delta assembly
+    /// loop.
     pub async fn run_turn(
         &self,
-        own_output: &str,
+        own_output: &OwnOutput,
         ctx: &ExecCtx,
         binding: Binding,
         is_cloud: bool,
@@ -358,6 +362,12 @@ mod tests {
     use crate::tools::fs::ReadFileTool;
     use crate::tools::{Capability, EchoTool, SyncFileTool, Tool};
     use crate::classifier::HeuristicClassifier;
+
+    /// Test-only constructor. `OwnOutput::from_stream_assembly` is `pub(crate)`,
+    /// so this compiles from any test module in the crate.
+    fn own(s: &str) -> OwnOutput {
+        OwnOutput::from_stream_assembly(s.to_string())
+    }
 
     fn ctx() -> ExecCtx {
         ExecCtx {
@@ -478,7 +488,7 @@ mod tests {
     async fn run_turn_returns_none_when_no_tool_is_called() {
         let dispatcher = ToolDispatcher::empty();
         let out = dispatcher
-            .run_turn("Just a plain answer.", &ctx(), Binding::Public, true)
+            .run_turn(&own("Just a plain answer."), &ctx(), Binding::Public, true)
             .await;
         assert!(out.is_none());
     }
@@ -504,7 +514,7 @@ mod tests {
         let model_output = "I'll read it.\n\
                             ```tool\n{\"name\": \"read_file\", \"args\": {\"path\": \"greeting.txt\"}}\n```";
         let feedback = dispatcher
-            .run_turn(model_output, &ctx(), Binding::Public, false)
+            .run_turn(&own(model_output), &ctx(), Binding::Public, false)
             .await
             .expect("a tool was called, so there must be feedback");
 
@@ -579,12 +589,12 @@ mod tests {
 
         let dispatcher = ToolDispatcher::empty(); // unknown tool -> Unknown outcome
         let feedback = dispatcher
-            .run_turn(&model_output, &ctx(), Binding::Public, true)
+            .run_turn(&own(&model_output), &ctx(), Binding::Public, true)
             .await
             .expect("an unknown tool call still produces feedback");
 
         assert!(
-            parse_tool_calls(&feedback.content).is_empty(),
+            parse_tool_calls(&own(&feedback.content)).is_empty(),
             "a fence smuggled via the tool name must not survive into replayed feedback: {}",
             feedback.content
         );

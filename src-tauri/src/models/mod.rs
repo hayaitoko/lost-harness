@@ -19,6 +19,6 @@ pub mod sse;
 #[cfg(test)]
 mod tests;
 
-pub use client::{ChatMessage, ModelClient};
+pub use client::{ChatMessage, ModelClient, OwnOutput};
 pub use manager::ModelManager;
 pub use provider::{Provider, ProviderKind};
