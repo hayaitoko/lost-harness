@@ -20,6 +20,11 @@
 //!   │  Deny ───────────────────────────────────────▶ short-circuit, stop
 //!   │  Continue
 //!   ▼
+//! [ProtectedPathHook] ── non-overridable always-Ask floor for .git/,
+//!   │                    config/secrets, .env, .ssh/ paths
+//!   │  Ask (Once-only) ───────────────────────────▶ short-circuit, stop
+//!   │  Continue
+//!   ▼
 //! [PermissionHook] ── tri-state mode + pattern rules
 //!   │  Deny/Ask ───────────────────────────────────▶ short-circuit, stop
 //!   │  Continue
@@ -32,15 +37,23 @@
 //!
 //! `SandboxHook` is deliberately positioned immediately after the (Deny-only,
 //! never-Ask) `PrivacyFilterHook` and ahead of every hook capable of
-//! returning `Ask` (`PermissionHook`, `FirstUseConfirmHook`). `run_gating`
-//! short-circuits on the first `Deny`/`Ask`, so if an Ask-capable hook ran
-//! before the hardline floor, a whole-tool "ask" permission mode (or an
-//! "ask" pattern rule) could reach human confirmation — and eventually
-//! `Tool::run()` — without the non-overridable denylist ever being
-//! consulted. Putting `SandboxHook` first among the fallible hooks means it
-//! always runs on every `PreToolUse` event, regardless of what any later
-//! hook decides. See `default_pretooluse_chain_is_in_spec_order` and
+//! returning `Ask` (`ProtectedPathHook`, `PermissionHook`,
+//! `FirstUseConfirmHook`). `run_gating` short-circuits on the first
+//! `Deny`/`Ask`, so if an Ask-capable hook ran before the hardline floor, a
+//! whole-tool "ask" permission mode (or an "ask" pattern rule) could reach
+//! human confirmation — and eventually `Tool::run()` — without the
+//! non-overridable denylist ever being consulted. Putting `SandboxHook`
+//! first among the fallible hooks means it always runs on every
+//! `PreToolUse` event, regardless of what any later hook decides. See
+//! `default_pretooluse_chain_is_in_spec_order` and
 //! `sandbox_runs_before_any_hook_that_can_ask` in `hooks::tests`.
+//!
+//! `ProtectedPathHook` follows the same non-overridable invariant — its
+//! path list is hardcoded, no config can narrow or broaden it, and its
+//! `Ask` is satisfiable only by a fresh `Once` grant (it consults
+//! `ApprovalLedger::covers_once`, which ignores `Session`/`Always`
+//! grants), so a future `Allow` rule or `shell_exec` can never reach
+//! these paths silently.
 //!
 //! Live wiring of real tool calls through this chain lands later in M3
 //! once actual tool implementations exist (`docs/PLAN.md` §8, M3 item 6+);
@@ -58,6 +71,7 @@ pub mod approval;
 pub mod first_use;
 pub mod permission;
 pub mod privacy_filter;
+pub mod protected_path;
 pub mod routing;
 pub mod sandbox;
 
@@ -70,6 +84,7 @@ pub use permission::{
     InMemoryPolicySource, PermissionHook, PermissionMode, PolicySource, ToolRule,
 };
 pub use privacy_filter::PrivacyFilterHook;
+pub use protected_path::ProtectedPathHook;
 pub use routing::{enforce_local_routing, LocalRoutingViolation};
 pub use sandbox::{SandboxConfig, SandboxHook, SandboxNetworkConfig};
 
@@ -353,14 +368,15 @@ impl HookChain {
 // ── Default PreToolUse chain ────────────────────────────────────────────
 
 /// Build the ordered chain:
-/// `[PrivacyFilterHook, SandboxHook, PermissionHook, FirstUseConfirmHook]`.
+/// `[PrivacyFilterHook, SandboxHook, ProtectedPathHook, PermissionHook, FirstUseConfirmHook]`.
 ///
 /// `SandboxHook` runs immediately after the Deny-only `PrivacyFilterHook`
-/// and ahead of both hooks capable of returning `Ask` (`PermissionHook`,
-/// `FirstUseConfirmHook`), so the non-overridable hardline floor is always
-/// reached on every `PreToolUse` event — see the module docs above for why
-/// putting an Ask-capable hook before `SandboxHook` would let the floor be
-/// skipped once Ask-resume is wired up.
+/// and ahead of every hook capable of returning `Ask`
+/// (`ProtectedPathHook`, `PermissionHook`, `FirstUseConfirmHook`), so the
+/// non-overridable hardline floor is always reached on every `PreToolUse`
+/// event — see the module docs above for why putting an Ask-capable hook
+/// before `SandboxHook` would let the floor be skipped once Ask-resume is
+/// wired up.
 ///
 /// Both bodies (app + future server) are meant to construct their own
 /// instance of this against their own profile config — same chain shape,
@@ -390,6 +406,7 @@ pub fn build_pretooluse_chain_with_confirmed(
     let mut chain = HookChain::new();
     chain.register_gating(Box::new(PrivacyFilterHook::new(gate)));
     chain.register_gating(Box::new(SandboxHook));
+    chain.register_gating(Box::new(ProtectedPathHook::new()));
     chain.register_gating(Box::new(PermissionHook::new(policy)));
     let first_use = FirstUseConfirmHook::new();
     for tool in confirmed {
@@ -401,10 +418,22 @@ pub fn build_pretooluse_chain_with_confirmed(
 
 /// Same ordered chain as [`build_pretooluse_chain_with_confirmed`], but with a
 /// shared [`ApprovalLedger`] threaded into the ask-capable hooks
-/// (`PermissionHook`, `FirstUseConfirmHook`). An interactive approval recorded
-/// by `ToolDispatcher` (see `ToolDispatcher::with_approval`) turns their `Ask`
-/// into `Continue` on the re-run — a single grant satisfies every ask-capable
-/// hook because they all consult the same ledger by fingerprint/tool.
+/// (`ProtectedPathHook`, `PermissionHook`, `FirstUseConfirmHook`). An
+/// interactive approval recorded by `ToolDispatcher` (see
+/// `ToolDispatcher::with_approval`) turns their `Ask` into `Continue` on
+/// the re-run — a single grant satisfies every ask-capable hook because
+/// they all consult the same ledger by fingerprint/tool.
+///
+/// `ProtectedPathHook` is wired here with a shared ledger but consults
+/// only `ApprovalLedger::covers_once` (the Once-only path), so a
+/// `Session`/`Tool` grant from a different ask never satisfies it — the
+/// floor stays Once-only by construction. The dispatcher also pins an
+/// extra `Once`+`Fingerprint` grant when a protected-path prompt is
+/// answered with anything broader than `Once`, so the re-run settles
+/// without upgrading the floor itself. See `dispatch.rs` `Approve` arm
+/// and the `protected_path_runs_before_permission_even_under_an_allow_policy`
+/// + `session_grant_does_not_bypass_the_floor_on_a_different_protected_path`
+/// tests.
 ///
 /// The dispatcher MUST hold the same `Arc<ApprovalLedger>` for grants to be
 /// visible here — pass one `Arc`, clone it into both.
@@ -417,6 +446,7 @@ pub fn build_pretooluse_chain_full(
     let mut chain = HookChain::new();
     chain.register_gating(Box::new(PrivacyFilterHook::new(gate)));
     chain.register_gating(Box::new(SandboxHook));
+    chain.register_gating(Box::new(ProtectedPathHook::new().with_ledger(Arc::clone(&ledger))));
     chain.register_gating(Box::new(
         PermissionHook::new(policy).with_ledger(Arc::clone(&ledger)),
     ));

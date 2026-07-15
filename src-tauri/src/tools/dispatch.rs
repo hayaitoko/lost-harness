@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::agent::gate::Binding;
 use crate::hooks::{
     ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter, ApprovalRequest,
-    EventContext, HookChain, HookResult, RoutingRequirement,
+    EventContext, GrantScope, GrantTarget, HookChain, HookResult, RoutingRequirement,
 };
 use crate::models::{ChatMessage, OwnOutput};
 use crate::tools::calling::{
@@ -274,7 +274,9 @@ impl ToolDispatcher {
                         // they're approving, not just which tool.
                         command: canonical.clone(),
                         prompt,
-                        by,
+                        // `by` is cloned (not moved) so the forced-Once
+                        // piggyback below can read it after this await.
+                        by: by.clone(),
                     };
                     // NOTE (known, deferred): `process_message` holds the agent
                     // loop's stream lock across this await, so while a prompt is
@@ -286,6 +288,26 @@ impl ToolDispatcher {
                     match approver.request(req).await {
                         ApprovalDecision::Approve(scope, target) => {
                             self.ledger.grant(target, scope);
+                            // The protected-paths floor is Once-only by
+                            // construction (it checks `covers_once`, not
+                            // `covers`). If the user answered a
+                            // protected-path `Ask` with anything broader
+                            // than `Once`, still honor their grant above
+                            // (it legitimately covers OTHER, non-protected
+                            // calls to this tool going forward) — but
+                            // independently pin a one-time grant for THIS
+                            // EXACT fingerprint so the re-run settles
+                            // without ever upgrading the floor itself to
+                            // standing coverage. The floor's
+                            // `covers_once` only consults `once_fps`, so
+                            // a `Session`/`Tool` grant from the user's
+                            // answer stays invisible there.
+                            if by == "protected_path" && scope != GrantScope::Once {
+                                self.ledger.grant(
+                                    GrantTarget::Fingerprint(fingerprint.clone()),
+                                    GrantScope::Once,
+                                );
+                            }
                             // Re-run the FULL chain: the grant now lets the
                             // asking hook(s) pass; Sandbox/Privacy re-checked.
                             continue;
@@ -1522,6 +1544,164 @@ mod tests {
         assert!(
             !ran_b.load(Ordering::SeqCst),
             "tool_b was denied by the user, so it must never run"
+        );
+    }
+
+    // ── Q4 do-now item 3: protected-paths floor (item 3) ─────────────────
+
+    /// Build a dispatcher wired with `WriteFileTool` against a temp
+    /// workspace, `build_pretooluse_chain_full`, and a `MockPrompter` —
+    /// the shape the real app uses. Lets each floor test build the
+    /// exact `policy` it needs without re-wiring the chain each time.
+    fn protected_path_dispatcher(
+        response: MockResponse,
+        write_file_mode: PermissionMode,
+    ) -> (
+        ToolDispatcher,
+        Arc<AtomicUsize>, // prompter calls
+        std::path::PathBuf, // workspace root
+    ) {
+        use crate::tools::fs::WriteFileTool;
+        let root = std::env::temp_dir().join(format!("lhp-pp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Pre-create the protected-path parent dirs the tests below
+        // write into — `WriteFileTool` requires the parent directory to
+        // exist (an orthogonal safety check that has nothing to do with
+        // the floor itself).
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(WriteFileTool::new(&root)));
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("write_file", write_file_mode);
+        let chain = build_pretooluse_chain_full(
+            gate(),
+            Box::new(policy),
+            &[],
+            Arc::clone(&ledger),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prompter = Arc::new(MockPrompter {
+            response,
+            calls: calls.clone(),
+        });
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::new([Capability::Filesystem]))
+            .with_approval(ledger, Some(prompter));
+        (dispatcher, calls, root)
+    }
+
+    #[tokio::test]
+    async fn protected_path_floor_asks_even_under_an_allow_policy() {
+        // The whole point: a whole-tool `Allow` policy on `write_file`
+        // would (on its own) let the call pass through PermissionHook
+        // without prompting. The floor must STILL Ask, so the user
+        // always sees a one-time confirmation for a `.git/config` write
+        // — even when they've said "I trust write_file".
+        let (dispatcher, calls, root) =
+            protected_path_dispatcher(MockResponse::ApproveOnceAction, PermissionMode::Allow);
+
+        let outcome = dispatcher
+            .dispatch(
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": ".git/config", "content": "x"}),
+                ),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::Ok(_)),
+            "after the Once grant the call should run, got {outcome:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the floor must have asked even though PermissionHook alone would never have asked"
+        );
+        // The file must actually have been written end-to-end, proving
+        // the Once+Fingerprint grant let the call proceed normally.
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git/config")).unwrap_or_default(),
+            "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_grant_does_not_bypass_the_floor_on_a_different_protected_path() {
+        // The exact failure mode the floor is designed to prevent: a
+        // user answers a protected-path prompt with "Allow for this
+        // session" → PermissionHook is now satisfied (Session+Tool
+        // covers every write_file). The floor must still Ask again on
+        // the next protected-path call, because `covers_once` ignores
+        // Session+Tool and the Once grant was pinned to the EXACT
+        // fingerprint of the first call, not a future one.
+        //
+        // With a `MockPrompter` wired, the re-prompt is auto-answered
+        // and the call runs, but `calls == 2` is the load-bearing
+        // assertion: the second call had to be re-prompted even though
+        // PermissionHook's standing Session+Tool grant was already
+        // active — so the prompt HAD to come from the floor, not
+        // PermissionHook. That proves the standing grant never
+        // satisfies the floor itself.
+        let (dispatcher, calls, _root) =
+            protected_path_dispatcher(MockResponse::ApproveSessionTool, PermissionMode::Ask);
+
+        // First dispatch: protected path `.git/config` → floor Asks,
+        // user clicks Session+Tool → forced-Once piggyback pins a
+        // Once+Fingerprint grant for THIS call → re-run passes both
+        // the floor (covers_once) and PermissionHook (Session+Tool).
+        let o1 = dispatcher
+            .dispatch(
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": ".git/config", "content": "a"}),
+                ),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(o1, ToolOutcome::Ok(_)),
+            "first protected-path dispatch should run after the session grant, got {o1:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "asked exactly once so far");
+
+        // Second dispatch: DIFFERENT protected path `.env` (different
+        // args → different fingerprint). The standing Session+Tool
+        // grant covers PermissionHook — if the floor were
+        // Session/Tool-visible, this call would skip the prompter
+        // entirely (PermissionHook would Continue, the floor would too).
+        // `calls == 2` proves the floor fired a SECOND prompt that
+        // PermissionHook alone would not have issued.
+        let o2 = dispatcher
+            .dispatch(
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": ".env", "content": "b"}),
+                ),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        // The MockPrompter auto-answers the re-prompt with Session+Tool
+        // again, and the forced-Once piggyback lets this exact call
+        // through. Outcome is Ok — but the IMPORTANT thing is that
+        // calls == 2 (the floor re-prompted). If the floor were
+        // Session/Tool-visible, calls would be 1 here.
+        assert!(
+            matches!(o2, ToolOutcome::Ok(_)),
+            "after the second Once grant the call should run, got {o2:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the second protected-path call must have re-prompted — Session+Tool must not satisfy the floor"
         );
     }
 }

@@ -143,6 +143,16 @@ impl ApprovalLedger {
             || self.session_tools.lock().unwrap().contains(tool_name)
     }
 
+    /// Is this fingerprint covered by a `Once` grant specifically — ignores
+    /// session/tool-wide coverage. Used by floor-style hooks
+    /// (`ProtectedPathHook`) that must never be satisfiable by a standing
+    /// grant: a `Session`/`Tool` or `Session`/`Fingerprint` grant is
+    /// invisible here, so the only way the floor flips to `Continue` is a
+    /// fresh `Once`+`Fingerprint` grant recorded for this exact action.
+    pub fn covers_once(&self, fingerprint: &str) -> bool {
+        self.once_fps.lock().unwrap().contains(fingerprint)
+    }
+
     /// Record a grant. `Always` currently maps to session storage (no
     /// persistence yet — see the module docs); when a persistent PolicySource
     /// lands, the dispatcher will route `Always` there instead of here.
@@ -270,6 +280,43 @@ mod tests {
         assert!(
             !led.covers("write_file", "any-fp"),
             "a Once+Tool grant must record nothing (re-prompt next time)"
+        );
+    }
+
+    #[test]
+    fn covers_once_only_sees_once_fps_not_session_grants() {
+        // The protected-path floor relies on covers_once to be Once-only
+        // — a Session+Tool grant that PermissionHook would happily
+        // consume must be invisible here, otherwise a future
+        // "Allow for this session" click on a protected-path prompt
+        // would silently widen the floor to standing coverage.
+        let led = ApprovalLedger::new();
+        let fp = "fp-1".to_string();
+
+        // No grant at all: not covered.
+        assert!(!led.covers_once(&fp));
+
+        // Session/Tool grant: a broad standing grant for the whole tool
+        // must not satisfy the floor.
+        led.grant(GrantTarget::Tool("write_file".into()), GrantScope::Session);
+        assert!(
+            !led.covers_once(&fp),
+            "a Session+Tool grant must not satisfy covers_once"
+        );
+
+        // Session/Fingerprint grant: even a pinned Session grant must
+        // not satisfy the floor.
+        led.grant(GrantTarget::Fingerprint(fp.clone()), GrantScope::Session);
+        assert!(
+            !led.covers_once(&fp),
+            "a Session+Fingerprint grant must not satisfy covers_once"
+        );
+
+        // Once/Fingerprint grant: THIS is what flips the floor to Continue.
+        led.grant(GrantTarget::Fingerprint(fp.clone()), GrantScope::Once);
+        assert!(
+            led.covers_once(&fp),
+            "a Once+Fingerprint grant must satisfy covers_once"
         );
     }
 }

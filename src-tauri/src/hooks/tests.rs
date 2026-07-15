@@ -186,7 +186,7 @@ fn default_pretooluse_chain_is_in_spec_order() {
     let chain = build_pretooluse_chain(real_gate(), policy);
     assert_eq!(
         chain.gating_names(),
-        vec!["privacy_filter", "sandbox", "permission", "first_use_confirm"]
+        vec!["privacy_filter", "sandbox", "protected_path", "permission", "first_use_confirm"]
     );
 }
 
@@ -236,6 +236,43 @@ fn sandbox_runs_before_any_hook_that_can_ask() {
         ),
     }
     assert_eq!(denied_by, Some("sandbox"));
+}
+
+#[test]
+fn protected_path_runs_before_permission_even_under_an_allow_policy() {
+    // Mirror of `sandbox_runs_before_any_hook_that_can_ask`, but for the
+    // protected-paths floor: a whole-tool `Allow` policy must not let a
+    // write_file to `.git/config` skip the floor and reach
+    // `Tool::run()`. The floor Asks (it can't Deny — `.git/` is a
+    // legitimate read target, just a protected write/edit/delete path),
+    // but it MUST be reached, and PermissionHook must NEVER have been
+    // consulted for this call.
+    let mut policy = InMemoryPolicySource::new();
+    policy.set_mode("write_file", PermissionMode::Allow);
+    let chain = build_pretooluse_chain(real_gate(), Box::new(policy));
+
+    // Use a fixture whose canonical text contains a protected-path
+    // substring. The floor is the third hook in the chain, and
+    // PermissionHook (fourth) would whole-tool-Allow it — if the floor
+    // were missing, the chain would fall through to FirstUseConfirmHook
+    // (a different "by" name) and never `Ask` from the floor.
+    let mut ctx = EventContext::pre_tool_use("write_file")
+        .with_binding(Binding::Public)
+        .with_content("write_file {\"path\":\".git/config\"}")
+        .with_command_text("write_file {\"path\":\".git/config\"}");
+
+    let (result, denied_by) = chain.run_gating(&mut ctx);
+    match result {
+        HookResult::Ask(_) => {}
+        other => panic!(
+            "expected Ask from the protected-path floor even under an Allow policy, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        denied_by,
+        Some("protected_path"),
+        "the floor must reach Ask before PermissionHook is consulted"
+    );
 }
 
 #[test]
