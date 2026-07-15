@@ -53,12 +53,14 @@
   `available_tools(env)` (filters by `Tool::available`, preserves registration order).
 - `ToolCall` / `ParsedToolCall` — `calling.rs:37-50`. `ParsedToolCall::Malformed { raw, error }`
   surfaces bad JSON rather than silently dropping it, so the loop can tell the model to retry.
-- `parse_tool_calls(own_output: &str) -> Vec<ParsedToolCall>` — `calling.rs:64-91`. Scans lines
-  for an opening fence matching ` ```tool ` **exactly** (case-insensitive after trim — not
-  ` ```json ` or any other fence), collects until the closing ` ``` `, JSON-decodes the body.
-  **The safety contract is entirely at the call site**: this function will parse whatever string
-  it's given, so the caller must pass only the model's own freshly-generated current-turn text.
-  The one caller in the tree, `ToolDispatcher::run_turn`, honors this (`dispatch.rs:271`).
+- `parse_tool_calls(own: &crate::models::OwnOutput) -> Vec<ParsedToolCall>` — `calling.rs:64-91`.
+  Scans lines for an opening fence matching ` ```tool ` **exactly** (case-insensitive after trim —
+  not ` ```json ` or any other fence), collects until the closing ` ``` `, JSON-decodes the body.
+  **The safety contract is enforced at the type level**: the parameter is `&OwnOutput` (a newtype
+  defined in `models::client` whose only constructor, `OwnOutput::from_stream_assembly`, is
+  `pub(crate)`), and the agent loop mints one exactly once, right after the SSE-delta assembly
+  loop. A bare `&str` from a tool result, web page, or history is a type error. The one caller in
+  the tree, `ToolDispatcher::run_turn`, honors this (`dispatch.rs:271`).
 - `render_tool_catalog(tools: &[&dyn Tool]) -> String` — `calling.rs:121-148`. Builds the
   system-prompt fragment teaching the dialect + rules + tool list. Returns `""` for an empty
   slice so the caller can skip adding a system message.
@@ -79,9 +81,11 @@
   - `catalog() -> String` — `dispatch.rs:108-110`.
   - `async fn dispatch(&self, call: &ToolCall, ctx: &ExecCtx, binding: Binding, is_cloud: bool) -> ToolOutcome`
     — `dispatch.rs:114-255`. The core resolve→gate→execute path (see Data flow below).
-  - `async fn run_turn(&self, own_output: &str, ctx: &ExecCtx, binding: Binding, is_cloud: bool) -> Option<ChatMessage>`
+  - `async fn run_turn(&self, own_output: &OwnOutput, ctx: &ExecCtx, binding: Binding, is_cloud: bool) -> Option<ChatMessage>`
     — `dispatch.rs:264-294`. Parses, dispatches every call, joins `format_outcome` sections into
-    one `ChatMessage::user(...)`, or `None` if no ` ```tool ` block was found.
+    one `ChatMessage::user(...)`, or `None` if no ` ```tool ` block was found. `own_output` is the
+    `&OwnOutput` newtype from `models::client` (see `parse_tool_calls` entry above) — passing a
+    bare `&str` is a type error.
 - `ToolOutcome` — `dispatch.rs:40-57`. `Ok(Value) | Err(String) | Denied{by,reason} |
   Ask{by,prompt} | Unavailable(String) | Unknown(String)` — every non-Ok variant is a distinct,
   explainable reason, not a silent nothing.
@@ -161,9 +165,13 @@
 ## Invariants (do NOT break)
 
 - **`parse_tool_calls` must only ever be called on the model's own current-turn output.** This is
-  the entire defense against a read web page/email/tool-result forging a tool call — it is not
-  enforced by the type system, only by caller discipline (`calling.rs:58-63`, `dispatch.rs:14-19`,
-  `264-267`). If you add a new call site, it must uphold this.
+  the entire defense against a read web page/email/tool-result forging a tool call. **Enforced at
+  the type level since item 1 of `docs/tool-system-build-plan.md`**: the parameter is `&OwnOutput`,
+  whose only constructor is `OwnOutput::from_stream_assembly` (`pub(crate)`, `models::client`),
+  and the agent loop mints one exactly once, right after the SSE-delta assembly loop
+  (`agent/loop_mod.rs`). A bare `&str` from a tool result, web page, or history is a type error. If
+  you add a new call site, you must call `OwnOutput::from_stream_assembly` (or a test-only
+  `&OwnOutput::from_stream_assembly(...)` helper) — passing a raw `&str` will not compile.
 - **Every mutating tool must override `risk()` to something other than `Safe`.** The trait default
   is `Safe` (`mod.rs:208-210`) specifically so a forgotten override only ever *under*-restricts a
   read tool's own claims, never a write tool's — but `build_tool_dispatcher` trusts `risk()` to

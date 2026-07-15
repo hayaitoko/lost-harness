@@ -1440,7 +1440,7 @@ Status legend: `todo` · `in-progress` · `done` · `blocked`.
 
 | # | Item | Status | Commit(s) | Notes / handoff |
 |---|---|---|---|---|
-| 1 | OwnOutput newtype | todo | — | |
+| 1 | OwnOutput newtype | done | 14c7122 | `OwnOutput(String)` newtype in `models::client`; `pub(crate) fn from_stream_assembly`; re-exported as `crate::models::OwnOutput`. `parse_tool_calls(own: &OwnOutput)` and `ToolDispatcher::run_turn(own_output: &OwnOutput, …)` now take the newtype. The agent loop mints one right after the SSE-delta assembly loop (`agent/loop_mod.rs:374-376`), and `assembled` stays alive for its other three uses (message persistence, `final_text`, history push) via `.clone()`. Test modules use a `fn own(s: &str) -> OwnOutput { OwnOutput::from_stream_assembly(s.to_string()) }` helper to wrap test inputs. `docs/codebase/tools.md` updated to reflect the type-level contract. `cargo build` (75 warnings — all pre-existing) and `cargo test --lib` (226 passed) green. |
 | 2 | Budgets + repeat + deny-cascade | todo | — | |
 | 3 | Protected-paths floor hook | todo | — | |
 | 4 | Crash-recovery + interrupted event | todo | — | build with #5 |
@@ -1450,4 +1450,5 @@ Status legend: `todo` · `in-progress` · `done` · `blocked`.
 | 8 | MCP into registry | todo | — | |
 
 **Log narrative** (append newest first — one line per meaningful step, so a fresh model sees the trail):
+- 2026-07-15 — Item 1 done. OwnOutput newtype minted once per turn in `agent/loop_mod.rs:374-376`; `parse_tool_calls` and `ToolDispatcher::run_turn` now take `&OwnOutput`; type-mismatch enforces the "only the model's own current-turn text" rule. See commit 14c7122. Next agent: pick up Item 2 (budgets + repeat + deny-cascade) — the spec is in Part 1, lines 202+, and the `run_turn` body you'll be rewriting is the same one I just type-changed. The `begin_run` reset hook has to land before any tool-call site that wants to count.
 - 2026-07-15 — plan created from Fable's decisions + Lukas's overrides. No items started yet.
