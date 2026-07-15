@@ -68,6 +68,7 @@ use crate::agent::gate::Binding;
 use crate::tools::ToolInput;
 
 pub mod approval;
+pub mod audit;
 pub mod first_use;
 pub mod permission;
 pub mod privacy_filter;
@@ -78,6 +79,10 @@ pub mod sandbox;
 pub use approval::{
     ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter, ApprovalRequest,
     GrantScope, GrantTarget,
+};
+pub use audit::{
+    outcome_gate_by, outcome_label, truncate_args, AuditEntry, AuditObserverHook, AuditWriter,
+    CAPTURED_ARGS_CAP, StorageAuditWriter,
 };
 pub use first_use::FirstUseConfirmHook;
 pub use permission::{
@@ -188,6 +193,26 @@ impl EventContext {
     pub fn pre_tool_use(tool_name: impl Into<String>) -> Self {
         Self {
             event: HookEvent::PreToolUse,
+            tool_name: tool_name.into(),
+            input: ToolInput::empty(),
+            command_text: String::new(),
+            binding: Binding::Auto,
+            content: String::new(),
+            is_cloud_endpoint: false,
+            conversation_id: String::new(),
+            routing: RoutingRequirement::Unconstrained,
+        }
+    }
+
+    /// Build a minimal `PostToolUse` context. Reserved for the
+    /// `ObserverHook` migration (item 5 + the future
+    /// `HookChain::notify_observers` swap): the audit observer is
+    /// wired today via the dispatcher's direct `write_audit` call, but
+    /// the same struct shape will be the on-the-wire EventContext
+    /// when notify_observers eventually carries the outcome.
+    pub fn post_tool_use(tool_name: impl Into<String>) -> Self {
+        Self {
+            event: HookEvent::PostToolUse,
             tool_name: tool_name.into(),
             input: ToolInput::empty(),
             command_text: String::new(),

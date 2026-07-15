@@ -10,7 +10,9 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use super::schema::{GLOBAL_SCHEMA_SQL, PROFILE_SCHEMA_SQL, SCHEMA_VERSION};
+use super::schema::{
+    GLOBAL_SCHEMA_SQL, GLOBAL_SCHEMA_VERSION, PROFILE_SCHEMA_SQL, PROFILE_SCHEMA_VERSION,
+};
 
 /// A single named migration. Migrations are append-only: never edit a
 /// shipped migration, add a new one instead.
@@ -29,11 +31,43 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[Migration {
 }];
 
 /// All per-profile DB migrations, in order.
-pub const PROFILE_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_profile_schema",
-    sql: PROFILE_SCHEMA_SQL,
-}];
+pub const PROFILE_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_profile_schema",
+        sql: PROFILE_SCHEMA_SQL,
+    },
+    Migration {
+        version: 2,
+        // Append-only per-dispatch audit trail (item 5, Fable Q9). Lives
+        // in the per-profile DB (same isolation logic as the rest of
+        // profile data); written from `tools::dispatch` AFTER the outcome
+        // exists, so it can never gate a call. The CREATE is
+        // IF NOT EXISTS because fresh DBs running the v1 migration in
+        // the same pass also get the table from PROFILE_SCHEMA_SQL
+        // (item 5 ships the table definition in both places so v2 is
+        // a no-op on a fresh install and a real upgrade on an existing
+        // v1 DB).
+        name: "tool_audit_table",
+        sql: "CREATE TABLE IF NOT EXISTS tool_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              INTEGER NOT NULL,
+            conversation_id TEXT NOT NULL,
+            tool_name       TEXT NOT NULL,
+            canonical_args  TEXT NOT NULL,
+            fingerprint     TEXT NOT NULL,
+            risk            TEXT NOT NULL,
+            outcome         TEXT NOT NULL,
+            gate_by         TEXT,
+            grant_used      TEXT,
+            decision        TEXT,
+            endpoint_kind   TEXT,
+            duration_ms     INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_audit_conversation ON tool_audit(conversation_id);
+        CREATE INDEX IF NOT EXISTS idx_tool_audit_created ON tool_audit(ts);",
+    },
+];
 
 /// Apply all pending global migrations to a freshly opened connection.
 ///
@@ -41,11 +75,11 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[Migration {
 /// migration row) and on an existing DB (skips already-applied versions).
 pub fn migrate_global(conn: &Connection) -> Result<()> {
     run_migrations(conn, GLOBAL_MIGRATIONS, "global")?;
-    // Sanity: the latest migration must equal SCHEMA_VERSION.
+    // Sanity: the latest migration must equal the global schema version.
     debug_assert_eq!(
         GLOBAL_MIGRATIONS.last().map(|m| m.version).unwrap_or(0),
-        SCHEMA_VERSION,
-        "GLOBAL_MIGRATIONS must end at SCHEMA_VERSION"
+        GLOBAL_SCHEMA_VERSION,
+        "GLOBAL_MIGRATIONS must end at GLOBAL_SCHEMA_VERSION"
     );
     Ok(())
 }
@@ -53,10 +87,11 @@ pub fn migrate_global(conn: &Connection) -> Result<()> {
 /// Apply all pending per-profile migrations to a freshly opened connection.
 pub fn migrate_profile(conn: &Connection) -> Result<()> {
     run_migrations(conn, PROFILE_MIGRATIONS, "profile")?;
+    // Sanity: the latest migration must equal the profile schema version.
     debug_assert_eq!(
         PROFILE_MIGRATIONS.last().map(|m| m.version).unwrap_or(0),
-        SCHEMA_VERSION,
-        "PROFILE_MIGRATIONS must end at SCHEMA_VERSION"
+        PROFILE_SCHEMA_VERSION,
+        "PROFILE_MIGRATIONS must end at PROFILE_SCHEMA_VERSION"
     );
     Ok(())
 }
@@ -122,7 +157,7 @@ mod tests {
         let v: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(v, GLOBAL_SCHEMA_VERSION);
     }
 
     #[test]
@@ -132,7 +167,7 @@ mod tests {
         let v: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(v, PROFILE_SCHEMA_VERSION);
     }
 
     #[test]
@@ -143,6 +178,6 @@ mod tests {
         let v: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(v, GLOBAL_SCHEMA_VERSION);
     }
 }

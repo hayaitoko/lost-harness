@@ -11,7 +11,9 @@
 //! `Storage::open` with a tempdir) to catch regressions early.
 
 use super::*;
-use crate::storage::schema::{GLOBAL_TABLES, PROFILE_TABLES, SCHEMA_VERSION};
+use crate::storage::schema::{
+    GLOBAL_SCHEMA_VERSION, GLOBAL_TABLES, PROFILE_SCHEMA_VERSION, PROFILE_TABLES,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Fresh in-memory DB has every expected table
@@ -54,7 +56,8 @@ fn fresh_in_memory_profile_has_all_tables() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. schema_version is 1 after init (and after reopening)
+// 5. schema_version lands at the expected version per store (global=1, profile=2)
+//    (and survives reopening)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -64,19 +67,21 @@ fn schema_version_is_one_after_init_global() {
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, SCHEMA_VERSION);
+    assert_eq!(v, GLOBAL_SCHEMA_VERSION);
     assert_eq!(v, 1);
 }
 
 #[test]
-fn schema_version_is_one_after_init_profile() {
+fn schema_version_is_two_after_init_profile() {
+    // Profile schema version is now 2 (item 5 added `tool_audit`); global
+    // stays at 1. The two are tracked independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, SCHEMA_VERSION);
-    assert_eq!(v, 1);
+    assert_eq!(v, PROFILE_SCHEMA_VERSION);
+    assert_eq!(v, 2);
 }
 
 #[test]
@@ -91,7 +96,7 @@ fn schema_version_survives_reopen_to_disk() {
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, SCHEMA_VERSION);
+    assert_eq!(v, GLOBAL_SCHEMA_VERSION);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -501,8 +506,136 @@ fn global_endpoints_and_memory_round_trip() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Extra: TRM log retention helper
+// Extra: tool_audit round trip (item 5, Fable Q9)
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn tool_audit_row_is_persisted_and_queryable() {
+    let p = ProfileDb::open_in_memory("personal").unwrap();
+    let now = chrono::Utc::now().timestamp();
+
+    // Empty profile has no rows.
+    let empty = p.list_tool_audit("conv-1").unwrap();
+    assert!(empty.is_empty(), "fresh profile must have zero audit rows");
+
+    // Insert a row shaped like a sandbox-denial observation.
+    let row = ToolAuditRow {
+        id: 0, // ignored; AUTOINCREMENT
+        ts: now,
+        conversation_id: "conv-1".to_string(),
+        tool_name: "shell_exec".to_string(),
+        canonical_args: "shell_exec {\"cmd\":\"rm -rf /\"}".to_string(),
+        fingerprint: "deadbeef".to_string(),
+        risk: "Write".to_string(),
+        outcome: "denied".to_string(),
+        gate_by: Some("sandbox".to_string()),
+        grant_used: None,
+        decision: None,
+        endpoint_kind: Some("local".to_string()),
+        duration_ms: Some(2),
+    };
+    p.add_tool_audit(&row).unwrap();
+
+    // Query it back — all fields round-trip exactly.
+    let got = p.list_tool_audit("conv-1").unwrap();
+    assert_eq!(got.len(), 1, "expected exactly one audit row");
+    assert!(got[0].id > 0, "AUTOINCREMENT id must be set on read");
+    assert_eq!(got[0].ts, now);
+    assert_eq!(got[0].conversation_id, "conv-1");
+    assert_eq!(got[0].tool_name, "shell_exec");
+    assert_eq!(got[0].canonical_args, "shell_exec {\"cmd\":\"rm -rf /\"}");
+    assert_eq!(got[0].fingerprint, "deadbeef");
+    assert_eq!(got[0].risk, "Write");
+    assert_eq!(got[0].outcome, "denied");
+    assert_eq!(got[0].gate_by.as_deref(), Some("sandbox"));
+    assert!(got[0].grant_used.is_none());
+    assert!(got[0].decision.is_none());
+    assert_eq!(got[0].endpoint_kind.as_deref(), Some("local"));
+    assert_eq!(got[0].duration_ms, Some(2));
+}
+
+#[test]
+fn tool_audit_filtered_to_conversation() {
+    let p = ProfileDb::open_in_memory("personal").unwrap();
+    let now = chrono::Utc::now().timestamp();
+
+    for conv in ["conv-a", "conv-b"] {
+        p.add_tool_audit(&ToolAuditRow {
+            id: 0,
+            ts: now,
+            conversation_id: conv.to_string(),
+            tool_name: "echo".to_string(),
+            canonical_args: "echo {}".to_string(),
+            fingerprint: format!("fp-{conv}"),
+            risk: "Safe".to_string(),
+            outcome: "ok".to_string(),
+            gate_by: None,
+            grant_used: Some("pre-trusted".to_string()),
+            decision: None,
+            endpoint_kind: Some("local".to_string()),
+            duration_ms: Some(1),
+        })
+        .unwrap();
+    }
+    // Add a second row for conv-a so we can verify ordering by id ASC.
+    p.add_tool_audit(&ToolAuditRow {
+        id: 0,
+        ts: now,
+        conversation_id: "conv-a".to_string(),
+        tool_name: "echo".to_string(),
+        canonical_args: "echo {}".to_string(),
+        fingerprint: "fp-conv-a-2".to_string(),
+        risk: "Safe".to_string(),
+        outcome: "ok".to_string(),
+        gate_by: None,
+        grant_used: Some("pre-trusted".to_string()),
+        decision: None,
+        endpoint_kind: Some("local".to_string()),
+        duration_ms: Some(1),
+    })
+    .unwrap();
+
+    let a = p.list_tool_audit("conv-a").unwrap();
+    let b = p.list_tool_audit("conv-b").unwrap();
+    assert_eq!(a.len(), 2);
+    assert_eq!(b.len(), 1);
+    // Both conv-a rows are for the same conversation, both fingerprints
+    // are the only thing distinguishing them in the row data.
+    assert_eq!(a[0].fingerprint, "fp-conv-a");
+    assert_eq!(a[1].fingerprint, "fp-conv-a-2");
+    assert_eq!(b[0].fingerprint, "fp-conv-b");
+}
+
+#[test]
+fn tool_audit_appends_only_no_update_path() {
+    // The audit table is intentionally append-only at the API surface:
+    // there is no `update_tool_audit` or `delete_tool_audit`. This test
+    // exists to make that contract visible — if a future contributor
+    // adds one, they'll have to acknowledge breaking the audit invariant
+    // (a Settings "Activity" pane is read-only by design).
+    let p = ProfileDb::open_in_memory("personal").unwrap();
+    let now = chrono::Utc::now().timestamp();
+    p.add_tool_audit(&ToolAuditRow {
+        id: 0,
+        ts: now,
+        conversation_id: "conv".to_string(),
+        tool_name: "echo".to_string(),
+        canonical_args: "echo {}".to_string(),
+        fingerprint: "fp".to_string(),
+        risk: "Safe".to_string(),
+        outcome: "ok".to_string(),
+        gate_by: None,
+        grant_used: None,
+        decision: None,
+        endpoint_kind: Some("local".to_string()),
+        duration_ms: None,
+    })
+    .unwrap();
+    // The whole point: there is no .update / .delete method on
+    // ToolAuditRow; we only see add/list. Just confirm we can re-read.
+    let rows = p.list_tool_audit("conv").unwrap();
+    assert_eq!(rows.len(), 1);
+}
 
 #[test]
 fn trm_log_purge_keeps_recent_drops_old() {

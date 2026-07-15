@@ -25,8 +25,9 @@ use uuid::Uuid;
 
 use crate::agent::gate::Binding;
 use crate::hooks::{
-    ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter, ApprovalRequest,
-    EventContext, GrantScope, GrantTarget, HookChain, HookResult, RoutingRequirement,
+    outcome_gate_by, outcome_label, truncate_args, ActionFingerprint, ApprovalDecision,
+    ApprovalLedger, ApprovalPrompter, ApprovalRequest, AuditEntry, AuditWriter, EventContext,
+    GrantScope, GrantTarget, HookChain, HookResult, RoutingRequirement,
 };
 use crate::models::{ChatMessage, OwnOutput};
 use crate::tools::calling::{
@@ -115,6 +116,13 @@ pub struct ToolDispatcher {
     /// flight against a given dispatcher. If concurrent runs are ever
     /// allowed, this must become per-conversation-keyed.
     run_state: Mutex<RunState>,
+    /// Q5 do-now: append-only post-tool-use audit writer. Fired once per
+    /// `dispatch()` call (every return path), AFTER the outcome exists.
+    /// `None` = no audit (test dispatchers that don't care; the default
+    /// `ToolDispatcher::new` is `None` for the same reason `empty()` is
+    /// `None` for everything else). The production app wires a
+    /// `StorageAuditWriter` via `with_audit_writer`.
+    audit_writer: Option<Arc<dyn AuditWriter>>,
 }
 
 impl ToolDispatcher {
@@ -127,6 +135,7 @@ impl ToolDispatcher {
             approver: None,
             reads: Arc::new(ConversationReads::new()),
             run_state: Mutex::new(RunState::default()),
+            audit_writer: None,
         }
     }
 
@@ -141,6 +150,73 @@ impl ToolDispatcher {
         self.ledger = ledger;
         self.approver = approver;
         self
+    }
+
+    /// Wire the append-only post-tool-use audit writer (Q5 do-now, item 5).
+    /// `dispatch` fires one `AuditEntry` per call (every return path,
+    /// including Unknown / Unavailable / Denied / Ask / Ok / Err) AFTER the
+    /// outcome exists — the writer is an *observer*, never a gate, and a
+    /// failed write is logged and swallowed at the call site, not bubbled
+    /// back into the call's outcome.
+    pub fn with_audit_writer(mut self, writer: Arc<dyn AuditWriter>) -> Self {
+        self.audit_writer = Some(writer);
+        self
+    }
+
+    /// Build one `AuditEntry` from the dispatch inputs and hand it to
+    /// the configured writer. No-op when no writer is wired (the default
+    /// for `ToolDispatcher::new` / `empty()` — see `audit_writer`).
+    ///
+    /// `grant_used` and `decision` are intentionally `None` for now:
+    /// deriving them requires inspecting the ledger before/after a call
+    /// (`grant_used`) or threading the approval decision out of the
+    /// for-loop (`decision`), neither of which this round is
+    /// responsible for. The audit row is still valuable without them
+    /// — the spec explicitly says "If the grant source isn't
+    /// determinable, None is fine."
+    fn fire_audit(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecCtx,
+        is_cloud: bool,
+        outcome: &ToolOutcome,
+        duration_ms: i64,
+    ) {
+        let Some(writer) = self.audit_writer.as_ref() else {
+            return;
+        };
+        // The canonical / fingerprint / risk derivations are duplicated
+        // from `dispatch_inner` so the audit row is complete even on
+        // the early-return paths (Unknown, Unavailable) where the tool
+        // lookup never succeeded. The cost is one format! + one
+        // SHA-256 + one Debug-format — negligible next to the actual
+        // tool execution.
+        let canonical = format!("{} {}", call.name, call.args);
+        let fingerprint = ActionFingerprint::of(&call.name, &call.args);
+        let risk = self
+            .registry
+            .get(&call.name)
+            .map(|t| format!("{:?}", t.risk()))
+            .unwrap_or_else(|| "Unknown".to_string());
+        let entry = AuditEntry {
+            profile: ctx.profile.clone(),
+            conversation_id: ctx.conversation_id.clone(),
+            tool_name: call.name.clone(),
+            canonical_args: truncate_args(&canonical),
+            fingerprint,
+            risk,
+            outcome: outcome_label(outcome).to_string(),
+            gate_by: outcome_gate_by(outcome),
+            grant_used: None,
+            decision: None,
+            endpoint_kind: if is_cloud {
+                "cloud".to_string()
+            } else {
+                "local".to_string()
+            },
+            duration_ms,
+        };
+        writer.write_audit(&entry);
     }
 
     /// An inert dispatcher: no tools, no gating hooks. Used where a real one
@@ -172,7 +248,32 @@ impl ToolDispatcher {
 
     /// Dispatch one already-parsed tool call: resolve → availability →
     /// gating chain → execute.
+    ///
+    /// This is a thin wrapper around `dispatch_inner` that fires one
+    /// post-tool-use audit entry on every return path (Unknown /
+    /// Unavailable / Denied / Ask / Ok / Err). The audit fires AFTER
+    /// the outcome exists, so it can never gate a call. A failed
+    /// `write_audit` is logged and swallowed at the call site (see
+    /// `StorageAuditWriter::write_audit`) — the tool call's outcome
+    /// is the user-visible fact, not whether the audit row landed.
     pub async fn dispatch(
+        &self,
+        call: &ToolCall,
+        ctx: &ExecCtx,
+        binding: Binding,
+        is_cloud: bool,
+    ) -> ToolOutcome {
+        let start = std::time::Instant::now();
+        let outcome = self.dispatch_inner(call, ctx, binding, is_cloud).await;
+        self.fire_audit(call, ctx, is_cloud, &outcome, start.elapsed().as_millis() as i64);
+        outcome
+    }
+
+    /// Inner body of `dispatch`: the actual resolve → availability →
+    /// gating chain → execute pipeline. Returned outcomes are wrapped
+    /// by the public `dispatch` for audit + observation. Do not call
+    /// this directly from outside — it bypasses the audit hook.
+    async fn dispatch_inner(
         &self,
         call: &ToolCall,
         ctx: &ExecCtx,
@@ -1704,4 +1805,217 @@ mod tests {
             "the second protected-path call must have re-prompted — Session+Tool must not satisfy the floor"
         );
     }
+
+    // ── Q5 do-now item 5: tool_audit fires on every dispatch return path ──
+    //
+    // The dispatcher writes one `AuditEntry` per call via its
+    // `AuditWriter` — for every return path: Ok, Err, Denied, Ask,
+    // Unavailable, Unknown. These tests use a `TestAuditWriter` that
+    // collects entries into a `Vec<Mutex<>>` so we can assert on the
+    // exact outcome label, `gate_by`, and other fields without going
+    // through SQLite.
+
+    /// Test-only `AuditWriter` that appends to a shared Vec. Returns
+    /// the handle separately so tests can `.lock()` it without holding
+    /// a reference to the dispatcher.
+    struct TestAuditWriter {
+        entries: Arc<Mutex<Vec<AuditEntry>>>,
+    }
+
+    impl TestAuditWriter {
+        fn new() -> (Self, Arc<Mutex<Vec<AuditEntry>>>) {
+            let entries = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    entries: Arc::clone(&entries),
+                },
+                entries,
+            )
+        }
+    }
+
+    impl AuditWriter for TestAuditWriter {
+        fn write_audit(&self, entry: &AuditEntry) {
+            self.entries.lock().unwrap().push(entry.clone());
+        }
+    }
+
+    /// Wrap a dispatcher with a TestAuditWriter, returning both the
+    /// dispatcher and the handle to inspect collected entries.
+    fn with_audit(
+        registry: ToolRegistry,
+        chain: HookChain,
+        env: BodyEnv,
+    ) -> (ToolDispatcher, Arc<Mutex<Vec<AuditEntry>>>) {
+        let (writer, entries) = TestAuditWriter::new();
+        let dispatcher = ToolDispatcher::new(registry, chain, env)
+            .with_audit_writer(Arc::new(writer) as Arc<dyn AuditWriter>);
+        (dispatcher, entries)
+    }
+
+    #[tokio::test]
+    async fn denied_call_produces_an_audit_row() {
+        // Same shape as the existing `sandbox_denied_call_never_runs_the_tool`:
+        // a real `shell_exec` tool (the SpyTool) behind a full pretooluse
+        // chain with whole-tool Allow, calling `rm -rf /` — the
+        // non-overridable SandboxHook denies underneath the permit.
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SpyTool { ran: ran.clone() }));
+        let chain =
+            build_pretooluse_chain(gate(), Box::new(allow_policy(&["shell_exec"])));
+        let (dispatcher, entries) = with_audit(registry, chain, BodyEnv::empty());
+
+        let outcome = dispatcher
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "rm -rf /"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+
+        // The user-visible outcome is unchanged.
+        match outcome {
+            ToolOutcome::Denied { by, .. } => assert_eq!(by, "sandbox"),
+            other => panic!("expected sandbox Denied, got {other:?}"),
+        }
+        assert!(!ran.load(Ordering::SeqCst));
+
+        // And exactly one audit row was written, with the right shape.
+        let entries = entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "exactly one audit row per dispatch");
+        let e = &entries[0];
+        assert_eq!(e.outcome, "denied");
+        assert_eq!(e.gate_by.as_deref(), Some("sandbox"));
+        assert_eq!(e.tool_name, "shell_exec");
+        assert_eq!(e.conversation_id, "conv-1");
+        assert_eq!(e.profile, "personal");
+        assert_eq!(e.endpoint_kind, "local");
+        // The fingerprint is the same one a `Just this action` grant
+        // would compute — proves the audit row is comparable to the
+        // ledger's grant set.
+        assert_eq!(
+            e.fingerprint,
+            ActionFingerprint::of("shell_exec", &serde_json::json!({"cmd": "rm -rf /"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_call_produces_an_audit_row() {
+        // Pre-trusted echo call: no gating hook fires, no Ask, the
+        // tool runs to Ok. The audit row should reflect that — no
+        // gate_by, outcome="ok", risk="Safe".
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let chain = build_pretooluse_chain_with_confirmed(
+            gate(),
+            Box::new(allow_policy(&["echo"])),
+            &["echo"],
+        );
+        let (dispatcher, entries) = with_audit(registry, chain, BodyEnv::empty());
+
+        let outcome = dispatcher
+            .dispatch(
+                &call("echo", serde_json::json!({"x": 1})),
+                &ctx(),
+                Binding::Public,
+                true, // cloud endpoint — exercises the endpoint_kind branch
+            )
+            .await;
+        assert_eq!(outcome, ToolOutcome::Ok(serde_json::json!({"x": 1})));
+
+        let entries = entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.outcome, "ok");
+        assert_eq!(e.tool_name, "echo");
+        assert!(e.gate_by.is_none(), "an Ok row has no gate_by");
+        assert_eq!(e.risk, "Safe");
+        assert_eq!(e.endpoint_kind, "cloud");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_produces_an_audit_row() {
+        // Dispatcher with no tools at all. The dispatch path's first
+        // action is `registry.get(&call.name)` → None → Unknown. The
+        // audit must still fire (Unknown is a load-bearing audit
+        // entry — a model hallucinating a tool name is exactly the
+        // thing an Activity pane should surface).
+        let (dispatcher, entries) = with_audit(
+            ToolRegistry::new(),
+            HookChain::new(),
+            BodyEnv::empty(),
+        );
+        let outcome = dispatcher
+            .dispatch(
+                &call("nope", serde_json::Value::Null),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(matches!(outcome, ToolOutcome::Unknown(_)));
+
+        let entries = entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.outcome, "unknown");
+        assert_eq!(e.tool_name, "nope");
+        assert!(e.gate_by.is_none());
+        // The tool wasn't found, so the risk fallback ("Unknown")
+        // applies — NOT a panic.
+        assert_eq!(e.risk, "Unknown");
+    }
+
+    #[tokio::test]
+    async fn unavailable_tool_produces_an_audit_row() {
+        // `SyncFileTool` needs Filesystem + Network; the env provides
+        // neither. Dispatch hits the `!tool.available(&env)` arm
+        // before the gating chain. The audit row must still fire.
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SyncFileTool));
+        let (dispatcher, entries) =
+            with_audit(registry, HookChain::new(), BodyEnv::empty());
+        let outcome = dispatcher
+            .dispatch(
+                &call("sync_file", serde_json::Value::Null),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(matches!(outcome, ToolOutcome::Unavailable(_)));
+
+        let entries = entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.outcome, "unavailable");
+        assert_eq!(e.tool_name, "sync_file");
+        assert!(e.gate_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_audit_writer_is_a_silent_no_op() {
+        // The default `ToolDispatcher::new` has `audit_writer: None`.
+        // Dispatching must still work — the audit step is a no-op
+        // when the writer is unwired (the in-process agent loop's
+        // IPC contract tests use `ToolDispatcher::empty()` and
+        // shouldn't have to care about audit). This test pins that
+        // contract: no panic, normal outcome, nothing to assert on.
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let dispatcher =
+            ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty());
+        let outcome = dispatcher
+            .dispatch(
+                &call("echo", serde_json::json!({})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(matches!(outcome, ToolOutcome::Ok(_)));
+    }
 }
+

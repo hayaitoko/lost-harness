@@ -92,12 +92,15 @@ pub fn run() {
             // §3 tool spine: workspace-confined read-only tools behind the
             // unified pretooluse hook chain, filtered by this body's caps.
             // State-changing tools (a later round) route through the approval
-            // spine wired here.
+            // spine wired here. `storage` is passed in so the dispatcher
+            // can build a StorageAuditWriter for the per-tool-call audit
+            // log (item 5 / Q5 do-now).
             let tools = Arc::new(build_tool_dispatcher(
                 &base_path,
                 Arc::clone(&classifier),
                 Arc::clone(&ledger),
                 Some(Arc::clone(&prompter)),
+                (*storage).clone(),
             ));
 
             let agent_loop = Arc::new(AgentLoop::new(
@@ -200,8 +203,12 @@ fn build_tool_dispatcher(
     classifier: Arc<dyn crate::classifier::Classifier>,
     ledger: Arc<crate::hooks::ApprovalLedger>,
     approver: Option<Arc<dyn crate::hooks::ApprovalPrompter>>,
+    storage: crate::storage::Storage,
 ) -> ToolDispatcher {
-    use crate::hooks::{build_pretooluse_chain_full, InMemoryPolicySource, PermissionMode};
+    use crate::hooks::{
+        build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
+        PermissionMode, StorageAuditWriter,
+    };
     use crate::tools::fs::{
         DeleteFileTool, EditFileTool, ListDirTool, ReadFileTool, SearchFilesTool, WriteFileTool,
     };
@@ -220,8 +227,8 @@ fn build_tool_dispatcher(
     registry.register(Box::new(ReadFileTool::new(workspace.clone())));
     registry.register(Box::new(ListDirTool::new(workspace.clone())));
     registry.register(Box::new(SearchFilesTool::new(workspace.clone())));
-    registry.register(Box::new(WriteFileTool::new(workspace.clone())));
-    registry.register(Box::new(EditFileTool::new(workspace.clone())));
+    registry.register(Box::new(WriteFileTool::new(&workspace)));
+    registry.register(Box::new(EditFileTool::new(&workspace)));
     registry.register(Box::new(DeleteFileTool::new(workspace)));
 
     // Policy DERIVED from each tool's RiskClass, so adding a tool can't
@@ -245,11 +252,26 @@ fn build_tool_dispatcher(
     }
     let pre_trusted_refs: Vec<&str> = pre_trusted.iter().map(String::as_str).collect();
 
-    let chain = build_pretooluse_chain_full(
+    // Q5 do-now (item 5): build the post-tool-use audit writer once, share
+    // the same `Arc<dyn AuditWriter>` between (a) the dispatcher's direct
+    // write_audit path and (b) the chain's observer registry, so the
+    // migration of dispatch to `notify_observers` later is just a call-site
+    // refactor — the writer side is already in place. The dispatcher's
+    // `write_audit` is the path actually used today; the observer
+    // registration is for structural completeness.
+    let audit_writer: Arc<dyn AuditWriter> = Arc::new(StorageAuditWriter::new(storage));
+
+    let mut chain = build_pretooluse_chain_full(
         PrivacyGate::new(classifier),
         Box::new(policy),
         &pre_trusted_refs,
         Arc::clone(&ledger),
     );
-    ToolDispatcher::new(registry, chain, env).with_approval(ledger, approver)
+    chain.register_observer(Box::new(AuditObserverHook::new(Arc::clone(
+        &audit_writer,
+    ))));
+
+    ToolDispatcher::new(registry, chain, env)
+        .with_approval(ledger, approver)
+        .with_audit_writer(audit_writer)
 }

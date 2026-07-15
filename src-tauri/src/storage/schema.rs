@@ -7,8 +7,16 @@
 //! Schema source of truth: spec §1 (Profile Data Model) + §5 (Storage Schema).
 //! All tables use INTEGER for timestamps (Unix seconds, UTC) — chrono::Utc::now().timestamp().
 
-/// Returns the current schema version. Bump when adding a new migration.
-pub const SCHEMA_VERSION: i32 = 1;
+/// Returns the current schema version for the GLOBAL database.
+/// Bump when adding a new global migration.
+pub const GLOBAL_SCHEMA_VERSION: i32 = 1;
+
+/// Returns the current schema version for each PROFILE database.
+/// Bump when adding a new per-profile migration. Profile and global
+/// track versions independently: an item that only adds a per-profile
+/// table (e.g. `tool_audit` in item 5) bumps `PROFILE_SCHEMA_VERSION`
+/// without touching `GLOBAL_SCHEMA_VERSION`.
+pub const PROFILE_SCHEMA_VERSION: i32 = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -128,6 +136,8 @@ pub const PROFILE_TABLES: &[&str] = &[
     "tag_definitions",
     // 11. session_tags — many-to-many join: conversation <-> tag
     "session_tags",
+    // 12. tool_audit — append-only per-dispatch record (item 5, Q9)
+    "tool_audit",
 ];
 
 /// CREATE TABLE statements for per-profile DBs (in dependency order).
@@ -246,6 +256,25 @@ CREATE TABLE IF NOT EXISTS session_tags (
     FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
     FOREIGN KEY(tag_id) REFERENCES tag_definitions(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS tool_audit (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              INTEGER NOT NULL,
+    conversation_id TEXT NOT NULL,
+    tool_name       TEXT NOT NULL,
+    canonical_args  TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,
+    risk            TEXT NOT NULL,
+    outcome         TEXT NOT NULL,
+    gate_by         TEXT,
+    grant_used      TEXT,
+    decision        TEXT,
+    endpoint_kind   TEXT,
+    duration_ms     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_audit_conversation ON tool_audit(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_tool_audit_created ON tool_audit(ts);
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);

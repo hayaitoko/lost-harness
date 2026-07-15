@@ -117,6 +117,50 @@ pub struct Folder {
     pub created_at: i64,
 }
 
+/// One row in the append-only `tool_audit` table — a single tool dispatch's
+/// post-hoc record (item 5, Fable Q9). Written AFTER the outcome exists
+/// (observer lane, never gates). Denied/asked/unknown/unavailable/err calls
+/// are rows too — refusals are the interesting audit entries.
+///
+/// `canonical_args` is size-capped on write (see `CAPTURED_ARGS_CAP` in
+/// `hooks::audit`) so a long file body can't blow up a row.
+/// All times are Unix seconds (UTC).
+#[derive(Debug, Clone)]
+pub struct ToolAuditRow {
+    /// Set by the DB on insert (AUTOINCREMENT). `0` means "not yet inserted".
+    pub id: i64,
+    pub ts: i64,
+    pub conversation_id: String,
+    pub tool_name: String,
+    pub canonical_args: String,
+    pub fingerprint: String,
+    /// `format!("{:?}", tool.risk())` — one of "Safe" / "Write" /
+    /// "External" / "Dangerous". Storing as text so a future risk-class
+    /// rename doesn't break the table.
+    pub risk: String,
+    /// One of "ok" / "err" / "denied" / "ask" / "unavailable" / "unknown".
+    pub outcome: String,
+    /// The hook name that denied/asked, if any — e.g. "sandbox",
+    /// "permission", "protected_path", "privacy-filter", "user",
+    /// "approval", "budget", "batch". `None` for `Ok`/`Err`/`Unknown`/
+    /// `Unavailable`.
+    pub gate_by: Option<String>,
+    /// What authority allowed the call, when applicable: "pre-trusted" for
+    /// whole-tool-allow Safe tools; "once-fp" for a Once+Fingerprint grant;
+    /// "session-fp" / "session-tool" for a session-scoped grant. `None`
+    /// when the audit row's grant source isn't determinable.
+    pub grant_used: Option<String>,
+    /// For an `Ask`-derived outcome: "approve-once" / "approve-session" /
+    /// "approve-tool" / "approve-always" / "deny" / "timeout". `None` for
+    /// other outcomes.
+    pub decision: Option<String>,
+    /// "local" or "cloud" — the endpoint kind the call was on at the
+    /// `is_cloud` argument to `dispatch()`. Tells the Activity pane at a
+    /// glance which calls would have left the device.
+    pub endpoint_kind: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TagDefinition {
     pub id: String,
@@ -811,6 +855,76 @@ impl ProfileDb {
             params![cutoff],
         )?;
         Ok(n)
+    }
+
+    // ── tool_audit (item 5, Fable Q9) ─────────────────────────────────────
+    //
+    // Append-only: only `add_tool_audit` (INSERT) and `list_tool_audit`
+    // (SELECT) — no UPDATE, no DELETE. The table is the post-hoc record
+    // lane; refusing to mutate rows keeps the audit chain defensible
+    // (a future "purge after N days" can only be a separate retention
+    // background task, not an in-band UPDATE).
+
+    /// Insert one audit row. `id` is ignored (the column is AUTOINCREMENT)
+    /// — the inserted `id` is reflected in the row after this call via
+    /// `conn.last_insert_rowid()` but we don't return it; the caller
+    /// that needs it back can re-`list_tool_audit` by `(ts, fingerprint)`.
+    pub fn add_tool_audit(&self, row: &ToolAuditRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tool_audit
+             (ts, conversation_id, tool_name, canonical_args, fingerprint, risk, outcome,
+              gate_by, grant_used, decision, endpoint_kind, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                row.ts,
+                row.conversation_id,
+                row.tool_name,
+                row.canonical_args,
+                row.fingerprint,
+                row.risk,
+                row.outcome,
+                row.gate_by,
+                row.grant_used,
+                row.decision,
+                row.endpoint_kind,
+                row.duration_ms,
+            ],
+        )
+        .context("insert tool_audit row")?;
+        Ok(())
+    }
+
+    /// All audit rows for a conversation, oldest-first (insertion order).
+    /// Empty Vec if there are no calls yet on this conversation — a fresh
+    /// install has no rows, and a conversation that hasn't called any tools
+    /// also has no rows.
+    pub fn list_tool_audit(&self, conversation_id: &str) -> Result<Vec<ToolAuditRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, conversation_id, tool_name, canonical_args, fingerprint,
+                    risk, outcome, gate_by, grant_used, decision, endpoint_kind, duration_ms
+             FROM tool_audit WHERE conversation_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![conversation_id], |row| {
+                Ok(ToolAuditRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    canonical_args: row.get(4)?,
+                    fingerprint: row.get(5)?,
+                    risk: row.get(6)?,
+                    outcome: row.get(7)?,
+                    gate_by: row.get(8)?,
+                    grant_used: row.get(9)?,
+                    decision: row.get(10)?,
+                    endpoint_kind: row.get(11)?,
+                    duration_ms: row.get(12)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("query tool_audit rows")?;
+        Ok(rows)
     }
 }
 
