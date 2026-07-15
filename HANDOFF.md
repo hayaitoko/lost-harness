@@ -7,7 +7,8 @@
 **Read this first, in this order:**
 1. This file — current state, what's next, gotchas.
 2. [`docs/PLAN.md`](docs/PLAN.md) — the **source of truth**. Everything decided lives here: what the product is, the architecture, the build order, the open decisions. Now includes full Memory system and Skills system sections.
-3. [`docs/server-companion.md`](docs/server-companion.md), [`docs/tooling-and-skills.md`](docs/tooling-and-skills.md), [`docs/argos-review.md`](docs/argos-review.md) — deeper reasoning behind specific PLAN.md decisions. Read these when you need the "why," not the "what."
+3. [`docs/codebase/README.md`](docs/codebase/README.md) — the **code-as-it-actually-is guide**: architecture map, one doc per subsystem (with `file:line`), the cross-cutting load-bearing invariants, how-to-run/test, toolchain gotchas, and a watch-items list. Read this when you're about to *change code* (PLAN is the design; this is the implementation).
+4. [`docs/server-companion.md`](docs/server-companion.md), [`docs/tooling-and-skills.md`](docs/tooling-and-skills.md), [`docs/argos-review.md`](docs/argos-review.md) — deeper reasoning behind specific PLAN.md decisions. Read these when you need the "why," not the "what."
 
 ---
 
