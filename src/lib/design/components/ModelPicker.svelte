@@ -8,23 +8,32 @@
     name: string;
     kind: "local" | "cloud";
     group: string;
+    /**
+     * Stable identity for selection. Defaults to `name`, but when two providers
+     * expose an identically-named model the caller must pass a disambiguating
+     * key (e.g. `providerId::name`) so the right one is selected/highlighted.
+     */
+    key?: string;
   }
 
   interface Props {
     /** Every selectable model, in display order. Consecutive items sharing a `group` are grouped under one header. */
     models: ModelOption[];
-    /** The currently selected model's `name`. */
+    /** The currently selected model's identity — its `key` (or `name` if no key was given). */
     value: string;
-    onchange?: (name: string) => void;
+    /** Shown on the button when nothing is selected. */
+    placeholder?: string;
+    onchange?: (key: string) => void;
   }
 
-  let { models, value, onchange }: Props = $props();
+  let { models, value, placeholder = "Select model", onchange }: Props = $props();
 
   let open = $state(false);
   let query = $state("");
   let rootEl: HTMLDivElement;
 
-  const selected = $derived(models.find((m) => m.name === value));
+  const keyOf = (m: ModelOption) => m.key ?? m.name;
+  const selected = $derived(models.find((m) => keyOf(m) === value));
 
   const groups = $derived.by(() => {
     const q = query.trim().toLowerCase();
@@ -81,7 +90,7 @@
         hover:bg-surface-hover hover:text-text hover:border-border-strong"
     >
       <span class="h-1.5 w-1.5 rounded-full {dotClass[selected?.kind ?? 'local']}"></span>
-      <span>{selected?.name ?? value}</span>
+      <span>{selected?.name ?? placeholder}</span>
       <svg
         width="11"
         height="11"
@@ -125,19 +134,19 @@
               {g.kind === "local" ? "on device" : "cloud"}
             </span>
           </div>
-          {#each g.items as m (m.name)}
+          {#each g.items as m (keyOf(m))}
             <button
               type="button"
               role="option"
-              aria-selected={m.name === value}
-              onclick={() => pick(m.name)}
+              aria-selected={keyOf(m) === value}
+              onclick={() => pick(keyOf(m))}
               class="flex w-full items-center gap-[9px] rounded-[var(--r-sm)] border-0 px-[9px] py-[7px] text-left text-[12.5px] text-text transition-[0.08s] hover:bg-surface-hover
-                {m.name === value ? 'bg-accent-soft' : 'bg-transparent'}"
+                {keyOf(m) === value ? 'bg-accent-soft' : 'bg-transparent'}"
             >
               <span class="h-1.5 w-1.5 shrink-0 rounded-full {dotClass[m.kind]}"></span>
               {m.name}
               <span
-                class="ml-auto text-accent {m.name === value ? 'opacity-100' : 'opacity-0'}"
+                class="ml-auto text-accent {keyOf(m) === value ? 'opacity-100' : 'opacity-0'}"
               >
                 <svg
                   width="13"

@@ -28,7 +28,7 @@
   import { sendOnEnter } from "$lib/stores/settings";
 
   type PanelTab = "routing" | "files" | "tasks" | "agents" | "terminal";
-  type ModelOption = { name: string; kind: "local" | "cloud"; group: string };
+  type ModelOption = { name: string; kind: "local" | "cloud"; group: string; key: string };
 
   const BINDING_LABEL: Record<Binding, string> = {
     auto: "Auto",
@@ -76,7 +76,12 @@
   // ── Model picker: build the design's flat ModelOption[] from the real
   // provider list, fetching each provider's models (cached by the store).
   let modelOptions = $state<ModelOption[]>([]);
-  let modelOwner = new Map<string, string>(); // model name -> provider id
+  // Keyed by the composite `providerId::name` so two providers that expose an
+  // identically-named model don't collide (the old name-keyed map let the
+  // last-registered provider silently shadow the others).
+  let modelOwner = new Map<string, { providerId: string; name: string }>();
+
+  const modelKey = (providerId: string, name: string) => `${providerId}::${name}`;
 
   $effect(() => {
     const provs = providersStore.providers;
@@ -87,15 +92,17 @@
       );
       if (cancelled) return;
       const opts: ModelOption[] = [];
-      const owner = new Map<string, string>();
+      const owner = new Map<string, { providerId: string; name: string }>();
       for (const { provider, models } of perProvider) {
         for (const name of models) {
+          const key = modelKey(provider.id, name);
           opts.push({
             name,
             kind: provider.kind === "cloud" ? "cloud" : "local",
             group: provider.name,
+            key,
           });
-          owner.set(name, provider.id);
+          owner.set(key, { providerId: provider.id, name });
         }
       }
       modelOptions = opts;
@@ -106,10 +113,18 @@
     };
   });
 
-  function handleModelChange(name: string) {
-    const providerId = modelOwner.get(name) ?? providersStore.activeProviderId;
-    if (providerId) setActiveModel(providerId, name);
+  function handleModelChange(key: string) {
+    const owner = modelOwner.get(key);
+    if (owner) setActiveModel(owner.providerId, owner.name);
   }
+
+  // The picker's selection identity: the active provider+model as a composite
+  // key, or "" when nothing is selected (the picker then shows its placeholder).
+  const activeModelKey = $derived(
+    providersStore.activeProviderId && providersStore.activeModel
+      ? modelKey(providersStore.activeProviderId, providersStore.activeModel)
+      : "",
+  );
 
   // ── Routing: map a real message's gate outcome to the design's Route.
   // "allow" means the gate let the request go to whichever endpoint was
@@ -351,7 +366,7 @@
           <span class="flex-shrink-0 whitespace-nowrap">
             <ModelPicker
               models={modelOptions}
-              value={providersStore.activeModel ?? "Select model"}
+              value={activeModelKey}
               onchange={handleModelChange}
             />
           </span>
