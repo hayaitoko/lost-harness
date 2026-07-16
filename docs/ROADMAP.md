@@ -15,19 +15,22 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-16: M3 COMPLETE. M4 in progress. Near-term items 1, 2, and the
-> core of 3 are DONE — the trained privacy classifier is now LIVE, not a stub.**
-> The Q8 Permissions pane and the frontend housekeeping landed; the trained
-> bge-small + distilbert INT8 ONNX ensemble now runs in-process via `ort`
-> (parity-verified against the Python reference), fused with the layer-0 rules.
-> What's left of item 3 is the annotated-redaction **sidebar UX** (engine exists,
-> no UI). Next after that: native tool-use (Q1). The two big unbuilt user-facing
-> systems are **memory** and **skills** — both fully designed, zero code.
+> **As of 2026-07-16: M3 COMPLETE. M4 in progress. Near-term items 1, 2, 3, and the
+> memory-system foundation (item 5) have all had major landings this session.**
+> Done + verified: the Q8 Permissions pane; the frontend housekeeping; the trained
+> bge-small + distilbert INT8 ONNX ensemble running in-process via `ort`
+> (parity-verified), fused with the rules layer; the annotated "why this was routed"
+> sidebar wired to the real classifier; and the **memory storage foundation**
+> (sensitivity buckets in physically-separate stores + FTS5 keyword search + curated
+> summary). Item 4 (native tool-use, Q1) is **blocked** on configuring a
+> native-tool-capable model endpoint. Item 3's tail (partial-delegation + classifier
+> settings) and the rest of the memory system (meaning lane, write triggers,
+> injection, events, UI) are the open fronts. **Skills** remains fully designed, zero code.
 
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 336 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 339 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -50,7 +53,7 @@ Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-featu
 | **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
 | **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. Everything else not started. |
-| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 📐 **Designed in full, not built.** Search engine (sqlite-vec) already wired + proven. Design: PLAN §9. |
+| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🔵 **Storage foundation built (2026-07-16, `3ee9790`)** — global migration v2: sensitivity buckets (private-local in a physically-separate table), FTS5 keyword search over both stores, curated-summary pinning; `GlobalDb` API (bucketed insert, `search_memory` with structural private-exclusion, `curated_summary`) + tests. Remaining: sqlite-vec meaning lane (needs a local embedder), write triggers, relevance-gated injection + pinned search tool, non-silent memory events, walled-profile DB routing, UI. Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
 | **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **Ensemble live + annotated sidebar done** — the trained bge-small + distilbert INT8 ONNX ensemble runs in-process via `ort` (`classifier/engine.rs`), fused with the layer-0 rules, parity-verified. Active when its models are installed (`~/Documents/Lost-Harness/models/classifier/`), rules-only fallback otherwise. The "why this was routed" sidebar renders real detected spans (inline marks + legend). Remaining tail: partial-delegation redact-and-send + the per-profile classifier settings page. |
 | **M5** — computer use | cross-platform screen control, the flagship | ⬜ **Not started** (stubs in `src-tauri/src/platform/`) |
@@ -98,7 +101,16 @@ Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-featu
    native `tool_use` path for models that support it; fenced dialect stays the fallback;
    fingerprint-parity regression test across transports. Needs a native-tool-capable
    endpoint configured to prove end-to-end.
-5. **[ ] Memory system** — the biggest missing user-facing capability. Design complete
+5. **[~] Memory system** — **storage foundation DONE** (`3ee9790`): sensitivity buckets
+   (private-local physically separate), FTS5 keyword search with structural
+   private-exclusion, curated-summary pinning, all in `storage/global.rs` + migration v2,
+   tested. **Remaining:** the sqlite-vec meaning lane (needs a local embedder — the
+   classifier's bge is fine-tuned for classification, not embeddings, so a separate
+   small embed model is the open choice), write triggers (save-as-you-go /
+   pre-compaction flush / new-chat nudge — agent-loop integration), relevance-gated
+   injection + the pinned search tool, non-silent memory events, walled-profile DB
+   routing (§7 toggle → per-profile memory DB), and the memory UI. The biggest missing
+   user-facing capability. Design complete
    (PLAN §9 incl. the 2026-07-15 refinements: 3 sensitivity buckets, relevance-gated
    injection, non-silent memory events). Storage schema branches on the per-profile
    privacy toggle (decided 2026-07-08).
