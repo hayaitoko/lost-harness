@@ -15,11 +15,13 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-16: M3 is COMPLETE. M4 has begun (its first item, Q8, is done).**
-> The security/tool spine is finished and adversarially reviewed. The next three
-> pieces of work, in order: (1) the Settings "Permissions" pane (last loose end of
-> Q8), (2) wiring the trained privacy classifier (blocked only on running an export
-> script), (3) native tool-use (Q1, the top parity gap). The two big unbuilt
+> **As of 2026-07-16: M3 is COMPLETE. M4 in progress. Items 1–2 of the near-term
+> list are DONE, and the classifier ONNX export (item 3's one blocker) is done.**
+> The security/tool spine is finished and adversarially reviewed; the Q8
+> Permissions pane and the frontend housekeeping have now landed. The trained
+> privacy classifier is exported to ONNX (fp32 + INT8, ~96 MB INT8) and preserved;
+> what remains of item 3 is the in-Rust `ort` wiring + `gate.rs` renames + the
+> redaction sidebar. After that: native tool-use (Q1). The two big unbuilt
 > user-facing systems are **memory** and **skills** — both fully designed, zero code.
 
 **Health check (run this before believing anything below; update expected numbers when they change):**
@@ -40,12 +42,12 @@ Last verified: 2026-07-16 (full checkup — all three green, git tree clean).
 |---|---|---|
 | **M0** — bootstrap | Tauri + Svelte + Tailwind + CI | ✅ **Done** |
 | **M1** — vertical slice | message → classify → route → model → stream → save | ✅ **Done + verified** (contract tests at the real IPC boundary) |
-| **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends); dev screen-switcher still in `App.svelte`. |
+| **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
 | **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. Everything else not started. |
 | **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 📐 **Designed in full, not built.** Search engine (sqlite-vec) already wired + proven. Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
-| **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟡 **Half-installed** — rules layer (layer 0) is live and is the active classifier. The trained ensemble (layer 1) is **blocked on an action, not code**: run the bundle's `export_onnx.py` to produce the `.onnx` files, then wire them into the waiting `classifier/engine.rs` stub. The annotated-redaction sidebar UX (decided, PLAN §11) has no engine behind it until then. |
+| **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟡 **Export done, wiring pending** — rules layer (layer 0) is live and is the active classifier. The trained ensemble (layer 1) is **exported** (2026-07-16: both encoders → fp32 + INT8 ONNX, preserved at `~/Desktop/Classifier Model + Install Guide for Claude/onnx-export/`). Remaining: wire them via `ort` into the `classifier/engine.rs` stub. The annotated-redaction sidebar UX (decided, PLAN §11) has no engine behind it until then. |
 | **M5** — computer use | cross-platform screen control, the flagship | ⬜ **Not started** (stubs in `src-tauri/src/platform/`) |
 | **M6** — voice | on-device STT/TTS, barge-in | ⬜ **Not started** (stub in `src-tauri/src/audio/`) |
 | **M7** — per-profile isolation | email/calendar/tasks, Capability Packs, real OS sandbox enforcement | ⬜ **Not started** |
@@ -58,20 +60,24 @@ Last verified: 2026-07-16 (full checkup — all three green, git tree clean).
 
 ## What's left — near term, in recommended order
 
-1. **[ ] Settings "Permissions" pane** *(small, do first)* — backend `list_tool_rules`/
-   `delete_tool_rule` + `tauri.ts` wrappers already exist; build the Settings tab that
-   lists persisted "Always allow" rules and revokes them. Until this exists a user can
-   *grant* a standing permission but can't *see or take it back*.
-2. **[ ] Frontend housekeeping** *(≈10 min)* — delete the 5 superseded components in
-   `src/lib/components/` (`Sidebar`, `ChatPanel`, `ModelPicker`, `PrivacyIndicator`,
-   `ProviderSettings` — **keep `ApprovalDialog.svelte`**, it's live); remove the dev
-   floating screen-switcher + theme toggle from `src/App.svelte`; fix the `ModelPicker`
-   flat model-name collision (two providers, same model name → only last wins).
-3. **[ ] Classifier integration round** — run `export_onnx.py` from the bundle at
-   `~/Desktop/Classifier Model + Install Guide for Claude/` to produce the `.onnx`
-   artifacts; load them via `ort` in `classifier/engine.rs`; do the deferred
-   `gate.rs`/`PrivacyGate`/"§7" → "privacy filter" renames in the same touch (that's
-   why they were deferred); build the annotated-redaction right-sidebar UX (PLAN §11).
+1. **[x] Settings "Permissions" pane** *(DONE 2026-07-16, `f38fd2c`)* — a "Permissions"
+   section in Settings (between Privacy guard and Models) lists the active profile's
+   persisted "Always allow" rules via `list_tool_rules` and revokes them via
+   `delete_tool_rule` (two-click confirm). Verified live in the browser preview.
+2. **[x] Frontend housekeeping** *(DONE 2026-07-16, `6dfcf12`)* — deleted the 5
+   superseded components (kept `ApprovalDialog.svelte`); removed the dev floating
+   screen-switcher + theme toggle from `App.svelte`; fixed the `ModelPicker` name
+   collision (options now carry a composite `providerId::name` key — two same-named
+   models list & select independently, verified live with LM Studio + Anthropic
+   `default`). CSS bundle dropped 63.6 → 56.4 kB.
+3. **[~] Classifier integration round** — **export DONE 2026-07-16**: ran the bundle's
+   `export_onnx.py` (Python 3.11 arm64 venv, torch/transformers/onnx) → both encoders
+   exported to fp32 + INT8; artifacts preserved at
+   `~/Desktop/Classifier Model + Install Guide for Claude/onnx-export/` (INT8 ~96 MB).
+   **Remaining:** load them via `ort` in `classifier/engine.rs` (mirror the bundle's
+   `ensemble.py`/`rules.py`/`serve.py` — rules OR bge OR distilbert, per-model
+   `thresholds.txt`); do the deferred `gate.rs`/`PrivacyGate`/"§7" → "privacy filter"
+   renames in the same touch; build the annotated-redaction right-sidebar UX (PLAN §11).
 4. **[ ] Native tool-use + `Tool::schema()` (Q1, M4)** — per-endpoint capability flag;
    native `tool_use` path for models that support it; fenced dialect stays the fallback;
    fingerprint-parity regression test across transports. Needs a native-tool-capable
@@ -95,8 +101,9 @@ idempotency keys (Q3 deferred half), headless approval queue (Q5, server-track p
 
 ## Blocked / waiting on something
 
-- **ONNX ensemble** — waiting on someone running `export_onnx.py` (see item 3 above).
-  Not blocked on any external party; the bundle ships everything needed.
+- **Nothing.** (The ONNX ensemble export — previously the only blocker — was run on
+  2026-07-16; artifacts are produced and preserved. Item 3's remaining work is
+  ordinary Rust wiring, no external dependency.)
 
 ## Accepted quirks (documented, not bugs to fix)
 
@@ -110,6 +117,10 @@ idempotency keys (Q3 deferred half), headless approval queue (Q5, server-track p
 
 - 7 screens render sample data only: Email, Files, Whiteboard, ScheduledJobs, Editor,
   Onboarding, EmptyState. They wire up as their subsystems land — don't wire them early.
+- Now that the dev screen-switcher is gone, Onboarding / Editor / EmptyState have no
+  in-app nav path yet (they're reached programmatically via `nav.go`). They get real
+  entry points when their subsystems land — sidebar/composer nav already reaches the
+  rest. To eyeball one during dev, call `nav.go('onboarding')` or temporarily route to it.
 - `CommandPalette.svelte` ported but not mounted anywhere (M2 leftover).
 - App entry is `/app.html`, **not** `/` — regressing this reproduces the blank-GUI bug.
 
