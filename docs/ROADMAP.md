@@ -52,7 +52,7 @@ Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-featu
 | **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. Everything else not started. |
 | **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 📐 **Designed in full, not built.** Search engine (sqlite-vec) already wired + proven. Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
-| **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **Ensemble live; redaction UX pending** — the trained bge-small + distilbert INT8 ONNX ensemble runs in-process via `ort` (`classifier/engine.rs`), fused with the layer-0 rules, verified parity against the Python reference. Active whenever its models are installed (`~/Documents/Lost-Harness/models/classifier/`), rules-only fallback otherwise. Remaining: the annotated-redaction right-sidebar UX (PLAN §11) — the redact-and-send-safe-parts flow has an engine but no UI. |
+| **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **Ensemble live + annotated sidebar done** — the trained bge-small + distilbert INT8 ONNX ensemble runs in-process via `ort` (`classifier/engine.rs`), fused with the layer-0 rules, parity-verified. Active when its models are installed (`~/Documents/Lost-Harness/models/classifier/`), rules-only fallback otherwise. The "why this was routed" sidebar renders real detected spans (inline marks + legend). Remaining tail: partial-delegation redact-and-send + the per-profile classifier settings page. |
 | **M5** — computer use | cross-platform screen control, the flagship | ⬜ **Not started** (stubs in `src-tauri/src/platform/`) |
 | **M6** — voice | on-device STT/TTS, barge-in | ⬜ **Not started** (stub in `src-tauri/src/audio/`) |
 | **M7** — per-profile isolation | email/calendar/tasks, Capability Packs, real OS sandbox enforcement | ⬜ **Not started** |
@@ -83,18 +83,17 @@ Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-featu
    encoders → fusion at 0.5/0.05), mirroring `serve.py` exactly; behind a default-on
    `onnx-classifier` feature (rules-only fallback with `--no-default-features`). Models
    installed live at `~/Documents/Lost-Harness/models/classifier/` (98 MB); parity test
-   passes on them. **Remaining:** (a) the annotated-redaction right-sidebar UX (PLAN
-   §11) — **backend done** (`explain_classification` IPC, `9bff6c2`: label + spans with
-   char offsets, category, friendly label, hard-block flag; `tauri.ts` wrapper; 3
-   tests). **Frontend TODO:** wire `WhyPanel`/`PrivacyEventBar` to it in the live message
-   flow (build the annotated `<mark class="span">` markup from char offsets; open the
-   sidebar from the "why routed here?" trigger on a held message) — heads-up:
-   MainScreen's current right panel is bespoke inline chrome, not the `WhyPanel`
-   component. Then the redact-and-send-safe-parts flow (`/redact` `safe_text`: merge
-   spans → `[REDACTED:CODE]` → re-classify → send only if clean) + the per-profile
-   classifier settings page (strictness/band/redaction/hard-block). (b) OPTIONAL cosmetic
-   `gate.rs`/`PrivacyGate`/"§7" → "privacy filter" renames (deferred as
-   low-value/high-churn; `gate.rs` cleanly delegates to the `Classifier` trait).
+   passes on them. **The annotated review sidebar is DONE** (PLAN §11 decisions c+d):
+   `explain_classification` IPC (`9bff6c2`) + MainScreen's routing panel wired to it
+   (`914ac74`) — the last user message renders with detected spans marked inline (amber
+   soft / red hard-block), a "what tripped the guard" legend (category · hard-flag ·
+   rule/model layer), verdict-driven heading, browser-QA'd end-to-end. **Remaining
+   (item-3 tail):** (a) partial-delegation redact-and-send flow (`serve.py /redact`
+   `safe_text`: merge spans → `[REDACTED:CODE]` → re-classify → send only if clean +
+   rehydrate — a deeper agent-loop change); (b) the per-profile classifier settings page
+   (strictness/band/redaction/hard-block — needs runtime-tunable thresholds, currently
+   hardcoded `TAU_BLOCK=0.5`/`TAU_BAND=0.05`); (c) OPTIONAL cosmetic `gate.rs` §7 renames
+   (deferred, low-value/high-churn).
 4. **[ ] Native tool-use + `Tool::schema()` (Q1, M4)** — per-endpoint capability flag;
    native `tool_use` path for models that support it; fenced dialect stays the fallback;
    fingerprint-parity regression test across transports. Needs a native-tool-capable
