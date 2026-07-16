@@ -441,6 +441,20 @@ of foundational weight. In dependency order:
    loop consult `RoutingRequirement`/`enforce_local_routing` to pick the
    endpoint for a tool-triggered follow-up turn.
 
+   **Final status (2026-07-16) — M3 is COMPLETE.** Everything the round-1
+   note above listed as remaining has since landed: the approval spine +
+   interactive confirmation (item 9), write/edit/delete tools, `shell_exec`
+   behind a real macOS-Seatbelt-sandboxed executor, MCP folded into the
+   registry (item 5), reroute-to-local plumbing (`NeedsLocalReroute`), and
+   the crash-recovery half of the durability trio (item 8's persisted
+   action journal + idempotency keys is *deliberately deferred* to the
+   first non-idempotent external-effect tool — email/calendar/delegate).
+   Still unbuilt from item 10 (they ride the existing spine when their
+   subsystems land): headless browser, delegate, ask-human, system status,
+   cron management, session search. Q8 (grant×risk matrix + persisted
+   `tool_rules` + risk-badged dialog) also landed as the first M4 item.
+   Live status board: `docs/ROADMAP.md`.
+
 **M4 — Model manager, running alongside the rest of the tooling spine.**
 Two independent tracks that both depend on M3's registry but not on each
 other, so they can proceed in parallel:
@@ -881,9 +895,9 @@ appropriate for local-first.
    large-file/cross-dispatch regression tests. `cargo test --lib`: 226
    passing, 0 failed. With this closed, **native tool-use (item 1, M4) is
    now the top remaining parity gap.**
-3. **Protected-paths always-prompt floor (medium).** CC always prompts for
-   `.git`/`.claude`/etc. regardless of an Allow rule. Add a small hardcoded
-   always-Ask path list — defense beyond the `workspace/` confinement.
+3. **Protected-paths always-prompt floor — DONE (2026-07-15, commit
+   `d13d71a`).** `ProtectedPathHook` forces Once-only Ask for `.git/`/
+   `config/secrets`/`.env`/`.ssh/` regardless of policy.
 4. **Permission modes + precedence (medium, M4+).** A plan/read-only mode
    and an accept-edits mode; deny-first evaluation across settings scopes
    once persisted rules land; re-check permission output against the sandbox
@@ -892,9 +906,10 @@ appropriate for local-first.
    message before processing; wiring the privacy filter as a
    `UserPromptSubmit` hook (in addition to `PreToolUse`) is the natural home.
    `PostToolUse` (durable logging) is a lower-priority companion.
-6. **Shell-tool guardrails (when `shell_exec` ships, M3).** Keep the
-   hardline denylist as the non-overridable floor and add CC's guardrails:
-   a command timeout (~2 min) and output caps.
+6. **Shell-tool guardrails — DONE (2026-07-16, commit `bd20f38`).**
+   `shell_exec` shipped with the hardline denylist floor intact, a command
+   timeout, output caps, and a real macOS Seatbelt sandbox around the
+   subprocess (verified working on the build machine).
 
 Not gaps, just roadmap: subagents, skills, and MCP are designed-not-built
 (§4, §10) — their "high" findings are "not wired yet," which is expected and

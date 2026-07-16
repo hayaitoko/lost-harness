@@ -6,9 +6,10 @@
 
 **Read this first, in this order:**
 1. This file — current state, what's next, gotchas.
-2. [`docs/PLAN.md`](docs/PLAN.md) — the **source of truth**. Everything decided lives here: what the product is, the architecture, the build order, the open decisions. Now includes full Memory system and Skills system sections.
-3. [`docs/codebase/README.md`](docs/codebase/README.md) — the **code-as-it-actually-is guide**: architecture map, one doc per subsystem (with `file:line`), the cross-cutting load-bearing invariants, how-to-run/test, toolchain gotchas, and a watch-items list. Read this when you're about to *change code* (PLAN is the design; this is the implementation).
-4. [`docs/server-companion.md`](docs/server-companion.md), [`docs/tooling-and-skills.md`](docs/tooling-and-skills.md), [`docs/argos-review.md`](docs/argos-review.md) — deeper reasoning behind specific PLAN.md decisions. Read these when you need the "why," not the "what."
+2. [`docs/ROADMAP.md`](docs/ROADMAP.md) — the **stage tracker / status board**: what milestone we're at, what's left in what order, what's blocked. When Lukas asks "where are we," answer from there. Keep it updated as you land work.
+3. [`docs/PLAN.md`](docs/PLAN.md) — the **source of truth**. Everything decided lives here: what the product is, the architecture, the build order, the open decisions. Now includes full Memory system and Skills system sections.
+4. [`docs/codebase/README.md`](docs/codebase/README.md) — the **code-as-it-actually-is guide**: architecture map, one doc per subsystem (with `file:line`), the cross-cutting load-bearing invariants, how-to-run/test, toolchain gotchas, and a watch-items list. Read this when you're about to *change code* (PLAN is the design; this is the implementation).
+5. [`docs/server-companion.md`](docs/server-companion.md), [`docs/tooling-and-skills.md`](docs/tooling-and-skills.md), [`docs/argos-review.md`](docs/argos-review.md) — deeper reasoning behind specific PLAN.md decisions. Read these when you need the "why," not the "what."
 
 ---
 
@@ -16,7 +17,7 @@
 
 This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The Electron app was a prototype to validate UX decisions; it's now a read-only reference. All new work goes in the Tauri project.
 
-**Current milestone:** M3 tool-system rounds 1–5 all landed (2026-07-15). M0 and M1 are done and verified. Everything is committed to `main` — there is nothing uncommitted or in-progress to pick up.
+**Current milestone:** **M3 is COMPLETE; M4 has begun** (its first item, Q8, landed 2026-07-16). M0 and M1 are done and verified. Everything is committed to `main` — there is nothing uncommitted or in-progress to pick up. The live stage tracker is [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 | Subsystem | Status |
 |---|---|
@@ -42,7 +43,7 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 
 **2026-07-16 (earlier): ALL 8 tool-system do-now items are COMPLETE + reviewed.** Items 6 (`NeedsLocalReroute` + loop reroute, `e03999b`), 7 (guarded executor + `shell_exec`, `bd20f38` — real macOS Seatbelt verified working on this machine), and 8 (MCP into the registry, `e63bca8`) all landed, then a 4-lens adversarial review found 6 real defects, all fixed (`ad87971`, 315 tests). The earlier round's 3 findings + LOW routing cleanup are also all fixed (269 → 278, commit `a73f43c`). See the build plan's "⚠ Review findings" sections and the Progress-Log narrative. The one deliberately-not-fully-fixed item: a `setsid()`-detached shell_exec descendant escapes the timeout group-kill but stays Seatbelt-confined (bounded runaway, documented; durable fix = VM isolation).
 
-**Tool-system build plan:** `docs/tool-system-build-plan.md` is the executable build bible. Items 1–5 are done (6 of 8 do-now items complete — the routing-badge fix was a parallel quick win outside the numbered list). Items 6–8 remain. Read its "How to use this doc" header and the Progress Log at the bottom for the full trail.
+**Tool-system build plan:** `docs/tool-system-build-plan.md` is the executable build bible. **All 8 Part-1 do-now items are done, plus Q8 (the first Part-2 item).** What remains of it is the rest of Part 2 (M4/later pointers: Q1 native tool-use, Q11 permission modes, Q3 durability journal, Q6 reroute UX, Q5 headless approval queue). Read its "How to use this doc" header and the Progress Log at the bottom for the full trail.
 
 ---
 
@@ -68,7 +69,7 @@ Two things landed in commit `f9223c9`:
 
 **Round 1 was adversarially reviewed** (a 4-lens multi-agent pass + verification); it surfaced 3 real issues, all fixed with regression tests before commit: (1) the privacy filter's `LocalRequired` annotation was a silent no-op in tool dispatch — now the dispatcher **fails closed** (blocks a must-stay-local tool call when the conversation is on a cloud endpoint); (2) `guard_wrap` neutralized backticks but not the trust-boundary banner it teaches the model — now both are neutralized; (3) `format_outcome` spliced model-controlled tool names/errors in raw — now all interpolated untrusted text runs through `neutralize_untrusted`.
 
-**Still NOT wired:** write/delete tools, the headless browser, delegate/ask-human/system-status/cron/session-search, the durability trio, the approval spine, and MCP-into-registry. The privacy filter now *fails closed* for tool calls on a cloud endpoint (blocks); **rerouting the loop to a local endpoint** instead of blocking is the enhancement — see "What's next."
+**Still NOT wired (updated 2026-07-16):** the headless browser, delegate/ask-human/system-status/cron/session-search tools, and the persisted-journal half of the durability trio (deliberately deferred to the first external-effect tool). Everything else once listed here has since shipped: write/delete tools, the approval spine, `shell_exec` (Seatbelt-sandboxed), MCP-into-registry, and reroute-to-local plumbing (`NeedsLocalReroute`).
 
 ---
 
@@ -84,7 +85,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 315 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 332 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -92,6 +93,8 @@ cd /Users/hayai/Desktop/lost-harness-product && npm run check               # sv
 ---
 
 ## What's next (in order)
+
+> **The ordered, maintained version of this list now lives in [`docs/ROADMAP.md`](docs/ROADMAP.md)** — start there. The short version (2026-07-16): ① Settings "Permissions" pane (small, do first) → ② frontend housekeeping (delete superseded components, dev switcher, ModelPicker collision) → ③ classifier integration round (run the bundle's `export_onnx.py` — the ONNX ensemble is blocked on that one action, not on code — then wire `engine.rs`, do the deferred `gate.rs` renames, build the annotated-redaction sidebar) → ④ native tool-use (Q1) → ⑤ memory system → ⑥ rest of M4 → ⑦ remaining core tools. Detail below is kept for context.
 
 1. **M3 do-now items 1–8 AND the first Part-2 item (Q8) are DONE.** Q8 (grant×risk matrix + persisted per-profile `tool_rules` + risk-badged dialog) landed 2026-07-16 in 6 commits and passed a 4-lens adversarial review (1 LOW, reconciled) + a live dialog visual QA. Full spec is the build plan's **"Part 2A"** section. Remaining **Part 2 (M4 / later)** items:
    - **Q8 follow-up — the Settings "Permissions" pane:** the backend `list_tool_rules`/`delete_tool_rule` commands + `tauri.ts` wrappers exist; a Settings tab to list persisted "Always allow" rules and revoke them is the one piece of Q8 not yet built. Small, self-contained.
@@ -198,7 +201,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 226 tests
+cd src-tauri && cargo test --lib   # 332 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
@@ -281,3 +284,14 @@ Three commits landed on `main`: read-before-write (backend), then a full fronten
 - **BACKEND WIRING SHIPPED** (`55ad9d5`), for the screens that have a backend: `Sidebar.svelte` → real `$conversations` + new-chat (`createConversation`) + profile switcher (`$profiles`/`switchProfile`); `MainScreen.svelte` → the real chat loop (messages from `$activeConversation`, send via `sendMessage`, streaming, model picker from `providersStore`, an Auto/Public/Private binding pill feeding `sendMessage`, and a per-message `RoutingBadge` driven by the real gate decision — un-stubs the old client-side privacy indicator); `Settings.svelte` → Models tab wired to `providersStore` (list/add/remove/select model), Appearance tab wired to the theme store. `src/App.svelte` hydrates profiles→providers+conversations on mount. `src/lib/stores/chat.ts` extended additively: `Message` gained optional `routing_decision`/`model`/`provider_id` (were previously dropped by `msgFromInfo`); `sendMessage` gained an optional 4th `bindingOverride` param — backward-compatible, the old 3-arg `ChatPanel` call still works.
 - **Known gaps surfaced, not yet fixed** (see "What's next" above): `ipc::send_message` returns `routing_decision: "allow"` **hardcoded**, so a live send can't yet surface a `route_local` badge from the response (the real decision is persisted, just not returned). `ModelPicker` uses a flat model-name namespace — two providers with an identically-named model collide. The old `src/lib/components/{Sidebar,ChatPanel,ModelPicker,PrivacyIndicator,ProviderSettings}.svelte` are now superseded and unused (`App` no longer imports them) — `ApprovalDialog.svelte` is still used and kept. The dev screen-switcher in `App.svelte` is a QA aid pending removal. **Still visual only, no backend:** Email, Files, Whiteboard, Scheduled-jobs, Editor, Onboarding, EmptyState screens.
 - **Tests:** `cargo test --lib` → 226 passing, 0 failed (unchanged by the two UI commits). Frontend `npm run build` + `npm run check` clean.
+
+## Session log — 2026-07-16 (checkup + docs refresh)
+
+Full repo health audit (requested by Lukas: "what's left, what's missing, what's broken"), then a documentation pass so the docs answer that question themselves.
+
+- **Verified health independently** (not just from the docs): `cargo test --lib` → **332 passed, 0 failed**; `npm run build` clean; `npm run check` 0 errors; git tree clean. Every "done" claim in the docs checked out against the actual code and git log. **Verdict: nothing broken; no fires.**
+- **Created [`docs/ROADMAP.md`](docs/ROADMAP.md)** — the stage tracker / status board. Milestone board (M0–M10 + memory/skills/classifier/server tracks), ordered what's-left checklist, blocked items, accepted quirks, and instructions for agents on how to report the current stage to Lukas and keep the file current. **This is now the second thing to read** (after this file) and the place to answer "what stage are we at."
+- **De-staled this file:** current-milestone line (M3 complete, M4 begun), the "items 6–8 remain" build-plan note, the round-1-era "Still NOT wired" list, test counts (315/226 → 332), and pointed "What's next" at the roadmap.
+- **Annotated PLAN.md** §8's round-1 M3 status block with a completion note (M3 done 2026-07-16) and marked the §12 parity gaps that have since closed (protected paths, shell guardrails).
+- **Findings worth acting on** (all now in the roadmap): the Settings "Permissions" pane is the one unfinished piece of Q8 (users can grant standing permissions but can't see/revoke them); the ONNX ensemble is blocked only on running `export_onnx.py` from the classifier bundle — an action, not code; `CommandPalette.svelte` is ported but mounted nowhere (M2 leftover).
+- No product code touched — docs-only session.
