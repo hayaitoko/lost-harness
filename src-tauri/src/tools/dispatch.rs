@@ -371,7 +371,10 @@ impl ToolDispatcher {
                 .with_command_text(tool.match_text(&call.args))
                 .with_binding(binding)
                 .with_cloud(is_cloud)
-                .with_conversation_id(ctx.conversation_id.as_str());
+                .with_conversation_id(ctx.conversation_id.as_str())
+                // Per-profile persisted `tool_rules` resolve against this
+                // profile (SqlitePolicySource); empty = pre-Q8 behavior.
+                .with_profile(ctx.profile.as_str());
 
             match self.chain.run_gating(&mut ev) {
                 (HookResult::Continue | HookResult::Allow, _) => {

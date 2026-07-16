@@ -221,7 +221,7 @@ fn build_tool_dispatcher(
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
-        PermissionMode, StorageAuditWriter,
+        LayeredPolicySource, PermissionMode, SqlitePolicySource, StorageAuditWriter,
     };
     use crate::tools::fs::{
         DeleteFileTool, EditFileTool, ListDirTool, ReadFileTool, SearchFilesTool, WriteFileTool,
@@ -304,11 +304,20 @@ fn build_tool_dispatcher(
     // refactor — the writer side is already in place. The dispatcher's
     // `write_audit` is the path actually used today; the observer
     // registration is for structural completeness.
-    let audit_writer: Arc<dyn AuditWriter> = Arc::new(StorageAuditWriter::new(storage));
+    let audit_writer: Arc<dyn AuditWriter> = Arc::new(StorageAuditWriter::new(storage.clone()));
+
+    // Q8: persisted per-profile `tool_rules` (SqlitePolicySource) layered OVER
+    // the risk-derived in-memory defaults. `mode_for` still comes from the
+    // defaults; persisted rules are read live on the gating path and resolved
+    // through the same deny>ask>allow / most-specific-wins path.
+    let layered = LayeredPolicySource::new(
+        Box::new(policy),
+        Box::new(SqlitePolicySource::new(storage)),
+    );
 
     let mut chain = build_pretooluse_chain_full(
         PrivacyGate::new(classifier),
-        Box::new(policy),
+        Box::new(layered),
         &pre_trusted_refs,
         Arc::clone(&ledger),
         Some(hook_workspace_root),

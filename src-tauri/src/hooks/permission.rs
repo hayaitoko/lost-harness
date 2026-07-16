@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::hooks::approval::{ActionFingerprint, ApprovalLedger};
 use crate::hooks::{EventContext, GatingHook, HookEvent, HookResult};
+use crate::storage::Storage;
 
 // ── PermissionMode ───────────────────────────────────────────────────────
 
@@ -125,8 +126,17 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// the signal to fall through to `FirstUseConfirmHook` rather than an
 /// implicit `Ask`.
 pub trait PolicySource: Send + Sync {
+    /// The whole-tool default mode, or `None` to fall through to
+    /// `FirstUseConfirmHook`. Profile-blind: the default is risk-derived and
+    /// the same for every profile (a *persisted* whole-tool policy is
+    /// expressed as a `(tool, "*", …)` pattern rule instead, so it flows
+    /// through `rules_for` and respects per-profile isolation).
     fn mode_for(&self, tool_name: &str) -> Option<PermissionMode>;
-    fn rules_for(&self, tool_name: &str) -> Vec<ToolRule>;
+
+    /// Pattern rules for this tool in this `profile`. Profile-scoped so a
+    /// persisted rule written in one profile (`SqlitePolicySource`) never
+    /// resolves in another. In-memory sources ignore `profile`.
+    fn rules_for(&self, tool_name: &str, profile: &str) -> Vec<ToolRule>;
 }
 
 /// A simple in-memory `PolicySource`. Stands in for the future
@@ -164,12 +174,108 @@ impl PolicySource for InMemoryPolicySource {
         self.modes.get(tool_name).copied()
     }
 
-    fn rules_for(&self, tool_name: &str) -> Vec<ToolRule> {
+    fn rules_for(&self, tool_name: &str, _profile: &str) -> Vec<ToolRule> {
         self.rules
             .iter()
             .filter(|r| r.tool_name == tool_name)
             .cloned()
             .collect()
+    }
+}
+
+// ── SqlitePolicySource ─────────────────────────────────────────────────────
+
+/// A per-profile `PolicySource` backed by the SQLite `tool_rules` table (Q8
+/// persisted `Always` grants). Read **live** on each gating pass — a freshly
+/// persisted rule is visible on the next same-session call and a Settings
+/// revoke takes effect immediately, no restart. One indexed lookup per pass;
+/// consistent with the item-5 audit write already on the dispatch path (rides
+/// the same `ProfileDb` `unsafe impl Sync` single-in-flight deferral).
+/// `mode_for` is always `None` — whole-tool defaults are risk-derived and live
+/// in-memory; a persisted whole-tool policy is a `(tool, "*", …)` pattern rule.
+pub struct SqlitePolicySource {
+    storage: Storage,
+}
+
+impl SqlitePolicySource {
+    pub fn new(storage: Storage) -> Self {
+        Self { storage }
+    }
+}
+
+impl PolicySource for SqlitePolicySource {
+    fn mode_for(&self, _tool_name: &str) -> Option<PermissionMode> {
+        None
+    }
+
+    fn rules_for(&self, tool_name: &str, profile: &str) -> Vec<ToolRule> {
+        // An empty profile (the EventContext default, tests, any path that
+        // didn't set one) has no per-profile DB — return nothing and fall
+        // through to the in-memory defaults, i.e. exactly the pre-Q8 behavior.
+        if profile.is_empty() {
+            return Vec::new();
+        }
+        let db = match self.storage.open_profile(profile) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!(profile, error = %e, "tool_rules: open_profile failed; no persisted rules this pass");
+                return Vec::new();
+            }
+        };
+        let rows = match db.list_tool_rules_for(tool_name) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(tool = tool_name, error = %e, "tool_rules: query failed; no persisted rules this pass");
+                return Vec::new();
+            }
+        };
+        rows.into_iter()
+            .filter_map(|r| {
+                let action = match r.action.as_str() {
+                    "allow" => PermissionMode::Allow,
+                    "ask" => PermissionMode::Ask,
+                    "deny" => PermissionMode::Deny,
+                    // A malformed action must NEVER silently widen access —
+                    // drop the rule (falls through to the default mode) + flag.
+                    other => {
+                        tracing::warn!(tool = tool_name, action = other, "tool_rules: skipping rule with unknown action");
+                        return None;
+                    }
+                };
+                Some(ToolRule::new(r.tool_name, r.pattern, action))
+            })
+            .collect()
+    }
+}
+
+// ── LayeredPolicySource ────────────────────────────────────────────────────
+
+/// Composes an in-memory `defaults` source (the risk-derived whole-tool modes
+/// built at boot, plus any static rules) with a `persisted` per-profile source
+/// (`SqlitePolicySource`). `mode_for` comes from the defaults; `rules_for` is
+/// `persisted ⧺ defaults`, so a dialog/Settings-authored rule participates in
+/// the SAME deny>ask>allow / most-specific-wins resolution as a static one —
+/// `PermissionHook::resolve` is unchanged.
+pub struct LayeredPolicySource {
+    defaults: Box<dyn PolicySource>,
+    persisted: Box<dyn PolicySource>,
+}
+
+impl LayeredPolicySource {
+    pub fn new(defaults: Box<dyn PolicySource>, persisted: Box<dyn PolicySource>) -> Self {
+        Self { defaults, persisted }
+    }
+}
+
+impl PolicySource for LayeredPolicySource {
+    fn mode_for(&self, tool_name: &str) -> Option<PermissionMode> {
+        self.defaults.mode_for(tool_name)
+    }
+
+    fn rules_for(&self, tool_name: &str, profile: &str) -> Vec<ToolRule> {
+        let mut out = self.persisted.rules_for(tool_name, profile);
+        out.extend(self.defaults.rules_for(tool_name, profile));
+        out
     }
 }
 
@@ -203,7 +309,7 @@ impl PermissionHook {
     /// pattern rule wins (deny > ask > allow tiebreak among equally
     /// specific matches), else the whole-tool mode, else `None`.
     fn resolve(&self, ctx: &EventContext) -> Option<PermissionMode> {
-        let rules = self.policy.rules_for(&ctx.tool_name);
+        let rules = self.policy.rules_for(&ctx.tool_name, &ctx.profile);
         let matching = rules
             .iter()
             .filter(|r| glob_match(&r.pattern, &ctx.command_text));
@@ -401,5 +507,118 @@ mod tests {
             HookResult::Ask(_) => {}
             o => panic!("a grant must not drift to a different action, got {o:?}"),
         }
+    }
+
+    // ── SqlitePolicySource / LayeredPolicySource (Q8 persisted rules) ────────
+
+    /// A throwaway on-disk `Storage` for the persisted-rule tests.
+    fn temp_storage() -> (crate::storage::Storage, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("lhp-perm-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let storage = crate::storage::Storage::open(&path).unwrap();
+        (storage, path)
+    }
+
+    fn persist_rule(storage: &Storage, profile: &str, tool: &str, pattern: &str, action: &str) {
+        storage
+            .open_profile(profile)
+            .unwrap()
+            .add_tool_rule(&crate::storage::ToolRuleRow {
+                id: format!("{tool}-{pattern}-{action}"),
+                tool_name: tool.into(),
+                pattern: pattern.into(),
+                action: action.into(),
+                created_at: 1,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn sqlite_source_resolves_only_the_calls_profile() {
+        let (storage, dir) = temp_storage();
+        persist_rule(&storage, "personal", "write_file", "*", "allow");
+        let src = SqlitePolicySource::new(storage);
+
+        // Resolves in the profile it was written to…
+        let personal = src.rules_for("write_file", "personal");
+        assert_eq!(personal.len(), 1);
+        assert_eq!(personal[0].action, PermissionMode::Allow);
+
+        // …never leaks into another profile, and an empty profile is inert.
+        assert!(src.rules_for("write_file", "work").is_empty());
+        assert!(src.rules_for("write_file", "").is_empty());
+        // A different tool is unaffected.
+        assert!(src.rules_for("read_file", "personal").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sqlite_source_skips_a_malformed_action() {
+        // A row with an unknown action must be dropped (fall through to the
+        // default), never silently widen access.
+        let (storage, dir) = temp_storage();
+        persist_rule(&storage, "personal", "write_file", "*", "yolo");
+        let src = SqlitePolicySource::new(storage);
+        assert!(
+            src.rules_for("write_file", "personal").is_empty(),
+            "an unknown action must not become a rule"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn layered_source_composes_persisted_over_defaults() {
+        let (storage, dir) = temp_storage();
+        persist_rule(&storage, "personal", "write_file", "notes/*", "allow");
+        let mut defaults = InMemoryPolicySource::new();
+        defaults.set_mode("write_file", PermissionMode::Ask);
+        defaults.add_rule("write_file", "static/*", PermissionMode::Deny);
+
+        let layered = LayeredPolicySource::new(
+            Box::new(defaults),
+            Box::new(SqlitePolicySource::new(storage)),
+        );
+
+        // mode_for comes from the defaults; rules_for merges both sources.
+        assert_eq!(layered.mode_for("write_file"), Some(PermissionMode::Ask));
+        let rules = layered.rules_for("write_file", "personal");
+        assert_eq!(rules.len(), 2, "persisted + default rules both present");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn permission_hook_honors_a_persisted_allow_rule_per_profile() {
+        // The end-to-end read path: a persisted (write_file, "*", allow) rule
+        // in `personal` turns the whole-tool Ask default into Continue — but
+        // ONLY when the call runs under `personal`.
+        let (storage, dir) = temp_storage();
+        persist_rule(&storage, "personal", "write_file", "*", "allow");
+        let mut defaults = InMemoryPolicySource::new();
+        defaults.set_mode("write_file", PermissionMode::Ask);
+        let layered = LayeredPolicySource::new(
+            Box::new(defaults),
+            Box::new(SqlitePolicySource::new(storage)),
+        );
+        let hook = PermissionHook::new(Box::new(layered));
+
+        // Under `personal` → the persisted allow-rule wins → Continue.
+        let mut in_personal = EventContext::pre_tool_use("write_file")
+            .with_command_text("write_file {}")
+            .with_profile("personal");
+        assert_eq!(hook.on_event(&mut in_personal), HookResult::Continue);
+
+        // Under `work` (isolation) → no rule → the whole-tool Ask default.
+        let mut in_work = EventContext::pre_tool_use("write_file")
+            .with_command_text("write_file {}")
+            .with_profile("work");
+        match hook.on_event(&mut in_work) {
+            HookResult::Ask(_) => {}
+            o => panic!("a personal-profile rule must not apply in work, got {o:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

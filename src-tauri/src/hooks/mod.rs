@@ -86,7 +86,8 @@ pub use audit::{
 };
 pub use first_use::FirstUseConfirmHook;
 pub use permission::{
-    InMemoryPolicySource, PermissionHook, PermissionMode, PolicySource, ToolRule,
+    InMemoryPolicySource, LayeredPolicySource, PermissionHook, PermissionMode, PolicySource,
+    SqlitePolicySource, ToolRule,
 };
 pub use privacy_filter::PrivacyFilterHook;
 pub use protected_path::ProtectedPathHook;
@@ -182,6 +183,11 @@ pub struct EventContext {
     /// truth upstream of this).
     pub is_cloud_endpoint: bool,
     pub conversation_id: String,
+    /// The active profile this call runs under. Drives per-profile persisted
+    /// `tool_rules` resolution (`SqlitePolicySource`). Empty string = no
+    /// profile (tests, or any path that didn't set one) → no persisted rules,
+    /// pre-Q8 behavior. Set by the dispatcher from `ExecCtx.profile`.
+    pub profile: String,
     /// Set by `PrivacyFilterHook` (or any future hook) when this request
     /// must not leave the device. See `RoutingRequirement`.
     pub routing: RoutingRequirement,
@@ -200,6 +206,7 @@ impl EventContext {
             content: String::new(),
             is_cloud_endpoint: false,
             conversation_id: String::new(),
+            profile: String::new(),
             routing: RoutingRequirement::Unconstrained,
         }
     }
@@ -220,8 +227,14 @@ impl EventContext {
             content: String::new(),
             is_cloud_endpoint: false,
             conversation_id: String::new(),
+            profile: String::new(),
             routing: RoutingRequirement::Unconstrained,
         }
+    }
+
+    pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
+        self.profile = profile.into();
+        self
     }
 
     pub fn with_content(mut self, content: impl Into<String>) -> Self {
