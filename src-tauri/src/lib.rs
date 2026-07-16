@@ -222,6 +222,7 @@ fn build_tool_dispatcher(
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
         LayeredPolicySource, PermissionMode, SqlitePolicySource, StorageAuditWriter,
+        StorageToolRuleWriter, ToolRuleWriter,
     };
     use crate::tools::fs::{
         DeleteFileTool, EditFileTool, ListDirTool, ReadFileTool, SearchFilesTool, WriteFileTool,
@@ -305,6 +306,9 @@ fn build_tool_dispatcher(
     // `write_audit` is the path actually used today; the observer
     // registration is for structural completeness.
     let audit_writer: Arc<dyn AuditWriter> = Arc::new(StorageAuditWriter::new(storage.clone()));
+    // Q8: the durable per-profile `tool_rules` writer for "Always allow".
+    let rule_writer: Arc<dyn ToolRuleWriter> =
+        Arc::new(StorageToolRuleWriter::new(storage.clone()));
 
     // Q8: persisted per-profile `tool_rules` (SqlitePolicySource) layered OVER
     // the risk-derived in-memory defaults. `mode_for` still comes from the
@@ -329,4 +333,5 @@ fn build_tool_dispatcher(
     ToolDispatcher::new(registry, chain, env)
         .with_approval(ledger, approver)
         .with_audit_writer(audit_writer)
+        .with_rule_writer(rule_writer)
 }

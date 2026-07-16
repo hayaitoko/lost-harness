@@ -51,6 +51,10 @@
   // Egress (external) and irreversible (dangerous) never do — every call
   // re-confirms.
   const allowSession = $derived(current?.risk === "write" || current?.risk === "safe");
+  // "Always" (a persisted, restart-surviving rule) is offered only for Write —
+  // the matrix refuses durable standing rules for external/dangerous. The
+  // server enforces this too, so the button is legibility, not the gate.
+  const allowAlways = $derived(current?.risk === "write");
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
@@ -69,13 +73,14 @@
 
   async function answer(
     decision: "approve" | "deny",
-    scope: "once" | "session" = "once",
+    scope: "once" | "session" | "always" = "once",
     target: "action" | "tool" = "action",
+    pattern: string = "*",
   ) {
     if (!current || resolving) return;
     resolving = true;
     try {
-      const delivered = await resolveToolApproval(current.id, decision, scope, target);
+      const delivered = await resolveToolApproval(current.id, decision, scope, target, pattern);
       if (!delivered) {
         // The backend had no such pending request — it was already answered or
         // it timed out and denied by default. The card is stale; just drop it.
@@ -159,6 +164,20 @@
         >
           Deny
         </button>
+        {#if allowAlways}
+          <!-- Broadest: a durable, restart-surviving rule (persisted
+               tool_rules). Write only — the matrix refuses durable standing
+               rules for external/dangerous. -->
+          <button
+            type="button"
+            onclick={() => answer("approve", "always", "tool", "*")}
+            disabled={resolving}
+            class="rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-300 transition hover:bg-neutral-900 disabled:opacity-50"
+            data-testid="approval-always"
+          >
+            Always allow
+          </button>
+        {/if}
         {#if allowSession}
           <!-- Secondary: allow every call to this tool this session. Offered
                only for reversible on-machine mutations (write/safe) — the

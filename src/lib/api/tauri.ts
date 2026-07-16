@@ -394,7 +394,8 @@ export async function onToolApprovalRequest(
 
 /**
  * Answers a pending tool-approval prompt. `decision` is "approve" or "deny";
- * `scope` / `target` only matter for an approval. Returns false if the request
+ * `scope` / `target` only matter for an approval. For scope="always", `pattern`
+ * is the persisted rule's glob ("*" = whole tool). Returns false if the request
  * id is unknown — already answered, or it timed out and denied by default.
  */
 export async function resolveToolApproval(
@@ -402,10 +403,11 @@ export async function resolveToolApproval(
   decision: "approve" | "deny",
   scope: ApprovalScope = "once",
   target: ApprovalTarget = "action",
+  pattern: string = "*",
 ): Promise<boolean> {
   if (isTauri()) {
     return tauriInvoke<boolean>("resolve_tool_approval", {
-      args: { id, decision, scope, target },
+      args: { id, decision, scope, target, pattern },
     });
   }
   return true;

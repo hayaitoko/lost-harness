@@ -47,6 +47,7 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
+use crate::hooks::permission::ToolRule;
 use crate::hooks::EventContext;
 use crate::tools::RiskClass;
 
@@ -258,6 +259,19 @@ pub fn resolve_grant(
     }
 }
 
+/// Which risk classes may persist a durable `Always` `tool_rules` row (Q8).
+/// **Only `Write`** — reversible, on-machine mutations get standing policy.
+///   * `External` — egress; a bare whole-tool standing grant is refused
+///     (destination-scoped authoring lands with the first External tool),
+///   * `Dangerous` — invariant #8, Once-only (never a standing grant),
+///   * `Safe` — pre-trusted, never reaches an Ask.
+/// A refused persist doesn't block the call: the human approved it, so it runs
+/// once (`(Once, Fingerprint)`), it just records nothing durable — the same
+/// narrowing `resolve_grant` applies to a standing `Approve` answer.
+pub fn persist_rule_allowed(risk: RiskClass) -> bool {
+    matches!(risk, RiskClass::Write)
+}
+
 // ── Prompter ───────────────────────────────────────────────────────────────
 
 /// A pending approval, handed to the prompter to surface to the human.
@@ -291,7 +305,14 @@ pub struct ApprovalRequest {
 /// The user's answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
+    /// An ephemeral grant (Once/Session). Narrowed per risk by `resolve_grant`
+    /// before it reaches the ledger.
     Approve(GrantScope, GrantTarget),
+    /// A durable `Always` grant — persist a per-profile `tool_rules` row. The
+    /// dialog produces this for "Always allow"; the dispatcher enforces the
+    /// matrix on it via `persist_rule_allowed` (only `Write` persists; the
+    /// rest degrade to run-once) and keys the write off the call's profile.
+    Persist(ToolRule),
     Deny,
     /// No answer within the timeout, or the channel dropped — deny by default.
     Timeout,

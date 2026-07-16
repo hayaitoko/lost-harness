@@ -77,8 +77,8 @@ pub mod routing;
 pub mod sandbox;
 
 pub use approval::{
-    resolve_grant, ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter,
-    ApprovalRequest, GrantScope, GrantTarget,
+    persist_rule_allowed, resolve_grant, ActionFingerprint, ApprovalDecision, ApprovalLedger,
+    ApprovalPrompter, ApprovalRequest, GrantScope, GrantTarget,
 };
 pub use audit::{
     outcome_gate_by, outcome_label, truncate_args, AuditEntry, AuditObserverHook, AuditWriter,
@@ -87,7 +87,7 @@ pub use audit::{
 pub use first_use::FirstUseConfirmHook;
 pub use permission::{
     InMemoryPolicySource, LayeredPolicySource, PermissionHook, PermissionMode, PolicySource,
-    SqlitePolicySource, ToolRule,
+    SqlitePolicySource, StorageToolRuleWriter, ToolRule, ToolRuleWriter,
 };
 pub use privacy_filter::PrivacyFilterHook;
 pub use protected_path::ProtectedPathHook;
@@ -188,6 +188,16 @@ pub struct EventContext {
     /// profile (tests, or any path that didn't set one) → no persisted rules,
     /// pre-Q8 behavior. Set by the dispatcher from `ExecCtx.profile`.
     pub profile: String,
+    /// Set by `PermissionHook` when it resolves the call to an EXPLICIT
+    /// `Allow` (a whole-tool `Allow` mode or a matching allow-rule — including
+    /// a persisted Q8 `tool_rules` "always allow"). A downstream
+    /// confirmation hook (`FirstUseConfirmHook`) honors this and skips its ask:
+    /// an explicit allow-policy is a definitive "yes", not the "no opinion"
+    /// fall-through, so first-use confirmation shouldn't second-guess it.
+    /// Communicated via the shared `ctx` (NOT a chain short-circuit), so the
+    /// non-overridable Sandbox/ProtectedPath floors — which run BEFORE
+    /// `PermissionHook` — are unaffected.
+    pub policy_allowed: bool,
     /// Set by `PrivacyFilterHook` (or any future hook) when this request
     /// must not leave the device. See `RoutingRequirement`.
     pub routing: RoutingRequirement,
@@ -207,6 +217,7 @@ impl EventContext {
             is_cloud_endpoint: false,
             conversation_id: String::new(),
             profile: String::new(),
+            policy_allowed: false,
             routing: RoutingRequirement::Unconstrained,
         }
     }
@@ -228,6 +239,7 @@ impl EventContext {
             is_cloud_endpoint: false,
             conversation_id: String::new(),
             profile: String::new(),
+            policy_allowed: false,
             routing: RoutingRequirement::Unconstrained,
         }
     }

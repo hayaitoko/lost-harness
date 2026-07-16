@@ -175,6 +175,12 @@ pub struct ToolDispatcher {
     /// `None` for everything else). The production app wires a
     /// `StorageAuditWriter` via `with_audit_writer`.
     audit_writer: Option<Arc<dyn AuditWriter>>,
+    /// Q8: writes a durable per-profile `tool_rules` row when the user answers
+    /// "Always allow". `None` (headless / round-1 / tests) means "always"
+    /// persists nothing and degrades to running the call once. Unlike the
+    /// audit writer, a persist error is surfaced (logged loudly) — a failed
+    /// rule never yields a silent standing grant.
+    rule_writer: Option<Arc<dyn crate::hooks::ToolRuleWriter>>,
 }
 
 impl ToolDispatcher {
@@ -188,6 +194,7 @@ impl ToolDispatcher {
             reads: Arc::new(ConversationReads::new()),
             run_state: Mutex::new(RunState::default()),
             audit_writer: None,
+            rule_writer: None,
         }
     }
 
@@ -212,6 +219,14 @@ impl ToolDispatcher {
     /// back into the call's outcome.
     pub fn with_audit_writer(mut self, writer: Arc<dyn AuditWriter>) -> Self {
         self.audit_writer = Some(writer);
+        self
+    }
+
+    /// Wire the durable per-profile `tool_rules` writer (Q8). Without it, an
+    /// "Always allow" answer persists nothing and degrades to running the call
+    /// once. The production app wires a `StorageToolRuleWriter`.
+    pub fn with_rule_writer(mut self, writer: Arc<dyn crate::hooks::ToolRuleWriter>) -> Self {
+        self.rule_writer = Some(writer);
         self
     }
 
@@ -493,6 +508,50 @@ impl ToolDispatcher {
                             }
                             // Re-run the FULL chain: the grant now lets the
                             // asking hook(s) pass; Sandbox/Privacy re-checked.
+                            continue;
+                        }
+                        ApprovalDecision::Persist(rule) => {
+                            // Q8 "Always allow" → a durable per-profile
+                            // `tool_rules` row. The matrix only lets `Write`
+                            // persist (persist_rule_allowed); `External`/
+                            // `Dangerous` degrade to run-once — the else of
+                            // `resolve_grant`'s narrowing, applied to a rule.
+                            if crate::hooks::persist_rule_allowed(tool.risk()) {
+                                match self.rule_writer.as_ref() {
+                                    Some(writer) => {
+                                        if let Err(e) = writer.persist(&ctx.profile, &rule) {
+                                            // A rule is an authorization the
+                                            // user relies on — surface the
+                                            // failure loudly, never swallow it
+                                            // like an audit row. Fail-SAFE: no
+                                            // standing grant is recorded, so the
+                                            // next call re-prompts (the `Once`
+                                            // pin below still runs THIS call,
+                                            // which the human approved).
+                                            tracing::error!(
+                                                tool = %call.name,
+                                                profile = %ctx.profile,
+                                                error = %e,
+                                                "failed to persist the 'always allow' rule; it did NOT save — running this call once only"
+                                            );
+                                        }
+                                    }
+                                    None => tracing::warn!(
+                                        tool = %call.name,
+                                        "no rule writer wired; 'always' persists nothing — running this call once only"
+                                    ),
+                                }
+                            }
+                            // Always pin a `(Once, fp)` so THIS approved call
+                            // settles the re-run regardless of whether a durable
+                            // rule landed (persist refused, failed, or its
+                            // pattern doesn't match this exact command). If a
+                            // rule DID persist, `SqlitePolicySource` resolves
+                            // future calls live; if not, only this call runs.
+                            self.ledger.grant(
+                                GrantTarget::Fingerprint(fingerprint.clone()),
+                                GrantScope::Once,
+                            );
                             continue;
                         }
                         ApprovalDecision::Deny => {
@@ -1423,6 +1482,8 @@ mod tests {
     enum MockResponse {
         ApproveOnceAction,
         ApproveSessionTool,
+        /// "Always allow" → a durable whole-tool rule (Q8 persist path).
+        PersistAlways,
         Deny,
         Timeout,
     }
@@ -1447,6 +1508,9 @@ mod tests {
                 MockResponse::ApproveSessionTool => {
                     ApprovalDecision::Approve(GrantScope::Session, GrantTarget::Tool(req.tool_name))
                 }
+                MockResponse::PersistAlways => ApprovalDecision::Persist(
+                    crate::hooks::ToolRule::new(req.tool_name, "*", PermissionMode::Allow),
+                ),
                 MockResponse::Deny => ApprovalDecision::Deny,
                 MockResponse::Timeout => ApprovalDecision::Timeout,
             };
@@ -2758,6 +2822,141 @@ mod tests {
             "a Dangerous tool must re-prompt every call — no session/tool coverage"
         );
         assert!(ran.load(Ordering::SeqCst));
+    }
+
+    // ── Q8 commit 3c: the "Always allow" persist path ─────────────────────
+
+    /// A throwaway on-disk `Storage` for the persist tests (dispatch tests
+    /// otherwise use in-memory profile DBs, which can't back a live
+    /// SqlitePolicySource across dispatches).
+    fn temp_storage_for_dispatch() -> (crate::storage::Storage, std::path::PathBuf) {
+        use std::sync::atomic::AtomicU64;
+        static C: AtomicU64 = AtomicU64::new(0);
+        let n = C.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("lhp-dispatch-q8-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let storage = crate::storage::Storage::open(&path).unwrap();
+        (storage, path)
+    }
+
+    #[tokio::test]
+    async fn always_allow_persists_a_write_rule_and_stops_prompting() {
+        use crate::hooks::{LayeredPolicySource, SqlitePolicySource, StorageToolRuleWriter};
+
+        let (storage, dir) = temp_storage_for_dispatch();
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaggedSpyTool {
+            name: "write_file".to_string(),
+            risk: RiskClass::Write,
+            ran: ran.clone(),
+        }));
+
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut defaults = InMemoryPolicySource::new();
+        defaults.set_mode("write_file", PermissionMode::Ask);
+        let layered = LayeredPolicySource::new(
+            Box::new(defaults),
+            Box::new(SqlitePolicySource::new(storage.clone())),
+        );
+        let chain =
+            build_pretooluse_chain_full(gate(), Box::new(layered), &[], Arc::clone(&ledger), None);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prompter = Arc::new(MockPrompter {
+            response: MockResponse::PersistAlways,
+            calls: calls.clone(),
+        });
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
+            .with_approval(ledger, Some(prompter))
+            .with_rule_writer(Arc::new(StorageToolRuleWriter::new(storage.clone())));
+
+        // First call: Ask → "Always allow" → persist a rule + run once.
+        let o1 = dispatcher
+            .dispatch(&call("write_file", serde_json::json!({"v": 1})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(o1, ToolOutcome::Ok(_)), "the approved call should run, got {o1:?}");
+        let rules = storage
+            .open_profile("personal")
+            .unwrap()
+            .list_tool_rules_for("write_file")
+            .unwrap();
+        assert_eq!(rules.len(), 1, "a durable rule must have been persisted");
+        assert_eq!(rules[0].action, "allow");
+
+        // Second call, DIFFERENT args: covered by the persisted rule read live
+        // by SqlitePolicySource → no re-prompt.
+        let o2 = dispatcher
+            .dispatch(&call("write_file", serde_json::json!({"v": 2})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(o2, ToolOutcome::Ok(_)), "the persisted rule should cover it, got {o2:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a persisted Always rule must stop re-prompting"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn always_allow_on_a_dangerous_tool_persists_nothing() {
+        // The matrix refuses a durable rule for Dangerous (persist_rule_allowed
+        // == false): the call runs once, NO row lands, and the next call
+        // re-prompts. Invariant #8, on the persist path.
+        use crate::hooks::{LayeredPolicySource, SqlitePolicySource, StorageToolRuleWriter};
+
+        let (storage, dir) = temp_storage_for_dispatch();
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaggedSpyTool {
+            name: "shell_exec".to_string(),
+            risk: RiskClass::Dangerous,
+            ran: ran.clone(),
+        }));
+
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut defaults = InMemoryPolicySource::new();
+        defaults.set_mode("shell_exec", PermissionMode::Ask);
+        let layered = LayeredPolicySource::new(
+            Box::new(defaults),
+            Box::new(SqlitePolicySource::new(storage.clone())),
+        );
+        let chain =
+            build_pretooluse_chain_full(gate(), Box::new(layered), &[], Arc::clone(&ledger), None);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prompter = Arc::new(MockPrompter {
+            response: MockResponse::PersistAlways,
+            calls: calls.clone(),
+        });
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
+            .with_approval(ledger, Some(prompter))
+            .with_rule_writer(Arc::new(StorageToolRuleWriter::new(storage.clone())));
+
+        let o1 = dispatcher
+            .dispatch(&call("shell_exec", serde_json::json!({"v": 1})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(o1, ToolOutcome::Ok(_)), "call 1 runs after approval, got {o1:?}");
+        assert!(
+            storage
+                .open_profile("personal")
+                .unwrap()
+                .list_tool_rules_for("shell_exec")
+                .unwrap()
+                .is_empty(),
+            "a Dangerous tool must never persist a standing rule"
+        );
+
+        let o2 = dispatcher
+            .dispatch(&call("shell_exec", serde_json::json!({"v": 2})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(o2, ToolOutcome::Ok(_)), "call 2 runs after RE-approval, got {o2:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a Dangerous 'always' must re-prompt every call — no durable coverage"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

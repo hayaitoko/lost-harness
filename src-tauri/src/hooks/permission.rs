@@ -48,7 +48,7 @@ impl PermissionMode {
 /// supporting `*` as a wildcard (e.g. `"git commit:*"`, `"rm -rf:*"`) —
 /// deliberately simple since these are user/profile-authored strings, not
 /// full regex.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRule {
     pub tool_name: String,
     pub pattern: String,
@@ -279,6 +279,50 @@ impl PolicySource for LayeredPolicySource {
     }
 }
 
+// ── ToolRuleWriter (Q8 persist path) ───────────────────────────────────────
+
+/// Persists a durable `Always` rule to per-profile storage. Mirrors
+/// `AuditWriter`, but — unlike audit — a write error MUST be surfaced by the
+/// caller (a rule is an authorization the user relies on, not best-effort
+/// telemetry). The dispatcher holds an `Option<Arc<dyn ToolRuleWriter>>`;
+/// `None` (headless / round-1) means "always" persists nothing and degrades to
+/// running the call once.
+pub trait ToolRuleWriter: Send + Sync {
+    fn persist(&self, profile: &str, rule: &ToolRule) -> anyhow::Result<()>;
+}
+
+/// SQLite-backed `ToolRuleWriter` — writes to the given profile's `tool_rules`.
+pub struct StorageToolRuleWriter {
+    storage: Storage,
+}
+
+impl StorageToolRuleWriter {
+    pub fn new(storage: Storage) -> Self {
+        Self { storage }
+    }
+}
+
+impl ToolRuleWriter for StorageToolRuleWriter {
+    fn persist(&self, profile: &str, rule: &ToolRule) -> anyhow::Result<()> {
+        if profile.is_empty() {
+            anyhow::bail!("cannot persist a tool rule without a profile");
+        }
+        let db = self.storage.open_profile(profile)?;
+        let action = match rule.action {
+            PermissionMode::Allow => "allow",
+            PermissionMode::Ask => "ask",
+            PermissionMode::Deny => "deny",
+        };
+        db.add_tool_rule(&crate::storage::ToolRuleRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            tool_name: rule.tool_name.clone(),
+            pattern: rule.pattern.clone(),
+            action: action.to_string(),
+            created_at: chrono::Utc::now().timestamp(),
+        })
+    }
+}
+
 // ── PermissionHook ───────────────────────────────────────────────────────
 
 pub struct PermissionHook {
@@ -333,7 +377,16 @@ impl GatingHook for PermissionHook {
         }
 
         match self.resolve(ctx) {
-            Some(PermissionMode::Allow) => HookResult::Continue,
+            Some(PermissionMode::Allow) => {
+                // An EXPLICIT allow (whole-tool Allow mode or a matching
+                // allow-rule, incl. a persisted Q8 "always allow") is a
+                // definitive yes — mark it so `FirstUseConfirmHook` doesn't
+                // re-ask on first use. Set on the shared ctx, not a chain
+                // short-circuit, so the Sandbox/ProtectedPath floors (already
+                // run) are untouched.
+                ctx.policy_allowed = true;
+                HookResult::Continue
+            }
             Some(PermissionMode::Deny) => HookResult::Deny(format!(
                 "denied by permission policy for tool '{}'",
                 ctx.tool_name
@@ -394,6 +447,10 @@ mod tests {
         let hook = PermissionHook::new(Box::new(policy));
         let mut ctx = EventContext::pre_tool_use("shell_exec").with_command_text("ls -la");
         assert_eq!(hook.on_event(&mut ctx), HookResult::Continue);
+        assert!(
+            ctx.policy_allowed,
+            "an explicit Allow must flag the ctx so FirstUseConfirm skips its ask"
+        );
     }
 
     #[test]

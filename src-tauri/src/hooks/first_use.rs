@@ -80,6 +80,15 @@ impl GatingHook for FirstUseConfirmHook {
             return HookResult::Continue;
         }
 
+        // An upstream `PermissionHook` explicit allow (whole-tool Allow mode
+        // or a matching allow-rule, incl. a persisted Q8 "always allow")
+        // already settled this as a definitive yes — don't re-ask on first
+        // use. This is what makes "Always allow" mean ZERO prompts, not
+        // "one first-use prompt per session".
+        if ctx.policy_allowed {
+            return HookResult::Continue;
+        }
+
         // Pre-trusted, or already granted at runtime? Continue. Otherwise ask
         // — WITHOUT marking anything: only an actual approval (recorded in the
         // ledger by the dispatcher) may flip a future call to Continue.
@@ -151,6 +160,21 @@ mod tests {
         hook.mark_confirmed("shell_exec");
         let mut ctx = EventContext::pre_tool_use("shell_exec");
         assert_eq!(hook.on_event(&mut ctx), HookResult::Continue);
+    }
+
+    #[test]
+    fn policy_allowed_flag_skips_the_ask() {
+        // An upstream PermissionHook explicit allow (e.g. a persisted Q8
+        // "always allow" rule) must bypass first-use confirmation — otherwise
+        // "Always allow" would still prompt once per session.
+        let hook = FirstUseConfirmHook::new();
+        let mut ctx = EventContext::pre_tool_use("write_file");
+        ctx.policy_allowed = true;
+        assert_eq!(
+            hook.on_event(&mut ctx),
+            HookResult::Continue,
+            "an explicit policy allow must bypass first-use confirmation"
+        );
     }
 
     #[test]

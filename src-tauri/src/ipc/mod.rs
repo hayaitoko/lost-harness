@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
-use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget};
+use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget, PermissionMode, ToolRule};
 use crate::ipc::approval::ApprovalRegistry;
 use crate::models::{ModelManager, Provider, ProviderKind};
 use crate::storage::{Conversation, Message, Storage};
@@ -453,6 +453,13 @@ pub struct ResolveApprovalArgs {
     /// Defaults to "action", the safer/narrower grant.
     #[serde(default)]
     pub target: Option<String>,
+    /// For scope="always": the glob pattern of the persisted `tool_rules` row
+    /// (`"*"` = whole tool). Defaults to `"*"`. Ignored for once/session/deny.
+    /// Untrusted client input — the dispatcher still enforces the grant×risk
+    /// matrix on the resulting rule (only `Write` persists), so a crafted
+    /// pattern for a `Dangerous`/`External` tool cannot buy standing coverage.
+    #[serde(default)]
+    pub pattern: Option<String>,
 }
 
 /// Answer a pending tool-approval prompt raised via `tool:approval_request`.
@@ -466,9 +473,13 @@ pub fn resolve_tool_approval(
     args: ResolveApprovalArgs,
 ) -> Result<bool, String> {
     let approve = args.decision.eq_ignore_ascii_case("approve");
-    let scope = match args.scope.as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+    let scope_str = args.scope.as_deref().map(|s| s.to_ascii_lowercase());
+    // "always" is a DURABLE grant — it becomes a persisted `tool_rules` row
+    // (ApprovalDecision::Persist), not a ledger scope. Only "once"/"session"
+    // reach the ledger here.
+    let is_always = scope_str.as_deref() == Some("always");
+    let scope = match scope_str.as_deref() {
         Some("session") => GrantScope::Session,
-        Some("always") => GrantScope::Always,
         _ => GrantScope::Once,
     };
     // A one-time grant is per-action, never whole-tool: force `action` for
@@ -476,10 +487,20 @@ pub fn resolve_tool_approval(
     // tool (defense in depth with `ApprovalLedger::grant`).
     let want_tool = !matches!(scope, GrantScope::Once)
         && matches!(args.target.as_deref(), Some(t) if t.eq_ignore_ascii_case("tool"));
+    let pattern = args.pattern.clone().unwrap_or_else(|| "*".to_string());
 
     let answered = state.approvals.answer(&args.id, |fingerprint, tool_name| {
         if !approve {
             return ApprovalDecision::Deny;
+        }
+        if is_always {
+            // Durable "Always allow" → a rule the dispatcher persists (and
+            // enforces the matrix on: only Write persists, others run once).
+            return ApprovalDecision::Persist(ToolRule::new(
+                tool_name,
+                pattern,
+                PermissionMode::Allow,
+            ));
         }
         let target = if want_tool {
             GrantTarget::Tool(tool_name.to_string())
