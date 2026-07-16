@@ -1449,7 +1449,42 @@ Status legend: `todo` · `in-progress` · `done` · `blocked`.
 | 7 | Guarded executor + shell_exec | todo | — | the big one; Seatbelt behind SandboxedSpawn |
 | 8 | MCP into registry | todo | — | |
 
+### ⚠ Review findings — 2026-07-15 (adversarial review of items 1–5 + routing fix)
+
+269 tests green. Items **1, 2, and the routing fix verified clean** (exhaustively — invariant #5 type-lock, the
+budget off-by-ones + Mutex-not-across-await + user-only cascade, all confirmed). **Three real issues to fix
+before the protected-path floor and audit trail are trusted** (none block current use; the fs write path is
+already Ask-gated):
+
+- **[HIGH] Item 3 — protected-path floor is bypassable via symlink / non-canonical path.** `ProtectedPathHook`
+  substring-matches the **raw** `path` arg (`ctx.command_text = "{name} {args}"`), but the fs tools canonicalize
+  and follow symlinks. A workspace dir symlink `alias -> .git` (name not containing `.git/`) lets
+  read/write/edit/delete reach the real protected dir while the floor never fires. **Fix:** check the
+  **resolved/canonical** path — canonicalize the workspace-relative arg inside the hook, or move the
+  protected-path check into `tools/fs.rs`'s `resolve_within`/`resolve_within_new` where the canonical path
+  exists. (Floor is defense-in-depth for the future Allow-rules + shell_exec; low impact today, worthless until fixed.)
+- **[MEDIUM] Item 4 — false "[tool interrupted]" on a healthy round-cap stop.** Hitting `MAX_TOOL_ROUNDS` (6)
+  leaves the last assistant message with an open ```` ```tool ```` fence and no completing tool row — identical
+  on disk to a crash. Next boot, crash-recovery inserts a bogus interrupted row. (`loop_mod.rs:403-405` ×
+  `crash_recovery.rs:105`.) **Fix:** distinguish a deliberate round-cap stop from a crash (persist a terminal
+  marker on the final round, or require "open fence AND turn not marked complete").
+- **[MEDIUM] Item 5 — circuit-breaker denials are missing from the audit.** Budget-ceiling, per-run-ceiling,
+  repeat-detection, and deny-cascade denials happen in `run_turn` **before** `dispatch()`, so they never write
+  an audit row — but they're surfaced as `Denied`, and the spec says "denied calls are rows too." **Fix:** fire
+  an audit row for these `run_turn`-level denials too (`dispatch.rs` ~494–592).
+
+Minor / lower priority:
+- **[LOW] Routing fix** — a comment references a `"tool_reroute_local"` value no path produces yet (item-6
+  territory); remove/relabel it. And no test covers `send_message`'s new routing_decision extraction (a refactor
+  could silently re-hardcode `"allow"` and stay green) — add one.
+- **[LOW/plausible] Audit hot-path soundness** — item 5 puts a sync `ProfileDb` write on every dispatch, resting
+  on `ProfileDb`'s `unsafe impl Sync` justified by "single-threaded per command." Under Tokio's multi-thread
+  runtime a concurrent unrelated IPC command could touch the same profile connection from another thread.
+  Pre-existing soundness question item 5 amplifies — resolve when the single-in-flight concurrency refactor lands.
+
 **Log narrative** (append newest first — one line per meaningful step, so a fresh model sees the trail):
+- 2026-07-15 — Reviewed items 1–5 + routing fix (adversarial, 6 verifiers). 1/2/routing clean; 3 real fixes
+  logged above (Item 3 HIGH floor-bypass, Item 4 MED false-interrupt, Item 5 MED audit-gap). 269 tests green.
 - 2026-07-15 — Item 4 done. `agent/crash_recovery.rs` with `run_boot_pass` (per-profile, log-and-skip on open or reconcile failure) + `reconcile_profile_db` (single `unchecked_transaction` held across the three CRUD calls — same pattern as migrations). Detection: last message `role=="assistant"` AND content contains an opening `` ```tool `` fence; completed tool rounds, plain final answers, and dangling user messages are explicit non-goals with regression tests. Repair row: `role="tool"`, `error=Some("interrupted_by_crash")`, `aborted=true`, `routing_decision=Some("crash_recovery")`. Idempotent by construction (no marker column). `contains_open_tool_fence` in `tools/calling.rs` is a pure string check — never parses JSON, never feeds dispatch. `lib.rs::run` calls `run_boot_pass` between `Storage::open` and provider hydration, deliberately NOT `?`-propagated. `hooks/approval.rs` module doc gained the "No half-durability" paragraph. 11 new tests (7 crash_recovery + 4 calling). 269 total green, 76 warnings (pre-existing). See commit 8fe04aa. Next agent: Item 6 (NeedsLocalReroute + loop plumbing).
 - 2026-07-15 — Item 5 done. `tool_audit` table (per-profile, append-only, migration v2 — `PROFILE_SCHEMA_VERSION` split from `GLOBAL_SCHEMA_VERSION` so the runner's debug_assert survives a profile-only bump). `hooks/audit.rs` with `AuditEntry` / `AuditWriter` / `StorageAuditWriter` / `AuditObserverHook` / `truncate_args` (4KB) / `outcome_label` / `outcome_gate_by`. `ToolDispatcher::dispatch` refactored to a thin wrapper around `dispatch_inner` that fires one audit row per call (every return path: Ok / Err / Denied / Ask / Unavailable / Unknown). `grant_used` + `decision` left as `None` for now per spec ("if the grant source isn't determinable, None is fine"). `lib.rs::build_tool_dispatcher` takes `Storage` and wires `StorageAuditWriter` + registers `AuditObserverHook`. 5 new dispatcher tests + 3 storage round-trip tests. 258 total green, 76 warnings (pre-existing). See commit f72a7f9. Next agent: Item 4 (crash-recovery + tool.interrupted) — spec at lines 524+.
 - 2026-07-15 — Item 3 done. ProtectedPathHook (no config, hardcoded `.git/`/`.env`/`.ssh/`/`config/secrets` list) inserted between SandboxHook and PermissionHook in all three chain constructors. `ApprovalLedger::covers_once` (only `once_fps`, ignores session/tool) is the entire mechanism that makes the floor Once-only. Dispatcher's `Approve` arm pins a forced `Once`+`Fingerprint` grant when the user answers a protected-path prompt with anything broader than `Once`, so the re-run settles without upgrading the floor itself. 11 new tests, 245 total green. See commit d13d71a. Next agent: Item 4 (crash-recovery + tool.interrupted) — spec at lines 524+.
