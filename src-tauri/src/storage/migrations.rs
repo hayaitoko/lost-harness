@@ -24,11 +24,87 @@ pub struct Migration {
 }
 
 /// All global.db migrations, in order.
-pub const GLOBAL_MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_global_schema",
-    sql: GLOBAL_SCHEMA_SQL,
-}];
+pub const GLOBAL_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_global_schema",
+        sql: GLOBAL_SCHEMA_SQL,
+    },
+    Migration {
+        version: 2,
+        // Memory system foundation (PLAN §9): sensitivity buckets + FTS5
+        // keyword search + curated-summary pinning.
+        //
+        // The `private-local` bucket lives in a PHYSICALLY SEPARATE table
+        // (`memory_facts_private`), not a filtered view of `memory_facts` —
+        // so a cloud-bound context assembly never even queries it, and a bug
+        // can't leak it (PLAN §9, same physical-separation principle as the
+        // §7 profile wall). `pinned` backs the always-loaded curated summary.
+        // FTS5 external-content indexes give the keyword lane of hybrid search;
+        // the meaning lane (sqlite-vec) layers on once an embedder is chosen.
+        //
+        // `pinned` is added ONLY here (not in GLOBAL_SCHEMA_SQL) because
+        // `ALTER TABLE ADD COLUMN` has no IF-NOT-EXISTS: a fresh DB runs v1
+        // (memory_facts without pinned) then v2 (adds it), matching an
+        // existing DB's upgrade path exactly.
+        name: "memory_buckets_fts_and_pinning",
+        sql: "
+        ALTER TABLE memory_facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+
+        CREATE TABLE IF NOT EXISTS memory_facts_private (
+            id              TEXT PRIMARY KEY,
+            content         TEXT NOT NULL,
+            origin_profile  TEXT NOT NULL,
+            tags            TEXT,
+            created_at      INTEGER NOT NULL,
+            pinned          INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_facts_private_origin
+            ON memory_facts_private(origin_profile);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_fts USING fts5(
+            content, content='memory_facts', content_rowid='rowid'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_private_fts USING fts5(
+            content, content='memory_facts_private', content_rowid='rowid'
+        );
+
+        -- Backfill the index for any rows that predate it.
+        INSERT INTO memory_facts_fts(rowid, content)
+            SELECT rowid, content FROM memory_facts;
+
+        CREATE TRIGGER IF NOT EXISTS memory_facts_ai AFTER INSERT ON memory_facts BEGIN
+            INSERT INTO memory_facts_fts(rowid, content) VALUES (new.rowid, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memory_facts_ad AFTER DELETE ON memory_facts BEGIN
+            INSERT INTO memory_facts_fts(memory_facts_fts, rowid, content)
+                VALUES('delete', old.rowid, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memory_facts_au AFTER UPDATE ON memory_facts BEGIN
+            INSERT INTO memory_facts_fts(memory_facts_fts, rowid, content)
+                VALUES('delete', old.rowid, old.content);
+            INSERT INTO memory_facts_fts(rowid, content) VALUES (new.rowid, new.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memory_facts_private_ai
+            AFTER INSERT ON memory_facts_private BEGIN
+            INSERT INTO memory_facts_private_fts(rowid, content)
+                VALUES (new.rowid, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memory_facts_private_ad
+            AFTER DELETE ON memory_facts_private BEGIN
+            INSERT INTO memory_facts_private_fts(memory_facts_private_fts, rowid, content)
+                VALUES('delete', old.rowid, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memory_facts_private_au
+            AFTER UPDATE ON memory_facts_private BEGIN
+            INSERT INTO memory_facts_private_fts(memory_facts_private_fts, rowid, content)
+                VALUES('delete', old.rowid, old.content);
+            INSERT INTO memory_facts_private_fts(rowid, content)
+                VALUES (new.rowid, new.content);
+        END;",
+    },
+];
 
 /// All per-profile DB migrations, in order.
 pub const PROFILE_MIGRATIONS: &[Migration] = &[

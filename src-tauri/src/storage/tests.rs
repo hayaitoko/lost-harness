@@ -61,14 +61,15 @@ fn fresh_in_memory_profile_has_all_tables() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn schema_version_is_one_after_init_global() {
+fn schema_version_is_current_after_init_global() {
+    // Global schema is now v2 (the memory system added buckets + FTS5 at v2).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 1);
+    assert_eq!(v, 2);
 }
 
 #[test]
@@ -569,6 +570,7 @@ fn global_endpoints_and_memory_round_trip() {
         origin_profile: "personal".into(),
         tags: Some(r#"["identity","name"]"#.into()),
         created_at: now,
+        pinned: false,
     })
     .unwrap();
 
@@ -601,6 +603,112 @@ fn global_endpoints_and_memory_round_trip() {
     assert!(
         vecs.is_empty(),
         "vectors should cascade-delete with the fact"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Memory system (PLAN §9): sensitivity buckets + FTS5 search + curated summary
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn mem_fact(id: &str, content: &str, profile: &str, pinned: bool) -> MemoryFact {
+    MemoryFact {
+        id: id.into(),
+        content: content.into(),
+        origin_profile: profile.into(),
+        tags: None,
+        created_at: chrono::Utc::now().timestamp(),
+        pinned,
+    }
+}
+
+#[test]
+fn memory_search_keyword_and_bucket_isolation() {
+    let g = GlobalDb::open_in_memory().unwrap();
+
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("s1", "Lukas prefers concise, direct replies", "personal", false),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("s2", "The payments service is written in Rust", "work", false),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::PrivateLocal,
+        &mem_fact("p1", "Home address is 123 Oak Street", "personal", false),
+    )
+    .unwrap();
+
+    // Keyword hit in the shared store on a cloud-bound search.
+    let cloud = g.search_memory("Rust payments", false, 10).unwrap();
+    assert_eq!(cloud.len(), 1);
+    assert_eq!(cloud[0].fact.id, "s2");
+    assert_eq!(cloud[0].bucket, MemoryBucket::Shared);
+
+    // A private-only term returns NOTHING on a cloud search — the private table
+    // is never even queried (the structural guarantee, PLAN §9).
+    let cloud_private = g.search_memory("Oak Street address", false, 10).unwrap();
+    assert!(
+        cloud_private.is_empty(),
+        "cloud-bound search must never surface a private-local fact"
+    );
+
+    // A local search (allow_private=true) can reach it.
+    let local = g.search_memory("Oak Street address", true, 10).unwrap();
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].fact.id, "p1");
+    assert_eq!(local[0].bucket, MemoryBucket::PrivateLocal);
+
+    // Non-matching query → empty; punctuation-only query → empty (no FTS syntax
+    // injection, no error).
+    assert!(g.search_memory("kangaroo", true, 10).unwrap().is_empty());
+    assert!(g.search_memory("   \"*(", true, 10).unwrap().is_empty());
+}
+
+#[test]
+fn curated_summary_pins_first_and_gates_private() {
+    let g = GlobalDb::open_in_memory().unwrap();
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("a", "oldest note", "personal", false))
+        .unwrap();
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("b", "pinned note", "personal", true))
+        .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::PrivateLocal,
+        &mem_fact("c", "private note", "personal", false),
+    )
+    .unwrap();
+
+    // Cloud-bound summary: private excluded, pinned first.
+    let cloud = g.curated_summary("personal", false, 10).unwrap();
+    assert_eq!(cloud.len(), 2, "private fact excluded from a cloud summary");
+    assert_eq!(cloud[0].id, "b", "pinned fact comes first");
+    assert!(cloud.iter().all(|f| f.id != "c"));
+
+    // Local summary includes the private fact.
+    let local = g.curated_summary("personal", true, 10).unwrap();
+    assert_eq!(local.len(), 3);
+
+    // Pinning is toggleable and reflected in the ordering.
+    assert!(g.set_memory_pinned("a", true).unwrap());
+    let after = g.curated_summary("personal", false, 10).unwrap();
+    assert!(after[0].pinned && after[1].pinned, "both pinned now sort first");
+}
+
+#[test]
+fn memory_fts_stays_in_sync_on_delete() {
+    let g = GlobalDb::open_in_memory().unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("x", "quantum entanglement notes", "work", false),
+    )
+    .unwrap();
+    assert_eq!(g.search_memory("quantum", false, 10).unwrap().len(), 1);
+    assert!(g.delete_memory_fact("x").unwrap());
+    assert!(
+        g.search_memory("quantum", false, 10).unwrap().is_empty(),
+        "FTS index must drop the row when the fact is deleted"
     );
 }
 
