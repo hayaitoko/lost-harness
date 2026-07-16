@@ -438,6 +438,46 @@ export async function deleteToolRule(profile: string, id: string): Promise<boole
   return false;
 }
 
+// ── classification explainability (PLAN §11 — the "why" sidebar) ────────────
+
+/** One detected sensitive span. Mirrors `ClassificationSpan` in `ipc/mod.rs`. */
+export interface ClassificationSpan {
+  /** Char offset of the span start (inclusive). */
+  start: number;
+  /** Char offset of the span end (exclusive). */
+  end: number;
+  text: string;
+  /** Machine category, e.g. "PII_CONTACT", "PROPRIETARY". */
+  category: string;
+  /** Human-friendly label for the legend, e.g. "contact info". */
+  label: string;
+  /** The specific rule that fired, e.g. "email". */
+  rule: string;
+  /** "rule" (deterministic) or "model" (the ensemble). */
+  layer: "rule" | "model";
+  /** Hard-block category (can never leave, no override). */
+  hard: boolean;
+}
+
+/** The classifier's explanation of a piece of text. Mirrors `ClassificationExplanation`. */
+export interface ClassificationExplanation {
+  label: "private" | "public" | "uncertain";
+  confidence: number;
+  spans: ClassificationSpan[];
+}
+
+/**
+ * Classify `text` and return the label + annotated spans, so the UI can show
+ * *why* a message was held/redacted (PLAN §11). In browser dev mode (no Tauri
+ * shell) returns an empty, public explanation.
+ */
+export async function explainClassification(text: string): Promise<ClassificationExplanation> {
+  if (isTauri()) {
+    return tauriInvoke<ClassificationExplanation>("explain_classification", { args: { text } });
+  }
+  return { label: "public", confidence: 0, spans: [] };
+}
+
 // ── Browser fallback (used when running outside Tauri) ──────────────────────
 
 const browserStreamListeners: StreamTokenCallback[] = [];

@@ -59,6 +59,10 @@ pub struct AppState {
     /// In-flight tool-approval prompts (§3.5). The dispatcher parks a request
     /// here and awaits it; `resolve_tool_approval` answers by id.
     pub approvals: Arc<ApprovalRegistry>,
+    /// The active privacy classifier (trained ensemble or rules-only fallback),
+    /// shared with the §7 gate. Backs `explain_classification` for the
+    /// annotated-redaction "why" sidebar (PLAN §11).
+    pub classifier: Arc<dyn crate::classifier::Classifier>,
 }
 
 // ── Response types ───────────────────────────────────────────────────────
@@ -577,6 +581,152 @@ pub fn delete_tool_rule(
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
     db.delete_tool_rule(&args.id).map_err(|e| e.to_string())
+}
+
+// ── classification explainability (PLAN §11 — the "why" sidebar) ──────────
+
+/// One detected sensitive span, for the annotated-review sidebar. Char offsets
+/// (not byte) so the frontend can slice the JS string directly.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassificationSpan {
+    /// Char offset of the span start in the original text (inclusive).
+    pub start: usize,
+    /// Char offset of the span end (exclusive).
+    pub end: usize,
+    /// The exact matched text.
+    pub text: String,
+    /// Machine category, shared vocabulary with the classifier/audit log
+    /// (e.g. "PII_CONTACT", "PROPRIETARY").
+    pub category: String,
+    /// Human-friendly category label for the legend (e.g. "contact info").
+    pub label: String,
+    /// The specific rule that fired (e.g. "email", "luhn_card").
+    pub rule: String,
+    /// Which layer caught it — "rule" (deterministic) or "model" (the ensemble).
+    /// Every span currently comes from the rules layer; the ensemble contributes
+    /// the overall label but no offsets.
+    pub layer: String,
+    /// Hard-block category (PROPRIETARY / HEALTH) — can never leave, no override.
+    pub hard: bool,
+}
+
+/// The classifier's explanation of a piece of text, for the "why" sidebar.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassificationExplanation {
+    /// "private" | "public" | "uncertain".
+    pub label: String,
+    /// 0.0..=1.0 confidence in the decision.
+    pub confidence: f32,
+    /// The detected sensitive spans (empty when nothing tripped the filter).
+    pub spans: Vec<ClassificationSpan>,
+}
+
+/// Human-friendly label + hard-block flag for a rules category string.
+fn category_display(category: &str) -> (&'static str, bool) {
+    match category {
+        "PII_CONTACT" => ("contact info", false),
+        "PII_ID" => ("ID number", false),
+        "FINANCIAL" => ("financial detail", false),
+        "CREDENTIAL" => ("credential / secret", false),
+        "PROPRIETARY" => ("confidential / proprietary", true),
+        "HEALTH" => ("health information", true),
+        _ => ("sensitive", false),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExplainClassificationArgs {
+    pub text: String,
+}
+
+/// Classify `text` and return the label + annotated spans, so the UI can show
+/// *why* a message was held/redacted (PLAN §11: "censorship is surfaced, never
+/// silent" + the annotated review view). Uses the same shared classifier the
+/// §7 gate does, so the explanation matches the routing decision exactly.
+#[tauri::command]
+pub fn explain_classification(
+    state: State<'_, AppState>,
+    args: ExplainClassificationArgs,
+) -> Result<ClassificationExplanation, String> {
+    Ok(build_explanation(state.classifier.classify(&args.text)))
+}
+
+/// Pure mapping from a `Classification` to the wire shape (testable without a
+/// Tauri `State`).
+fn build_explanation(c: crate::classifier::Classification) -> ClassificationExplanation {
+    let label = match c.label {
+        crate::classifier::Label::Private => "private",
+        crate::classifier::Label::Public => "public",
+        crate::classifier::Label::Uncertain => "uncertain",
+    }
+    .to_string();
+
+    let spans = c
+        .spans
+        .into_iter()
+        .map(|s| {
+            let category = s.category.as_str().to_string();
+            let (display, hard) = category_display(&category);
+            ClassificationSpan {
+                start: s.start_char,
+                end: s.end_char,
+                text: s.text,
+                category,
+                label: display.to_string(),
+                rule: s.rule.to_string(),
+                layer: "rule".to_string(),
+                hard,
+            }
+        })
+        .collect();
+
+    ClassificationExplanation {
+        label,
+        confidence: c.confidence,
+        spans,
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+    use crate::classifier::{Classifier, RulesClassifier};
+
+    #[test]
+    fn explains_rule_spans_with_labels_and_hard_flags() {
+        let c = RulesClassifier::new().classify("email me at jane@example.com; SSN 123-45-6789");
+        let exp = build_explanation(c);
+        assert_eq!(exp.label, "private", "PII present → private");
+        assert!(!exp.spans.is_empty(), "should surface the detected spans");
+
+        // Every span carries valid char offsets, a friendly label, and layer.
+        for s in &exp.spans {
+            assert!(s.end > s.start, "char range must be non-empty");
+            assert_eq!(s.layer, "rule");
+            assert!(!s.label.is_empty());
+        }
+        // The email is a (non-hard) contact span.
+        assert!(
+            exp.spans
+                .iter()
+                .any(|s| s.category == "PII_CONTACT" && !s.hard),
+            "email should be a PII_CONTACT span"
+        );
+    }
+
+    #[test]
+    fn proprietary_is_hard_blocked() {
+        let (label, hard) = category_display("PROPRIETARY");
+        assert!(hard, "proprietary is a hard-block category");
+        assert_eq!(label, "confidential / proprietary");
+        assert!(!category_display("PII_CONTACT").1, "contact info is not hard");
+    }
+
+    #[test]
+    fn benign_text_has_no_spans() {
+        let exp = build_explanation(RulesClassifier::new().classify("what time is the meeting?"));
+        assert!(exp.spans.is_empty());
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────

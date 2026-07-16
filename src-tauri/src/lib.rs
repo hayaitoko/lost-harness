@@ -148,6 +148,7 @@ pub fn run() {
                 model_manager,
                 storage,
                 approvals,
+                classifier: Arc::clone(&classifier),
             };
             app.manage(state);
 
@@ -169,6 +170,7 @@ pub fn run() {
             ipc::resolve_tool_approval,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
+            ipc::explain_classification,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lost Harness");
