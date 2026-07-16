@@ -27,7 +27,7 @@ pub mod dispatch;
 pub mod fs;
 
 pub use calling::ToolCall;
-pub use dispatch::ToolDispatcher;
+pub use dispatch::{ToolDispatcher, TurnOutcome};
 
 // ── Capability ───────────────────────────────────────────────────────────
 

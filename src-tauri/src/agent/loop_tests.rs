@@ -521,3 +521,153 @@ async fn trm_log_entry_is_written_for_every_decision() {
     let expected = sha256_hex(b"hello");
     assert_eq!(logs[0].message_hash, expected);
 }
+
+// ── item 6: resolve_turn_outcome (reroute resolution) ────────────────────
+//
+// These call the loop-level reroute resolver DIRECTLY (it's `pub(crate)` and
+// never calls `stream_chat`, so no HTTP is needed) with a hand-built
+// `TurnOutcome::NeedsLocalReroute`. The existing `TestLoop` harness does not
+// wire a `ToolDispatcher`, so we build a real one here.
+
+fn local_provider(id: &str) -> Provider {
+    Provider::new(id, "LocalLLM", "http://localhost:1234/v1", None, ProviderKind::Local)
+}
+
+/// A `ToolDispatcher` with one `EchoTool`, allowed + pre-confirmed, so gating
+/// passes and `resume_after_local_switch` actually runs the tool.
+fn echo_allow_dispatcher() -> crate::tools::ToolDispatcher {
+    use crate::hooks::{build_pretooluse_chain_with_confirmed, InMemoryPolicySource, PermissionMode};
+    use crate::tools::{BodyEnv, EchoTool, ToolDispatcher, ToolRegistry};
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(EchoTool));
+    let mut policy = InMemoryPolicySource::new();
+    policy.set_mode("echo", PermissionMode::Allow);
+    let chain = build_pretooluse_chain_with_confirmed(
+        PrivacyGate::new(Arc::new(HeuristicClassifier::new())),
+        Box::new(policy),
+        &["echo"],
+    );
+    ToolDispatcher::new(registry, chain, BodyEnv::empty())
+}
+
+fn exec_ctx() -> crate::tools::ExecCtx {
+    crate::tools::ExecCtx {
+        conversation_id: "c1".to_string(),
+        profile: "personal".to_string(),
+        reads: None,
+    }
+}
+
+#[tokio::test]
+async fn resolve_turn_outcome_reroutes_to_local_and_hides_reason() {
+    // Test 11: a local candidate exists → switch to it, fire on_reroute once
+    // with the detailed reason, but keep the reason OUT of the replayed
+    // ChatMessage (pins Fable's specific risk callout).
+    use crate::agent::loop_mod::resolve_turn_outcome;
+    use crate::models::ModelManager;
+    use crate::tools::{dispatch::TurnOutcome, ToolCall};
+
+    let manager = ModelManager::new();
+    let cloud = cloud_provider("cloud1");
+    manager.add_provider(cloud.clone());
+    manager.add_provider(local_provider("local1"));
+    let tools = echo_allow_dispatcher();
+
+    let turn = TurnOutcome::NeedsLocalReroute {
+        reason: "UNIQUE_TEST_MARKER".to_string(),
+        call: ToolCall { name: "echo".to_string(), args: serde_json::json!({"x": 1}) },
+        prior_sections: vec![],
+        remaining: vec![],
+    };
+
+    let fired = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let fired2 = fired.clone();
+    let cloud_client = manager.get_client("cloud1").expect("cloud client");
+
+    let (msg, provider, _client, is_cloud, routing) = resolve_turn_outcome(
+        &tools,
+        &manager,
+        turn,
+        &exec_ctx(),
+        Binding::Auto,
+        cloud,
+        cloud_client,
+        true,
+        "allow",
+        &move |_from, _to, reason| fired2.lock().push(reason.to_string()),
+    )
+    .await
+    .expect("resolve ok");
+
+    assert!(!is_cloud, "must switch to the local endpoint");
+    assert_eq!(provider.id, "local1");
+    assert_eq!(routing, "tool_reroute_local");
+    {
+        let fired = fired.lock();
+        assert_eq!(fired.len(), 1, "on_reroute fires exactly once");
+        assert_eq!(fired[0], "UNIQUE_TEST_MARKER");
+    }
+    let content = msg.expect("feedback present").content;
+    assert!(
+        !content.contains("UNIQUE_TEST_MARKER"),
+        "the detailed reason must never leak into the replayed content: {content}"
+    );
+    assert!(content.contains("[routing] switched to the local model"), "banner: {content}");
+}
+
+#[tokio::test]
+async fn resolve_turn_outcome_no_local_candidate_stays_cloud_with_hard_deny() {
+    // Test 12: only a cloud provider is registered → no switch, on_reroute
+    // never fires, and the feedback is exactly today's hard-deny wording.
+    use crate::agent::loop_mod::resolve_turn_outcome;
+    use crate::models::ModelManager;
+    use crate::tools::{dispatch::TurnOutcome, ToolCall};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let manager = ModelManager::new();
+    let cloud = cloud_provider("cloud1");
+    manager.add_provider(cloud.clone());
+    let tools = echo_allow_dispatcher();
+
+    let turn = TurnOutcome::NeedsLocalReroute {
+        reason: "content must not leave this device".to_string(),
+        call: ToolCall { name: "echo".to_string(), args: serde_json::json!({"x": 1}) },
+        prior_sections: vec![],
+        remaining: vec![],
+    };
+
+    let fired = Arc::new(AtomicUsize::new(0));
+    let fired2 = fired.clone();
+    let cloud_client = manager.get_client("cloud1").expect("cloud client");
+
+    let (msg, provider, _client, is_cloud, routing) = resolve_turn_outcome(
+        &tools,
+        &manager,
+        turn,
+        &exec_ctx(),
+        Binding::Auto,
+        cloud.clone(),
+        cloud_client,
+        true,
+        "allow",
+        &move |_, _, _| {
+            fired2.fetch_add(1, Ordering::SeqCst);
+        },
+    )
+    .await
+    .expect("resolve ok");
+
+    assert!(is_cloud, "no local candidate → stays on cloud");
+    assert_eq!(provider.id, cloud.id);
+    assert_eq!(routing, "allow", "routing_decision unchanged");
+    assert_eq!(fired.load(Ordering::SeqCst), 0, "on_reroute must never fire");
+    let content = msg.expect("feedback present").content;
+    assert!(content.contains("must stay on-device"), "content: {content}");
+    assert!(
+        content.contains("switch to a local model or set the conversation binding to Private"),
+        "content: {content}"
+    );
+    // Test 13 (by construction): resolve_turn_outcome never calls stream_chat,
+    // so local-down can never be silently retried against cloud — see the
+    // function's doc comment; there is no catch-and-retry-on-cloud path.
+}

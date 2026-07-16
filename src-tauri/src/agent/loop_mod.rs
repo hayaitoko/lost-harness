@@ -41,9 +41,10 @@ use uuid::Uuid;
 
 use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
+use crate::hooks::{enforce_local_routing, RoutingRequirement};
 use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider};
 use crate::storage::{Message, ProfileDb, Storage, TrmLog};
-use crate::tools::{ExecCtx, ToolDispatcher};
+use crate::tools::{ExecCtx, ToolDispatcher, TurnOutcome};
 
 // ── Event payloads ────────────────────────────────────────────────────────
 
@@ -64,6 +65,18 @@ pub struct StreamErrorPayload {
     pub conversation_id: String,
     /// "gate" | "routing" | "model" — helps the UI render a useful toast.
     pub source: &'static str,
+}
+
+/// Payload of the `stream:local_reroute` event — emitted once when a tool
+/// call forced the rest of a turn onto a local endpoint (Q6). Ephemeral UI
+/// signal ONLY: `reason` is the detailed privacy signal and must never be
+/// persisted or replayed into a model (see `resolve_turn_outcome`).
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalReroutePayload {
+    pub conversation_id: String,
+    pub reason: String,
+    pub from_provider: String,
+    pub to_provider: String,
 }
 
 // ── Model streamer abstraction ───────────────────────────────────────────
@@ -260,17 +273,22 @@ impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     async fn stream_to_provider(
         &self,
-        provider: Provider,
+        mut provider: Provider,
         model: String,
         content: String,
         conversation_id: String,
         profile: String,
-        routing_decision: &'static str,
+        mut routing_decision: &'static str,
         binding: Binding,
-        is_cloud: bool,
+        mut is_cloud: bool,
         app: AppHandle,
     ) -> Result<String> {
-        let client = self
+        // `provider`/`client`/`is_cloud`/`routing_decision` are mutable because
+        // a must-stay-local tool call mid-turn can switch the rest of THIS
+        // turn to a local endpoint (Q6, `resolve_turn_outcome`). The switch is
+        // turn-scoped: the next user message starts a fresh `stream_to_provider`
+        // with a fresh gate check.
+        let mut client = self
             .model_manager
             .get_client(&provider.id)
             .ok_or_else(|| anyhow!("provider {} has no client", provider.id))?;
@@ -422,14 +440,50 @@ impl AgentLoop {
             // Run any tool calls the model made in ITS OWN output. Passing
             // only `own_output` here (typed `&OwnOutput`, never a tool result
             // or prior turn) is the "parse only your own current output"
-            // safety rule — now enforced at the type level.
-            match self
+            // safety rule — enforced at the type level. A call that must stay
+            // on-device on this (cloud) endpoint is resolved by
+            // `resolve_turn_outcome`, which may switch
+            // provider/client/is_cloud/routing_decision to a local endpoint
+            // for the rest of this turn.
+            let turn_outcome = self
                 .tools
                 .run_turn(&own_output, &exec_ctx, binding, is_cloud)
-                .await
-            {
+                .await;
+            let conv_id = conversation_id.clone();
+            let (tool_feedback, new_provider, new_client, new_is_cloud, new_routing_decision) =
+                resolve_turn_outcome(
+                    &self.tools,
+                    &self.model_manager,
+                    turn_outcome,
+                    &exec_ctx,
+                    binding,
+                    provider.clone(),
+                    client,
+                    is_cloud,
+                    routing_decision,
+                    &|from, to, reason| {
+                        let payload = LocalReroutePayload {
+                            conversation_id: conv_id.clone(),
+                            reason: reason.to_string(),
+                            from_provider: from.to_string(),
+                            to_provider: to.to_string(),
+                        };
+                        if let Err(e) = app.emit("stream:local_reroute", payload) {
+                            tracing::warn!(error = %e, "failed to emit stream:local_reroute");
+                        }
+                    },
+                )
+                .await?;
+            provider = new_provider;
+            client = new_client;
+            is_cloud = new_is_cloud;
+            routing_decision = new_routing_decision;
+
+            match tool_feedback {
                 Some(tool_feedback) => {
                     // Persist the tool feedback (role "tool" for the transcript).
+                    // Uses the now-current provider/routing_decision, so a
+                    // reroute's feedback row is tagged with the local endpoint.
                     let tool_message = Message {
                         id: Uuid::new_v4().to_string(),
                         conversation_id: conversation_id.clone(),
@@ -510,6 +564,137 @@ fn emit_error(app: &AppHandle, conversation_id: &str, error: String, source: &'s
     };
     if let Err(e) = app.emit("stream:error", payload) {
         tracing::warn!(error = %e, "failed to emit stream:error");
+    }
+}
+
+/// The transcript banner shown when a tool call forced the rest of a turn
+/// onto a local endpoint. Deliberately **reason-free**: it is persisted and
+/// replayed into future turns of the conversation (which may be cloud-bound),
+/// so it must never carry the detailed privacy `reason` — that flows only
+/// through the ephemeral `stream:local_reroute` event. See
+/// `resolve_turn_outcome`.
+fn reroute_banner(local_provider_name: &str) -> String {
+    format!(
+        "[routing] switched to the local model \"{local_provider_name}\" for the rest of this \
+         turn — a tool call needed to stay on-device."
+    )
+}
+
+/// Drive a [`TurnOutcome`] to completion, resolving any `NeedsLocalReroute`
+/// via `enforce_local_routing` over `model_manager`'s current providers.
+/// Returns the feedback message (`None` if there were no tool calls) plus the
+/// provider/client/is_cloud/routing_decision to use for the REST of this turn
+/// (unchanged unless a reroute actually happened).
+///
+/// Pulled out of `stream_to_provider` as a free function so it's unit-testable
+/// without a live HTTP model endpoint — it never calls `stream_chat`.
+///
+/// `on_reroute(from_name, to_name, reason)` fires exactly once per successful
+/// switch. This is the ONLY place `reason` — a privacy signal — is allowed to
+/// travel; it must never end up in the returned `ChatMessage` (which gets
+/// persisted and replayed into a future turn that may be on cloud). The
+/// returned message carries only the reason-free `reroute_banner`.
+///
+/// Local-model-down fails loud, never falls back to cloud: this function never
+/// calls `stream_chat`, so an unreachable local endpoint surfaces on the NEXT
+/// round's `client.stream_chat(...)?` as a propagated error — there is no
+/// catch-and-retry-on-cloud path here, and none must be added.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) async fn resolve_turn_outcome(
+    tools: &ToolDispatcher,
+    model_manager: &ModelManager,
+    mut turn_outcome: TurnOutcome,
+    exec_ctx: &ExecCtx,
+    binding: Binding,
+    mut provider: Provider,
+    mut client: ModelClient,
+    mut is_cloud: bool,
+    mut routing_decision: &'static str,
+    // `Send + Sync` because this reference is held across `.await` points
+    // inside the reroute loop, and `stream_to_provider`'s future must stay
+    // `Send` for the Tauri command boundary.
+    on_reroute: &(dyn Fn(&str, &str, &str) + Send + Sync),
+) -> Result<(Option<ChatMessage>, Provider, ModelClient, bool, &'static str)> {
+    // Backstop, not a designed retry count — `remaining` strictly shrinks
+    // each pass, so a reroute chain terminates naturally; hitting the cap
+    // means a logic bug, and it fails closed. Same philosophy as
+    // MAX_APPROVAL_ROUNDS / MAX_TOOL_ROUNDS.
+    const MAX_REROUTE_STEPS: usize = 8;
+    let mut steps = 0;
+    loop {
+        match turn_outcome {
+            TurnOutcome::NoToolCalls => {
+                return Ok((None, provider, client, is_cloud, routing_decision))
+            }
+            TurnOutcome::Feedback(msg) => {
+                return Ok((Some(msg), provider, client, is_cloud, routing_decision))
+            }
+            TurnOutcome::NeedsLocalReroute {
+                reason,
+                call,
+                prior_sections,
+                remaining,
+            } => {
+                steps += 1;
+                if steps > MAX_REROUTE_STEPS {
+                    anyhow::bail!("too many local-reroute steps in one tool round");
+                }
+                let candidates = model_manager.list_providers();
+                let routing = RoutingRequirement::LocalRequired {
+                    reason: reason.clone(),
+                };
+                // `enforce_local_routing` is the ONLY thing structurally
+                // guaranteed to never return a cloud provider on the
+                // LocalRequired branch — never hand-roll is_local()&&is_private().
+                let found = match enforce_local_routing(&routing, &candidates) {
+                    Ok(local) => model_manager
+                        .get_client(&local.id)
+                        .map(|c| (local.clone(), c)),
+                    Err(_) => None,
+                };
+                match found {
+                    Some((local, local_client)) => {
+                        on_reroute(&provider.name, &local.name, &reason);
+                        let resumed = tools
+                            .resume_after_local_switch(
+                                call,
+                                remaining,
+                                prior_sections,
+                                exec_ctx,
+                                binding,
+                            )
+                            .await;
+                        // Reason-free banner only — see the doc comment.
+                        let combined = ChatMessage::user(format!(
+                            "{}\n\n{}",
+                            reroute_banner(&local.name),
+                            resumed.content
+                        ));
+                        provider = local;
+                        client = local_client;
+                        is_cloud = false; // enforce_local_routing proved is_local() && is_private()
+                        routing_decision = "tool_reroute_local";
+                        return Ok((Some(combined), provider, client, is_cloud, routing_decision));
+                    }
+                    None => {
+                        // No local candidate — format the call as exactly
+                        // today's hard-deny text (no re-dispatch) and keep
+                        // driving the rest of the batch on the same endpoint.
+                        turn_outcome = tools
+                            .deny_and_continue_turn(
+                                call,
+                                remaining,
+                                prior_sections,
+                                reason,
+                                exec_ctx,
+                                binding,
+                                is_cloud,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
     }
 }
 

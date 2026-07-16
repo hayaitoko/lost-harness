@@ -132,6 +132,8 @@ pub fn outcome_label(outcome: &crate::tools::dispatch::ToolOutcome) -> &'static 
         ToolOutcome::Ask { .. } => "ask",
         ToolOutcome::Unavailable(_) => "unavailable",
         ToolOutcome::Unknown(_) => "unknown",
+        // Not run on the cloud endpoint; the caller may reroute to local.
+        ToolOutcome::NeedsLocalReroute { .. } => "needs_local_reroute",
     }
 }
 
@@ -141,6 +143,8 @@ pub fn outcome_gate_by(outcome: &crate::tools::dispatch::ToolOutcome) -> Option<
     use crate::tools::dispatch::ToolOutcome;
     match outcome {
         ToolOutcome::Denied { by, .. } | ToolOutcome::Ask { by, .. } => Some(by.clone()),
+        // The privacy filter is what forced the reroute; name it as the gate.
+        ToolOutcome::NeedsLocalReroute { .. } => Some("privacy-filter".to_string()),
         ToolOutcome::Ok(_)
         | ToolOutcome::Err(_)
         | ToolOutcome::Unavailable(_)

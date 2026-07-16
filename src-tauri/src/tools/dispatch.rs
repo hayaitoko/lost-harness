@@ -88,6 +88,52 @@ pub enum ToolOutcome {
     Unavailable(String),
     /// No tool with that name is registered.
     Unknown(String),
+    /// The call must stay on-device (`PrivacyFilterHook` annotated
+    /// `routing = LocalRequired`) but the conversation is on a cloud
+    /// endpoint. The tool was NOT run (invariant #2 intact). Typed
+    /// distinctly from `Denied` so the *caller* — which owns providers; the
+    /// dispatcher deliberately does not — can try to reroute to a local
+    /// endpoint and re-issue the call, rather than just failing. `reason` is
+    /// the plain classifier/annotation reason (not yet formatted); the
+    /// hard-deny wording is produced once, in `format_outcome`.
+    NeedsLocalReroute { reason: String },
+}
+
+/// The result of driving one model turn's tool calls (`run_turn`). Unlike a
+/// single `ToolOutcome`, this spans the whole batch and can pause mid-batch
+/// when a call needs a local endpoint the dispatcher can't choose.
+#[derive(Debug)]
+pub enum TurnOutcome {
+    /// No ```` ```tool ```` block in the model's output — this turn is the
+    /// final answer.
+    NoToolCalls,
+    /// Every call in this batch settled (ran / errored / denied / asked /
+    /// unavailable / unknown) with no reroute needed. Ready to replay.
+    Feedback(ChatMessage),
+    /// `call` needs a local endpoint; everything dispatched *before* it in
+    /// this batch is already formatted into `prior_sections`; `remaining` are
+    /// the calls after it, not yet dispatched. The caller (the loop) must
+    /// resolve this via `enforce_local_routing` and call either
+    /// `resume_after_local_switch` (candidate found) or
+    /// `deny_and_continue_turn` (none found) to finish the batch.
+    NeedsLocalReroute {
+        reason: String,
+        call: ToolCall,
+        prior_sections: Vec<String>,
+        remaining: Vec<ParsedToolCall>,
+    },
+}
+
+#[cfg(test)]
+impl TurnOutcome {
+    /// Test helper: unwrap the `Feedback` message or panic. Replaces the old
+    /// `.expect(..)` on the pre-item-6 `Option<ChatMessage>` return.
+    fn feedback(self) -> ChatMessage {
+        match self {
+            TurnOutcome::Feedback(m) => m,
+            other => panic!("expected TurnOutcome::Feedback, got {other:?}"),
+        }
+    }
 }
 
 /// Owns the tools, the gating chain, and the current body's capability set,
@@ -333,14 +379,15 @@ impl ToolDispatcher {
                             RoutingRequirement::LocalRequired { reason } => reason.clone(),
                             RoutingRequirement::Unconstrained => "must stay on-device".to_string(),
                         };
-                        return ToolOutcome::Denied {
-                            by: "privacy-filter".to_string(),
-                            reason: format!(
-                                "this call must stay on-device ({reason}), but the conversation is \
-                                 on a cloud model — switch to a local model or set the conversation \
-                                 binding to Private to run it"
-                            ),
-                        };
+                        // Still never runs the tool on a cloud endpoint —
+                        // invariant #2 intact. Typed distinctly from Denied so
+                        // the caller (which owns providers; the dispatcher
+                        // deliberately does not) can try to reroute to a local
+                        // endpoint instead of just failing. The reason is
+                        // unformatted — formatting happens once, in
+                        // `format_outcome`, so a no-candidate reroute produces
+                        // byte-identical wording to the old hard-deny.
+                        return ToolOutcome::NeedsLocalReroute { reason };
                     }
                     // Inject the shared read-tracking handle so the fs tools'
                     // read-before-write guard sees reads recorded on earlier
@@ -445,9 +492,13 @@ impl ToolDispatcher {
         }
     }
 
-    /// Parse tool calls out of the model's own current-turn output, dispatch
-    /// each, and return the message to feed back — or `None` if the model
-    /// requested no tools (i.e. this turn is the final answer).
+    /// Parse tool calls out of the model's own current-turn output and drive
+    /// them to a [`TurnOutcome`]: `NoToolCalls` (no ```` ```tool ```` block —
+    /// this turn is the final answer), `Feedback` (every call settled, ready
+    /// to replay), or `NeedsLocalReroute` (a call must stay on-device but the
+    /// conversation is on a cloud endpoint — the caller, which owns providers,
+    /// resolves it; the dispatcher deliberately stays out of the provider
+    /// business).
     ///
     /// The `own_output` MUST be the model's freshly-generated text and
     /// nothing else. That's the rule that stops content the model merely
@@ -456,6 +507,25 @@ impl ToolDispatcher {
     /// `OwnOutput::from_stream_assembly` can produce one, and the agent
     /// loop calls it exactly once, right after the SSE-delta assembly
     /// loop.
+    pub async fn run_turn(
+        &self,
+        own_output: &OwnOutput,
+        ctx: &ExecCtx,
+        binding: Binding,
+        is_cloud: bool,
+    ) -> TurnOutcome {
+        let parsed = parse_tool_calls(own_output);
+        if parsed.is_empty() {
+            return TurnOutcome::NoToolCalls;
+        }
+        self.drive(Vec::new(), parsed, ctx, binding, is_cloud).await
+    }
+
+    /// The shared driver behind `run_turn` and the two reroute-continuation
+    /// methods. Runs the full pre-dispatch circuit-breaker pipeline over
+    /// `calls`, appending each formatted outcome to `sections`, and stops
+    /// early — handing control back to the caller — the instant a call
+    /// returns `NeedsLocalReroute`.
     ///
     /// Pre-dispatch circuit breakers (Q4 do-now item 2), all enforced
     /// BEFORE `self.dispatch()` is reached:
@@ -472,27 +542,36 @@ impl ToolDispatcher {
     ///      turn skips every not-yet-run non-`Safe` call without
     ///      prompting. Policy/sandbox/privacy-filter denials do NOT trip
     ///      the cascade.
-    pub async fn run_turn(
+    ///
+    /// State note: the per-turn ceiling counter and the deny-cascade flag are
+    /// turn-LOCAL and restart when `drive` is re-entered after a reroute
+    /// (`deny_and_continue_turn` / `resume_after_local_switch`) — reroute is
+    /// rare, and the true runaway bound (the per-RUN dispatch ceiling + repeat
+    /// detection) lives in `self.run_state`, which persists across every
+    /// `drive` call in the run. So a reroute never widens the real ceiling,
+    /// only the per-turn courtesy stop.
+    async fn drive(
         &self,
-        own_output: &OwnOutput,
+        mut sections: Vec<String>,
+        calls: Vec<ParsedToolCall>,
         ctx: &ExecCtx,
         binding: Binding,
         is_cloud: bool,
-    ) -> Option<ChatMessage> {
-        let parsed = parse_tool_calls(own_output);
-        if parsed.is_empty() {
-            return None;
-        }
-
-        let total = parsed.len();
-        let mut sections = Vec::new();
+    ) -> TurnOutcome {
+        let total = calls.len();
         let mut turn_call_count: usize = 0;
         let mut cascade_active = false;
+        let mut iter = calls.into_iter();
+        let mut idx = 0usize;
 
-        for (idx, item) in parsed.into_iter().enumerate() {
+        while let Some(item) = iter.next() {
+            // `cur_idx` is this item's 0-based position; bump `idx`
+            // unconditionally here so a `continue` below can't skip it.
+            let cur_idx = idx;
+            idx += 1;
             // Per-turn ceiling: every item counts, malformed included.
             if turn_call_count >= PER_TURN_CALL_CEILING {
-                let remaining = total - idx;
+                let remaining = total - cur_idx;
                 let outcome = ToolOutcome::Denied {
                     by: "budget".to_string(),
                     reason: format!(
@@ -600,6 +679,19 @@ impl ToolDispatcher {
                     }
 
                     let outcome = self.dispatch(&call, ctx, binding, is_cloud).await;
+                    // Reroute early-return: this call must stay on-device but
+                    // the conversation is on cloud. Hand control back to the
+                    // caller (the loop, which owns providers). Everything
+                    // before `call` is already formatted into `sections`;
+                    // `remaining` are the calls after it, not yet driven.
+                    if let ToolOutcome::NeedsLocalReroute { reason } = outcome {
+                        return TurnOutcome::NeedsLocalReroute {
+                            reason,
+                            call,
+                            prior_sections: sections,
+                            remaining: iter.collect(),
+                        };
+                    }
                     if matches!(&outcome, ToolOutcome::Denied { by, .. } if by == "user") {
                         cascade_active = true;
                     }
@@ -608,7 +700,53 @@ impl ToolDispatcher {
             }
         }
 
-        Some(ChatMessage::user(sections.join("\n\n")))
+        TurnOutcome::Feedback(ChatMessage::user(sections.join("\n\n")))
+    }
+
+    /// No local candidate exists for `call`. Format it as the same hard-deny
+    /// text `dispatch` would produce (WITHOUT re-dispatching — re-dispatching
+    /// at the same `is_cloud=true` would just yield another `NeedsLocalReroute`
+    /// for the same reason and loop forever), then keep driving `remaining` at
+    /// the same `is_cloud` — which may itself surface a further reroute for a
+    /// later call; the caller handles that the same way.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn deny_and_continue_turn(
+        &self,
+        call: ToolCall,
+        remaining: Vec<ParsedToolCall>,
+        mut prior_sections: Vec<String>,
+        reason: String,
+        ctx: &ExecCtx,
+        binding: Binding,
+        is_cloud: bool,
+    ) -> TurnOutcome {
+        prior_sections.push(format_outcome(
+            &call.name,
+            ToolOutcome::NeedsLocalReroute { reason },
+        ));
+        self.drive(prior_sections, remaining, ctx, binding, is_cloud)
+            .await
+    }
+
+    /// The caller has committed to a local endpoint for the rest of this turn.
+    /// Re-issue `call` (now it actually runs — `is_cloud=false` structurally
+    /// cannot hit the reroute branch again) then keep driving `remaining` on
+    /// the same endpoint. Always settles in one pass (can never itself need a
+    /// reroute), so it hands back the finished message directly.
+    pub async fn resume_after_local_switch(
+        &self,
+        call: ToolCall,
+        remaining: Vec<ParsedToolCall>,
+        prior_sections: Vec<String>,
+        ctx: &ExecCtx,
+        binding: Binding,
+    ) -> ChatMessage {
+        let mut calls = vec![ParsedToolCall::Call(call)];
+        calls.extend(remaining);
+        match self.drive(prior_sections, calls, ctx, binding, false).await {
+            TurnOutcome::Feedback(msg) => msg,
+            _ => unreachable!("is_cloud=false can't reroute; calls is non-empty"),
+        }
     }
 }
 
@@ -643,6 +781,16 @@ fn format_outcome(name: &str, outcome: ToolOutcome) -> String {
         ToolOutcome::Unknown(msg) => {
             format!("[tool {name} → unknown tool] {}", neutralize_untrusted(&msg))
         }
+        // Byte-identical to the wording the old `Denied{by:"privacy-filter"}`
+        // arm produced — so a reroute with NO local candidate (see
+        // `deny_and_continue_turn`) yields exactly today's hard-deny message
+        // by construction, not by hand-duplicating strings.
+        ToolOutcome::NeedsLocalReroute { reason } => format!(
+            "[tool {name} → denied by privacy-filter] this call must stay on-device ({}), but the \
+             conversation is on a cloud model — switch to a local model or set the conversation \
+             binding to Private to run it",
+            neutralize_untrusted(&reason)
+        ),
     }
 }
 
@@ -821,7 +969,7 @@ mod tests {
         let out = dispatcher
             .run_turn(&own("Just a plain answer."), &ctx(), Binding::Public, true)
             .await;
-        assert!(out.is_none());
+        assert!(matches!(out, TurnOutcome::NoToolCalls));
     }
 
     #[tokio::test]
@@ -847,7 +995,7 @@ mod tests {
         let feedback = dispatcher
             .run_turn(&own(model_output), &ctx(), Binding::Public, false)
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
 
         assert_eq!(feedback.role, "user");
         assert!(feedback.content.contains("hello from disk"), "content: {}", feedback.content);
@@ -856,9 +1004,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_required_call_is_blocked_on_a_cloud_endpoint() {
+    async fn local_required_call_needs_reroute_on_a_cloud_endpoint() {
         // Auto binding + PII in the args => the privacy filter flags the call
-        // as must-stay-local. On a cloud endpoint that must fail closed, not run.
+        // as must-stay-local. On a cloud endpoint the tool must NOT run; the
+        // outcome is the typed `NeedsLocalReroute` (item 6) so the caller can
+        // reroute to a local endpoint instead of just failing.
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
         let chain = build_pretooluse_chain_with_confirmed(
@@ -876,10 +1026,10 @@ mod tests {
                 true, // cloud endpoint
             )
             .await;
-        match outcome {
-            ToolOutcome::Denied { by, .. } => assert_eq!(by, "privacy-filter"),
-            other => panic!("PII on a cloud endpoint must be blocked, got {other:?}"),
-        }
+        assert!(
+            matches!(outcome, ToolOutcome::NeedsLocalReroute { .. }),
+            "PII on a cloud endpoint must yield NeedsLocalReroute, got {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -909,6 +1059,204 @@ mod tests {
         );
     }
 
+    // ── item 6: NeedsLocalReroute + TurnOutcome ──────────────────────────
+
+    /// Args whose content the heuristic classifier flags as must-stay-local
+    /// (an SSN), so a call carrying them on a cloud endpoint reroutes.
+    fn pii_args() -> serde_json::Value {
+        serde_json::json!({"note": "my SSN is 123-45-6789"})
+    }
+
+    /// One `EchoTool`, allowed + pre-confirmed through the full pretooluse
+    /// chain (so the privacy filter runs and the routing check is what
+    /// decides) — the production reroute-path wiring shape.
+    fn reroute_echo_dispatcher() -> ToolDispatcher {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let chain = build_pretooluse_chain_with_confirmed(
+            gate(),
+            Box::new(allow_policy(&["echo"])),
+            &["echo"],
+        );
+        ToolDispatcher::new(registry, chain, BodyEnv::empty())
+    }
+
+    fn one_block(name: &str, args: serde_json::Value) -> String {
+        format!(
+            "```tool\n{}\n```",
+            serde_json::to_string(&serde_json::json!({"name": name, "args": args})).unwrap()
+        )
+    }
+
+    #[tokio::test]
+    async fn needs_local_reroute_never_runs_the_tool() {
+        // Test 2: a NeedsLocalReroute outcome must never reach Tool::run.
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaggedSpyTool {
+            name: "note_tool".to_string(),
+            risk: RiskClass::Safe,
+            ran: ran.clone(),
+        }));
+        let chain = build_pretooluse_chain_with_confirmed(
+            gate(),
+            Box::new(allow_policy(&["note_tool"])),
+            &["note_tool"],
+        );
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty());
+        let outcome = dispatcher
+            .dispatch(&call("note_tool", pii_args()), &ctx(), Binding::Auto, true)
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::NeedsLocalReroute { .. }),
+            "PII on cloud must be NeedsLocalReroute, got {outcome:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "a rerouted call must never run the tool");
+    }
+
+    #[test]
+    fn format_outcome_needs_local_reroute_wording() {
+        // Test 3: pins the wording `deny_and_continue_turn` relies on being
+        // identical to the old hard-deny text.
+        let s = format_outcome(
+            "echo",
+            ToolOutcome::NeedsLocalReroute {
+                reason: "content must not leave this device".to_string(),
+            },
+        );
+        assert!(s.contains("must stay on-device"), "got: {s}");
+        assert!(
+            s.contains("switch to a local model or set the conversation binding to Private"),
+            "got: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_single_reroute_call_has_empty_prior_and_remaining() {
+        // Test 6.
+        let dispatcher = reroute_echo_dispatcher();
+        let out = dispatcher
+            .run_turn(&own(&one_block("echo", pii_args())), &ctx(), Binding::Auto, true)
+            .await;
+        match out {
+            TurnOutcome::NeedsLocalReroute {
+                prior_sections,
+                remaining,
+                call,
+                ..
+            } => {
+                assert!(prior_sections.is_empty(), "prior: {prior_sections:?}");
+                assert!(remaining.is_empty(), "remaining: {remaining:?}");
+                assert_eq!(call.name, "echo");
+            }
+            other => panic!("expected NeedsLocalReroute, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_reroute_carries_prior_ok_section_and_no_remaining() {
+        // Test 7: ordinary call (clean args, runs OK), then a reroute call.
+        let dispatcher = reroute_echo_dispatcher();
+        let output = format!(
+            "{}\n{}",
+            one_block("echo", serde_json::json!({"n": 1})),
+            one_block("echo", pii_args()),
+        );
+        let out = dispatcher
+            .run_turn(&own(&output), &ctx(), Binding::Auto, true)
+            .await;
+        match out {
+            TurnOutcome::NeedsLocalReroute {
+                prior_sections,
+                remaining,
+                ..
+            } => {
+                assert_eq!(prior_sections.len(), 1, "prior: {prior_sections:?}");
+                assert!(prior_sections[0].contains("→ ok"), "prior[0]: {}", prior_sections[0]);
+                assert!(remaining.is_empty(), "remaining: {remaining:?}");
+            }
+            other => panic!("expected NeedsLocalReroute, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_and_continue_no_candidate_matches_hard_deny_text() {
+        // Test 8: no local candidate ⇒ byte-identical to today's hard-deny.
+        let dispatcher = reroute_echo_dispatcher();
+        let reason = "content must not leave this device".to_string();
+        let out = dispatcher
+            .deny_and_continue_turn(
+                call("echo", pii_args()),
+                vec![],
+                vec![],
+                reason.clone(),
+                &ctx(),
+                Binding::Auto,
+                true,
+            )
+            .await;
+        let expected = format_outcome("echo", ToolOutcome::NeedsLocalReroute { reason });
+        match out {
+            TurnOutcome::Feedback(msg) => assert_eq!(msg.content, expected),
+            other => panic!("expected Feedback, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_after_local_switch_runs_the_previously_rerouted_call() {
+        // Test 9: is_cloud=false is what lets the previously-rerouted call run.
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaggedSpyTool {
+            name: "note_tool".to_string(),
+            risk: RiskClass::Safe,
+            ran: ran.clone(),
+        }));
+        let chain = build_pretooluse_chain_with_confirmed(
+            gate(),
+            Box::new(allow_policy(&["note_tool"])),
+            &["note_tool"],
+        );
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty());
+        let msg = dispatcher
+            .resume_after_local_switch(
+                call("note_tool", pii_args()),
+                vec![],
+                vec![],
+                &ctx(),
+                Binding::Auto,
+            )
+            .await;
+        assert!(msg.content.contains("→ ok"), "content: {}", msg.content);
+        assert!(ran.load(Ordering::SeqCst), "resume runs on is_cloud=false → the tool must run");
+    }
+
+    #[tokio::test]
+    async fn resume_after_local_switch_includes_prior_and_remaining_in_order() {
+        // Test 10: prior section, then the resumed call, then remaining.
+        let dispatcher = reroute_echo_dispatcher();
+        let prior = vec!["PRIOR_SECTION_MARKER".to_string()];
+        let remaining = vec![ParsedToolCall::Call(call("echo", serde_json::json!({"n": 99})))];
+        let msg = dispatcher
+            .resume_after_local_switch(
+                call("echo", serde_json::json!({"n": 1})),
+                remaining,
+                prior,
+                &ctx(),
+                Binding::Public,
+            )
+            .await;
+        let marker = msg.content.find("PRIOR_SECTION_MARKER").expect("prior section present");
+        let first_ok = msg.content.find("→ ok").expect("resumed call ran");
+        assert!(marker < first_ok, "prior must precede the resumed output: {}", msg.content);
+        assert_eq!(
+            msg.content.matches("→ ok").count(),
+            2,
+            "resumed call + remaining call both run: {}",
+            msg.content
+        );
+    }
+
     #[tokio::test]
     async fn a_fence_smuggled_through_a_tool_name_is_neutralized_in_feedback() {
         // A malicious model tries to stash a live ```tool block inside an
@@ -922,7 +1270,7 @@ mod tests {
         let feedback = dispatcher
             .run_turn(&own(&model_output), &ctx(), Binding::Public, true)
             .await
-            .expect("an unknown tool call still produces feedback");
+            .feedback();
 
         assert!(
             parse_tool_calls(&own(&feedback.content)).is_empty(),
@@ -1282,7 +1630,7 @@ mod tests {
                 false,
             )
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
 
         let sections = split_sections(&feedback.content);
         assert_eq!(sections.len(), 9, "sections: {sections:?}");
@@ -1334,7 +1682,7 @@ mod tests {
                 false,
             )
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
 
         let sections = split_sections(&feedback.content);
         assert_eq!(sections.len(), 9, "sections: {sections:?}");
@@ -1397,7 +1745,7 @@ mod tests {
                     false,
                 )
                 .await
-                .expect("a tool was called, so there must be feedback");
+                .feedback();
             let sections = split_sections(&feedback.content);
             total_ok += sections
                 .iter()
@@ -1429,7 +1777,7 @@ mod tests {
             let feedback = dispatcher
                 .run_turn(&own(&model_output(&[block.as_str()])), &ctx(), Binding::Public, false)
                 .await
-                .expect("a tool was called, so there must be feedback");
+                .feedback();
             assert!(
                 feedback.content.contains("[tool echo → ok]"),
                 "dispatch {i} should succeed before the ceiling is hit, got: {}",
@@ -1447,7 +1795,7 @@ mod tests {
                 false,
             )
             .await
-            .expect("the model emitted a tool call, so there must be feedback");
+            .feedback();
         assert!(
             overflow.content.contains("→ denied by budget"),
             "without begin_run(), the 51st dispatch is denied by budget, got: {}",
@@ -1465,7 +1813,7 @@ mod tests {
                 false,
             )
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
         assert!(
             after_reset.content.contains("[tool echo → ok]"),
             "after begin_run(), the next dispatch should run, got: {}",
@@ -1483,15 +1831,15 @@ mod tests {
         let r1 = dispatcher
             .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
         let r2 = dispatcher
             .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
         let r3 = dispatcher
             .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
 
         assert!(r1.content.contains("[tool echo → ok]"), "call 1: {}", r1.content);
         assert!(r2.content.contains("[tool echo → ok]"), "call 2: {}", r2.content);
@@ -1517,7 +1865,7 @@ mod tests {
             let feedback = dispatcher
                 .run_turn(&own(&model_output(&[block.as_str()])), &ctx(), Binding::Public, false)
                 .await
-                .expect("a tool was called, so there must be feedback");
+                .feedback();
             assert!(
                 feedback.content.contains("[tool echo → ok]"),
                 "call {i} with different args should run, got: {}",
@@ -1548,7 +1896,7 @@ mod tests {
         let feedback = dispatcher
             .run_turn(&own(&model_output(&blocks)), &ctx(), Binding::Public, false)
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
 
         let sections = split_sections(&feedback.content);
         assert_eq!(sections.len(), 3, "sections: {sections:?}");
@@ -1641,7 +1989,7 @@ mod tests {
         let feedback = dispatcher
             .run_turn(&own(&model_output(&blocks)), &ctx(), Binding::Public, false)
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
 
         let sections = split_sections(&feedback.content);
         assert_eq!(sections.len(), 2, "sections: {sections:?}");
@@ -2110,15 +2458,15 @@ mod tests {
         let r1 = dispatcher
             .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
             .await
-            .unwrap();
+            .feedback();
         let r2 = dispatcher
             .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
             .await
-            .unwrap();
+            .feedback();
         let r3 = dispatcher
             .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
             .await
-            .unwrap();
+            .feedback();
 
         // Observer-only: the text fed back to the model is exactly as before.
         assert!(r1.content.contains("[tool echo → ok]"));
@@ -2162,7 +2510,7 @@ mod tests {
         let _ = dispatcher
             .run_turn(&own(&model_output(&blocks)), &ctx(), Binding::Public, false)
             .await
-            .expect("a tool was called, so there must be feedback");
+            .feedback();
 
         let entries = entries.lock().unwrap();
         let tool_b_row = entries
