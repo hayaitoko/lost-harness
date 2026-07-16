@@ -26,6 +26,11 @@
     fetchModels,
   } from "$lib/stores/providers.svelte";
   import { sendOnEnter } from "$lib/stores/settings";
+  import {
+    explainClassification,
+    type ClassificationExplanation,
+    type ClassificationSpan,
+  } from "$lib/api/tauri";
 
   type PanelTab = "routing" | "files" | "tasks" | "agents" | "terminal";
   type ModelOption = { name: string; kind: "local" | "cloud"; group: string; key: string };
@@ -71,6 +76,68 @@
   const openTab = (t: PanelTab) => {
     whyOpen = true;
     panelTab = t;
+  };
+
+  // ── "Why this was routed" — real classifier explanation of the last user
+  // message (PLAN §11: censorship surfaced, never silent + the annotated view).
+  let explanation = $state<ClassificationExplanation | null>(null);
+  let explaining = $state(false);
+
+  // The message the routing panel explains: the most recent user turn.
+  const lastUserMessage = $derived(
+    [...($activeConversation?.messages ?? [])]
+      .reverse()
+      .find((m) => m.role === "user")?.content ?? "",
+  );
+
+  // Load the explanation whenever the routing tab is open, re-loading if the
+  // last user message changes under it. The classifier is the same one the §7
+  // gate uses, so this matches the actual routing decision.
+  $effect(() => {
+    if (!whyOpen || panelTab !== "routing") return;
+    const text = lastUserMessage;
+    if (!text.trim()) {
+      explanation = null;
+      return;
+    }
+    explaining = true;
+    explainClassification(text)
+      .then((e) => {
+        explanation = e;
+      })
+      .catch(() => {
+        explanation = null;
+      })
+      .finally(() => {
+        explaining = false;
+      });
+  });
+
+  // Split the message into plain / marked segments at the classifier's span
+  // offsets (Unicode scalar values → slice over a code-point array so multi-byte
+  // characters don't shift the marks).
+  type AnnotatedSegment = { text: string; kind: "plain" | "span" | "hard" };
+  function annotateMessage(text: string, spans: ClassificationSpan[]): AnnotatedSegment[] {
+    if (spans.length === 0) return [{ text, kind: "plain" }];
+    const chars = Array.from(text);
+    const sorted = [...spans].sort((a, b) => a.start - b.start);
+    const segs: AnnotatedSegment[] = [];
+    let cursor = 0;
+    for (const s of sorted) {
+      const start = Math.max(s.start, cursor);
+      if (start >= s.end) continue; // fully overlapped by an earlier span
+      if (start > cursor) segs.push({ text: chars.slice(cursor, start).join(""), kind: "plain" });
+      segs.push({ text: chars.slice(start, s.end).join(""), kind: s.hard ? "hard" : "span" });
+      cursor = s.end;
+    }
+    if (cursor < chars.length) segs.push({ text: chars.slice(cursor).join(""), kind: "plain" });
+    return segs;
+  }
+
+  const VERDICT_HEADING: Record<ClassificationExplanation["label"], string> = {
+    private: "Why this stayed local",
+    uncertain: "Kept local — borderline",
+    public: "Nothing sensitive detected",
   };
 
   // ── Model picker: build the design's flat ModelOption[] from the real
@@ -195,8 +262,6 @@
   }
 
   // Reusable chrome recipes (mirror the React inline styles).
-  const panelBtn =
-    "text-left px-[11px] py-[9px] rounded-[var(--r)] border border-border-strong bg-surface-2 text-text-2 text-[11.5px] font-semibold cursor-pointer";
   const card =
     "px-3 py-[10px] bg-surface border border-border rounded-[var(--r-lg)]";
 </script>
@@ -435,43 +500,67 @@
       <div class="min-h-0 flex-1 overflow-y-auto">
         {#if panelTab === "routing"}
           <div class="px-[14px] py-[15px]">
-            <div class="mb-2.5 flex items-center gap-2">
-              <span class="text-[12.5px] font-semibold">Why this stayed local</span>
-            </div>
-            <RoutingBadge route="local" label="Local · Qwen3-14B" />
-            <p class="mb-1 mt-3 text-[12.5px] text-text-2">
-              This turn was answered on <b class="text-text">tadashi</b> because
-              the classifier detected personal details in your message.
-            </p>
-            <div
-              class="px-0 pb-1.5 pt-[14px] text-[10.5px] font-semibold uppercase tracking-[0.06em] text-text-3"
-            >
-              Kept on your machine
-            </div>
-            <div class="flex flex-col gap-1.5">
+            {#if explaining && !explanation}
+              <p class="text-[12px] text-text-3">Checking this message…</p>
+            {:else if !explanation}
+              <p class="text-[12px] text-text-3">
+                Send a message to see how the privacy guard classified it.
+              </p>
+            {:else}
+              <div class="mb-2.5 flex items-center gap-2">
+                <span class="text-[12.5px] font-semibold">
+                  {VERDICT_HEADING[explanation.label]}
+                </span>
+              </div>
+              <RoutingBadge
+                route={explanation.label === "public" ? "cloud" : "local"}
+                label={explanation.label === "public" ? "Eligible for cloud" : "Kept on your machine"}
+              />
+
               <div
-                class="flex items-center gap-[9px] rounded-[var(--r)] border border-border bg-surface px-2.5 py-2"
+                class="px-0 pb-1.5 pt-[14px] text-[10.5px] font-semibold uppercase tracking-[0.06em] text-text-3"
               >
-                {@render dot("bg-warn")}
-                <span class="flex-1 text-[12px]">Home address</span>
-                <span class="text-[10.5px] text-text-3">rule</span>
+                Your message
               </div>
               <div
-                class="flex items-center gap-[9px] rounded-[var(--r)] border border-border bg-surface px-2.5 py-2"
+                class="lh-annotated rounded-[var(--r)] border border-border bg-surface px-[11px] py-[9px] text-[12.5px] leading-[1.7]"
               >
-                {@render dot("bg-warn")}
-                <span class="flex-1 text-[12px]">Lease terms</span>
-                <span class="text-[10.5px] text-text-3">model</span>
+                {#each annotateMessage(lastUserMessage, explanation.spans) as seg, i (i)}
+                  {#if seg.kind === "plain"}{seg.text}{:else}<mark
+                      class="span {seg.kind === 'hard' ? 'hard' : ''}">{seg.text}</mark
+                    >{/if}
+                {/each}
               </div>
-            </div>
-            <div class="mt-[14px] flex flex-col gap-[7px]">
-              <button type="button" class={panelBtn}>
-                What tripped the guard
-              </button>
-              <button type="button" class={panelBtn}>
-                Send the safe parts to a stronger model?
-              </button>
-            </div>
+
+              {#if explanation.spans.length > 0}
+                <div
+                  class="px-0 pb-1.5 pt-[14px] text-[10.5px] font-semibold uppercase tracking-[0.06em] text-text-3"
+                >
+                  What tripped the guard
+                </div>
+                <div class="flex flex-col gap-1.5">
+                  {#each explanation.spans as s, i (i)}
+                    <div
+                      class="flex items-center gap-[9px] rounded-[var(--r)] border border-border bg-surface px-2.5 py-2"
+                    >
+                      {@render dot(s.hard ? "bg-blocked" : "bg-warn")}
+                      <span class="flex-1 text-[12px]">
+                        {s.label}{#if s.hard}<span class="font-semibold text-blocked">
+                            · hard-block</span
+                          >{/if}
+                      </span>
+                      <span class="text-[10.5px] text-text-3">{s.layer}</span>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <p class="mt-3 text-[12px] text-text-3">
+                  {explanation.label === "public"
+                    ? "Nothing sensitive detected — this message is eligible for a cloud model."
+                    : "The model read this as sensitive but found no exact spans to highlight — the whole message stays local."}
+                </p>
+              {/if}
+            {/if}
           </div>
         {:else if panelTab === "files"}
           <div class="p-3">
@@ -669,5 +758,23 @@
       opacity: 1;
       transform: translateY(-2px);
     }
+  }
+
+  /* Annotated message in the routing panel — detected spans are wrapped in
+     <mark class="span"> / <mark class="span hard"> (mirrors WhyPanel + the
+     design's `.span` / `.span.hard`). */
+  .lh-annotated {
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .lh-annotated :global(.span) {
+    border-radius: 3px;
+    padding: 0 2px;
+    background: var(--warn-soft);
+    border-bottom: 1.5px dashed var(--warn);
+  }
+  .lh-annotated :global(.span.hard) {
+    background: var(--blocked-soft);
+    border-bottom-color: var(--blocked);
   }
 </style>
