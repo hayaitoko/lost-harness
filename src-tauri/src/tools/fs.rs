@@ -384,6 +384,32 @@ fn resolve_within_new(root: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+/// Best-effort canonicalization of a workspace-relative path against `root`,
+/// following symlinks exactly the way the fs tools do before ever touching
+/// disk: `resolve_within` when the target already exists, falling back to
+/// `resolve_within_new`'s parent-canonicalization for a target that doesn't
+/// exist yet (e.g. a fresh `write_file` under a symlinked alias dir).
+/// Returns `None` on any validation failure (absolute, `..`, inaccessible
+/// parent) — callers must treat `None` as "no additional signal," NOT as
+/// "safe": each resolver's own checks are the actual guard against those
+/// cases. This is a read-only peek used by `ProtectedPathHook` to see the
+/// REAL on-disk target of a call before deciding whether to Ask; it does not
+/// replace either resolver, it just re-exposes them to a caller outside this
+/// module so the hook and the tool share one symlink-resolution algorithm
+/// and can never drift (the drift between the hook's raw-text match and the
+/// tools' `resolve_within*` is exactly what created the bypass this closes).
+///
+/// Note the two resolvers differ on an existing symlink *leaf*:
+/// `resolve_within` follows it (reporting the real target), while
+/// `resolve_within_new` would REFUSE to write through it. That only ever
+/// yields an extra, harmless protected-path Ask for a call the tool would
+/// reject anyway — never a false negative.
+pub(crate) fn canonicalize_best_effort(root: &Path, rel: &str) -> Option<PathBuf> {
+    resolve_within(root, rel)
+        .or_else(|_| resolve_within_new(root, rel))
+        .ok()
+}
+
 /// Write `content` to `target` atomically: write a temp file in the same
 /// directory, then rename over the target (rename is atomic on one
 /// filesystem, so a reader never sees a half-written file).

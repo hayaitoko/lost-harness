@@ -357,6 +357,27 @@ pub async fn list_models(
 
 // ── send_message ─────────────────────────────────────────────────────────
 
+/// From a conversation's persisted rows, pick the `(message_id,
+/// routing_decision)` to report to the frontend: the most recent
+/// `assistant` row's real gate decision (what `process_message` stamped —
+/// "allow" / "route_local"), defaulting to `"allow"` only when that row
+/// carries no decision. Returns `None` when there is no assistant row yet,
+/// leaving the caller to mint a fallback id.
+///
+/// Extracted as a pure function so this stays covered by a unit test — a
+/// refactor that silently re-hardcoded the decision back to `"allow"` (the
+/// bug this replaced) would fail the test instead of shipping green.
+fn latest_assistant_routing(rows: &[Message]) -> Option<(String, String)> {
+    rows.iter().rev().find(|m| m.role == "assistant").map(|m| {
+        (
+            m.id.clone(),
+            m.routing_decision
+                .clone()
+                .unwrap_or_else(|| "allow".to_string()),
+        )
+    })
+}
+
 /// Process a user message end-to-end: gate → model → stream tokens →
 /// persist transcript. The frontend already renders `stream:token` events
 /// for the in-flight response; this command returns the assembled text
@@ -394,30 +415,17 @@ pub async fn send_message(
     // Look up the assistant message we just persisted. We re-query the
     // profile db (read-only) and pick the most recent assistant row —
     // this gives us both the message id AND the real routing decision
-    // that process_message stamped on it (e.g. "allow", "route_local",
-    // "tool_reroute_local"), so the frontend's RoutingBadge is honest on
-    // a live send instead of only after a reload.
-    let assistant_row = state
+    // that process_message stamped on it (one of "allow" / "route_local"),
+    // so the frontend's RoutingBadge is honest on a live send instead of
+    // only after a reload.
+    let rows = state
         .storage
         .open_profile(&profile)
         .ok()
         .and_then(|db| db.list_messages_by_conversation(&conversation_id).ok())
-        .and_then(|rows| {
-            rows.into_iter()
-                .rev()
-                .find(|m| m.role == "assistant")
-        });
-
-    let message_id = assistant_row
-        .as_ref()
-        .map(|m| m.id.clone())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-    let routing_decision = assistant_row
-        .as_ref()
-        .and_then(|m| m.routing_decision.as_deref())
-        .unwrap_or("allow")
-        .to_string();
+        .unwrap_or_default();
+    let (message_id, routing_decision) = latest_assistant_routing(&rows)
+        .unwrap_or_else(|| (Uuid::new_v4().to_string(), "allow".to_string()));
 
     Ok(SendMessageResponse {
         message_id,
@@ -571,5 +579,58 @@ mod tests {
     #[test]
     fn default_binding_is_auto() {
         assert_eq!(default_binding(), "auto");
+    }
+
+    // ── latest_assistant_routing (send_message's routing-decision source) ──
+
+    fn msg(id: &str, role: &str, routing: Option<&str>) -> Message {
+        Message {
+            id: id.to_string(),
+            conversation_id: "c1".to_string(),
+            role: role.to_string(),
+            content: String::new(),
+            model: None,
+            provider_id: None,
+            routing_decision: routing.map(str::to_string),
+            thinking_content: None,
+            error: None,
+            aborted: false,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn latest_assistant_routing_reads_the_real_decision() {
+        // The regression this guards: a live send must surface the real
+        // persisted decision (e.g. "route_local"), not a hardcoded "allow".
+        let rows = vec![msg("u1", "user", None), msg("a1", "assistant", Some("route_local"))];
+        let (id, decision) = latest_assistant_routing(&rows).expect("assistant present");
+        assert_eq!(id, "a1");
+        assert_eq!(decision, "route_local");
+    }
+
+    #[test]
+    fn latest_assistant_routing_defaults_to_allow_when_unset() {
+        let rows = vec![msg("a1", "assistant", None)];
+        let (_, decision) = latest_assistant_routing(&rows).unwrap();
+        assert_eq!(decision, "allow");
+    }
+
+    #[test]
+    fn latest_assistant_routing_picks_the_most_recent_assistant() {
+        let rows = vec![
+            msg("a1", "assistant", Some("allow")),
+            msg("t1", "tool", None),
+            msg("a2", "assistant", Some("route_local")),
+        ];
+        let (id, decision) = latest_assistant_routing(&rows).unwrap();
+        assert_eq!(id, "a2", "must pick the newest assistant row, not the first");
+        assert_eq!(decision, "route_local");
+    }
+
+    #[test]
+    fn latest_assistant_routing_is_none_without_an_assistant_row() {
+        let rows = vec![msg("u1", "user", None)];
+        assert!(latest_assistant_routing(&rows).is_none());
     }
 }

@@ -462,16 +462,28 @@ pub fn build_pretooluse_chain_with_confirmed(
 ///
 /// The dispatcher MUST hold the same `Arc<ApprovalLedger>` for grants to be
 /// visible here — pass one `Arc`, clone it into both.
+///
+/// `workspace_root` is the fs tools' workspace directory (or `None` in
+/// bodies/tests with no fs tools). When set, `ProtectedPathHook` uses it to
+/// resolve a call's `path` arg through the same symlink-following logic the
+/// fs tools use, so an in-workspace symlink aliasing a protected dir (e.g.
+/// `alias -> .git`) can't slip a write/read/edit/delete past the raw-text
+/// floor. See `ProtectedPathHook::with_workspace_root`.
 pub fn build_pretooluse_chain_full(
     gate: crate::agent::gate::PrivacyGate,
     policy: Box<dyn PolicySource>,
     confirmed: &[&str],
     ledger: Arc<ApprovalLedger>,
+    workspace_root: Option<std::path::PathBuf>,
 ) -> HookChain {
     let mut chain = HookChain::new();
     chain.register_gating(Box::new(PrivacyFilterHook::new(gate)));
     chain.register_gating(Box::new(SandboxHook));
-    chain.register_gating(Box::new(ProtectedPathHook::new().with_ledger(Arc::clone(&ledger))));
+    let mut protected = ProtectedPathHook::new().with_ledger(Arc::clone(&ledger));
+    if let Some(root) = workspace_root {
+        protected = protected.with_workspace_root(root);
+    }
+    chain.register_gating(Box::new(protected));
     chain.register_gating(Box::new(
         PermissionHook::new(policy).with_ledger(Arc::clone(&ledger)),
     ));

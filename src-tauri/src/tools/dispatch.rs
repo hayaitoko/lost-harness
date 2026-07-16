@@ -493,17 +493,24 @@ impl ToolDispatcher {
             // Per-turn ceiling: every item counts, malformed included.
             if turn_call_count >= PER_TURN_CALL_CEILING {
                 let remaining = total - idx;
-                sections.push(format_outcome(
-                    "tool_call_budget",
-                    ToolOutcome::Denied {
-                        by: "budget".to_string(),
-                        reason: format!(
-                            "per-turn tool-call limit ({PER_TURN_CALL_CEILING}) reached this turn; \
-                             {remaining} further call(s) in this reply were not run — stop and \
-                             summarize what you've done so far."
-                        ),
-                    },
-                ));
+                let outcome = ToolOutcome::Denied {
+                    by: "budget".to_string(),
+                    reason: format!(
+                        "per-turn tool-call limit ({PER_TURN_CALL_CEILING}) reached this turn; \
+                         {remaining} further call(s) in this reply were not run — stop and \
+                         summarize what you've done so far."
+                    ),
+                };
+                // Audit this denial too (item 5 fix): circuit-breaker denials
+                // happen before `dispatch()`, so they'd otherwise never get a
+                // row. Only the item that tripped the ceiling is audited here
+                // — the remaining suppressed items were never pulled out of
+                // the iterator, so there's no ToolCall to name. `duration_ms`
+                // is 0: nothing executed.
+                if let ParsedToolCall::Call(c) = &item {
+                    self.fire_audit(c, ctx, is_cloud, &outcome, 0);
+                }
+                sections.push(format_outcome("tool_call_budget", outcome));
                 break;
             }
             turn_call_count += 1;
@@ -529,14 +536,14 @@ impl ToolDispatcher {
                             .map(|t| t.risk() == RiskClass::Safe)
                             .unwrap_or(false);
                         if !is_safe {
-                            sections.push(format_outcome(
-                                &name,
-                                ToolOutcome::Denied {
-                                    by: "batch".to_string(),
-                                    reason: "an earlier call in this batch was denied"
-                                        .to_string(),
-                                },
-                            ));
+                            let outcome = ToolOutcome::Denied {
+                                by: "batch".to_string(),
+                                reason: "an earlier call in this batch was denied".to_string(),
+                            };
+                            // Audit the cascade-skip denial (item 5 fix): it
+                            // never reaches `dispatch()`, so fire the row here.
+                            self.fire_audit(&call, ctx, is_cloud, &outcome, 0);
+                            sections.push(format_outcome(&name, outcome));
                             continue;
                         }
                     }
@@ -578,13 +585,14 @@ impl ToolDispatcher {
                         }
                     };
                     if let Some((reason, stop_turn)) = budget_denial {
-                        sections.push(format_outcome(
-                            &name,
-                            ToolOutcome::Denied {
-                                by: "budget".to_string(),
-                                reason,
-                            },
-                        ));
+                        let outcome = ToolOutcome::Denied {
+                            by: "budget".to_string(),
+                            reason,
+                        };
+                        // Audit the per-run-ceiling / repeat-detection denial
+                        // (item 5 fix): it never reaches `dispatch()`.
+                        self.fire_audit(&call, ctx, is_cloud, &outcome, 0);
+                        sections.push(format_outcome(&name, outcome));
                         if stop_turn {
                             break;
                         }
@@ -974,7 +982,7 @@ mod tests {
         let mut policy = InMemoryPolicySource::new();
         policy.set_mode("shell_exec", PermissionMode::Ask);
         let chain =
-            build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger));
+            build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger), None);
 
         let prompter = Arc::new(MockPrompter { response, calls: calls.clone() });
         let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
@@ -1068,7 +1076,8 @@ mod tests {
         let ledger = Arc::new(ApprovalLedger::new());
         let mut policy = InMemoryPolicySource::new();
         policy.set_mode("write_file", PermissionMode::Ask);
-        let chain = build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger));
+        let chain =
+            build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger), None);
         let calls = Arc::new(AtomicUsize::new(0));
         let prompter = Arc::new(MockPrompter {
             response: MockResponse::ApproveOnceAction,
@@ -1194,9 +1203,17 @@ mod tests {
     /// `MockResponse::Deny`, so a Write-risk call that *does* reach the
     /// prompter is denied — and we can count how many times the prompter
     /// was actually asked to verify the cascade-skip fired.
+    #[allow(clippy::type_complexity)]
     fn cascade_dispatcher(
         response: MockResponse,
-    ) -> (ToolDispatcher, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+    ) -> (
+        ToolDispatcher,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<Mutex<Vec<AuditEntry>>>,
+    ) {
         let ran_a = Arc::new(AtomicBool::new(false));
         let ran_b = Arc::new(AtomicBool::new(false));
         let ran_echo = Arc::new(AtomicBool::new(false));
@@ -1230,15 +1247,20 @@ mod tests {
             Box::new(policy),
             &["echo"],
             Arc::clone(&ledger),
+            None,
         );
 
         let prompter: Arc<dyn ApprovalPrompter> = Arc::new(MockPrompter {
             response,
             calls: prompter_calls.clone(),
         });
+        // Wire a TestAuditWriter too, so cascade tests can assert that a
+        // cascade-skipped call still produces an audit row (item 5 fix).
+        let (writer, entries) = TestAuditWriter::new();
         let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
-            .with_approval(ledger, Some(prompter));
-        (dispatcher, prompter_calls, ran_a, ran_b, ran_echo)
+            .with_approval(ledger, Some(prompter))
+            .with_audit_writer(Arc::new(writer) as Arc<dyn AuditWriter>);
+        (dispatcher, prompter_calls, ran_a, ran_b, ran_echo, entries)
     }
 
     #[tokio::test]
@@ -1515,7 +1537,7 @@ mod tests {
         //   1. tool_a (Write, Ask) → user denies → cascade_active
         //   2. tool_b (Write, Ask) → cascade skip, prompter NEVER asked
         //   3. echo (Safe, Allow) → still runs (Safe reads under cascade)
-        let (dispatcher, prompter_calls, ran_a, ran_b, _ran_echo) =
+        let (dispatcher, prompter_calls, ran_a, ran_b, _ran_echo, _entries) =
             cascade_dispatcher(MockResponse::Deny);
 
         let blocks = [
@@ -1601,6 +1623,7 @@ mod tests {
             Box::new(policy),
             &[],
             Arc::clone(&ledger),
+            None,
         );
 
         let prompter: Arc<dyn ApprovalPrompter> = Arc::new(MockPrompter {
@@ -1677,11 +1700,22 @@ mod tests {
         let ledger = Arc::new(ApprovalLedger::new());
         let mut policy = InMemoryPolicySource::new();
         policy.set_mode("write_file", write_file_mode);
+        // Pre-confirm `write_file` so `FirstUseConfirmHook` (the last hook)
+        // can't fire an unrelated first-use Ask that would mask the floor's
+        // decision — critical for the symlink test, whose whole point is a
+        // call the raw-text floor MISSES: without pre-confirming, that call
+        // would reach FirstUseConfirmHook and Ask for a reason unrelated to
+        // the protected-path bypass, making the test pass before AND after
+        // the fix. Pre-confirming is a no-op for the raw-text tests (they
+        // short-circuit at ProtectedPathHook, before FirstUseConfirmHook).
+        // The workspace root is wired so the floor resolves `path` args the
+        // same way the fs tools do.
         let chain = build_pretooluse_chain_full(
             gate(),
             Box::new(policy),
-            &[],
+            &["write_file"],
             Arc::clone(&ledger),
+            Some(root.clone()),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let prompter = Arc::new(MockPrompter {
@@ -1803,6 +1837,48 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "the second protected-path call must have re-prompted — Session+Tool must not satisfy the floor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protected_path_floor_blocks_symlink_indirection_to_dot_git_until_approved() {
+        // The bypass this closes: `write_file {"path":"alias/pwned"}` where
+        // `alias -> .git` is an in-workspace symlink. The raw command text
+        // never contains ".git/", so pre-fix the floor's substring match
+        // missed it and (with write_file pre-confirmed + Allow policy) the
+        // tool ran, following the symlink straight into the real .git dir.
+        // Post-fix the floor resolves the path the same way the tool does,
+        // sees the real ".git/" target, and Asks — here the user declines.
+        let (dispatcher, calls, root) =
+            protected_path_dispatcher(MockResponse::Deny, PermissionMode::Allow);
+        std::os::unix::fs::symlink(root.join(".git"), root.join("alias")).unwrap();
+
+        let outcome = dispatcher
+            .dispatch(
+                &call("write_file", serde_json::json!({"path": "alias/pwned", "content": "x"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+
+        match outcome {
+            ToolOutcome::Denied { by, .. } => assert_eq!(by, "user"),
+            other => panic!(
+                "a write reaching .git through a symlink alias must be Asked (and here declined), \
+                 not silently allowed, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the floor must have prompted via canonical-path resolution — pre-fix, this call's raw \
+             text never contains '.git/' so it would never have reached the prompter at all"
+        );
+        assert!(
+            !root.join(".git").join("pwned").exists(),
+            "the real .git directory must never have been touched — exactly the bypass being closed"
         );
     }
 
@@ -2016,6 +2092,93 @@ mod tests {
             )
             .await;
         assert!(matches!(outcome, ToolOutcome::Ok(_)));
+    }
+
+    // ── item 5 fix: circuit-breaker (pre-dispatch) denials are audited too ──
+
+    #[tokio::test]
+    async fn repeat_detection_denial_produces_an_audit_row() {
+        // Drive run_turn 3× with an IDENTICAL echo block. Calls 1–2 run via
+        // dispatch() (audited Ok); call 3 is repeat-denied in run_turn BEFORE
+        // dispatch(), which pre-fix produced NO audit row. Prove the denial
+        // is now audited AND the model-facing behavior is unchanged.
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let (dispatcher, entries) = with_audit(registry, HookChain::new(), BodyEnv::empty());
+        let block = r#"{"name": "echo", "args": {"x": 1}}"#;
+
+        let r1 = dispatcher
+            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .await
+            .unwrap();
+        let r2 = dispatcher
+            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .await
+            .unwrap();
+        let r3 = dispatcher
+            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .await
+            .unwrap();
+
+        // Observer-only: the text fed back to the model is exactly as before.
+        assert!(r1.content.contains("[tool echo → ok]"));
+        assert!(r2.content.contains("[tool echo → ok]"));
+        assert!(r3.content.contains("→ denied by budget"), "call 3: {}", r3.content);
+        assert!(
+            r3.content.contains("repeat detected — same call, same args"),
+            "call 3: {}",
+            r3.content
+        );
+
+        let entries = entries.lock().unwrap();
+        let ok = entries.iter().filter(|e| e.outcome == "ok").count();
+        let denied: Vec<_> = entries.iter().filter(|e| e.outcome == "denied").collect();
+        assert_eq!(ok, 2, "calls 1–2 produce ok rows via dispatch()");
+        assert_eq!(
+            denied.len(),
+            1,
+            "call 3's pre-dispatch repeat denial must produce exactly one audit row"
+        );
+        assert_eq!(entries.len(), 3, "3 rows total: 2 ok + 1 denied, got {}", entries.len());
+        let d = denied[0];
+        assert_eq!(d.tool_name, "echo");
+        assert_eq!(d.gate_by.as_deref(), Some("budget"));
+        assert_eq!(d.duration_ms, 0, "a pre-dispatch denial executes nothing");
+    }
+
+    #[tokio::test]
+    async fn cascade_skip_denial_produces_an_audit_row() {
+        // tool_a (Write/Ask) → user denies → cascade active; tool_b (Write)
+        // is cascade-skipped and NEVER reaches dispatch(). Pre-fix that skip
+        // wrote no audit row; the item-5 fix audits it. (echo is Safe, still
+        // runs.) Assert tool_b has a denied/"batch" row.
+        let (dispatcher, _prompter_calls, _ran_a, _ran_b, _ran_echo, entries) =
+            cascade_dispatcher(MockResponse::Deny);
+        let blocks = [
+            r#"{"name": "tool_a", "args": {"v": 1}}"#,
+            r#"{"name": "tool_b", "args": {"v": 2}}"#,
+            r#"{"name": "echo", "args": {"v": 3}}"#,
+        ];
+        let _ = dispatcher
+            .run_turn(&own(&model_output(&blocks)), &ctx(), Binding::Public, false)
+            .await
+            .expect("a tool was called, so there must be feedback");
+
+        let entries = entries.lock().unwrap();
+        let tool_b_row = entries
+            .iter()
+            .find(|e| e.tool_name == "tool_b")
+            .expect("tool_b's cascade-skip must produce an audit row");
+        assert_eq!(tool_b_row.outcome, "denied");
+        assert_eq!(tool_b_row.gate_by.as_deref(), Some("batch"));
+        assert_eq!(tool_b_row.duration_ms, 0);
+        // Sanity: tool_a's genuine user-deny (via dispatch) is also present.
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.tool_name == "tool_a" && e.gate_by.as_deref() == Some("user")),
+            "tool_a's dispatch()-routed user-deny row must also be present"
+        );
     }
 }
 

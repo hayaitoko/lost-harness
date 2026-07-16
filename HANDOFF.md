@@ -35,7 +35,9 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (hybrid keyword+meaning search, curated summary + archive) | **Designed in full, not built.** See PLAN.md §"Memory system." |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **269 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean.
+**Tests:** `cargo test --lib` → **278 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean.
+
+**2026-07-15 (later): the 3 adversarial-review findings + the LOW routing cleanup are all FIXED** (269 → 278 tests). Item 3 (HIGH) protected-path symlink bypass, Item 4 (MED) false round-cap interrupt, Item 5 (MED) audit gap for circuit-breaker denials, and the LOW routing-comment/test gap. See the build plan's "⚠ Review findings" section (now marked FIXED with residual watch-outs) and the newest Progress-Log narrative entry. **Next agent starts clean at Item 6** (`NeedsLocalReroute` + loop plumbing) — nothing from the review is left open.
 
 **Tool-system build plan:** `docs/tool-system-build-plan.md` is the executable build bible. Items 1–5 are done (6 of 8 do-now items complete — the routing-badge fix was a parallel quick win outside the numbered list). Items 6–8 remain. Read its "How to use this doc" header and the Progress Log at the bottom for the full trail.
 
@@ -79,7 +81,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 269 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 278 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```

@@ -380,6 +380,21 @@ impl AgentLoop {
             // model's own current-turn SSE stream — see models::client::OwnOutput.
             let own_output = OwnOutput::from_stream_assembly(assembled.clone());
 
+            // A deliberate round-cap stop persists this last assistant turn
+            // with `aborted: true`. The turn may still carry an open
+            // ```tool fence (the model tried to call another tool, but we
+            // stop it at the budget) — on disk that is byte-identical to a
+            // genuine crash mid-tool-call, which crash-recovery repairs with
+            // a "[tool interrupted]" row. The marker is what lets
+            // crash-recovery tell the two apart: a real crash kills the
+            // process before this row is ever written, so a genuine
+            // interrupted turn can never carry `aborted: true`. (Here
+            // `aborted` means "cut off by the round budget," not "content
+            // truncated mid-fence" — reconcile only repairs when an open
+            // fence is ALSO present, so a clean final answer on the cap
+            // round is still left alone.)
+            let is_round_cap_stop = round == MAX_TOOL_ROUNDS;
+
             // Persist this assistant turn.
             let assistant_message = Message {
                 id: assistant_id,
@@ -391,7 +406,7 @@ impl AgentLoop {
                 routing_decision: Some(routing_decision.to_string()),
                 thinking_content: None,
                 error: None,
-                aborted: false,
+                aborted: is_round_cap_stop,
                 created_at: chrono::Utc::now().timestamp(),
             };
             profile_db
@@ -400,7 +415,7 @@ impl AgentLoop {
             final_text = assembled.clone();
 
             // On the last permitted round, stop without dispatching more tools.
-            if round == MAX_TOOL_ROUNDS {
+            if is_round_cap_stop {
                 break;
             }
 

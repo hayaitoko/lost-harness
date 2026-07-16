@@ -236,6 +236,11 @@ fn build_tool_dispatcher(
             "failed to create the tool workspace directory"
         );
     }
+    // Captured before `workspace` is moved into `DeleteFileTool::new` below,
+    // so the protected-path floor can resolve a call's `path` arg the same
+    // way the fs tools do (following symlinks) and catch an in-workspace
+    // symlink aliasing a protected dir.
+    let hook_workspace_root = workspace.clone();
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFileTool::new(workspace.clone())));
@@ -280,6 +285,7 @@ fn build_tool_dispatcher(
         Box::new(policy),
         &pre_trusted_refs,
         Arc::clone(&ledger),
+        Some(hook_workspace_root),
     );
     chain.register_observer(Box::new(AuditObserverHook::new(Arc::clone(
         &audit_writer,

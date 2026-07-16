@@ -27,13 +27,19 @@
 //! message is `tool`, not `assistant` — it's skipped automatically. No
 //! "already_reconciled" marker to drift.
 //!
-//! **Two explicit non-goals** (per the build-plan Invariants): we do NOT
+//! **Three explicit non-goals** (per the build-plan Invariants): we do NOT
 //! touch (a) a conversation whose last message is `role: "user"` with
-//! no assistant reply, or (b) one whose last message is `role: "tool"`
-//! with no follow-up assistant reply. Both are normal states, not crash
-//! damage — the user is waiting on a reply / the model hasn't answered
-//! yet. The detection rule is narrowly: "assistant + open `tool` fence,
-//! nothing after."
+//! no assistant reply, (b) one whose last message is `role: "tool"`
+//! with no follow-up assistant reply, or (c) an assistant turn the agent
+//! loop itself marked `aborted: true` — today that means a deliberate
+//! stop at the tool-round budget (`MAX_TOOL_ROUNDS`), which leaves an open
+//! fence with no completing tool row that is otherwise byte-identical to a
+//! crash. All three are normal states, not crash damage — the user is
+//! waiting on a reply / the model hasn't answered / the loop stopped on
+//! purpose. The detection rule is narrowly: "assistant + open `tool`
+//! fence + NOT already marked `aborted`, nothing after." A genuine crash
+//! can never carry `aborted: true` (the process dies before that row is
+//! written), so this cleanly separates the deliberate stop from the crash.
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
@@ -100,9 +106,13 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
         // Only an assistant message that opened a tool call and got no
         // reply is "non-terminal" in this codebase. Plain-text final
         // answers (no fence), already-completed tool rounds (last is
-        // role="tool"), and dangling user messages (last is role="user")
-        // are all normal states — see module docs.
-        if last.role != "assistant" || !contains_open_tool_fence(&last.content) {
+        // role="tool"), dangling user messages (last is role="user"), and
+        // turns the agent loop DELIBERATELY stopped at the tool-round budget
+        // (marked `aborted: true` on write — see `loop_mod.rs`) are all
+        // normal states, not crash damage — see module docs. A genuine
+        // crash can never carry `aborted: true`, because the process dies
+        // before the row that would set it is ever written.
+        if last.role != "assistant" || last.aborted || !contains_open_tool_fence(&last.content) {
             continue;
         }
         let repair = Message {

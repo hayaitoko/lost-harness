@@ -62,6 +62,28 @@ fn add_msg(db: &ProfileDb, conversation_id: &str, role: &str, content: &str) {
     .expect("add_message");
 }
 
+/// Append an assistant row explicitly marked `aborted: true`, as
+/// `loop_mod.rs` does when it stops the tool loop at the round budget
+/// (`MAX_TOOL_ROUNDS`). `add_msg` hardcodes `aborted: false` (a genuine
+/// crash's shape, since the process dies before any marker is written), so
+/// this is its deliberate-stop counterpart.
+fn add_aborted_assistant(db: &ProfileDb, conversation_id: &str, content: &str) {
+    db.add_message(&Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        conversation_id: conversation_id.to_string(),
+        role: "assistant".to_string(),
+        content: content.to_string(),
+        model: Some("test-model".to_string()),
+        provider_id: Some("test-provider".to_string()),
+        routing_decision: None,
+        thinking_content: None,
+        error: None,
+        aborted: true,
+        created_at: chrono::Utc::now().timestamp(),
+    })
+    .expect("add_message");
+}
+
 /// Hand-rolled tempdir impl. Mirrors `storage::tests::TempDir` but with a
 /// distinct prefix so concurrent test runs against the two modules
 /// can't collide.
@@ -244,6 +266,48 @@ fn reconcile_leaves_a_dangling_user_message_alone() {
         1,
         "no row may be appended"
     );
+}
+
+#[test]
+fn reconcile_distinguishes_round_cap_stop_from_genuine_crash() {
+    // Two conversations with IDENTICAL dangling-fence assistant content.
+    // `a-roundcap`'s assistant row is marked `aborted: true` (what
+    // loop_mod.rs writes on a deliberate MAX_TOOL_ROUNDS stop); `b-crash`'s
+    // is `aborted: false` via add_msg (a genuine crash — the process died
+    // before any marker could be written). Only the crash may be repaired;
+    // the round-cap stop must not get a phantom [tool interrupted] row.
+    let db = fresh_profile("p");
+
+    add_conv(&db, "a-roundcap");
+    add_msg(&db, "a-roundcap", "user", "read a.txt");
+    add_aborted_assistant(&db, "a-roundcap", DANGLING_TOOL_CALL);
+
+    add_conv(&db, "b-crash");
+    add_msg(&db, "b-crash", "user", "read b.txt");
+    add_msg(&db, "b-crash", "assistant", DANGLING_TOOL_CALL);
+
+    let terminalized = reconcile_profile_db(&db).expect("reconcile ok");
+    assert_eq!(
+        terminalized,
+        vec!["b-crash".to_string()],
+        "only the genuine crash may be repaired; the round-cap stop must be left alone"
+    );
+
+    // a-roundcap: untouched — the deliberate stop gets no phantom repair row.
+    assert_eq!(
+        db.list_messages_by_conversation("a-roundcap")
+            .expect("list")
+            .len(),
+        2,
+        "a deliberate round-cap stop (aborted: true) must not be terminalized"
+    );
+
+    // b-crash: repaired — the interrupted row was appended.
+    let b = db
+        .list_messages_by_conversation("b-crash")
+        .expect("list");
+    assert_eq!(b.len(), 3, "the genuine crash must be terminalized with a repair row");
+    assert_eq!(b.last().unwrap().error.as_deref(), Some(INTERRUPTED_ERROR_TAG));
 }
 
 // ── run_boot_pass: integration against on-disk Storage ───────────────────

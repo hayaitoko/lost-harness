@@ -22,6 +22,7 @@
 //! never the next call to a different protected path. See
 //! `dispatch.rs`'s `Approve` arm.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::hooks::approval::{ActionFingerprint, ApprovalLedger};
@@ -75,6 +76,14 @@ fn normalize(s: &str) -> String {
 /// and asks every time.
 pub struct ProtectedPathHook {
     ledger: Arc<ApprovalLedger>,
+    /// The fs tools' workspace root, shared so this hook can canonicalize a
+    /// call's `path` arg the SAME way `tools::fs::resolve_within` /
+    /// `resolve_within_new` do (symlinks followed) before deciding whether
+    /// the REAL on-disk target is protected. `None` (the default) means the
+    /// signal is unavailable; the raw-text match below still runs
+    /// unconditionally, so a future non-fs tool (shell_exec, an Allow-rule
+    /// target) is caught exactly as before.
+    workspace_root: Option<PathBuf>,
 }
 
 impl Default for ProtectedPathHook {
@@ -87,6 +96,7 @@ impl ProtectedPathHook {
     pub fn new() -> Self {
         Self {
             ledger: Arc::new(ApprovalLedger::new()),
+            workspace_root: None,
         }
     }
 
@@ -95,6 +105,18 @@ impl ProtectedPathHook {
     /// `Continue`. See `crate::hooks::build_pretooluse_chain_full`.
     pub fn with_ledger(mut self, ledger: Arc<ApprovalLedger>) -> Self {
         self.ledger = ledger;
+        self
+    }
+
+    /// Give the hook the workspace root shared with the fs tools. Closes the
+    /// symlink / non-canonical-path bypass: a workspace symlink like
+    /// `alias -> .git` never mentions `.git/` in the raw command text, but
+    /// `resolve_within` / `resolve_within_new` (which the fs tools call
+    /// before ever touching disk) follow it to the real directory — this
+    /// makes the hook see the same resolved target the tool will act on, so
+    /// the floor fires on the real path, not the alias.
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = Some(root.into());
         self
     }
 }
@@ -108,8 +130,36 @@ impl GatingHook for ProtectedPathHook {
         if ctx.event != HookEvent::PreToolUse {
             return HookResult::Continue;
         }
+
+        // Second signal: the REAL, symlink-resolved on-disk target of the
+        // call's "path" arg. The raw-text match below catches a literal
+        // ".git/"/".env"/etc. in the command; this catches the case the raw
+        // text can't see — a workspace symlink `alias -> .git` whose name
+        // never contains the protected substring but whose resolved target
+        // does. Only computed for tools that carry a workspace-relative
+        // "path" arg and only when a workspace root is wired; everything
+        // else yields `None` and relies solely on the raw-text match,
+        // unchanged from before.
+        let resolved_text: Option<String> = self.workspace_root.as_deref().and_then(|root| {
+            let rel = ctx.input.args.get("path")?.as_str()?;
+            let resolved = crate::tools::fs::canonicalize_best_effort(root, rel)?;
+            let mut s = resolved.to_string_lossy().into_owned();
+            // Normalize a bare-directory target (e.g. `alias` itself, which
+            // resolves straight to `.../.git`) so it still matches the
+            // trailing-slash patterns (".git/", ".ssh/").
+            if resolved.is_dir() {
+                s.push('/');
+            }
+            Some(s)
+        });
+
         for entry in PROTECTED {
-            if (entry.matches)(&ctx.command_text) {
+            let raw_hit = (entry.matches)(&ctx.command_text);
+            let resolved_hit = resolved_text
+                .as_deref()
+                .map(|s| (entry.matches)(s))
+                .unwrap_or(false);
+            if raw_hit || resolved_hit {
                 // The whole mechanism: `covers_once` ignores `Session`/
                 // `Always` grants, so the floor is satisfiable only by
                 // a fresh `Once`+`Fingerprint` grant for this exact
@@ -211,6 +261,42 @@ mod tests {
         // covered.
         let mut c2 = ctx("write_file {\"path\":\".git/config\"}");
         assert_eq!(hook.on_event(&mut c2), HookResult::Continue);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_git_is_caught_via_canonical_resolution_even_though_raw_text_never_mentions_git() {
+        // The isolated, load-bearing regression for the symlink bypass: the
+        // hook must flip to Ask purely because of the new resolved-path
+        // signal, with an explicit sanity check that the raw text alone
+        // would NOT have triggered it. Pinpoints which code path (raw vs.
+        // resolved) is doing the work — the dispatch.rs integration test is
+        // an end-to-end smoke test on top of this.
+        let root =
+            std::env::temp_dir().join(format!("lhp-protected-symlink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(root.join(".git"), root.join("alias")).unwrap();
+
+        let hook = ProtectedPathHook::new().with_workspace_root(&root);
+
+        let raw_text = "write_file {\"path\":\"alias/pwned\"}";
+        assert!(
+            !raw_text.to_ascii_lowercase().contains(".git/"),
+            "sanity: the symlink name itself must not contain the protected substring"
+        );
+
+        let mut c = EventContext::pre_tool_use("write_file")
+            .with_command_text(raw_text)
+            .with_input(crate::tools::ToolInput::new(
+                serde_json::json!({"path": "alias/pwned"}),
+            ));
+
+        match hook.on_event(&mut c) {
+            HookResult::Ask(_) => {}
+            other => panic!("expected Ask via canonical-path resolution, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

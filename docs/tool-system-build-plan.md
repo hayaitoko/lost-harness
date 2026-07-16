@@ -1451,38 +1451,62 @@ Status legend: `todo` · `in-progress` · `done` · `blocked`.
 
 ### ⚠ Review findings — 2026-07-15 (adversarial review of items 1–5 + routing fix)
 
-269 tests green. Items **1, 2, and the routing fix verified clean** (exhaustively — invariant #5 type-lock, the
-budget off-by-ones + Mutex-not-across-await + user-only cascade, all confirmed). **Three real issues to fix
-before the protected-path floor and audit trail are trusted** (none block current use; the fs write path is
-already Ask-gated):
+**STATUS: all three real findings + the LOW routing cleanup are FIXED (2026-07-15, 278 tests green).** A
+design+critique workflow produced the fixes; the HIGH one was empirically proven fail-before/pass-after (the two
+symlink tests fail — the write silently lands in `.git` through the alias — when the resolved-path signal is
+disabled). The `[LOW/plausible]` audit-soundness item below is a pre-existing concurrency question, still deferred.
 
-- **[HIGH] Item 3 — protected-path floor is bypassable via symlink / non-canonical path.** `ProtectedPathHook`
-  substring-matches the **raw** `path` arg (`ctx.command_text = "{name} {args}"`), but the fs tools canonicalize
-  and follow symlinks. A workspace dir symlink `alias -> .git` (name not containing `.git/`) lets
-  read/write/edit/delete reach the real protected dir while the floor never fires. **Fix:** check the
-  **resolved/canonical** path — canonicalize the workspace-relative arg inside the hook, or move the
-  protected-path check into `tools/fs.rs`'s `resolve_within`/`resolve_within_new` where the canonical path
-  exists. (Floor is defense-in-depth for the future Allow-rules + shell_exec; low impact today, worthless until fixed.)
-- **[MEDIUM] Item 4 — false "[tool interrupted]" on a healthy round-cap stop.** Hitting `MAX_TOOL_ROUNDS` (6)
-  leaves the last assistant message with an open ```` ```tool ```` fence and no completing tool row — identical
-  on disk to a crash. Next boot, crash-recovery inserts a bogus interrupted row. (`loop_mod.rs:403-405` ×
-  `crash_recovery.rs:105`.) **Fix:** distinguish a deliberate round-cap stop from a crash (persist a terminal
-  marker on the final round, or require "open fence AND turn not marked complete").
-- **[MEDIUM] Item 5 — circuit-breaker denials are missing from the audit.** Budget-ceiling, per-run-ceiling,
-  repeat-detection, and deny-cascade denials happen in `run_turn` **before** `dispatch()`, so they never write
-  an audit row — but they're surfaced as `Denied`, and the spec says "denied calls are rows too." **Fix:** fire
-  an audit row for these `run_turn`-level denials too (`dispatch.rs` ~494–592).
-
-Minor / lower priority:
-- **[LOW] Routing fix** — a comment references a `"tool_reroute_local"` value no path produces yet (item-6
-  territory); remove/relabel it. And no test covers `send_message`'s new routing_decision extraction (a refactor
-  could silently re-hardcode `"allow"` and stay green) — add one.
-- **[LOW/plausible] Audit hot-path soundness** — item 5 puts a sync `ProfileDb` write on every dispatch, resting
-  on `ProfileDb`'s `unsafe impl Sync` justified by "single-threaded per command." Under Tokio's multi-thread
-  runtime a concurrent unrelated IPC command could touch the same profile connection from another thread.
-  Pre-existing soundness question item 5 amplifies — resolve when the single-in-flight concurrency refactor lands.
+- **[HIGH — FIXED] Item 3 — protected-path floor bypassable via symlink / non-canonical path.** `ProtectedPathHook`
+  now takes the fs workspace root and, in addition to the raw-text match, resolves the call's `path` arg with a
+  shared `tools::fs::canonicalize_best_effort` (thin wrapper over `resolve_within`/`resolve_within_new`, so the
+  hook and the tools use ONE symlink-resolution algorithm and can't drift) and substring-matches the resolved
+  path against the same `PROTECTED` list. Ask-not-block, Once-only-via-`covers_once`, and non-configurable are all
+  preserved (the resolved signal is only OR'd into the existing Ask branch). Wired through a new 5th param on
+  `build_pretooluse_chain_full` (only the production `lib.rs` call passes `Some(root)`; test call sites pass
+  `None`). Tests: `symlink_to_git_is_caught_via_canonical_resolution…` (isolated unit, the load-bearing proof) +
+  `protected_path_floor_blocks_symlink_indirection_to_dot_git_until_approved` (end-to-end). **Test-fixture fix the
+  critique caught:** `protected_path_dispatcher` now pre-confirms `write_file`, or `FirstUseConfirmHook` would fire
+  an unrelated Ask that masked the assertion (making the test pass before AND after). Residual watch-outs (flagged,
+  not bugs): a TOCTOU window between hook-time and tool-time canonicalization (pre-existing pattern); an existing
+  symlink *leaf* yields a harmless extra Ask (never a false negative); `PROTECTED` hardcodes forward slashes
+  (pre-existing, Windows ticket).
+- **[MEDIUM — FIXED] Item 4 — false "[tool interrupted]" on a healthy round-cap stop.** The round-cap assistant
+  turn is now persisted with `aborted: true`, and `crash_recovery::reconcile_profile_db` skips
+  `role=="assistant" && aborted`. A genuine crash can't carry the marker (the process dies before the row is
+  written). Test: `reconcile_distinguishes_round_cap_stop_from_genuine_crash`. Watch-out: `aborted` now also means
+  "cut off by the round budget" (not strictly "content truncated"); reconcile only acts when an open fence is ALSO
+  present, so a clean final answer on the cap round is still left alone. Note the dead-code `ProfileDb::update_message`
+  (sets `aborted=1`, no prod caller today) — a future "stop generation" feature must not flip a genuine-crash-shaped
+  row's `aborted` to true, or it would reopen the false-negative side.
+- **[MEDIUM — FIXED] Item 5 — circuit-breaker denials missing from the audit.** The three pre-dispatch denial sites
+  in `run_turn` (per-turn ceiling, per-run ceiling / repeat detection, deny-cascade) now call `self.fire_audit(…, 0)`
+  before pushing their `format_outcome`. Tests: `repeat_detection_denial_produces_an_audit_row`,
+  `cascade_skip_denial_produces_an_audit_row` (`cascade_dispatcher` extended to wire a `TestAuditWriter`). Residual
+  (documented, not full closure): at the per-turn ceiling only the item that trips the limit is audited — the
+  further suppressed items were never pulled off the iterator, so there's no `ToolCall` to name.
+- **[LOW — FIXED] Routing fix** — the misleading `"tool_reroute_local"` comment in `ipc::send_message` is
+  corrected to the real values (`"allow"` / `"route_local"`), and the routing-decision extraction is now a pure
+  helper `latest_assistant_routing(&[Message])` with 4 unit tests, so a refactor can't silently re-hardcode
+  `"allow"` and stay green.
+- **[LOW/plausible — STILL DEFERRED] Audit hot-path soundness** — item 5 puts a sync `ProfileDb` write on every
+  dispatch, resting on `ProfileDb`'s `unsafe impl Sync` justified by "single-threaded per command." Under Tokio's
+  multi-thread runtime a concurrent unrelated IPC command could touch the same profile connection from another
+  thread. Pre-existing soundness question item 5 amplifies — resolve when the single-in-flight concurrency
+  refactor lands.
 
 **Log narrative** (append newest first — one line per meaningful step, so a fresh model sees the trail):
+- 2026-07-15 — Fixed all 3 review findings + the LOW routing cleanup. Ran a design+critique workflow (3 designs ×
+  3 adversarial critiques) then implemented against the plans + critique corrections. **Item 3 (HIGH):**
+  `canonicalize_best_effort` in `tools/fs.rs` + `ProtectedPathHook::with_workspace_root` + resolved-path signal
+  OR'd into the raw-text match; new 5th param on `build_pretooluse_chain_full` (prod passes `Some(root)`, tests
+  `None`); `protected_path_dispatcher` pre-confirms `write_file` (critique catch — else a first-use Ask masked the
+  test). **Item 4 (MED):** round-cap turn persisted `aborted: true`; reconcile skips `assistant && aborted`.
+  **Item 5 (MED):** the 3 pre-dispatch denial sites in `run_turn` now `fire_audit(…, 0)`; `cascade_dispatcher`
+  wires a `TestAuditWriter`. **LOW:** `send_message` routing extraction pulled into pure `latest_assistant_routing`
+  (+4 tests), stale `"tool_reroute_local"` comment corrected. Empirically PROVED the HIGH fix fail-before/pass-after
+  (both symlink tests fail — write lands in `.git` via the alias — with the resolved signal disabled). 269 → **278
+  tests green**, 0 clippy errors, no new warnings. Residual watch-outs recorded in the findings section above. Next
+  agent: Item 6 (NeedsLocalReroute + loop plumbing) — spec at lines 748+.
 - 2026-07-15 — Reviewed items 1–5 + routing fix (adversarial, 6 verifiers). 1/2/routing clean; 3 real fixes
   logged above (Item 3 HIGH floor-bypass, Item 4 MED false-interrupt, Item 5 MED audit-gap). 269 tests green.
 - 2026-07-15 — Item 4 done. `agent/crash_recovery.rs` with `run_boot_pass` (per-profile, log-and-skip on open or reconcile failure) + `reconcile_profile_db` (single `unchecked_transaction` held across the three CRUD calls — same pattern as migrations). Detection: last message `role=="assistant"` AND content contains an opening `` ```tool `` fence; completed tool rounds, plain final answers, and dangling user messages are explicit non-goals with regression tests. Repair row: `role="tool"`, `error=Some("interrupted_by_crash")`, `aborted=true`, `routing_decision=Some("crash_recovery")`. Idempotent by construction (no marker column). `contains_open_tool_fence` in `tools/calling.rs` is a pure string check — never parses JSON, never feeds dispatch. `lib.rs::run` calls `run_boot_pass` between `Storage::open` and provider hydration, deliberately NOT `?`-propagated. `hooks/approval.rs` module doc gained the "No half-durability" paragraph. 11 new tests (7 crash_recovery + 4 calling). 269 total green, 76 warnings (pre-existing). See commit 8fe04aa. Next agent: Item 6 (NeedsLocalReroute + loop plumbing).
