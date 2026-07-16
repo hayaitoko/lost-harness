@@ -1577,6 +1577,67 @@ dispatch re-run loop). This is invariant #8 made structural.
    `always` + dialog "Always" button. Round-trip + isolation + durability tests.
 4. **(stretch) Settings revoke UI** + `list_tool_rules`/`delete_tool_rule` commands.
 
+### Critique fixes folded in (2026-07-16, adversarial spec review — 4 lenses + synthesis)
+
+The pre-implementation critique confirmed the core is sound (enforcement is server-derived from
+`tool.risk()`, so the dialog's hidden buttons are correctly *just UX* — the server is the enforcement).
+Concrete corrections, already reflected in commit 1 where noted:
+
+- **`resolve_grant` threads the fingerprint** — signature is `resolve_grant(risk, scope, target,
+  fingerprint)` (NOT `(&ApprovalDecision)`), so it can actually emit the fp-pinned narrowings the
+  matrix requires. ✅ done in commit 1. The `Persist` case is decided in dispatch (where `fingerprint`
+  is a local) via a pure `persist_rule_allowed(risk)` check — **Write** → write the rule; **External /
+  Dangerous / Safe** → refuse, degrade to `(Once, fp)` (runs once, no standing). NOT a dispatch re-hack:
+  the matrix decision stays in `hooks`.
+- **Refuse ALL External persist in v1** (not "pattern != `*`"). A client-supplied `pattern` is
+  server-unverifiable; accepting a non-`*` pattern would let a hand-crafted IPC persist
+  `(email_tool, "attacker@evil.com*", allow)`. Destination-scoped authoring is derived *server-side from
+  the call* and lands with the first real External tool, never from `ResolveApprovalArgs`.
+- **Dispatcher gets a `ToolRuleWriter` seam** mirroring `AuditWriter`: `Option<Arc<dyn ToolRuleWriter>>`
+  + `with_rule_writer` + a `StorageToolRuleWriter` owning `Storage`, wired in `build_tool_dispatcher`;
+  the write keys off `ctx.profile` (same source as the audit path). Fast synchronous insert.
+- **Persist-failure surfaces, never swallows.** A rule is an authorization the user relies on, not
+  telemetry — so unlike `StorageAuditWriter` it must NOT swallow-and-log. On write `Err`:
+  `tracing::error!` loudly AND degrade to a **`Session` ledger grant** (honest fallback = the pre-Q8
+  "Always behaves like Session" behavior) rather than silently claiming a standing rule that doesn't
+  exist. (A `tool:rule_persist_failed` toast is a documented follow-up.) The current call still runs
+  once (the human approved it).
+- **Only `rules_for` gains `profile`** — `mode_for` (the risk-derived whole-tool default) stays
+  profile-blind. A Settings-authored whole-tool *deny* is a `(tool, "*", deny)` pattern rule (rules
+  checked first, deny>allow), so no profile-aware `mode_for` is needed.
+- **`SqlitePolicySource` reads LIVE per gating pass** (`open_profile(profile)` → fast cached `Arc`,
+  then an indexed `SELECT`). Freshly-persisted rules are visible on the next same-session call and a
+  Settings revoke takes effect immediately (no restart). One cheap sync SQLite read on the gating path
+  — consistent with the item-5 audit write already there; rides the same `ProfileDb` `unsafe impl Sync`
+  deferral (single-in-flight under the stream lock). A rules-cache with explicit invalidation is the
+  perf follow-up if human-paced desktop tool calls ever make it matter. Add a same-session
+  "second call now allowed without prompting" test.
+- **Durability test must reopen from disk.** `tool_rules` never live in `ApprovalLedger`, and
+  `open_profile` returns a *memoized* `Arc<ProfileDb>`. Use a real temp-file base_path → write rule →
+  `storage.close_profile(name)` → `open_profile` (reopens from disk) → assert the rule resolves.
+- **Migration coupling:** bumping `PROFILE_SCHEMA_VERSION` 2→3 REQUIRES a matching v3 `Migration` in
+  `PROFILE_MIGRATIONS` (else `migrate_profile`'s `debug_assert_eq` panics) and breaks
+  `storage/tests.rs::schema_version_is_two_after_init_profile` (`assert_eq!(v, 2)` → 3 + rename). Add
+  `tool_rules`'s `CREATE TABLE` to BOTH `PROFILE_SCHEMA_SQL` and the v3 migration (item-5 dual-def
+  convention) and add `"tool_rules"` to `PROFILE_TABLES`. `storage/tests.rs` joins Files-to-touch.
+- **No half-durability (Q3) is NOT violated** — a persisted rule is a standing *policy*, not an armed
+  pending *intent*; nothing to reconcile at boot. The rule-write + `(Once, fp)` pin does not
+  double-execute (the tool runs once after gating passes; the pin only settles the same-call re-run and
+  is consumed). `approval.rs`'s module doc already anticipates routing `Always` through a rule table.
+- **KNOWN LIMITATION — the in-memory ledger stays profile-blind (documented, not fixed).** `Once`/`Session`
+  grants live in a single app-global `ApprovalLedger` keyed on `(tool, fingerprint)` — no profile — so a
+  `Session` grant approved in one profile also satisfies gating in another for the rest of the app run.
+  This is a pre-existing property, NOT introduced by Q8. Q8 walls the *persisted* layer (per-profile
+  `tool_rules`), and deliberately leaves the *ephemeral* layer session-global because (a) it matches the
+  "shared by default" posture, (b) the walled-profile *toggle* that would gate per-profile ledger
+  isolation ships with the (unbuilt) memory system, so there is nothing to branch on yet, and (c) a
+  Session grant is ephemeral (dies at restart) and lower-stakes than a durable fact. Add a test that
+  documents the current behavior; flag per-profile ledger isolation as a follow-up tied to the walled
+  toggle. **tool_rules themselves are per-profile (conservative: a rule written in one profile never
+  applies in another) — intentionally MORE isolated than memory's "shared by default", because a
+  standing tool authorization is higher-stakes than a remembered fact; widening to shared later is the
+  safe direction if Lukas wants it.**
+
 ---
 
 ## Part 3 — Progress Log (UPDATE THIS AS YOU BUILD)
