@@ -26,9 +26,13 @@ pub mod calling;
 pub mod dispatch;
 pub mod exec;
 pub mod fs;
+pub mod mcp;
 
 pub use calling::ToolCall;
 pub use dispatch::{ToolDispatcher, TurnOutcome};
+pub use mcp::{
+    McpServerConfig, McpTool, McpToolAnnotations, McpToolDescriptor, McpTransport, McpTrustTier,
+};
 
 // ── Capability ───────────────────────────────────────────────────────────
 
