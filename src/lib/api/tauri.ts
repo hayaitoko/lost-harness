@@ -478,6 +478,58 @@ export async function explainClassification(text: string): Promise<Classificatio
   return { label: "public", confidence: 0, spans: [] };
 }
 
+// ── memory (PLAN §9) ────────────────────────────────────────────────────────
+
+/** A memory fact for the UI. Mirrors `MemoryInfo` in `ipc/mod.rs`. */
+export interface MemoryInfo {
+  id: string;
+  content: string;
+  tags: string | null;
+  created_at: number;
+  pinned: boolean;
+  /** "shared" (may inform cloud turns) | "private_local" (local-only). */
+  sensitivity: "shared" | "private_local";
+}
+
+/** Result of a memory save. Mirrors `SaveMemoryResult`. */
+export interface SaveMemoryResult {
+  /** The route the classifier chose. `never_persist` means it was dropped. */
+  sensitivity: "shared" | "private_local" | "never_persist";
+  fact: MemoryInfo | null;
+}
+
+/** List a profile's memory facts (both buckets — the user's own local view). */
+export async function listMemory(profile: string): Promise<MemoryInfo[]> {
+  if (isTauri()) {
+    return tauriInvoke<MemoryInfo[]>("list_memory", { args: { profile } });
+  }
+  return [];
+}
+
+/** Save a memory fact, routed by sensitivity. Returns the saved fact (or null if dropped). */
+export async function saveMemory(profile: string, content: string): Promise<SaveMemoryResult> {
+  if (isTauri()) {
+    return tauriInvoke<SaveMemoryResult>("save_memory", { args: { profile, content } });
+  }
+  return { sensitivity: "shared", fact: null };
+}
+
+/** Forget a memory fact by id. */
+export async function deleteMemory(id: string): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("delete_memory", { args: { id } });
+  }
+  return false;
+}
+
+/** Pin/unpin a fact into the always-loaded curated summary. */
+export async function setMemoryPinned(id: string, pinned: boolean): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("set_memory_pinned", { args: { id, pinned } });
+  }
+  return false;
+}
+
 // ── Browser fallback (used when running outside Tauri) ──────────────────────
 
 const browserStreamListeners: StreamTokenCallback[] = [];

@@ -171,6 +171,10 @@ pub fn run() {
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::explain_classification,
+            ipc::list_memory,
+            ipc::save_memory,
+            ipc::delete_memory,
+            ipc::set_memory_pinned,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lost Harness");

@@ -727,6 +727,197 @@ mod explain_tests {
         let exp = build_explanation(RulesClassifier::new().classify("what time is the meeting?"));
         assert!(exp.spans.is_empty());
     }
+
+    #[test]
+    fn memory_sensitivity_routing() {
+        let clf = RulesClassifier::new();
+        // Benign → shared.
+        assert_eq!(
+            route_memory_sensitivity(&clf.classify("the standup is at 10am")),
+            MemoryRoute::Shared
+        );
+        // A credential span → never-persist (dropped).
+        assert_eq!(
+            route_memory_sensitivity(&clf.classify("my api key is sk-ABCD1234efgh5678ijkl9012mnop3456")),
+            MemoryRoute::NeverPersist
+        );
+        // Sensitive-but-durable PII (an SSN — PII_ID, not a credential) → local.
+        assert_eq!(
+            route_memory_sensitivity(&clf.classify("my SSN is 123-45-6789")),
+            MemoryRoute::PrivateLocal
+        );
+    }
+}
+
+// ── memory (PLAN §9 — the curated summary / archive, viewable + editable) ──
+
+/// A memory fact for the UI. `sensitivity` is the bucket it lives in.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryInfo {
+    pub id: String,
+    pub content: String,
+    /// JSON-encoded tag array, or null.
+    pub tags: Option<String>,
+    pub created_at: i64,
+    pub pinned: bool,
+    /// "shared" (may inform cloud turns) | "private_local" (local-only).
+    pub sensitivity: String,
+}
+
+fn bucket_str(b: crate::storage::MemoryBucket) -> &'static str {
+    match b {
+        crate::storage::MemoryBucket::Shared => "shared",
+        crate::storage::MemoryBucket::PrivateLocal => "private_local",
+    }
+}
+
+fn to_memory_info(fact: crate::storage::MemoryFact, bucket: crate::storage::MemoryBucket) -> MemoryInfo {
+    MemoryInfo {
+        id: fact.id,
+        content: fact.content,
+        tags: fact.tags,
+        created_at: fact.created_at,
+        pinned: fact.pinned,
+        sensitivity: bucket_str(bucket).to_string(),
+    }
+}
+
+/// Where a memory write should go (PLAN §9's 3-bucket model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryRoute {
+    Shared,
+    PrivateLocal,
+    /// Truly ephemeral secret (credential) — dropped, never written anywhere.
+    NeverPersist,
+}
+
+/// Route a fact by the classifier's read of it: a credential span → never
+/// persist; otherwise Private/Uncertain → private-local, Public → shared.
+fn route_memory_sensitivity(c: &crate::classifier::Classification) -> MemoryRoute {
+    use crate::classifier::rules::RuleCategory;
+    use crate::classifier::Label;
+    if c
+        .spans
+        .iter()
+        .any(|s| s.category == RuleCategory::Credential)
+    {
+        return MemoryRoute::NeverPersist;
+    }
+    match c.label {
+        Label::Public => MemoryRoute::Shared,
+        Label::Private | Label::Uncertain => MemoryRoute::PrivateLocal,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListMemoryArgs {
+    pub profile: String,
+}
+
+/// List a profile's memory facts (both buckets — this is the user's own local
+/// view), pinned-first then newest.
+#[tauri::command]
+pub fn list_memory(
+    state: State<'_, AppState>,
+    args: ListMemoryArgs,
+) -> Result<Vec<MemoryInfo>, String> {
+    state
+        .storage
+        .global()
+        .list_memory_by_profile(&args.profile, true)
+        .map(|rows| rows.into_iter().map(|(f, b)| to_memory_info(f, b)).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SaveMemoryArgs {
+    pub profile: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SaveMemoryResult {
+    /// The sensitivity route the classifier chose.
+    pub sensitivity: String,
+    /// The saved fact, or null when the route was never-persist (dropped).
+    pub fact: Option<MemoryInfo>,
+}
+
+/// Save a memory fact, routing it by sensitivity (PLAN §9). A credential is
+/// dropped (never-persist); a private fact goes to the local-only store; a
+/// benign fact to the shared store. Returns the saved fact (or null if dropped).
+#[tauri::command]
+pub fn save_memory(
+    state: State<'_, AppState>,
+    args: SaveMemoryArgs,
+) -> Result<SaveMemoryResult, String> {
+    let content = args.content.trim();
+    if content.is_empty() {
+        return Err("cannot save an empty memory".to_string());
+    }
+    let classification = state.classifier.classify(content);
+    let route = route_memory_sensitivity(&classification);
+    let bucket = match route {
+        MemoryRoute::NeverPersist => {
+            return Ok(SaveMemoryResult {
+                sensitivity: "never_persist".to_string(),
+                fact: None,
+            });
+        }
+        MemoryRoute::Shared => crate::storage::MemoryBucket::Shared,
+        MemoryRoute::PrivateLocal => crate::storage::MemoryBucket::PrivateLocal,
+    };
+    let fact = crate::storage::MemoryFact {
+        id: Uuid::new_v4().to_string(),
+        content: content.to_string(),
+        origin_profile: args.profile.clone(),
+        tags: None,
+        created_at: chrono::Utc::now().timestamp(),
+        pinned: false,
+    };
+    state
+        .storage
+        .global()
+        .insert_memory_fact_in(bucket, &fact)
+        .map_err(|e| e.to_string())?;
+    Ok(SaveMemoryResult {
+        sensitivity: bucket_str(bucket).to_string(),
+        fact: Some(to_memory_info(fact, bucket)),
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryIdArgs {
+    pub id: String,
+}
+
+/// Forget a memory fact by id (checks both buckets).
+#[tauri::command]
+pub fn delete_memory(state: State<'_, AppState>, args: MemoryIdArgs) -> Result<bool, String> {
+    state
+        .storage
+        .global()
+        .delete_memory_fact(&args.id)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetMemoryPinnedArgs {
+    pub id: String,
+    pub pinned: bool,
+}
+
+/// Pin/unpin a fact into the always-loaded curated summary.
+#[tauri::command]
+pub fn set_memory_pinned(
+    state: State<'_, AppState>,
+    args: SetMemoryPinnedArgs,
+) -> Result<bool, String> {
+    state
+        .storage
+        .global()
+        .set_memory_pinned(&args.id, args.pinned)
+        .map_err(|e| e.to_string())
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────

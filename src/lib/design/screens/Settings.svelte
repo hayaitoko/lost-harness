@@ -25,7 +25,16 @@
   import { modelsForProvider } from "$lib/stores/provider-catalog";
   import { theme, applyTheme, type Theme } from "$lib/stores/settings";
   import { activeProfileId } from "$lib/stores/profiles";
-  import { listToolRules, deleteToolRule, type ToolRule } from "$lib/api/tauri";
+  import {
+    listToolRules,
+    deleteToolRule,
+    type ToolRule,
+    listMemory,
+    saveMemory,
+    deleteMemory,
+    setMemoryPinned,
+    type MemoryInfo,
+  } from "$lib/api/tauri";
 
   type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "appearance";
   const SECTIONS: [Section, string][] = [
@@ -37,21 +46,6 @@
     ["appearance", "Appearance"],
   ];
 
-  type Memory = { text: string; date: string; tag?: string };
-  const INITIAL_MEMORIES: Record<string, Memory[]> = {
-    Personal: [
-      { text: "Prefers concise, direct replies", date: "Jun 12" },
-      { text: "Home address: 123 Oak Street, Apt 4B", date: "Jul 2", tag: "never leaves" },
-      { text: "Lease renews in August; landlord is Marcus Webb", date: "Jul 8" },
-      { text: "Planning a Kyoto trip Oct 12–16 with Nina", date: "Jul 10" },
-      { text: "Vitamin D slightly low — flagged by Dr. Chen", date: "Jul 8", tag: "health · hard-blocked" },
-    ],
-    Work: [
-      { text: "Works in Rust on the payments service", date: "Jun 20" },
-      { text: "Weekly report due Fridays to Priya", date: "Jun 27" },
-      { text: "Prefers PR descriptions in bullet form", date: "Jul 3" },
-    ],
-  };
 
   const ACCENTS = ["#5f74e0", "#3fa87d", "#4a97cf", "#c49a55", "#b06fc2", "#d0685f", "#5fb8b0", "#8a8a93"];
 
@@ -105,13 +99,14 @@
   let savingProvider = $state(false);
   // Fetched model lists per provider id (populated lazily below).
   let modelsByProvider = $state<Record<string, string[]>>({});
-  // memory
+  // memory — real facts for the active profile (PLAN §9)
   let memoryMode = $state("walled");
-  let memProfile = $state("Personal");
-  let memMenuOpen = $state(false);
-  let memories = $state<Record<string, Memory[]>>(INITIAL_MEMORIES);
-  let editingMem = $state<number | null>(null);
-  let cancelEdit = false;
+  let memoryItems = $state<MemoryInfo[]>([]);
+  let memoryLoading = $state(false);
+  let memDraft = $state("");
+  let memSaving = $state(false);
+  let memNote = $state<string | null>(null);
+  let confirmForgetId = $state<string | null>(null);
   // appearance
   let accent = $state("#5f74e0");
   let tone = $state("neutral");
@@ -125,7 +120,6 @@
   let rulesError = $state<string | null>(null);
   let confirmRevokeId = $state<string | null>(null);
 
-  let mems = $derived(memories[memProfile] ?? []);
   let activeLabel = $derived(SECTIONS.find(([id]) => id === section)![1]);
 
   // Name + URL required for save to be enabled (mirrors ProviderSettings.svelte).
@@ -264,33 +258,77 @@
     applyTheme(t);
   }
 
-  function updateMems(fn: (arr: Memory[]) => Memory[]) {
-    memories = { ...memories, [memProfile]: fn(memories[memProfile] ?? []) };
+  // Load the active profile's real memory facts when the Memory pane is open
+  // (and re-load if the profile changes under it).
+  $effect(() => {
+    if (section !== "memory") return;
+    const profile = $activeProfileId;
+    memoryLoading = true;
+    listMemory(profile)
+      .then((items) => {
+        memoryItems = items;
+      })
+      .catch(() => {
+        memoryItems = [];
+      })
+      .finally(() => {
+        memoryLoading = false;
+      });
+  });
+
+  function reloadMemory() {
+    listMemory($activeProfileId)
+      .then((items) => (memoryItems = items))
+      .catch(() => {});
   }
 
-  function addMemory() {
-    const i = mems.length;
-    updateMems((arr) => [...arr, { text: "New memory", date: "now" }]);
-    editingMem = i;
+  async function addMemoryFact() {
+    const content = memDraft.trim();
+    if (!content || memSaving) return;
+    memSaving = true;
+    memNote = null;
+    try {
+      const res = await saveMemory($activeProfileId, content);
+      if (res.sensitivity === "never_persist") {
+        memNote =
+          "That looked like a secret (e.g. a credential), so it was not saved anywhere — even locally.";
+      } else if (res.sensitivity === "private_local") {
+        memNote = "Saved to this device only — a cloud model will never see it.";
+      } else {
+        memNote = "Saved.";
+      }
+      memDraft = "";
+      reloadMemory();
+    } finally {
+      memSaving = false;
+    }
   }
-  function commitMem(i: number, value: string) {
-    if (cancelEdit) {
-      cancelEdit = false;
-      editingMem = null;
+
+  async function forgetMemory(id: string) {
+    // Two-click confirm, mirroring the provider-remove pattern.
+    if (confirmForgetId !== id) {
+      confirmForgetId = id;
+      setTimeout(() => {
+        if (confirmForgetId === id) confirmForgetId = null;
+      }, 3000);
       return;
     }
-    const v = value.trim();
-    updateMems((arr) => {
-      const next = arr.slice();
-      if (v) next[i] = { ...next[i], text: v };
-      else next.splice(i, 1);
-      return next;
-    });
-    editingMem = null;
+    confirmForgetId = null;
+    await deleteMemory(id);
+    memoryItems = memoryItems.filter((m) => m.id !== id);
   }
-  function autofocus(node: HTMLInputElement) {
-    node.focus();
-    node.select();
+
+  async function toggleMemoryPin(m: MemoryInfo) {
+    const next = !m.pinned;
+    await setMemoryPinned(m.id, next);
+    reloadMemory();
+  }
+
+  function formatMemDate(epochSeconds: number): string {
+    return new Date(epochSeconds * 1000).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    });
   }
 
   const navBtnBase =
@@ -655,143 +693,87 @@
               {/snippet}
             </SettingRow>
             <div class="mb-2 mt-4 flex items-center gap-2.5">
-              <div class="relative flex-shrink-0">
-                <button
-                  type="button"
-                  onclick={() => (memMenuOpen = !memMenuOpen)}
-                  aria-haspopup="true"
-                  class="flex min-w-[150px] cursor-pointer items-center gap-2 rounded-[var(--r)] border border-border-strong
-                    bg-surface-2 px-[9px] py-1.5 text-[12.5px] font-[550] text-text"
-                >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" class="flex-shrink-0 text-text-3">
-                    <circle cx="12" cy="8" r="4" />
-                    <path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6" />
-                  </svg>
-                  <span class="flex-1 text-left">{memProfile}</span>
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="flex-shrink-0 text-text-3">
-                    <path d="M6 9l6 6 6-6" />
-                  </svg>
-                </button>
-                {#if memMenuOpen}
-                  <div
-                    class="absolute left-0 top-9 z-[5] max-h-[230px] w-[230px] overflow-y-auto rounded-[var(--r-lg)]
-                      border border-border-strong bg-surface p-[5px] shadow-[var(--shadow-pop)]"
-                  >
-                    {#each Object.keys(memories) as name (name)}
-                      <button
-                        type="button"
-                        onclick={() => {
-                          memProfile = name;
-                          memMenuOpen = false;
-                          editingMem = null;
-                        }}
-                        class="flex w-full cursor-pointer items-center gap-2 rounded-[var(--r)] border-0 bg-transparent px-[9px] py-[7px] text-left text-text"
-                      >
-                        <span class="min-w-0 flex-1 text-[12.5px] font-[550]">{name}</span>
-                        <span class="flex-shrink-0 text-[11px] text-text-3">{memories[name].length}</span>
-                        {#if name === memProfile}
-                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.4" class="flex-shrink-0">
-                            <path d="M4 12l5 5L20 7" />
-                          </svg>
-                        {/if}
-                      </button>
-                    {/each}
-                    <div class="mx-1 my-[5px] h-px bg-border"></div>
-                    <button
-                      type="button"
-                      class="flex w-full cursor-pointer items-center gap-2 rounded-[var(--r)] border-0 bg-transparent px-[9px] py-2 text-left text-[12.5px] font-medium text-text-2"
-                    >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M12 5v14M5 12h14" />
-                      </svg>
-                      New profile…
-                    </button>
-                  </div>
-                {/if}
-              </div>
-              <span class="text-[11.5px] text-text-3">{mems.length} memories · stored locally, per profile</span>
+              <span class="text-[12px] font-[550] text-text">This profile's memory</span>
+              <span class="text-[11.5px] text-text-3">
+                {memoryItems.length}
+                {memoryItems.length === 1 ? "fact" : "facts"} · stored on this Mac
+              </span>
               <div class="flex-1"></div>
-              <Button variant="ghost">Export</Button>
-              <Button variant="ghost">Forget all…</Button>
             </div>
 
+            <form
+              class="mb-2 flex items-center gap-1.5"
+              onsubmit={(e) => {
+                e.preventDefault();
+                addMemoryFact();
+              }}
+            >
+              <input
+                bind:value={memDraft}
+                placeholder="Add something to remember…"
+                class="min-w-0 flex-1 rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12.5px]
+                  text-text outline-none placeholder:text-text-3 focus:border-accent"
+              />
+              <Button variant="primary" type="submit" disabled={!memDraft.trim() || memSaving}>
+                {memSaving ? "Saving…" : "Remember"}
+              </Button>
+            </form>
+            {#if memNote}
+              <p class="mb-2 text-[11.5px] text-text-2">{memNote}</p>
+            {/if}
+
             <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border">
-              {#each mems as m, i (i)}
-                <div class="flex items-center gap-2 border-b border-border py-[7px] pl-3 pr-2.5">
-                  {#if editingMem === i}
-                    <input
-                      use:autofocus
-                      value={m.text}
-                      aria-label="Edit memory"
-                      onkeydown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          e.currentTarget.blur();
-                        } else if (e.key === "Escape") {
-                          e.preventDefault();
-                          cancelEdit = true;
-                          e.currentTarget.blur();
-                        }
-                      }}
-                      onblur={(e) => commitMem(i, e.currentTarget.value)}
-                      class="min-w-0 flex-1 rounded-[var(--r)] border border-accent bg-surface-2 px-2 py-[5px] text-[12.5px] text-text outline-none"
-                    />
-                  {:else}
+              {#if memoryLoading && memoryItems.length === 0}
+                <div class="px-3 py-6 text-center text-[12px] text-text-3">Loading…</div>
+              {:else if memoryItems.length === 0}
+                <div class="px-3 py-8 text-center text-[12px] text-text-3">
+                  No memories yet. Anything you add — or the assistant saves — appears
+                  here, and you can forget it any time.
+                </div>
+              {:else}
+                {#each memoryItems as m (m.id)}
+                  <div class="flex items-center gap-2 border-b border-border py-[7px] pl-2.5 pr-2.5">
                     <button
                       type="button"
-                      onclick={() => (editingMem = i)}
-                      title="Click to edit"
-                      class="min-w-0 flex-1 cursor-text rounded-[4px] border-0 bg-transparent px-0.5 py-1 text-left text-[12.5px] text-text"
+                      aria-label={m.pinned ? "Unpin from summary" : "Pin to summary"}
+                      title={m.pinned
+                        ? "Pinned into every conversation — click to unpin"
+                        : "Pin into the always-loaded summary"}
+                      onclick={() => toggleMemoryPin(m)}
+                      class="grid h-6 w-6 flex-shrink-0 place-items-center rounded-[var(--r)] border-0 bg-transparent
+                        {m.pinned ? 'text-accent' : 'text-text-3'} hover:bg-surface-hover"
                     >
-                      {m.text}
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill={m.pinned ? "currentColor" : "none"} stroke="currentColor" stroke-width="1.6">
+                        <path d="M12 2l2.9 6.3L22 9.3l-5 4.6 1.3 6.8L12 17.6 5.7 20.7 7 13.9l-5-4.6 7.1-1z" />
+                      </svg>
                     </button>
-                  {/if}
-                  {#if m.tag}
-                    <span
-                      class="flex-shrink-0 rounded-[8px] px-[7px] py-px text-[10px]
-                        {m.tag.includes('health')
-                        ? 'bg-blocked-soft text-blocked'
-                        : 'bg-warn-soft text-warn'}"
+                    <span class="min-w-0 flex-1 text-[12.5px] text-text">{m.content}</span>
+                    {#if m.sensitivity === "private_local"}
+                      <span
+                        class="flex-shrink-0 rounded-[8px] bg-blocked-soft px-[7px] py-px text-[10px] text-blocked"
+                      >
+                        on device only
+                      </span>
+                    {/if}
+                    <span class="flex-shrink-0 text-[11px] text-text-3">{formatMemDate(m.created_at)}</span>
+                    <button
+                      type="button"
+                      aria-label="Forget this memory"
+                      title={confirmForgetId === m.id ? "Click again to forget" : "Forget"}
+                      onclick={() => forgetMemory(m.id)}
+                      class="grid h-6 w-6 flex-shrink-0 place-items-center rounded-[var(--r)] border-0 bg-transparent
+                        {confirmForgetId === m.id ? 'text-blocked' : 'text-text-3'} hover:bg-surface-hover hover:text-text"
                     >
-                      {m.tag}
-                    </span>
-                  {/if}
-                  <span class="flex-shrink-0 text-[11px] text-text-3">{m.date}</span>
-                  <button
-                    type="button"
-                    aria-label="Edit this memory"
-                    onclick={() => (editingMem = i)}
-                    class="grid h-6 w-6 place-items-center rounded-[var(--r)] border-0 bg-transparent text-text-3 hover:bg-surface-hover hover:text-text"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-                      <path d="M5 19l1-4L16 5l3 3L9 18z" />
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="Forget this memory"
-                    onclick={() => updateMems((arr) => arr.filter((_, j) => j !== i))}
-                    class="grid h-6 w-6 place-items-center rounded-[var(--r)] border-0 bg-transparent text-text-3 hover:bg-surface-hover hover:text-text"
-                  >
-                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M6 6l12 12M18 6 6 18" />
-                    </svg>
-                  </button>
-                </div>
-              {/each}
-              <button
-                type="button"
-                onclick={addMemory}
-                class="flex w-full cursor-pointer items-center gap-2 border-0 border-b border-border bg-transparent px-3 py-[9px] text-left text-[12.5px] text-text-2"
-              >
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="flex-shrink-0">
-                  <path d="M12 5v14M5 12h14" />
-                </svg>
-                Add a memory
-              </button>
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M6 6l12 12M18 6 6 18" />
+                      </svg>
+                    </button>
+                  </div>
+                {/each}
+              {/if}
               <div class="px-3 py-2 text-[11px] text-text-3">
-                Click any memory to edit it. Memories are written only with your
-                approval and stay on this Mac.
+                Facts are routed by sensitivity: secrets are never saved, private
+                details stay on this Mac, and pinned facts load into every conversation.
               </div>
             </div>
           {:else if section === "appearance"}

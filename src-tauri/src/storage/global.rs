@@ -480,6 +480,50 @@ impl GlobalDb {
         Ok(facts)
     }
 
+    /// All of a profile's memory facts, newest first, each tagged with its
+    /// bucket. `include_private` gates the private-local store (pass `false`
+    /// for any cloud-bound reader; `true` for the user's own local memory view).
+    pub fn list_memory_by_profile(
+        &self,
+        profile: &str,
+        include_private: bool,
+    ) -> Result<Vec<(MemoryFact, MemoryBucket)>> {
+        let mut out: Vec<(MemoryFact, MemoryBucket)> = self
+            .list_bucket_by_profile(MemoryBucket::Shared, profile)?
+            .into_iter()
+            .map(|f| (f, MemoryBucket::Shared))
+            .collect();
+        if include_private {
+            out.extend(
+                self.list_bucket_by_profile(MemoryBucket::PrivateLocal, profile)?
+                    .into_iter()
+                    .map(|f| (f, MemoryBucket::PrivateLocal)),
+            );
+        }
+        out.sort_by(|a, b| {
+            b.0.pinned
+                .cmp(&a.0.pinned)
+                .then(b.0.created_at.cmp(&a.0.created_at))
+        });
+        Ok(out)
+    }
+
+    fn list_bucket_by_profile(
+        &self,
+        bucket: MemoryBucket,
+        profile: &str,
+    ) -> Result<Vec<MemoryFact>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, content, origin_profile, tags, created_at, pinned
+             FROM {} WHERE origin_profile = ?1 ORDER BY created_at DESC",
+            bucket.table()
+        ))?;
+        let rows = stmt
+            .query_map(params![profile], row_to_memory_fact)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     fn summary_from(
         &self,
         bucket: MemoryBucket,
