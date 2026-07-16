@@ -1434,6 +1434,151 @@ Break these out into full specs (same format as Part 1) when their round begins.
 
 ---
 
+## Part 2A — Q8 full spec (grant×risk matrix + persisted rules + risk-badged dialog)
+
+**Broken out from the Part 2 pointer 2026-07-16.** Source: `docs/tool-system-decisions.md` Q8
+(lines 328-383), the "Decided design" section above (lines 35-62), and the "Things you didn't ask"
+items (force `Once ⇒ Fingerprint`; risk-badge is load-bearing). This is the item **items 7 and 8
+both explicitly deferred to** — today `External`/`Dangerous` get the *identical* `PermissionMode::Ask`
+treatment as `Write` (`lib.rs:293`), and the only thing holding the `Dangerous` line is a narrow
+"collapse any grant to Once" hack in `dispatch.rs`'s Approve arm (lines 450-465).
+
+**Goal.** Make the grant-scope × risk matrix a *structural, tested property* of the grant path
+(not a UI behavior, not a dispatch hack), and give `Always` a durable home (per-profile SQLite
+`tool_rules`) instead of the current "behaves like `Session`" placeholder. Ship the risk-badged
+dialog in the same round so the matrix is legible and the current uniform "Allow for this session"
+button stops training habits the matrix then has to break.
+
+**The matrix (v1, honoring the current tool set):**
+
+| Risk | Default | Once (fp) | Session (fp/tool) | Always (rule) |
+|---|---|---|---|---|
+| Safe | Allow, pre-trusted (never reaches Approve) | — | — | — |
+| Write | Ask | ✓ | ✓ (fp or whole-tool) | ✓ persist rule (whole-tool `*` or path-prefix) |
+| External | Ask | ✓ | **fingerprint only** (whole-tool downgraded to fp) | **destination-scoped pattern only** — bare whole-tool refused |
+| Dangerous | Ask | ✓ | **refused → runs once, no standing** | **refused → runs once, no standing** |
+
+"Refused" NEVER means the call is blocked — the human approved it in person, so it runs this once;
+only the *standing coverage* is refused (collapse to `(Once, Fingerprint)`, which also settles the
+dispatch re-run loop). This is invariant #8 made structural.
+
+### Decisions locked (honor these)
+
+1. **Single enforcement point, server-side.** A pure `resolve_grant(risk, &ApprovalDecision) ->
+   GrantOutcome` in `hooks/approval.rs` is the ONLY thing that turns a user's answer into a recorded
+   grant. The dialog *proposes* (scope/target/pattern); `resolve_grant` *disposes*. The UI is never
+   the enforcement (a hand-crafted IPC call sending `scope="session"` for a `Dangerous` tool is
+   narrowed by `resolve_grant`, not trusted). `GrantOutcome ∈ { Ledger(GrantScope, GrantTarget),
+   Persist(ToolRule) }` — a `Dangerous`/`External`-bad-pattern answer resolves to
+   `Ledger(Once, Fingerprint(fp))`, so "runs once, no standing" needs no third variant.
+2. **`resolve_grant` replaces the dispatch hack.** Delete the `if tool.risk() == Dangerous { collapse }`
+   block (`dispatch.rs:458-465`); call `resolve_grant(tool.risk(), &decision)` instead. The
+   protected-path forced-Once piggyback (lines 481-486) stays — it's an orthogonal floor.
+3. **Persisted `Always` = per-profile `tool_rules` rows**, never fingerprints (per Q8's core override).
+   Table lives in the **per-profile DB** (consistent with `tool_audit`'s per-profile isolation and the
+   walled-profile principle — a work profile's `shell_exec` allow-rule must not apply while in a
+   personal profile). `ExecCtx.profile` is a real value in the live flow (frontend `send_message` →
+   `process_message` → `ExecCtx.profile`), so per-profile is meaningful, not theoretical.
+4. **`PolicySource` becomes profile-aware.** `mode_for(tool, profile)` / `rules_for(tool, profile)`.
+   `EventContext` gains a `profile` field, set by `dispatch` from `ctx.profile`. A new
+   `SqlitePolicySource` reads persisted per-profile rules; `LayeredPolicySource { defaults:
+   InMemoryPolicySource, persisted: SqlitePolicySource }` composes them — `mode_for` = the
+   risk-derived whole-tool default (built at boot), `rules_for` = persisted rules ⧺ in-memory rules.
+   `PermissionHook::resolve` already does deny>ask>allow / most-specific-wins, so a persisted
+   `(write_file, "*", allow)` rule matching the command overrides the whole-tool `Ask` default →
+   "Always allow write_file" works with zero change to the resolution algorithm.
+5. **`ApprovalDecision::Persist(ToolRule)`** new variant, produced by `resolve_tool_approval` when
+   `scope="always"`. `ResolveApprovalArgs` gains an optional `pattern` (defaults to `"*"` = whole-tool).
+   Dispatch, on a `Persist` outcome: risk-check via `resolve_grant` (refuse persist for `Dangerous`;
+   require a destination-scoped pattern for `External` — v1 with no live `External` tool, this is an
+   enforced refusal, minimal authoring), write the row via `ProfileDb::add_tool_rule`, AND pin a
+   `(Once, Fingerprint)` so the current call settles even if the freshly-written rule's pattern
+   somehow doesn't match the current `command_text`.
+6. **Force `Once ⇒ Fingerprint` at construction + log the illegal combo.** `resolve_grant` never
+   emits `(Once, Tool)`; if the ledger's `grant` ever *sees* `(Once, Tool)` it stays a no-op (as
+   today) but now also `tracing::warn!`s — the "Things you didn't ask" item.
+7. **Risk-badged dialog is load-bearing, not polish.** `ApprovalRequest` / the Tauri payload / the
+   TS `ToolApprovalRequest` type gain `risk: "safe"|"write"|"external"|"dangerous"` and an optional
+   `destination` (for `External`). The dialog renders a risk badge and offers ONLY the matrix-legal
+   buttons: `Dangerous` → Deny + Allow once (no Session, no Always); `External` → Deny + Allow once +
+   Allow always for `{destination}`; `Write` → Deny + Allow once + Allow for session + Always allow.
+   The badge answers "why can't I session-allow this?" — because it's red.
+8. **Rule vocabulary v1 stays minimal** (per Q8): whole-tool and path-prefix for fs tools. No
+   arg-shape-general rule builder. `shell_exec` command-pattern rules are out of scope (they arrive
+   with a later `shell_exec`-patterns round); `Dangerous` gets no rules at all anyway.
+
+### Files to touch
+
+- `src-tauri/src/hooks/approval.rs` — add `resolve_grant` + `GrantOutcome`; `ApprovalDecision::Persist`;
+  `grant` logs the `(Once, Tool)` combo. Re-export `ToolRule` here or from permission (it lives in
+  permission.rs today).
+- `src-tauri/src/hooks/permission.rs` — `PolicySource` methods gain `profile`; `InMemoryPolicySource`
+  ignores it; add `SqlitePolicySource` + `LayeredPolicySource`. `PermissionHook::resolve` passes
+  `ctx.profile`.
+- `src-tauri/src/hooks/mod.rs` — `EventContext` gains `profile` + `with_profile`; re-exports for the
+  new types; `build_pretooluse_chain_full` takes the layered policy (or the persisted source + storage).
+- `src-tauri/src/tools/dispatch.rs` — Approve/Persist arms call `resolve_grant`; set `ev.profile`;
+  write persisted rules through storage.
+- `src-tauri/src/storage/schema.rs` + `migrations.rs` — `tool_rules` per-profile table, PROFILE
+  migration v2→v3, `PROFILE_SCHEMA_VERSION` → 3, add `"tool_rules"` to `PROFILE_TABLES`.
+- `src-tauri/src/storage/profile.rs` — `ToolRuleRow` + `add_tool_rule` / `list_tool_rules` /
+  `delete_tool_rule`.
+- `src-tauri/src/lib.rs` — `build_tool_dispatcher` splits `External`/`Dangerous` out of the `Write`
+  arm (line 293), wires the `LayeredPolicySource` (defaults + `SqlitePolicySource::new(storage)`).
+- `src-tauri/src/ipc/mod.rs` — `ResolveApprovalArgs` gains `pattern`; `resolve_tool_approval` emits
+  `Persist` for `always`; new `list_tool_rules` / `delete_tool_rule` commands for the Settings pane.
+- `src-tauri/src/ipc/approval.rs` — `ToolApprovalRequestPayload` gains `risk` + `destination`;
+  `ApprovalRequest` carries them from dispatch.
+- `src/lib/api/tauri.ts` — `ToolApprovalRequest` type gains `risk`/`destination`; `resolveToolApproval`
+  gains `pattern`; add `listToolRules`/`deleteToolRule`.
+- `src/lib/components/ApprovalDialog.svelte` — risk badge + matrix-driven buttons + destination line.
+- (stretch) a Settings "Permissions" pane listing/revoking rules.
+
+### Acceptance criteria
+
+- Every matrix cell has a `resolve_grant` unit test (Write/External/Dangerous × Once/Session/Always).
+- `Dangerous` + "Allow for this session" answer ⇒ recorded grant is `(Once, Fingerprint)` only; a
+  second identical call re-prompts. (Structural invariant #8; the existing dispatch integration test
+  that asserts this must keep passing, now via `resolve_grant` not the hack.)
+- `External` + "Allow always" with a bare whole-tool (no destination) ⇒ refused to persist; runs once.
+- A persisted `(write_file, "*", allow)` rule in profile A's DB does NOT affect profile B (per-profile
+  isolation round-trip test).
+- Restart simulation: write a rule, drop the in-memory ledger, reopen the profile DB → the rule still
+  resolves `write_file` to Allow (durability test).
+- Frontend `npm run build` + `npm run check` clean; dialog shows the badge and the right buttons per risk.
+- `cargo test --lib` green; no locked invariant regressed (esp. #1, #4, #8).
+
+### Invariants / gotchas
+
+- **Do not let `resolve_grant` ever widen.** It can only narrow the user's answer (Session→Once for
+  Dangerous, Tool→Fingerprint for External). A test asserts no cell produces a grant broader than
+  requested.
+- **`PermissionHook::resolve` ordering unchanged** — persisted rules ride the existing deny>ask>allow /
+  most-specific-wins path. A persisted `deny` rule (Settings-authored) must still beat an `allow` rule
+  and the whole-tool default — keep `PermissionMode::priority`'s deny=2.
+- **Migration safety:** `tool_rules` is additive (`CREATE TABLE IF NOT EXISTS`), profile-only —
+  `GLOBAL_SCHEMA_VERSION` stays 1 (the split-const debug_assert from item 5 already handles a
+  profile-only bump).
+- **Per-profile threading:** `EventContext.profile` must be set at EVERY dispatch call site (the real
+  one + tests), or a persisted rule silently won't resolve. Default it to `""` (matches
+  `InMemoryPolicySource` ignoring profile) so old tests don't need `.with_profile`.
+- **`External` has no live tool yet** — its matrix arm is enforced-but-undriven. Do NOT build
+  destination-pattern *authoring* machinery beyond the refusal; the first real `External` tool
+  (web-fetch / email, M4+) drives the authoring UX.
+
+### Suggested commit order
+
+1. **Matrix core (in-memory, no schema).** `resolve_grant` + `GrantOutcome` + tests; swap the dispatch
+   hack for it; force `Once⇒Fingerprint` + log. Fully green before touching storage.
+2. **Risk-badged dialog.** Payload/type gain `risk`/`destination`; dialog badge + matrix buttons.
+   (Persisted "Always" button lands in commit 3 — until then the dialog offers Once/Session per risk.)
+3. **Persisted `tool_rules`.** Schema/migration + `ProfileDb` CRUD + profile-aware `PolicySource` +
+   `SqlitePolicySource`/`LayeredPolicySource` + `EventContext.profile` + `Persist` decision + resolve
+   `always` + dialog "Always" button. Round-trip + isolation + durability tests.
+4. **(stretch) Settings revoke UI** + `list_tool_rules`/`delete_tool_rule` commands.
+
+---
+
 ## Part 3 — Progress Log (UPDATE THIS AS YOU BUILD)
 
 Status legend: `todo` · `in-progress` · `done` · `blocked`.

@@ -48,6 +48,7 @@ use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::hooks::EventContext;
+use crate::tools::RiskClass;
 
 // ── ActionFingerprint ──────────────────────────────────────────────────────
 
@@ -182,9 +183,17 @@ impl ApprovalLedger {
             // into a session-length, whole-tool grant — a `Once` + `Tool`
             // request has no fingerprint to pin, so it grants NOTHING (the
             // next call re-prompts). `resolve_tool_approval` also forces
-            // `Once => action`, so this arm shouldn't be reached in practice;
-            // it's the defensive floor.
-            (GrantScope::Once, GrantTarget::Tool(_)) => {}
+            // `Once => action`, and `resolve_grant` (Q8) never emits this
+            // combo, so this arm shouldn't be reached in practice; it's the
+            // defensive floor. Reaching it means a caller constructed the
+            // illegal pair directly — record nothing AND flag it, since a
+            // silently-lost approval click is a real UX bug worth surfacing.
+            (GrantScope::Once, GrantTarget::Tool(t)) => {
+                tracing::warn!(
+                    tool = %t,
+                    "ignored an illegal (Once, Tool) grant — a one-time grant must be per-action; nothing recorded"
+                );
+            }
             (GrantScope::Session | GrantScope::Always, GrantTarget::Fingerprint(fp)) => {
                 self.session_fps.lock().unwrap().insert(fp);
             }
@@ -198,6 +207,54 @@ impl ApprovalLedger {
     /// a `Once` approval covers exactly one execution and no more).
     pub fn consume_once(&self, fingerprint: &str) {
         self.once_fps.lock().unwrap().remove(fingerprint);
+    }
+}
+
+// ── Grant × risk matrix (Q8) ────────────────────────────────────────────────
+
+/// The single server-side enforcement point of Q8's grant-scope × risk
+/// matrix. Given a tool's [`RiskClass`] and the scope/target the human's
+/// answer requested, return the grant that may actually be RECORDED in the
+/// ledger — **never wider than requested** on either axis (duration
+/// `Once` < `Session` < `Always`; target `Fingerprint` < `Tool`).
+///
+/// The call still RUNS when this is reached (the human approved it in person);
+/// only the *standing* coverage is narrowed. This is what makes invariant #8
+/// ("a `Dangerous` action can never be silently covered by a Session/Always
+/// grant") a structural, tested property of the grant path rather than a UI
+/// behavior or a one-off dispatch special-case.
+///
+/// | Risk | Once | Session | Always |
+/// |---|---|---|---|
+/// | Safe | (Once, fp) | as-asked | as-asked | *(defensive; Safe is pre-trusted and never Asks)* |
+/// | Write | (Once, fp) | as-asked | as-asked |
+/// | External | (Once, fp) | (Session, fp) | (Session, fp) | *fingerprint-pinned only — no whole-tool standing for egress; a bare whole-tool "always" is refused, narrowed to a session fingerprint. Destination-scoped standing rules are the External path and arrive via [`ApprovalDecision::Persist`] with the first External tool.* |
+/// | Dangerous | (Once, fp) | (Once, fp) | (Once, fp) | *Once-only: any standing answer collapses; runs once, records nothing.* |
+///
+/// `Once` is always forced to `Fingerprint` regardless of risk (a one-time
+/// grant is inherently per-action — the "Things you didn't ask" hardening).
+pub fn resolve_grant(
+    risk: RiskClass,
+    scope: GrantScope,
+    target: GrantTarget,
+    fingerprint: &str,
+) -> (GrantScope, GrantTarget) {
+    let fp = || GrantTarget::Fingerprint(fingerprint.to_string());
+    match (risk, scope) {
+        // Dangerous: never a standing grant (invariant #8). Runs once.
+        (RiskClass::Dangerous, _) => (GrantScope::Once, fp()),
+
+        // External: fingerprint-pinned only — a whole-tool standing grant for
+        // an egress tool is refused. `Always` (bare whole-tool) narrows to a
+        // session fingerprint, strictly narrower than the requested Always/Tool.
+        (RiskClass::External, GrantScope::Once) => (GrantScope::Once, fp()),
+        (RiskClass::External, GrantScope::Session | GrantScope::Always) => {
+            (GrantScope::Session, fp())
+        }
+
+        // Safe / Write: honor the request, but a one-time grant is per-action.
+        (_, GrantScope::Once) => (GrantScope::Once, fp()),
+        (_, scope) => (scope, target),
     }
 }
 
@@ -335,5 +392,130 @@ mod tests {
             led.covers_once(&fp),
             "a Once+Fingerprint grant must satisfy covers_once"
         );
+    }
+
+    // ── resolve_grant: the grant × risk matrix ──────────────────────────────
+
+    const FP: &str = "deadbeef";
+
+    /// A one-time grant is per-action for EVERY risk — `Once` never widens to
+    /// a whole tool.
+    #[test]
+    fn resolve_grant_forces_once_to_fingerprint_for_every_risk() {
+        for risk in [
+            RiskClass::Safe,
+            RiskClass::Write,
+            RiskClass::External,
+            RiskClass::Dangerous,
+        ] {
+            let (scope, target) =
+                resolve_grant(risk, GrantScope::Once, GrantTarget::Tool("t".into()), FP);
+            assert_eq!(scope, GrantScope::Once);
+            assert_eq!(
+                target,
+                GrantTarget::Fingerprint(FP.into()),
+                "{risk:?}: Once must pin the fingerprint, never a whole tool"
+            );
+        }
+    }
+
+    /// Write honors a Session/Always answer as-asked (whole-tool standing is
+    /// legal for a reversible, on-machine mutation).
+    #[test]
+    fn resolve_grant_write_honors_standing_grants() {
+        let (s, t) = resolve_grant(
+            RiskClass::Write,
+            GrantScope::Session,
+            GrantTarget::Tool("write_file".into()),
+            FP,
+        );
+        assert_eq!(s, GrantScope::Session);
+        assert_eq!(t, GrantTarget::Tool("write_file".into()));
+    }
+
+    /// External is fingerprint-pinned only — a whole-tool Session answer is
+    /// narrowed to this exact fingerprint (no standing coverage for egress).
+    #[test]
+    fn resolve_grant_external_session_is_fingerprint_only() {
+        let (s, t) = resolve_grant(
+            RiskClass::External,
+            GrantScope::Session,
+            GrantTarget::Tool("send_email".into()),
+            FP,
+        );
+        assert_eq!(s, GrantScope::Session);
+        assert_eq!(
+            t,
+            GrantTarget::Fingerprint(FP.into()),
+            "External must never grant a whole-tool standing grant"
+        );
+    }
+
+    /// External `Always` (bare whole-tool) is refused — narrowed to a session
+    /// fingerprint, strictly narrower than the requested Always/Tool.
+    #[test]
+    fn resolve_grant_external_always_whole_tool_is_refused() {
+        let (s, t) = resolve_grant(
+            RiskClass::External,
+            GrantScope::Always,
+            GrantTarget::Tool("send_email".into()),
+            FP,
+        );
+        assert_eq!(s, GrantScope::Session);
+        assert_eq!(t, GrantTarget::Fingerprint(FP.into()));
+    }
+
+    /// Dangerous collapses ANY standing answer to `(Once, Fingerprint)` — the
+    /// structural form of invariant #8. Runs once, records nothing standing.
+    #[test]
+    fn resolve_grant_dangerous_collapses_all_standing_to_once() {
+        for (scope, target) in [
+            (GrantScope::Session, GrantTarget::Tool("shell_exec".into())),
+            (GrantScope::Always, GrantTarget::Tool("shell_exec".into())),
+            (GrantScope::Session, GrantTarget::Fingerprint("other".into())),
+            (GrantScope::Always, GrantTarget::Fingerprint("other".into())),
+        ] {
+            let (s, t) = resolve_grant(RiskClass::Dangerous, scope, target, FP);
+            assert_eq!(s, GrantScope::Once, "Dangerous must never grant a standing scope");
+            assert_eq!(t, GrantTarget::Fingerprint(FP.into()));
+        }
+    }
+
+    /// The matrix never WIDENS: for every risk × scope × target, the output is
+    /// no broader than the input on either axis.
+    #[test]
+    fn resolve_grant_never_widens() {
+        let dur = |s: GrantScope| match s {
+            GrantScope::Once => 0u8,
+            GrantScope::Session => 1,
+            GrantScope::Always => 2,
+        };
+        let breadth = |t: &GrantTarget| match t {
+            GrantTarget::Fingerprint(_) => 0u8,
+            GrantTarget::Tool(_) => 1,
+        };
+        for risk in [
+            RiskClass::Safe,
+            RiskClass::Write,
+            RiskClass::External,
+            RiskClass::Dangerous,
+        ] {
+            for scope in [GrantScope::Once, GrantScope::Session, GrantScope::Always] {
+                for target in [
+                    GrantTarget::Fingerprint(FP.into()),
+                    GrantTarget::Tool("t".into()),
+                ] {
+                    let (os, ot) = resolve_grant(risk, scope, target.clone(), FP);
+                    assert!(
+                        dur(os) <= dur(scope),
+                        "{risk:?}/{scope:?}: duration widened"
+                    );
+                    assert!(
+                        breadth(&ot) <= breadth(&target),
+                        "{risk:?}/{target:?}: target breadth widened"
+                    );
+                }
+            }
+        }
     }
 }

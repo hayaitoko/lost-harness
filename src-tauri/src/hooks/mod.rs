@@ -77,8 +77,8 @@ pub mod routing;
 pub mod sandbox;
 
 pub use approval::{
-    ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter, ApprovalRequest,
-    GrantScope, GrantTarget,
+    resolve_grant, ActionFingerprint, ApprovalDecision, ApprovalLedger, ApprovalPrompter,
+    ApprovalRequest, GrantScope, GrantTarget,
 };
 pub use audit::{
     outcome_gate_by, outcome_label, truncate_args, AuditEntry, AuditObserverHook, AuditWriter,

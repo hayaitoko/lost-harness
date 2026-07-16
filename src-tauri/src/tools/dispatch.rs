@@ -447,22 +447,18 @@ impl ToolDispatcher {
                     // concurrency-model refactor deferred past this round.
                     match approver.request(req).await {
                         ApprovalDecision::Approve(scope, target) => {
-                            // Item 7: a `Dangerous` tool can NEVER be covered
-                            // by a standing grant. Whatever scope/target the
-                            // answer carried (e.g. "Allow for this session"),
-                            // collapse it to `Once` + this exact fingerprint —
-                            // the call still runs (the human just approved it,
-                            // in person), only the STANDING coverage is refused.
-                            // A minimal slice of Q8's grant×risk matrix, pulled
-                            // forward because `shell_exec` exists now.
-                            let (scope, target) = if tool.risk() == RiskClass::Dangerous {
-                                (
-                                    GrantScope::Once,
-                                    GrantTarget::Fingerprint(fingerprint.clone()),
-                                )
-                            } else {
-                                (scope, target)
-                            };
+                            // Q8 grant×risk matrix — the single server-side
+                            // enforcement point. Narrows the user's answer per
+                            // the tool's risk (never widens): a `Dangerous`
+                            // tool collapses ANY standing answer to
+                            // `(Once, fp)` (invariant #8), `External` is
+                            // fingerprint-pinned only, and `Once` is always
+                            // per-action. The call still runs (the human
+                            // approved it in person); only the STANDING
+                            // coverage is narrowed. Replaces the item-7
+                            // Dangerous-only collapse hack with the full matrix.
+                            let (scope, target) =
+                                crate::hooks::resolve_grant(tool.risk(), scope, target, &fingerprint);
                             self.ledger.grant(target, scope);
                             // The protected-paths floor is Once-only by
                             // construction (it checks `covers_once`, not
