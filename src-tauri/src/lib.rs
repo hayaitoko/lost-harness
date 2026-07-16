@@ -77,15 +77,34 @@ pub fn run() {
             let model_manager = Arc::new(ModelManager::new());
             hydrate_providers_from_storage(&storage, &model_manager);
 
-            // Privacy classifier. Now the ported deterministic rules layer
-            // (classifier/rules.rs — layer 0: structured PII + confidentiality
-            // cues, recall-biased, with span offsets). Supersedes the old
-            // low-false-positive heuristic; the trained ONNX ensemble
-            // (EnsembleClassifier) layers on top once its models are wired.
-            // Shared between the message-level §7 gate and the tool gating
-            // chain so both classify identically.
+            // Privacy classifier. The trained ONNX ensemble (bge-small +
+            // distilbert, INT8) fused with the layer-0 rules, loaded from
+            // <storage>/models/classifier/ if its models are installed;
+            // otherwise the rules-only classifier (classifier/rules.rs — layer
+            // 0: structured PII + confidentiality cues, recall-biased, with span
+            // offsets). Both implement `Classifier`, so the message-level §7
+            // gate and the tool gating chain classify identically either way.
+            // Shared via Arc; a missing model dir never breaks boot.
+            let classifier_models = base_path.join("models").join("classifier");
             let classifier: Arc<dyn crate::classifier::Classifier> =
-                Arc::new(RulesClassifier::new());
+                match crate::classifier::EnsembleClassifier::load(&classifier_models) {
+                    Ok(ensemble) => {
+                        tracing::info!(
+                            target: "lhp::classifier",
+                            path = %classifier_models.display(),
+                            "loaded trained ONNX ensemble classifier"
+                        );
+                        Arc::new(ensemble)
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            target: "lhp::classifier",
+                            reason = %e,
+                            "trained classifier unavailable — using rules-only classifier"
+                        );
+                        Arc::new(RulesClassifier::new())
+                    }
+                };
 
             // §7 Privacy Gate for message egress.
             let gate = PrivacyGate::new(Arc::clone(&classifier));

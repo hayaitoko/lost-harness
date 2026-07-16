@@ -1,13 +1,15 @@
 //! Privacy classifier — the interface the privacy filter classifies text
 //! through (Private / Public / Uncertain).
 //!
-//! The trait and logging schema are defined now so the trained model drops
-//! in cleanly. `HeuristicClassifier` is the conservative regex/keyword
-//! fallback that ships today; `EnsembleClassifier` is the stub for the real
-//! trained model (a bge-small + distilbert ONNX ensemble fused with rules —
-//! see engine.rs / PLAN §11). The two are interchangeable behind the
-//! `Classifier` trait, so the real model drops in without touching the
-//! privacy filter itself.
+//! The trait and logging schema keep the classifiers interchangeable.
+//! `RulesClassifier` (rules.rs — layer 0: structured PII + confidentiality
+//! cues) is the always-available fallback; `HeuristicClassifier` is the older
+//! conservative regex/keyword variant; `EnsembleClassifier` (engine.rs) is the
+//! trained model — a bge-small + distilbert INT8 ONNX ensemble fused with the
+//! rules layer, wired via ONNX Runtime (PLAN §11). All are interchangeable
+//! behind the `Classifier` trait, so the gate never changes when the active
+//! classifier does. `EnsembleClassifier::load` errors (→ rules fallback) when
+//! its models aren't installed, so the app runs with or without them.
 
 pub mod engine;
 pub mod heuristic;

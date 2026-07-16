@@ -1,0 +1,112 @@
+[
+  {
+    "text": "what is the capital of France?",
+    "tf_bge_scaled": 0.001086,
+    "tf_bge_scaled_ntok": 7,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.000107,
+    "tf_distilbert_scaled_ntok": 7,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.001086,
+    "model_private_at_0.05": false
+  },
+  {
+    "text": "Write a haiku about the ocean.",
+    "tf_bge_scaled": 0.001152,
+    "tf_bge_scaled_ntok": 8,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.000172,
+    "tf_distilbert_scaled_ntok": 8,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.001152,
+    "model_private_at_0.05": false
+  },
+  {
+    "text": "email me at jane.doe@example.com",
+    "tf_bge_scaled": 0.948656,
+    "tf_bge_scaled_ntok": 10,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.148403,
+    "tf_distilbert_scaled_ntok": 10,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.948656,
+    "model_private_at_0.05": true
+  },
+  {
+    "text": "My SSN is 123-45-6789 and my card is 4111 1111 1111 1111.",
+    "tf_bge_scaled": 0.99811,
+    "tf_bge_scaled_ntok": 24,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.999809,
+    "tf_distilbert_scaled_ntok": 24,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.999809,
+    "model_private_at_0.05": true
+  },
+  {
+    "text": "I was diagnosed with type 2 diabetes and started metformin last week.",
+    "tf_bge_scaled": 0.995129,
+    "tf_bge_scaled_ntok": 15,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.997295,
+    "tf_distilbert_scaled_ntok": 15,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.997295,
+    "model_private_at_0.05": true
+  },
+  {
+    "text": "Patient Maria Gonzalez, DOB 03/14/1980, presented with chest pain.",
+    "tf_bge_scaled": 0.992684,
+    "tf_bge_scaled_ntok": 17,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.999477,
+    "tf_distilbert_scaled_ntok": 17,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.999477,
+    "model_private_at_0.05": true
+  },
+  {
+    "text": "The quarterly revenue projections are confidential and proprietary.",
+    "tf_bge_scaled": 0.009316,
+    "tf_bge_scaled_ntok": 9,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.718002,
+    "tf_distilbert_scaled_ntok": 9,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.718002,
+    "model_private_at_0.05": true
+  },
+  {
+    "text": "Let's meet at 742 Evergreen Terrace, Springfield tomorrow at noon.",
+    "tf_bge_scaled": 0.866944,
+    "tf_bge_scaled_ntok": 15,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.99903,
+    "tf_distilbert_scaled_ntok": 15,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.99903,
+    "model_private_at_0.05": true
+  },
+  {
+    "text": "def add(a, b):\n    return a + b\n\nprint(add(2,3))",
+    "tf_bge_scaled": 0.001325,
+    "tf_bge_scaled_ntok": 21,
+    "tf_bge_scaled_nwin": 1,
+    "tf_distilbert_scaled": 0.002227,
+    "tf_distilbert_scaled_ntok": 21,
+    "tf_distilbert_scaled_nwin": 1,
+    "max_prob": 0.002227,
+    "model_private_at_0.05": false
+  },
+  {
+    "text": "Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message. Here is a very long message.  My password is hunter2secret!",
+    "tf_bge_scaled": 0.99413,
+    "tf_bge_scaled_ntok": 429,
+    "tf_bge_scaled_nwin": 5,
+    "tf_distilbert_scaled": 0.053698,
+    "tf_distilbert_scaled_ntok": 429,
+    "tf_distilbert_scaled_nwin": 5,
+    "max_prob": 0.99413,
+    "model_private_at_0.05": true
+  }
+]
