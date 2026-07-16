@@ -27,6 +27,7 @@ pub mod dispatch;
 pub mod exec;
 pub mod fs;
 pub mod mcp;
+pub mod memory;
 
 pub use calling::ToolCall;
 pub use dispatch::{ToolDispatcher, TurnOutcome};

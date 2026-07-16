@@ -278,6 +278,13 @@ fn build_tool_dispatcher(
     registry.register(Box::new(EditFileTool::new(&workspace)));
     registry.register(Box::new(DeleteFileTool::new(workspace)));
 
+    // Memory: the always-available "pinned search tool" (PLAN §9). Read-only
+    // (Safe → pre-trusted); searches the SHARED store only, so it can never
+    // surface a private-local fact back into a model's context.
+    registry.register(Box::new(crate::tools::memory::RecallMemoryTool::new(
+        storage.clone(),
+    )));
+
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
     // scratch dir, network off by default, killed on timeout, OS-sandboxed via
     // Seatbelt on macOS (UnsupportedSandbox — a hard error — elsewhere until a
