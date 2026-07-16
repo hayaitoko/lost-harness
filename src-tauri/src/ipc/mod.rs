@@ -512,6 +512,73 @@ pub fn resolve_tool_approval(
     Ok(answered)
 }
 
+// ── persisted tool rules (Q8) — list + revoke ─────────────────────────────
+
+/// A persisted `tool_rules` row, for the Settings "Permissions" pane. Mirrors
+/// `storage::ToolRuleRow`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolRuleInfo {
+    pub id: String,
+    pub tool_name: String,
+    pub pattern: String,
+    pub action: String,
+    pub created_at: i64,
+}
+
+impl From<crate::storage::ToolRuleRow> for ToolRuleInfo {
+    fn from(r: crate::storage::ToolRuleRow) -> Self {
+        Self {
+            id: r.id,
+            tool_name: r.tool_name,
+            pattern: r.pattern,
+            action: r.action,
+            created_at: r.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListToolRulesArgs {
+    pub profile: String,
+}
+
+/// List the persisted "Always allow" rules for a profile (newest first) so the
+/// user can review/revoke them. Per-profile — a rule in one profile is
+/// invisible to another.
+#[tauri::command]
+pub fn list_tool_rules(
+    state: State<'_, AppState>,
+    args: ListToolRulesArgs,
+) -> Result<Vec<ToolRuleInfo>, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.list_tool_rules()
+        .map(|rows| rows.into_iter().map(Into::into).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteToolRuleArgs {
+    pub profile: String,
+    pub id: String,
+}
+
+/// Revoke one persisted rule by id (takes effect immediately — `SqlitePolicySource`
+/// reads live, so the next call re-prompts). Returns `true` if a row was removed.
+#[tauri::command]
+pub fn delete_tool_rule(
+    state: State<'_, AppState>,
+    args: DeleteToolRuleArgs,
+) -> Result<bool, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.delete_tool_rule(&args.id).map_err(|e| e.to_string())
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────
 
 fn parse_kind(s: &str) -> Result<ProviderKind, String> {

@@ -148,6 +148,8 @@ pub fn run() {
             ipc::list_models,
             ipc::send_message,
             ipc::resolve_tool_approval,
+            ipc::list_tool_rules,
+            ipc::delete_tool_rule,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lost Harness");

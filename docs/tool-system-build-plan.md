@@ -1596,12 +1596,14 @@ Concrete corrections, already reflected in commit 1 where noted:
 - **Dispatcher gets a `ToolRuleWriter` seam** mirroring `AuditWriter`: `Option<Arc<dyn ToolRuleWriter>>`
   + `with_rule_writer` + a `StorageToolRuleWriter` owning `Storage`, wired in `build_tool_dispatcher`;
   the write keys off `ctx.profile` (same source as the audit path). Fast synchronous insert.
-- **Persist-failure surfaces, never swallows.** A rule is an authorization the user relies on, not
-  telemetry — so unlike `StorageAuditWriter` it must NOT swallow-and-log. On write `Err`:
-  `tracing::error!` loudly AND degrade to a **`Session` ledger grant** (honest fallback = the pre-Q8
-  "Always behaves like Session" behavior) rather than silently claiming a standing rule that doesn't
-  exist. (A `tool:rule_persist_failed` toast is a documented follow-up.) The current call still runs
-  once (the human approved it).
+- **Persist-failure surfaces, never swallows — and fails SAFE.** A rule is an authorization the user
+  relies on, not telemetry — so unlike `StorageAuditWriter` it must NOT swallow-and-log. On write
+  `Err`: `tracing::error!` loudly AND record **NO standing grant at all** — only the `(Once, fp)` pin
+  runs THIS approved call, so the next call re-prompts. (This is stricter than the critique's
+  "degrade to Session" suggestion: a *failed* persist must never silently widen into session-length
+  coverage — fail-closed is this codebase's posture. The tradeoff is a surprising re-prompt, which a
+  `tool:rule_persist_failed` toast will explain — a documented follow-up.) The current call still runs
+  once (the human approved it in person).
 - **Only `rules_for` gains `profile`** — `mode_for` (the risk-derived whole-tool default) stays
   profile-blind. A Settings-authored whole-tool *deny* is a `(tool, "*", deny)` pattern rule (rules
   checked first, deny>allow), so no profile-aware `mode_for` is needed.

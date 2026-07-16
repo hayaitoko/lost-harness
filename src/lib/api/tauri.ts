@@ -413,6 +413,31 @@ export async function resolveToolApproval(
   return true;
 }
 
+/** A persisted "Always allow" rule. Mirrors `ToolRuleInfo` in `ipc/mod.rs`. */
+export interface ToolRule {
+  id: string;
+  tool_name: string;
+  pattern: string;
+  action: string;
+  created_at: number;
+}
+
+/** List a profile's persisted "Always allow" rules (newest first). */
+export async function listToolRules(profile: string): Promise<ToolRule[]> {
+  if (isTauri()) {
+    return tauriInvoke<ToolRule[]>("list_tool_rules", { args: { profile } });
+  }
+  return [];
+}
+
+/** Revoke one persisted rule by id. Returns true if a row was removed. */
+export async function deleteToolRule(profile: string, id: string): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("delete_tool_rule", { args: { profile, id } });
+  }
+  return false;
+}
+
 // ── Browser fallback (used when running outside Tauri) ──────────────────────
 
 const browserStreamListeners: StreamTokenCallback[] = [];
