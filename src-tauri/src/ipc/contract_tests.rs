@@ -104,6 +104,7 @@ fn test_app() -> App<MockRuntime> {
             ipc::list_models,
             ipc::get_classifier_settings,
             ipc::set_classifier_settings,
+            ipc::set_redaction_enabled,
             ipc::reset_classifier_settings,
         ])
         .build(mock_context(noop_assets()))
@@ -452,7 +453,20 @@ fn classifier_settings_round_trip_through_real_ipc() {
     assert_eq!(reget["strictness"], 100, "persisted strictness must survive a re-read");
     assert_eq!(reget["uncertainty_band"], "wide");
 
-    // Reset → back to defaults.
+    // Toggling redaction preserves the thresholds (and vice versa).
+    let red: Value = call(
+        &webview,
+        "set_redaction_enabled",
+        json!({"args": {"profile": "personal", "enabled": false}}),
+    )
+    .expect("set_redaction_enabled must dispatch")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(red["redaction_enabled"], false);
+    assert_eq!(red["strictness"], 100, "redaction toggle preserved thresholds");
+    assert_eq!(red["uncertainty_band"], "wide");
+
+    // Reset → back to defaults (thresholds AND redaction on).
     let reset: Value = call(
         &webview,
         "reset_classifier_settings",
@@ -463,6 +477,7 @@ fn classifier_settings_round_trip_through_real_ipc() {
     .expect("valid JSON");
     assert_eq!(reset["strictness"], 50);
     assert_eq!(reset["uncertainty_band"], "medium");
+    assert_eq!(reset["redaction_enabled"], true);
 }
 
 #[test]

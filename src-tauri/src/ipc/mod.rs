@@ -597,16 +597,19 @@ pub struct ClassifierSettingsInfo {
     /// Raw fusion thresholds (the source of truth in storage).
     pub tau_block: f32,
     pub tau_band: f32,
+    /// Whether partial-delegation redaction is enabled (PLAN §11).
+    pub redaction_enabled: bool,
 }
 
-impl From<crate::classifier::ClassifierConfig> for ClassifierSettingsInfo {
-    fn from(cfg: crate::classifier::ClassifierConfig) -> Self {
+impl ClassifierSettingsInfo {
+    fn from_parts(cfg: crate::classifier::ClassifierConfig, redaction_enabled: bool) -> Self {
         let (strictness, band) = cfg.to_ui();
         Self {
             strictness,
             uncertainty_band: band.to_string(),
             tau_block: cfg.tau_block,
             tau_band: cfg.tau_band,
+            redaction_enabled,
         }
     }
 }
@@ -627,7 +630,8 @@ pub fn get_classifier_settings(
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
     let cfg = db.classifier_config().map_err(|e| e.to_string())?;
-    Ok(cfg.into())
+    let redaction = db.redaction_enabled().map_err(|e| e.to_string())?;
+    Ok(ClassifierSettingsInfo::from_parts(cfg, redaction))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -639,8 +643,9 @@ pub struct SetClassifierSettingsArgs {
     pub uncertainty_band: String,
 }
 
-/// Persist a profile's classifier tuning. Takes effect on the next message
-/// (the gate loads the config live per send). Returns the stored settings.
+/// Persist a profile's classifier tuning (thresholds only — the redaction
+/// toggle is preserved). Takes effect on the next message (the gate loads the
+/// config live per send). Returns the full stored settings.
 #[tauri::command]
 pub fn set_classifier_settings(
     state: State<'_, AppState>,
@@ -653,7 +658,31 @@ pub fn set_classifier_settings(
     let cfg =
         crate::classifier::ClassifierConfig::from_ui(args.strictness, &args.uncertainty_band);
     db.set_classifier_config(&cfg).map_err(|e| e.to_string())?;
-    Ok(cfg.into())
+    let redaction = db.redaction_enabled().map_err(|e| e.to_string())?;
+    Ok(ClassifierSettingsInfo::from_parts(cfg, redaction))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetRedactionEnabledArgs {
+    pub profile: String,
+    pub enabled: bool,
+}
+
+/// Toggle a profile's partial-delegation redaction (PLAN §11). Preserves the
+/// profile's thresholds. Returns the full stored settings.
+#[tauri::command]
+pub fn set_redaction_enabled(
+    state: State<'_, AppState>,
+    args: SetRedactionEnabledArgs,
+) -> Result<ClassifierSettingsInfo, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.set_redaction_enabled(args.enabled)
+        .map_err(|e| e.to_string())?;
+    let cfg = db.classifier_config().map_err(|e| e.to_string())?;
+    Ok(ClassifierSettingsInfo::from_parts(cfg, args.enabled))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -661,8 +690,8 @@ pub struct ResetClassifierSettingsArgs {
     pub profile: String,
 }
 
-/// Revert a profile's classifier tuning to defaults. Returns the (default)
-/// settings now in effect.
+/// Revert a profile's classifier settings to defaults (thresholds AND the
+/// redaction toggle). Returns the (default) settings now in effect.
 #[tauri::command]
 pub fn reset_classifier_settings(
     state: State<'_, AppState>,
@@ -673,7 +702,10 @@ pub fn reset_classifier_settings(
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
     db.reset_classifier_config().map_err(|e| e.to_string())?;
-    Ok(crate::classifier::ClassifierConfig::default().into())
+    Ok(ClassifierSettingsInfo::from_parts(
+        crate::classifier::ClassifierConfig::default(),
+        true,
+    ))
 }
 
 // ── classification explainability (PLAN §11 — the "why" sidebar) ──────────

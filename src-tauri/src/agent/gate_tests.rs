@@ -170,6 +170,19 @@ fn strictness_config_flips_the_gate_egress_decision() {
     );
 }
 
+#[test]
+fn check_detailed_surfaces_classification_only_for_auto() {
+    // Auto runs the classifier, so the caller (redact-and-send) can see the
+    // detected spans; Public/Private bypass it and return None.
+    let g = gate();
+    let (_d, auto) = g.check_detailed(&Binding::Auto, "my SSN is 123-45-6789", true, &ClassifierConfig::default());
+    assert!(auto.is_some(), "Auto must surface the classification");
+    let (_d, public) = g.check_detailed(&Binding::Public, "my SSN is 123-45-6789", true, &ClassifierConfig::default());
+    assert!(public.is_none(), "Public bypasses the classifier");
+    let (_d, private) = g.check_detailed(&Binding::Private, "anything", true, &ClassifierConfig::default());
+    assert!(private.is_none(), "Private bypasses the classifier");
+}
+
 // --- is_private_endpoint ---------------------------------------------------
 
 #[test]

@@ -199,9 +199,9 @@ impl AgentLoop {
             .open_profile(&profile)
             .and_then(|db| db.classifier_config())
             .unwrap_or_default();
-        let decision = self
-            .gate
-            .check(&binding, &content, is_cloud, &classifier_cfg);
+        let (decision, classification) =
+            self.gate
+                .check_detailed(&binding, &content, is_cloud, &classifier_cfg);
 
         // Log + stream every decision. We always log (the spec says
         // "always log the decision"), even when Allow — that gives the
@@ -220,6 +220,48 @@ impl AgentLoop {
                 return Ok(reason);
             }
             GateDecision::RouteLocal => {
+                // ── Partial delegation (PLAN §11): before forcing the whole
+                // turn local, try to black out the sensitive VALUE spans and
+                // send the safe remainder to the ORIGINAL cloud provider. This
+                // only happens when the profile allows redaction, the redaction
+                // fully cleans the current message (re-classified Public), AND
+                // the rest of the outgoing payload (prior turns) is already
+                // cloud-safe — otherwise a prior private turn replayed in the
+                // history would leak. Any failure falls through to local.
+                if is_cloud {
+                    if let Some(redaction) = self.plan_redaction(
+                        &profile,
+                        &content,
+                        classification.as_ref(),
+                        &classifier_cfg,
+                    ) {
+                        if self.conversation_is_cloud_safe(
+                            &profile,
+                            &conversation_id,
+                            &classifier_cfg,
+                        ) {
+                            // The non-silent signal is the persisted
+                            // `routing_decision = "redact_send"`, which
+                            // MainScreen renders as an inline event bar (survives
+                            // reload — unlike a transient event).
+                            return self
+                                .stream_to_provider(
+                                    provider,
+                                    model,
+                                    content,
+                                    conversation_id,
+                                    profile,
+                                    "redact_send",
+                                    binding,
+                                    is_cloud,
+                                    Some(redaction),
+                                    app,
+                                )
+                                .await;
+                        }
+                    }
+                }
+
                 // Find a local provider. Prefer a provider whose `kind` is
                 // `Local` AND whose `base_url` is private; this catches the
                 // case where someone marked a Cloud provider pointing at
@@ -239,6 +281,7 @@ impl AgentLoop {
                         "route_local",
                         binding,
                         local_is_cloud,
+                        None,
                         app,
                     )
                     .await;
@@ -254,11 +297,103 @@ impl AgentLoop {
                         "allow",
                         binding,
                         is_cloud,
+                        None,
                         app,
                     )
                     .await;
             }
         }
+    }
+
+    /// Plan a redact-and-send for the current message, or `None` if it can't be
+    /// done safely. Returns `Some(redaction)` only when: (1) the profile has
+    /// redaction enabled, (2) the classification carries redactable VALUE spans,
+    /// (3) blacking them out and **re-classifying the result** yields a clean
+    /// (Public) verdict under the same thresholds. The re-classify is the
+    /// load-bearing safety check — redaction alone is never trusted; if the
+    /// redacted text is still non-Public (a proprietary cue, a model-detected
+    /// disclosure, or a value the redaction missed), this returns `None` and the
+    /// caller keeps the turn local.
+    pub(crate) fn plan_redaction(
+        &self,
+        profile: &str,
+        content: &str,
+        classification: Option<&crate::classifier::Classification>,
+        cfg: &crate::classifier::ClassifierConfig,
+    ) -> Option<crate::classifier::Redaction> {
+        // Redaction toggle (default on). A read error → treat as OFF (safe:
+        // keep the turn local rather than risk a redact-and-send).
+        let redaction_on = self
+            .storage
+            .open_profile(profile)
+            .and_then(|db| db.redaction_enabled())
+            .unwrap_or(false);
+        if !redaction_on {
+            return None;
+        }
+
+        // A per-turn random nonce makes the placeholders unforgeable, so
+        // untrusted tool/web content can't inject a `[REDACTED:…]` string that
+        // rehydration would blindly expand into the user's real value.
+        let nonce = Uuid::new_v4().simple().to_string();
+        let redaction = crate::classifier::redact(content, &classification?.spans, &nonce);
+        if !redaction.is_redacted() {
+            return None; // nothing redactable (proprietary/model-only) → local
+        }
+        // Re-classify the redacted REMAINDER — the load-bearing safety check:
+        // only a clean (Public) verdict means the safe part may go to cloud.
+        // The placeholders themselves must not be scored (the nonce can look
+        // ID-ish to the rules layer), so they're normalized to a benign token
+        // first; this isolates the actual remaining text. The text SENT still
+        // carries the real (nonce'd) placeholders.
+        let mut probe = redaction.redacted_text.clone();
+        for r in &redaction.replacements {
+            probe = probe.replace(&r.placeholder, " redacted ");
+        }
+        let recheck = self.gate.check(&Binding::Auto, &probe, true, cfg);
+        if matches!(recheck, GateDecision::Allow) {
+            Some(redaction)
+        } else {
+            None
+        }
+    }
+
+    /// True when every already-persisted turn in the conversation is safe to
+    /// replay to a cloud model (each classifies Public under `cfg`). Redact-and-
+    /// send builds the outgoing prompt from the full history, so a single prior
+    /// private turn would leak if we sent to cloud — this is the guard that
+    /// keeps the WHOLE payload safe, not just the freshly-redacted message.
+    /// Conservative by design: any non-Public prior turn (or a read error)
+    /// returns `false`, and the turn stays local.
+    pub(crate) fn conversation_is_cloud_safe(
+        &self,
+        profile: &str,
+        conversation_id: &str,
+        cfg: &crate::classifier::ClassifierConfig,
+    ) -> bool {
+        // This re-classifies each prior turn (potentially a full ONNX pass) and
+        // runs under the app-wide `stream_lock`, so bound the cost: past this
+        // many prior turns we fail closed (keep the turn local) rather than
+        // stall every in-flight send. Redact-and-send is a best-effort
+        // optimization — declining it on a long conversation is always safe.
+        const MAX_HISTORY_SCAN: usize = 40;
+
+        let Ok(db) = self.storage.open_profile(profile) else {
+            return false;
+        };
+        let Ok(messages) = db.list_messages_by_conversation(conversation_id) else {
+            return false;
+        };
+        if messages.len() > MAX_HISTORY_SCAN {
+            return false; // too long to vet cheaply → stay local
+        }
+        messages.iter().all(|m| {
+            m.content.trim().is_empty()
+                || matches!(
+                    self.gate.check(&Binding::Auto, &m.content, true, cfg),
+                    GateDecision::Allow
+                )
+        })
     }
 
     // ── helpers ─────────────────────────────────────────────────────────
@@ -292,6 +427,12 @@ impl AgentLoop {
         mut routing_decision: &'static str,
         binding: Binding,
         mut is_cloud: bool,
+        // Partial-delegation redaction (PLAN §11). `Some` ⇒ the current user
+        // message is sent to the model as `redaction.redacted_text` (sensitive
+        // value spans blacked out) while the ORIGINAL `content` is persisted to
+        // the transcript, and the model's reply is rehydrated back to the real
+        // values before it's persisted/returned. `None` ⇒ ordinary send.
+        redaction: Option<crate::classifier::Redaction>,
         app: AppHandle,
     ) -> Result<String> {
         // `provider`/`client`/`is_cloud`/`routing_decision` are mutable because
@@ -351,10 +492,16 @@ impl AgentLoop {
         }
         // The persisted copy of the current user message may differ from the
         // live `content` by whitespace; make the last user turn authoritative.
+        // When redacting, the model sees the redacted remainder — never the
+        // original sensitive spans — even though the transcript kept the original.
+        let sent_content = redaction
+            .as_ref()
+            .map(|r| r.redacted_text.clone())
+            .unwrap_or_else(|| content.clone());
         if let Some(last_user) = history.iter_mut().rev().find(|m| m.role == "user") {
-            last_user.content = content.clone();
+            last_user.content = sent_content;
         } else {
-            history.push(ChatMessage::user(content.clone()));
+            history.push(ChatMessage::user(sent_content));
         }
 
         // `reads` is injected by the dispatcher (which owns the shared handle),
@@ -424,12 +571,21 @@ impl AgentLoop {
             // round is still left alone.)
             let is_round_cap_stop = round == MAX_TOOL_ROUNDS;
 
+            // If this turn was a redact-and-send, un-mask the placeholders in the
+            // reply for what the USER sees and what we persist — but NOT in
+            // `assembled`, which is what feeds back into the model-facing history
+            // below (rehydrated originals must never travel back to the cloud).
+            let persisted_content = match &redaction {
+                Some(r) => crate::classifier::rehydrate(&assembled, &r.replacements),
+                None => assembled.clone(),
+            };
+
             // Persist this assistant turn.
             let assistant_message = Message {
                 id: assistant_id,
                 conversation_id: conversation_id.clone(),
                 role: "assistant".to_string(),
-                content: assembled.clone(),
+                content: persisted_content.clone(),
                 model: Some(model.clone()),
                 provider_id: Some(provider.id.clone()),
                 routing_decision: Some(routing_decision.to_string()),
@@ -441,7 +597,7 @@ impl AgentLoop {
             profile_db
                 .add_message(&assistant_message)
                 .context("persist assistant message")?;
-            final_text = assembled.clone();
+            final_text = persisted_content;
 
             // On the last permitted round, stop without dispatching more tools.
             if is_round_cap_stop {

@@ -675,3 +675,111 @@ async fn resolve_turn_outcome_no_local_candidate_stays_cloud_with_hard_deny() {
     // so local-down can never be silently retried against cloud — see the
     // function's doc comment; there is no catch-and-retry-on-cloud path.
 }
+
+// ── Round 2: partial-delegation redact-and-send helpers ────────────────────
+
+/// Build a real `AgentLoop` (rules classifier) plus the shared `Storage` handle
+/// so a test can seed prior turns and then exercise the private redaction
+/// helpers directly.
+fn redaction_loop() -> (crate::agent::loop_mod::AgentLoop, Arc<Storage>, std::path::PathBuf) {
+    use crate::agent::loop_mod::AgentLoop;
+    use crate::classifier::RulesClassifier;
+    use crate::models::ModelManager;
+    let dir = tempdir();
+    let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+    let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
+    let agent = AgentLoop::new(
+        gate,
+        Arc::new(ModelManager::new()),
+        Arc::clone(&storage),
+        Arc::new(echo_allow_dispatcher()),
+    );
+    (agent, storage, dir)
+}
+
+#[test]
+fn plan_redaction_redacts_value_spans_and_honors_the_toggle() {
+    use crate::classifier::{Classifier, ClassifierConfig, RulesClassifier};
+    let (agent, storage, dir) = redaction_loop();
+    let clf = RulesClassifier::new();
+    let cfg = ClassifierConfig::default();
+
+    // An email is a concrete VALUE span → redactable. plan_redaction blacks it
+    // out, re-classifies the remainder clean, and returns Some.
+    let content = "please email me at a@b.com about the invoice";
+    let classification = clf.classify(content);
+    let red = agent
+        .plan_redaction("personal", content, Some(&classification), &cfg)
+        .expect("an email-only message must be redact-and-sendable");
+    assert!(red.is_redacted());
+    assert!(!red.redacted_text.contains("a@b.com"), "the value must not survive redaction");
+
+    // A proprietary CUE ("confidential") is not a value — redacting it would
+    // strip the signal, not the secret — so nothing is redacted and the turn
+    // must stay local (None).
+    let cue = "this is strictly confidential, do not share";
+    let cue_cls = clf.classify(cue);
+    assert!(
+        agent.plan_redaction("personal", cue, Some(&cue_cls), &cfg).is_none(),
+        "a proprietary-cue message can't be partially delegated → stays local"
+    );
+
+    // With redaction disabled for the profile, even the email message stays local.
+    storage
+        .open_profile("personal")
+        .unwrap()
+        .set_redaction_enabled(false)
+        .unwrap();
+    assert!(
+        agent.plan_redaction("personal", content, Some(&classification), &cfg).is_none(),
+        "redaction toggle off ⇒ no redact-and-send"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn conversation_is_cloud_safe_blocks_on_a_prior_private_turn() {
+    use crate::classifier::ClassifierConfig;
+    let (agent, storage, dir) = redaction_loop();
+    let cfg = ClassifierConfig::default();
+
+    // An empty conversation is vacuously safe.
+    assert!(agent.conversation_is_cloud_safe("personal", "empty", &cfg));
+
+    // Seed a prior turn that carries private content (an SSN). Now the whole
+    // conversation is unsafe to replay to a cloud model — redact-and-send must
+    // NOT fire, because that prior turn would leak in the history.
+    let db = storage.open_profile("personal").unwrap();
+    db.create_conversation(&crate::storage::Conversation {
+        id: "c-private".to_string(),
+        name: "P".to_string(),
+        pinned: false,
+        binding: "auto".to_string(),
+        folder_id: None,
+        color: None,
+        created_at: 1,
+        updated_at: 1,
+    })
+    .unwrap();
+    db.add_message(&Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        conversation_id: "c-private".to_string(),
+        role: "user".to_string(),
+        content: "my SSN is 123-45-6789".to_string(),
+        model: None,
+        provider_id: None,
+        routing_decision: None,
+        thinking_content: None,
+        error: None,
+        aborted: false,
+        created_at: 1,
+    })
+    .unwrap();
+    assert!(
+        !agent.conversation_is_cloud_safe("personal", "c-private", &cfg),
+        "a prior private turn makes the conversation unsafe for cloud replay"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -201,6 +201,9 @@
   function messageRoute(m: Message): Route {
     if (m.error_source === "gate" || m.routing_decision === "block") return "blocked";
     if (m.routing_decision === "route_local") return "local";
+    // redact_send: the safe remainder went to the cloud (sensitive spans stayed
+    // local) — surface it as a cloud route; the event bar explains the redaction.
+    if (m.routing_decision === "redact_send") return "cloud";
     if (m.routing_decision === "allow") {
       const provider = getProvider(m.provider_id ?? null);
       if (provider) return provider.kind === "cloud" ? "cloud" : "local";
@@ -375,6 +378,12 @@
               <PrivacyEventBar kind="kept" title="Kept on your machine">
                 This turn was routed to a local model — the content looked
                 sensitive, or a cloud endpoint wasn't reachable.
+              </PrivacyEventBar>
+            {:else if m.routing_decision === "redact_send"}
+              <PrivacyEventBar kind="kept" title="Sent the safe parts only">
+                Sensitive details were blacked out and kept on this Mac; only the
+                redacted remainder went to the cloud, and the reply was restored
+                locally. Open “Why” to see exactly what was held back.
               </PrivacyEventBar>
             {:else if m.error_source === "gate"}
               <PrivacyEventBar kind="stop" title="Held from leaving this machine">

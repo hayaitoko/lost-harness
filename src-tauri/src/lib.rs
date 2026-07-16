@@ -172,6 +172,7 @@ pub fn run() {
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,
             ipc::set_classifier_settings,
+            ipc::set_redaction_enabled,
             ipc::reset_classifier_settings,
             ipc::explain_classification,
             ipc::list_memory,

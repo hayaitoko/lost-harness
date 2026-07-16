@@ -176,6 +176,18 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
             updated_at  INTEGER NOT NULL
         );",
     },
+    Migration {
+        version: 5,
+        // Per-profile redaction toggle (PLAN §11 partial delegation). Added as a
+        // column on the existing classifier_settings row. Like the `pinned`
+        // column in global v2, ADD COLUMN has no IF-NOT-EXISTS, so this lives
+        // ONLY here (not in PROFILE_SCHEMA_SQL): a fresh DB runs v1..v4 (row
+        // without the column) then v5 adds it, matching an existing DB's upgrade.
+        // Default 1 (on) — redaction is the privacy-preserving default.
+        name: "classifier_redaction_toggle",
+        sql: "ALTER TABLE classifier_settings
+              ADD COLUMN redaction_enabled INTEGER NOT NULL DEFAULT 1;",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.

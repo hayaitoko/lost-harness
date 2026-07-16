@@ -36,6 +36,7 @@
     type MemoryInfo,
     getClassifierSettings,
     setClassifierSettings,
+    setRedactionEnabled,
     resetClassifierSettings,
   } from "$lib/api/tauri";
 
@@ -92,11 +93,11 @@
   // routing
   let defaultBinding = $state("auto");
   let uncertainty = $state(true);
-  let redaction = $state(false);
   // privacy — real per-profile classifier thresholds (PLAN §11), loaded live
   let guard = $state(true);
   let classifierStrictness = $state(50);
   let classifierBand = $state<"narrow" | "medium" | "wide">("medium");
+  let classifierRedaction = $state(true);
   let classifierLoading = $state(false);
   let classifierError = $state<string | null>(null);
   let classifierSaving = $state(false);
@@ -185,6 +186,7 @@
       .then((s) => {
         classifierStrictness = s.strictness;
         classifierBand = s.uncertainty_band;
+        classifierRedaction = s.redaction_enabled;
       })
       .catch((err) => {
         classifierError = String(err);
@@ -193,6 +195,20 @@
         classifierLoading = false;
       });
   });
+
+  async function toggleRedaction(enabled: boolean) {
+    classifierRedaction = enabled;
+    classifierSaving = true;
+    classifierError = null;
+    try {
+      const s = await setRedactionEnabled($activeProfileId, enabled);
+      classifierRedaction = s.redaction_enabled;
+    } catch (err) {
+      classifierError = String(err);
+    } finally {
+      classifierSaving = false;
+    }
+  }
 
   async function saveClassifierSettings() {
     classifierSaving = true;
@@ -220,6 +236,7 @@
       const s = await resetClassifierSettings($activeProfileId);
       classifierStrictness = s.strictness;
       classifierBand = s.uncertainty_band;
+      classifierRedaction = s.redaction_enabled;
     } catch (err) {
       classifierError = String(err);
     } finally {
@@ -495,14 +512,9 @@
                 <Toggle checked={uncertainty} onchange={(v) => (uncertainty = v)} />
               {/snippet}
             </SettingRow>
-            <SettingRow
-              title="Send only the safe parts to the cloud"
-              desc="Strip private details before asking a cloud model"
-            >
-              {#snippet control()}
-                <Toggle checked={redaction} onchange={(v) => (redaction = v)} />
-              {/snippet}
-            </SettingRow>
+            <!-- The real, per-profile "Send only the safe parts" toggle lives in
+                 the Privacy guard tab (wired to setRedactionEnabled). No duplicate
+                 mock here. -->
           {:else if section === "privacy"}
             <SettingRow
               title="Egress guard"
@@ -564,6 +576,15 @@
                     saveClassifierSettings();
                   }}
                 />
+              {/snippet}
+            </SettingRow>
+
+            <SettingRow
+              title="Send only the safe parts to the cloud"
+              desc="When a message is private only because of specific details (an email, an SSN, a card number), black those out and send the rest to a cloud model — the details stay on this Mac and the reply is restored locally."
+            >
+              {#snippet control()}
+                <Toggle checked={classifierRedaction} onchange={toggleRedaction} />
               {/snippet}
             </SettingRow>
 

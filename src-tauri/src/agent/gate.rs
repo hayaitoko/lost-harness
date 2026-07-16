@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use crate::classifier::{Classifier, ClassifierConfig};
+use crate::classifier::{Classification, Classifier, ClassifierConfig};
 
 /// Per-conversation routing binding (spec §12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,23 +83,36 @@ impl PrivacyGate {
         is_cloud_endpoint: bool,
         cfg: &ClassifierConfig,
     ) -> GateDecision {
+        self.check_detailed(binding, text, is_cloud_endpoint, cfg).0
+    }
+
+    /// Like [`check`], but also returns the `Classification` the `Auto` binding
+    /// computed (so a caller can see the detected spans — e.g. for redact-and-
+    /// send). `None` for `Public`/`Private` bindings, which bypass the
+    /// classifier. The classification is computed at most once.
+    pub fn check_detailed(
+        &self,
+        binding: &Binding,
+        text: &str,
+        is_cloud_endpoint: bool,
+        cfg: &ClassifierConfig,
+    ) -> (GateDecision, Option<Classification>) {
         match binding {
             // User explicitly chose cloud for this conversation — bypass the
             // classifier entirely.
-            Binding::Public => GateDecision::Allow,
+            Binding::Public => (GateDecision::Allow, None),
 
             // User explicitly chose private. Cloud endpoints are never OK
             // regardless of content. The block message names the binding so
             // the UI can surface a useful "switch binding to Public to send"
             // prompt.
             Binding::Private => {
-                if is_cloud_endpoint {
-                    GateDecision::Block(
-                        "Private binding blocks cloud egress".to_string(),
-                    )
+                let d = if is_cloud_endpoint {
+                    GateDecision::Block("Private binding blocks cloud egress".to_string())
                 } else {
                     GateDecision::Allow
-                }
+                };
+                (d, None)
             }
 
             // The classifier (or fallback) decides. The endpoint's cloud-ness only
@@ -107,7 +120,7 @@ impl PrivacyGate {
             // is always safe to send.
             Binding::Auto => {
                 let classification = self.classifier.classify_with(text, cfg);
-                match classification.label {
+                let d = match classification.label {
                     crate::classifier::Label::Public => GateDecision::Allow,
                     crate::classifier::Label::Private | crate::classifier::Label::Uncertain => {
                         if is_cloud_endpoint {
@@ -116,7 +129,8 @@ impl PrivacyGate {
                             GateDecision::Allow
                         }
                     }
-                }
+                };
+                (d, Some(classification))
             }
         }
     }

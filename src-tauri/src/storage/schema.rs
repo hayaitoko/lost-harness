@@ -17,7 +17,7 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 2;
 /// table (e.g. `tool_audit` in item 5, `tool_rules` in Q8,
 /// `classifier_settings` in the classifier settings round) bumps
 /// `PROFILE_SCHEMA_VERSION` without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 4;
+pub const PROFILE_SCHEMA_VERSION: i32 = 5;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)

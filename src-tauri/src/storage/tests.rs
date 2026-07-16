@@ -73,18 +73,54 @@ fn schema_version_is_current_after_init_global() {
 }
 
 #[test]
-fn schema_version_is_four_after_init_profile() {
-    // Profile schema version is now 4 (item 5 added `tool_audit` at v2, Q8
-    // added `tool_rules` at v3, the classifier-settings round added
-    // `classifier_settings` at v4); global stays at 2. The two are tracked
-    // independently.
+fn schema_version_is_five_after_init_profile() {
+    // Profile schema version is now 5 (v2 tool_audit, v3 tool_rules, v4
+    // classifier_settings, v5 the classifier_settings.redaction_enabled column);
+    // global stays at 2. The two are tracked independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 4);
+    assert_eq!(v, 5);
+}
+
+#[test]
+fn redaction_toggle_is_independent_of_thresholds() {
+    // The ON CONFLICT upserts must keep thresholds and the redaction flag from
+    // clobbering each other (they share one row).
+    use crate::classifier::ClassifierConfig;
+    let db = ProfileDb::open_in_memory("personal").unwrap();
+    assert!(db.redaction_enabled().unwrap(), "default is redaction ON");
+
+    // Setting thresholds must NOT flip redaction.
+    let strict = ClassifierConfig::from_ui(90, "wide");
+    db.set_classifier_config(&strict).unwrap();
+    assert!(db.redaction_enabled().unwrap(), "threshold change preserved redaction");
+
+    // Disabling redaction must NOT change thresholds.
+    db.set_redaction_enabled(false).unwrap();
+    assert!(!db.redaction_enabled().unwrap());
+    let cfg = db.classifier_config().unwrap();
+    assert!(
+        (cfg.tau_band - strict.tau_band).abs() < 1e-6,
+        "toggling redaction preserved thresholds"
+    );
+
+    // Another threshold change must NOT re-enable redaction.
+    db.set_classifier_config(&ClassifierConfig::from_ui(10, "narrow")).unwrap();
+    assert!(!db.redaction_enabled().unwrap(), "redaction stayed off across a threshold change");
+
+    // Setting redaction on a fresh profile (no row yet) uses default thresholds.
+    let fresh = ProfileDb::open_in_memory("work").unwrap();
+    fresh.set_redaction_enabled(false).unwrap();
+    assert!(!fresh.redaction_enabled().unwrap());
+    assert_eq!(fresh.classifier_config().unwrap(), ClassifierConfig::default());
+
+    // Reset clears both back to defaults (redaction on).
+    db.reset_classifier_config().unwrap();
+    assert!(db.redaction_enabled().unwrap());
 }
 
 #[test]

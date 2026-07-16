@@ -1047,28 +1047,70 @@ impl ProfileDb {
 
     /// Persist this profile's classifier thresholds (upsert the single row).
     /// The value is `sanitized` before storage so the table never holds an
-    /// out-of-range/leakier-than-valid threshold.
+    /// out-of-range/leakier-than-valid threshold. Column-scoped `ON CONFLICT`
+    /// updates ONLY the thresholds — the `redaction_enabled` flag on the same
+    /// row is preserved (a threshold change must not silently flip redaction).
     pub fn set_classifier_config(&self, cfg: &crate::classifier::ClassifierConfig) -> Result<()> {
         let cfg = cfg.sanitized();
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO classifier_settings (id, tau_block, tau_band, updated_at)
-                 VALUES (1, ?1, ?2, ?3)",
+                "INSERT INTO classifier_settings (id, tau_block, tau_band, updated_at)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                     tau_block = excluded.tau_block,
+                     tau_band = excluded.tau_band,
+                     updated_at = excluded.updated_at",
                 params![cfg.tau_block as f64, cfg.tau_band as f64, now],
             )
-            .context("insert classifier_settings row")?;
+            .context("upsert classifier_settings thresholds")?;
         Ok(())
     }
 
-    /// Clear this profile's classifier thresholds (revert to defaults). Returns
-    /// `true` if a row was actually removed.
+    /// Clear this profile's classifier settings (revert thresholds AND the
+    /// redaction toggle to defaults). Returns `true` if a row was removed.
     pub fn reset_classifier_config(&self) -> Result<bool> {
         let n = self
             .conn
             .execute("DELETE FROM classifier_settings WHERE id = 1", [])
             .context("delete classifier_settings row")?;
         Ok(n > 0)
+    }
+
+    /// Whether partial-delegation redaction is enabled for this profile (PLAN
+    /// §11). Defaults to `true` (redaction is the privacy-preserving default)
+    /// when no row exists.
+    pub fn redaction_enabled(&self) -> Result<bool> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT redaction_enabled FROM classifier_settings WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("read redaction_enabled")?;
+        Ok(v.map(|n| n != 0).unwrap_or(true))
+    }
+
+    /// Set this profile's redaction toggle. Column-scoped `ON CONFLICT` updates
+    /// ONLY the flag — the thresholds on the same row are preserved. On a fresh
+    /// insert (no row yet) the thresholds take their column defaults.
+    pub fn set_redaction_enabled(&self, enabled: bool) -> Result<()> {
+        use crate::classifier::ClassifierConfig;
+        let d = ClassifierConfig::default();
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO classifier_settings (id, tau_block, tau_band, redaction_enabled, updated_at)
+                 VALUES (1, ?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                     redaction_enabled = excluded.redaction_enabled,
+                     updated_at = excluded.updated_at",
+                params![d.tau_block as f64, d.tau_band as f64, enabled as i64, now],
+            )
+            .context("upsert classifier_settings redaction toggle")?;
+        Ok(())
     }
 }
 

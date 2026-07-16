@@ -13,10 +13,12 @@
 
 pub mod engine;
 pub mod heuristic;
+pub mod redact;
 pub mod rules;
 
 pub use engine::EnsembleClassifier;
 pub use heuristic::HeuristicClassifier;
+pub use redact::{redact, rehydrate, Redaction};
 pub use rules::{RuleCategory, RulesClassifier, Span};
 
 // `Classifier` (the trait) is declared `pub` in this module below and is

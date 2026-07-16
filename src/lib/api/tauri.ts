@@ -496,6 +496,8 @@ export interface ClassifierSettingsInfo {
   /** Raw fusion thresholds (display/debug only). */
   tau_block: number;
   tau_band: number;
+  /** Whether partial-delegation redaction is enabled (PLAN §11). */
+  redaction_enabled: boolean;
 }
 
 const DEFAULT_CLASSIFIER_SETTINGS: ClassifierSettingsInfo = {
@@ -503,6 +505,7 @@ const DEFAULT_CLASSIFIER_SETTINGS: ClassifierSettingsInfo = {
   uncertainty_band: "medium",
   tau_block: 0.5,
   tau_band: 0.05,
+  redaction_enabled: true,
 };
 
 /** The active classifier settings for a profile (defaults when unset). */
@@ -525,6 +528,19 @@ export async function setClassifierSettings(
     });
   }
   return { ...DEFAULT_CLASSIFIER_SETTINGS, strictness, uncertainty_band: uncertaintyBand };
+}
+
+/** Toggle a profile's partial-delegation redaction. Returns the stored settings. */
+export async function setRedactionEnabled(
+  profile: string,
+  enabled: boolean,
+): Promise<ClassifierSettingsInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ClassifierSettingsInfo>("set_redaction_enabled", {
+      args: { profile, enabled },
+    });
+  }
+  return { ...DEFAULT_CLASSIFIER_SETTINGS, redaction_enabled: enabled };
 }
 
 /** Revert a profile's classifier tuning to defaults. Returns the defaults. */
