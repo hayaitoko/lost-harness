@@ -1494,7 +1494,49 @@ disabled). The `[LOW/plausible]` audit-soundness item below is a pre-existing co
   thread. Pre-existing soundness question item 5 amplifies — resolve when the single-in-flight concurrency
   refactor lands.
 
+### ⚠ Review findings — 2026-07-16 (adversarial review of items 6–8) — ALL FIXED
+
+A 4-lens review (one deep reviewer per item + a cross-cutting invariants lens) over the three feat commits, each
+finding verified against source, surfaced **6 distinct real defects (7 confirmed reports, 2 were the same temp-file
+leak)** — all fixed in commit `ad87971` (312 → 315 tests). No locked invariant was broken; the item-6 restructure
+preserves the budget/cascade/audit pipeline.
+
+- **[Item 6 — HIGH — FIXED] deny-cascade reset across a reroute.** `cascade_active` was a `drive()` local reset to
+  `false` on every re-entry, so a user's earlier deny stopped protecting the calls AFTER a `NeedsLocalReroute` split —
+  a later non-Safe call covered by a standing grant could run silently. Fix: `turn_call_count` + `cascade_active`
+  are now carried in `TurnOutcome::NeedsLocalReroute` and threaded through both continuation methods, so `drive()`
+  resumes the SAME turn's state. Carried in the payload (not `run_state`) → stays turn-scoped, never leaks across
+  user messages. Test: `cascade_survives_a_reroute_continuation`.
+- **[Item 6 — MED — FIXED] rerouted call double-booked against the budget** (per-run ceiling + repeat ring, once on
+  the cloud pass + once on resume). Fix: `resume_after_local_switch` dispatches the rerouted call DIRECTLY (it was
+  already counted) then drives the rest through normal accounting.
+- **[Item 7 — MED — FIXED] exit-65 false-positive** — a command legitimately exiting 65 while printing
+  `sandbox-exec:` on its own stderr was misread as a profile-apply failure, discarding its stdout. Fix: also require
+  `stdout.is_empty()` (a real apply failure never lets the target run). Test:
+  `exit_65_with_stdout_is_not_misreported_as_sandbox_failure`.
+- **[Item 7 — MED/LOW — FIXED] `.sb` profile temp-file leak** — never deleted. Fix: `SandboxedSpawn::spawn` returns
+  cleanup paths; `run_guarded` unlinks them after the child is reaped (race-free post-exit).
+- **[Item 7 — HIGH→MED — DOCUMENTED, bounded] `setsid()`-detached descendant escapes the process-group kill** and
+  survives the timeout. It stays fully Seatbelt-confined (no network, workspace/tmp-only), so it's a bounded runaway,
+  NOT a containment break. Corrected the overclaiming "kills the whole tree" comment; documented the limitation
+  (durable fix = VM/container isolation, already deferred). Not building fragile sysctl pid-tree-walking now.
+- **[Item 8 — HIGH→MED — FIXED] `mcp__{server}__{tool}` namespace collision** (MCP-vs-MCP, NOT native shadowing —
+  MCP names always start `mcp__`, so a native tool is still safe): `sanitize_name_segment` kept literal `_`, so a
+  `__` inside a raw name was indistinguishable from the separator, letting two `(server, tool)` pairs produce the
+  same name. Fix: collapse `_` runs too, so no segment contains `__`. Test: `namespace_separator_is_collision_free`.
+
 **Log narrative** (append newest first — one line per meaningful step, so a fresh model sees the trail):
+- 2026-07-16 — Built items 6, 7, 8 (all remaining do-now items) + reviewed. Implemented sequentially (heavy file
+  overlap on dispatch.rs/tools/mod.rs precludes parallel). **Item 6** (`e03999b`): `NeedsLocalReroute`/`TurnOutcome`
+  via a `drive()` that preserves the item-2/5 budget pipeline; `resolve_turn_outcome` in the loop consults
+  `enforce_local_routing`, reason-free banner, ephemeral `stream:local_reroute` event; 287 tests. **Item 7**
+  (`bd20f38`): `tools/exec.rs` guarded executor behind `SandboxedSpawn`; `MacSeatbeltSpawn` verified working live on
+  this machine (real Seatbelt tests pass: workspace-confined / network-off / group-kill); `Tool::match_text`;
+  Dangerous Once-only; 299 tests. **Item 8** (`e63bca8`): `tools/mcp.rs` — `McpTool` folds into the registry with
+  zero dispatch/lib changes; namespacing + risk-raise-only + sanitization; `render_tool_catalog` neutralizes every
+  tool; 312 tests. Then a 4-lens adversarial review (11 agents) → 6 confirmed findings, all fixed (`ad87971`, 315
+  tests). **All 8 do-now items complete.** Next: Part 2 (M4/later) — native tool-use, permission modes,
+  UserPromptSubmit, durability trio, reroute auto-switch UX, plus memory + skills + ONNX classifier.
 - 2026-07-15 — Fixed all 3 review findings + the LOW routing cleanup. Ran a design+critique workflow (3 designs ×
   3 adversarial critiques) then implemented against the plans + critique corrections. **Item 3 (HIGH):**
   `canonicalize_best_effort` in `tools/fs.rs` + `ProtectedPathHook::with_workspace_root` + resolved-path signal

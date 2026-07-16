@@ -35,9 +35,9 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (hybrid keyword+meaning search, curated summary + archive) | **Designed in full, not built.** See PLAN.md §"Memory system." |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **278 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean.
+**Tests:** `cargo test --lib` → **315 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean.
 
-**2026-07-15 (later): the 3 adversarial-review findings + the LOW routing cleanup are all FIXED** (269 → 278 tests). Item 3 (HIGH) protected-path symlink bypass, Item 4 (MED) false round-cap interrupt, Item 5 (MED) audit gap for circuit-breaker denials, and the LOW routing-comment/test gap. See the build plan's "⚠ Review findings" section (now marked FIXED with residual watch-outs) and the newest Progress-Log narrative entry. **Next agent starts clean at Item 6** (`NeedsLocalReroute` + loop plumbing) — nothing from the review is left open.
+**2026-07-16: ALL 8 tool-system do-now items are COMPLETE + reviewed.** Items 6 (`NeedsLocalReroute` + loop reroute, `e03999b`), 7 (guarded executor + `shell_exec`, `bd20f38` — real macOS Seatbelt verified working on this machine), and 8 (MCP into the registry, `e63bca8`) all landed, then a 4-lens adversarial review found 6 real defects, all fixed (`ad87971`, 315 tests). The earlier round's 3 findings + LOW routing cleanup are also all fixed (269 → 278, commit `a73f43c`). See the build plan's two "⚠ Review findings" sections (both marked FIXED with residual watch-outs) and the Progress-Log narrative. **Next work is Part 2 (M4/later)** — no do-now item is left open. The one deliberately-not-fully-fixed item: a `setsid()`-detached shell_exec descendant escapes the timeout group-kill but stays Seatbelt-confined (bounded runaway, documented; durable fix = VM isolation).
 
 **Tool-system build plan:** `docs/tool-system-build-plan.md` is the executable build bible. Items 1–5 are done (6 of 8 do-now items complete — the routing-badge fix was a parallel quick win outside the numbered list). Items 6–8 remain. Read its "How to use this doc" header and the Progress Log at the bottom for the full trail.
 
@@ -81,7 +81,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 278 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 315 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -90,10 +90,7 @@ cd /Users/hayai/Desktop/lost-harness-product && npm run check               # sv
 
 ## What's next (in order)
 
-1. **Finish M3 — the remaining tool-system items.** Items 1–5 are done (see the build plan's Progress Log). Remaining, in order:
-   - **Item 6: `NeedsLocalReroute` typed outcome + loop consults `enforce_local_routing`** — replaces the dispatcher's hard `Denied` for must-stay-local tool calls on cloud with a typed `ToolOutcome::NeedsLocalReroute{reason}`; the agent loop resolves it by switching to a local+private provider and re-issuing the call. Most structurally invasive item — splits `run_turn`'s return from `Option<ChatMessage>` to a `TurnOutcome` enum. Spec at `docs/tool-system-build-plan.md` lines 748+. ~1–2 days.
-   - **Item 7: Guarded subprocess executor (`tools/exec.rs`) → `shell_exec` (Dangerous)** — the big one. macOS `sandbox-exec`/Seatbelt behind a swappable `SandboxedSpawn` trait. ~2–3 days.
-   - **Item 8: MCP into the registry** — namespacing (`mcp__{server}__{tool}`), tier→risk defaults, description neutralization. M3 item.
+1. **M3 tool-system do-now items 1–8 are ALL DONE** (see the build plan's Progress Log — every row is `done` with a commit). Item 6 (`NeedsLocalReroute` + loop reroute), 7 (`tools/exec.rs` guarded executor + `shell_exec`, real Seatbelt), and 8 (`tools/mcp.rs` MCP spine) landed 2026-07-16 and passed a 4-lens adversarial review (6 findings, all fixed). Nothing in the numbered do-now list remains. What's left is **Part 2 (M4 / later)** in the build plan:
    - **The remaining Claude Code parity gaps (PLAN §12):** native tool-use when the endpoint supports it (M4, the fenced dialect stays the fallback); `UserPromptSubmit` hook event; permission modes (plan / accept-edits) + deny-first precedence.
    - **The durability trio** (deferred per Q3): persisted action journal + idempotency keys — moves to the first non-idempotent external-effect tool (email/calendar/delegate — M7/server track).
    - **Reroute auto-switch UX** (M4): toast styling, model-manager-first-class-endpoint object — the plumbing from Item 6 ships now, the UX ships in M4.
