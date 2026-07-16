@@ -16,21 +16,28 @@
 
 This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The Electron app was a prototype to validate UX decisions; it's now a read-only reference. All new work goes in the Tauri project.
 
-**Current milestone:** in M3, **round 1 landed** (the tool spine is now load-bearing) and **read-before-write shipped** (2026-07-15, commit `5724f73`). The **frontend was also reskinned to the ported design system and wired to the backend** for chat/sidebar/providers, same day (commits `a22855e`, `55ad9d5`). M0 and M1 are done and verified. Everything below is committed to `main` — there is nothing uncommitted or in-progress to pick up.
+**Current milestone:** M3 tool-system rounds 1–5 all landed (2026-07-15). M0 and M1 are done and verified. Everything is committed to `main` — there is nothing uncommitted or in-progress to pick up.
 
 | Subsystem | Status |
 |---|---|
 | M0 — project bootstrap (Tauri + Svelte + Tailwind + CI) | Done |
 | M1 — the core loop end-to-end (message → privacy-filter classification → route → model → stream → save) | Done + verified at the real Tauri IPC boundary by a contract-test suite |
 | M3 spine — tool registry (filtered per body) + the unified "one-gate" hook chain | Built |
-| **M3 round 1 — the spine is now LOAD-BEARING** | **Done.** A live conversation can call a tool: fenced tool-call dialect + "parse only your own output" rule, untrusted-output guard-wrapping, a `ToolDispatcher` that runs every call through the hook chain before executing, three read-only workspace-confined filesystem tools (`read_file`/`list_dir`/`search_files`), and the agentic tool loop wired into `AgentLoop`. |
-| M3 — read-before-write guard (blind-clobber protection) | **Done** (2026-07-15). `write_file`/`edit_file` refuse an *existing* file the conversation hasn't `read_file`'d yet; a conversation-scoped read-set (`ConversationReads`) is owned by `ToolDispatcher`. Adversarially reviewed → 4 fixes (canonicalization mismatch, MAX_READ_BYTES/MAX_WRITE_BYTES parity, write self-recording, regression tests). |
-| Frontend — design-system port + backend wiring | **Done** (2026-07-15). The React design source (`lost-harness-ui`) was ported to Svelte 5 under `src/lib/design/` (Tailwind-translated, not imported). Sidebar, MainScreen (chat loop + routing badge), and Settings (Models/Appearance) are wired to the real backend; Email/Files/Whiteboard/Scheduled-jobs/Editor/Onboarding/EmptyState are still visual-only sample data. |
+| M3 round 1 — the spine is now LOAD-BEARING | **Done.** A live conversation can call a tool: fenced tool-call dialect + "parse only your own output" rule (now type-enforced via `OwnOutput` newtype), untrusted-output guard-wrapping, a `ToolDispatcher` that runs every call through the hook chain before executing, three read-only workspace-confined filesystem tools, and the agentic tool loop wired into `AgentLoop`. |
+| M3 — read-before-write guard (blind-clobber protection) | **Done** (2026-07-15, commit `5724f73`). Adversarially reviewed → 4 fixes. |
+| M3 — OwnOutput newtype (item 1) | **Done** (commit `14c7122`). `parse_tool_calls` now takes `&OwnOutput` — the "parse only the model's own current-turn output" rule is a compile-time fact, not a doc comment. |
+| M3 — Tool-call budgets + repeat detection + deny-cascade (item 2) | **Done** (commit `af2226d`). Per-turn ceiling (8), per-run ceiling (50), repeat detection (threshold 3), deny-cascade (user-deny only, Safe reads exempt). `begin_run()` resets per user message. |
+| M3 — Protected-paths always-Ask floor hook (item 3) | **Done** (commit `d13d71a`). `ProtectedPathHook` between SandboxHook and PermissionHook; forces Once-only Ask for `.git/`/`config/secrets`/`.env`/`.ssh/` regardless of policy. `covers_once` on ApprovalLedger. |
+| M3 — tool_audit table + PostToolUse observer (item 5) | **Done** (commit `f72a7f9`). Append-only `tool_audit` table in per-profile DB (migration v2). `AuditWriter` trait + `StorageAuditWriter` + `AuditObserverHook`. `dispatch()` fires one audit row per call on every return path. |
+| M3 — Crash-recovery boot pass + tool.interrupted event (item 4) | **Done** (commit `8fe04aa`). On app launch, terminalizes any conversation left mid-tool-call by writing a `role="tool"`, `error="interrupted_by_crash"`, `aborted=true` repair row. Idempotent. `contains_open_tool_fence` pure check. "No half-durability" doc in `approval.rs`. |
+| Frontend — design-system port + backend wiring | **Done** (2026-07-15). Sidebar, MainScreen (chat loop + routing badge), and Settings wired to real backend. Routing-badge fix: `send_message` returns real `routing_decision` from the persisted row (commit `7ecf2d8`). Email/Files/Whiteboard/Scheduled-jobs/Editor/Onboarding/EmptyState still visual-only. |
 | sqlite-vec (semantic memory search engine) | Wired + proven — registered on every DB open, a smoke test does a real nearest-neighbour query |
 | Memory system (hybrid keyword+meaning search, curated summary + archive) | **Designed in full, not built.** See PLAN.md §"Memory system." |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **226 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean.
+**Tests:** `cargo test --lib` → **269 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean.
+
+**Tool-system build plan:** `docs/tool-system-build-plan.md` is the executable build bible. Items 1–5 are done (6 of 8 do-now items complete — the routing-badge fix was a parallel quick win outside the numbered list). Items 6–8 remain. Read its "How to use this doc" header and the Progress Log at the bottom for the full trail.
 
 ---
 
@@ -72,7 +79,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 226 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 269 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -81,14 +88,14 @@ cd /Users/hayai/Desktop/lost-harness-product && npm run check               # sv
 
 ## What's next (in order)
 
-1. **Finish M3 — the rest of the tools.** Round 1 wired the spine + read-only tools; since then the **approval spine** (interactive confirm + pin/lock), the **write/edit/delete tools**, a policy-driving **`RiskClass`**, and **read-before-write** (2026-07-15, commit `5724f73` — see the session log below) all shipped (done ✓). Remaining, in order:
-   - **The remaining core tools** — headless browser, delegate-to-subagent, ask-human, system status, cron management, session search — each a small impl on the same `Tool` trait + gating (shell_exec, when it ships, gets the denylist floor + a ~2-min timeout + output caps per PLAN §12).
-   - **The durability trio**: crash-recovery on startup, idempotency keys (no double-run on double-click/restart), loud-vs-silent failure split.
-   - **Reroute (don't just block) for tool-triggered local-required calls** — today the dispatcher fails closed; better UX is to switch the loop to a local endpoint (`enforce_local_routing`) for the rest of the turn. Needs mid-loop re-selection of `client`/`provider`/`is_cloud`.
-   - **MCP tools folded into the same registry** (filtered by capability like a built-in).
-   - **The other Claude Code parity gaps (PLAN §12):** protected-paths always-Ask floor; permission modes (plan / accept-edits) + deny-first precedence; a `UserPromptSubmit` hook event (run the privacy filter on the user message, not just PreToolUse); and — **M4, bigger — native tool-use when the endpoint supports it** (the fenced dialect stays the fallback).
+1. **Finish M3 — the remaining tool-system items.** Items 1–5 are done (see the build plan's Progress Log). Remaining, in order:
+   - **Item 6: `NeedsLocalReroute` typed outcome + loop consults `enforce_local_routing`** — replaces the dispatcher's hard `Denied` for must-stay-local tool calls on cloud with a typed `ToolOutcome::NeedsLocalReroute{reason}`; the agent loop resolves it by switching to a local+private provider and re-issuing the call. Most structurally invasive item — splits `run_turn`'s return from `Option<ChatMessage>` to a `TurnOutcome` enum. Spec at `docs/tool-system-build-plan.md` lines 748+. ~1–2 days.
+   - **Item 7: Guarded subprocess executor (`tools/exec.rs`) → `shell_exec` (Dangerous)** — the big one. macOS `sandbox-exec`/Seatbelt behind a swappable `SandboxedSpawn` trait. ~2–3 days.
+   - **Item 8: MCP into the registry** — namespacing (`mcp__{server}__{tool}`), tier→risk defaults, description neutralization. M3 item.
+   - **The remaining Claude Code parity gaps (PLAN §12):** native tool-use when the endpoint supports it (M4, the fenced dialect stays the fallback); `UserPromptSubmit` hook event; permission modes (plan / accept-edits) + deny-first precedence.
+   - **The durability trio** (deferred per Q3): persisted action journal + idempotency keys — moves to the first non-idempotent external-effect tool (email/calendar/delegate — M7/server track).
+   - **Reroute auto-switch UX** (M4): toast styling, model-manager-first-class-endpoint object — the plumbing from Item 6 ships now, the UX ships in M4.
 2. **Finish wiring the ported frontend.** The design-system port (2026-07-15, commits `a22855e`/`55ad9d5`) is visually complete and wired for chat/sidebar/providers; near-term cleanup and gaps surfaced by that work:
-   - **NEXT — un-hardcode `routing_decision` in `ipc::send_message`** (`src-tauri/src/ipc/mod.rs`, currently returns the literal `"allow"`). The real gate decision is already persisted, just not returned — a small backend fix makes the per-message `RoutingBadge` (e.g. `route_local`) honest on a live send instead of only on reload.
    - **Delete the superseded old components** — `src/lib/components/{Sidebar,ChatPanel,ModelPicker,PrivacyIndicator,ProviderSettings}.svelte` are unused now that `App.svelte` renders from `src/lib/design/`. `ApprovalDialog.svelte` in the same folder is still used (backend-driven) — keep it.
    - **Remove the dev floating screen-switcher + theme toggle** in `src/App.svelte` — it's a QA aid, meant to go once real nav cross-links between screens are wired.
    - **Fix the `ModelPicker` flat model-name namespace** — two providers exposing an identically-named model collide today (only the last-registered is addressable).
@@ -248,7 +255,20 @@ Ratified the memory-toggle decision (committed `docs:` on `main`), then ran **M3
 
 **Next, per the Claude Code parity check (PLAN §12):** (1) **read-before-write** (high, next — refuse to write/edit a file not read this session); (2) **native tool-use when the endpoint supports it** (high, M4 — fenced dialect stays the fallback); (3) protected-paths always-prompt floor; (4) permission modes + `UserPromptSubmit` hook. Then the remaining core tools (browser/delegate/ask-human/system-status/cron/session-search), the durability trio, reroute-to-local, and MCP-into-registry. A **visual QA pass on the approval dialog** (live `npm run tauri dev`) is worthwhile once a model is configured to trigger a write.
 
-## Session log — 2026-07-15
+## Session log — 2026-07-15 (tool-system rounds)
+
+Orchestrator session: Zed (GLM-5.2) directed MiniMax M3 subagents for items 1–5 of the tool-system build plan, plus a routing-badge quick win. All verified against actual source before commit.
+
+- **Routing-badge fix** (`7ecf2d8`): `send_message` returns real `routing_decision` from the persisted assistant row instead of hardcoded `"allow"`. Backend-only, 226 tests.
+- **Item 1 — OwnOutput newtype** (`14c7122` + `2cac2c2`): `parse_tool_calls` and `run_turn` take `&OwnOutput`; the "parse only your own current-turn text" rule is now a compile error, not a doc comment. 226 tests.
+- **Item 2 — Budgets + repeat detection + deny-cascade** (`af2226d` + `c21b058`): Per-turn ceiling (8), per-run ceiling (50), repeat detection (threshold 3, exact reason strings), deny-cascade (only `by:"user"` triggers, Safe reads exempt). `begin_run()` resets per user message. Mutex guard never held across `.await`. 234 tests.
+- **Item 3 — Protected-paths floor hook** (`d13d71a` + `a47a591`): `ProtectedPathHook` between SandboxHook and PermissionHook in all three chain constructors. Forces Once-only Ask for `.git/`/`config/secrets`/`.env`/`.ssh/`. `covers_once` on ApprovalLedger ignores session/tool grants. Forced-Once piggyback in dispatch's Approve arm. 245 tests.
+- **Item 5 — tool_audit + PostToolUse observer** (`f72a7f9` + `23293c8`): Append-only `tool_audit` table (per-profile, migration v2, `PROFILE_SCHEMA_VERSION` split from `GLOBAL_SCHEMA_VERSION`). `AuditWriter` trait + `StorageAuditWriter` + `AuditObserverHook`. `dispatch()` fires one audit row per call on every return path. `grant_used`/`decision` left None for now. 258 tests.
+- **Item 4 — Crash-recovery boot pass** (`8fe04aa` + `3434059`): `run_boot_pass` at core init terminalizes conversations left mid-tool-call. `contains_open_tool_fence` pure check (never parses JSON). Idempotent by construction. "No half-durability" doc in `approval.rs`. 269 tests.
+
+**Next agent — start here:** Item 6 in the build plan — `NeedsLocalReroute` typed outcome + loop consults `enforce_local_routing`. Spec at `docs/tool-system-build-plan.md` lines 748+. Most structurally invasive remaining item — splits `run_turn`'s return from `Option<ChatMessage>` to a `TurnOutcome` enum. Then items 7 (shell_exec, the big one) and 8 (MCP into registry).
+
+
 
 Three commits landed on `main`: read-before-write (backend), then a full frontend design-system port, then backend wiring for that port.
 
