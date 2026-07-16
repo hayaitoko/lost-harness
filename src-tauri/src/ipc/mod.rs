@@ -583,6 +583,99 @@ pub fn delete_tool_rule(
     db.delete_tool_rule(&args.id).map_err(|e| e.to_string())
 }
 
+// ── classifier settings (PLAN §11 — per-profile strictness) ───────────────
+
+/// The classifier tuning for one profile, in the UI's own vocabulary
+/// (strictness 0–100, an uncertainty-band label) plus the raw thresholds those
+/// map to (for display/debugging).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifierSettingsInfo {
+    /// Detection strictness, 0 (permissive) – 100 (paranoid).
+    pub strictness: u8,
+    /// "narrow" | "medium" | "wide".
+    pub uncertainty_band: String,
+    /// Raw fusion thresholds (the source of truth in storage).
+    pub tau_block: f32,
+    pub tau_band: f32,
+}
+
+impl From<crate::classifier::ClassifierConfig> for ClassifierSettingsInfo {
+    fn from(cfg: crate::classifier::ClassifierConfig) -> Self {
+        let (strictness, band) = cfg.to_ui();
+        Self {
+            strictness,
+            uncertainty_band: band.to_string(),
+            tau_block: cfg.tau_block,
+            tau_band: cfg.tau_band,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetClassifierSettingsArgs {
+    pub profile: String,
+}
+
+/// The active classifier settings for a profile (defaults when unset).
+#[tauri::command]
+pub fn get_classifier_settings(
+    state: State<'_, AppState>,
+    args: GetClassifierSettingsArgs,
+) -> Result<ClassifierSettingsInfo, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    let cfg = db.classifier_config().map_err(|e| e.to_string())?;
+    Ok(cfg.into())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetClassifierSettingsArgs {
+    pub profile: String,
+    /// 0–100 (clamped). Higher = more content kept local.
+    pub strictness: u8,
+    /// "narrow" | "medium" | "wide" (unknown → "medium").
+    pub uncertainty_band: String,
+}
+
+/// Persist a profile's classifier tuning. Takes effect on the next message
+/// (the gate loads the config live per send). Returns the stored settings.
+#[tauri::command]
+pub fn set_classifier_settings(
+    state: State<'_, AppState>,
+    args: SetClassifierSettingsArgs,
+) -> Result<ClassifierSettingsInfo, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    let cfg =
+        crate::classifier::ClassifierConfig::from_ui(args.strictness, &args.uncertainty_band);
+    db.set_classifier_config(&cfg).map_err(|e| e.to_string())?;
+    Ok(cfg.into())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResetClassifierSettingsArgs {
+    pub profile: String,
+}
+
+/// Revert a profile's classifier tuning to defaults. Returns the (default)
+/// settings now in effect.
+#[tauri::command]
+pub fn reset_classifier_settings(
+    state: State<'_, AppState>,
+    args: ResetClassifierSettingsArgs,
+) -> Result<ClassifierSettingsInfo, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.reset_classifier_config().map_err(|e| e.to_string())?;
+    Ok(crate::classifier::ClassifierConfig::default().into())
+}
+
 // ── classification explainability (PLAN §11 — the "why" sidebar) ──────────
 
 /// One detected sensitive span, for the annotated-review sidebar. Char offsets
@@ -637,18 +730,44 @@ fn category_display(category: &str) -> (&'static str, bool) {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExplainClassificationArgs {
     pub text: String,
+    /// Optional active profile — when present, the explanation uses that
+    /// profile's classifier thresholds so the "why" sidebar matches the real
+    /// routing decision. Absent (or unknown) → default thresholds.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Classify `text` and return the label + annotated spans, so the UI can show
 /// *why* a message was held/redacted (PLAN §11: "censorship is surfaced, never
 /// silent" + the annotated review view). Uses the same shared classifier the
-/// §7 gate does, so the explanation matches the routing decision exactly.
+/// §7 gate does, under the same per-profile thresholds, so the explanation
+/// matches the routing decision exactly.
 #[tauri::command]
 pub fn explain_classification(
     state: State<'_, AppState>,
     args: ExplainClassificationArgs,
 ) -> Result<ClassificationExplanation, String> {
-    Ok(build_explanation(state.classifier.classify(&args.text)))
+    let cfg = profile_classifier_config(&state, args.profile.as_deref());
+    Ok(build_explanation(
+        state.classifier.classify_with(&args.text, &cfg),
+    ))
+}
+
+/// Load a profile's classifier thresholds from storage, defaulting on any
+/// error or when `profile` is `None`. Central helper for every command that
+/// classifies on the user's behalf.
+fn profile_classifier_config(
+    state: &AppState,
+    profile: Option<&str>,
+) -> crate::classifier::ClassifierConfig {
+    match profile {
+        Some(p) => state
+            .storage
+            .open_profile(p)
+            .and_then(|db| db.classifier_config())
+            .unwrap_or_default(),
+        None => crate::classifier::ClassifierConfig::default(),
+    }
 }
 
 /// Pure mapping from a `Classification` to the wire shape (testable without a
@@ -833,7 +952,10 @@ pub fn save_memory(
     if content.is_empty() {
         return Err("cannot save an empty memory".to_string());
     }
-    let classification = state.classifier.classify(content);
+    // Classify under the profile's own thresholds so a manual save routes to the
+    // same sensitivity bucket the profile's gate would pick for the same text.
+    let cfg = profile_classifier_config(&state, Some(&args.profile));
+    let classification = state.classifier.classify_with(content, &cfg);
     let route = route_memory_sensitivity(&classification);
     let bucket = match route {
         MemoryRoute::NeverPersist => {

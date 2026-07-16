@@ -15,6 +15,7 @@
 //!     than a convention someone can forget.
 
 use crate::agent::gate::{GateDecision, PrivacyGate};
+use crate::classifier::ClassifierConfig;
 use crate::hooks::{EventContext, GatingHook, HookEvent, HookResult, RoutingRequirement};
 
 pub struct PrivacyFilterHook {
@@ -37,7 +38,27 @@ impl GatingHook for PrivacyFilterHook {
             return HookResult::Continue;
         }
 
-        match self.gate.check(&ctx.binding, &ctx.content, ctx.is_cloud_endpoint) {
+        // Tool-action content is gated at the DEFAULT classifier thresholds.
+        // The per-profile strictness knob (PLAN §11) is threaded into the
+        // message-egress gate (`AgentLoop::process_message`) but NOT here yet —
+        // carrying the profile's `ClassifierConfig` through `EventContext` from
+        // the dispatcher is a tracked follow-up (see HANDOFF).
+        //
+        // Honest scope note: for a profile configured STRICTER than default,
+        // tool-action content in the borderline band is gated *less* strictly
+        // here than the same profile's chat messages — a real inconsistency, not
+        // "always safe." Two things bound it: (1) it is no leakier than the
+        // pre-Round-1 baseline (the whole app used these same fixed constants
+        // everywhere before), and (2) the rules-layer floor (SSN/keys/email/…)
+        // is un-tunable and still fires regardless of thresholds, so structured
+        // PII in tool args is always caught. Free-text semantic PII in the
+        // narrow (profile_tau_band, 0.05) window is the residual gap the
+        // follow-up closes.
+        let cfg = ClassifierConfig::default();
+        match self
+            .gate
+            .check(&ctx.binding, &ctx.content, ctx.is_cloud_endpoint, &cfg)
+        {
             GateDecision::Allow => HookResult::Continue,
             GateDecision::Block(reason) => HookResult::Deny(reason),
             GateDecision::RouteLocal => {

@@ -34,7 +34,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 342 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 353 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -82,7 +82,23 @@ Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-featu
    collision (options now carry a composite `providerId::name` key — two same-named
    models list & select independently, verified live with LM Studio + Anthropic
    `default`). CSS bundle dropped 63.6 → 56.4 kB.
-3. **[~] Classifier integration round** — **export + ONNX wiring DONE 2026-07-16**
+3. **[~] Classifier integration round** — **per-profile settings page DONE
+   2026-07-16** (the classifier-settings round): `ClassifierConfig` (tau_block /
+   tau_band) is now per-profile runtime-tunable via a back-compat `classify_with`
+   trait method, a per-profile `classifier_settings` table (migration v4),
+   `get/set/reset_classifier_settings` IPC, and a live Settings "Privacy guard"
+   section (strictness slider + uncertainty band + reset). **Strictness drives
+   `tau_band`** (the actual egress line — Private/Uncertain route identically, so
+   `tau_block` alone never gates egress; the review caught this), band drives
+   `tau_block` (the Private/Uncertain *labeling* split, shown in the "why"
+   sidebar). `sanitized()` clamps to the reachable UI range so a corrupt row can't
+   make the filter looser than strictness 0. `remember`/`save_memory` route under
+   the profile config too. Adversarially reviewed (3 lenses) → 5 findings fixed
+   (leaky `sanitized`, inert strictness knob, `remember` bypass, inverted copy,
+   overclaiming hook comment). 353 tests. Tool-action gate still uses default
+   thresholds (documented follow-up). **Below: the earlier ONNX-wiring work.**
+
+   **[~] Classifier integration round (ONNX)** — **export + ONNX wiring DONE 2026-07-16**
    (`283789b`). Export: ran the bundle's `export_onnx.py` (Python 3.11 arm64 venv) →
    both encoders to fp32 + INT8, preserved at `~/Desktop/Classifier Model + Install
    Guide for Claude/onnx-export/`. Wiring: `classifier/engine.rs` now runs the real

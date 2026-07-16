@@ -26,6 +26,7 @@
     fetchModels,
   } from "$lib/stores/providers.svelte";
   import { sendOnEnter } from "$lib/stores/settings";
+  import { activeProfileId } from "$lib/stores/profiles";
   import {
     explainClassification,
     type ClassificationExplanation,
@@ -101,7 +102,7 @@
       return;
     }
     explaining = true;
-    explainClassification(text)
+    explainClassification(text, $activeProfileId)
       .then((e) => {
         explanation = e;
       })

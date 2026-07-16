@@ -14,9 +14,10 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 2;
 /// Returns the current schema version for each PROFILE database.
 /// Bump when adding a new per-profile migration. Profile and global
 /// track versions independently: an item that only adds a per-profile
-/// table (e.g. `tool_audit` in item 5, `tool_rules` in Q8) bumps
+/// table (e.g. `tool_audit` in item 5, `tool_rules` in Q8,
+/// `classifier_settings` in the classifier settings round) bumps
 /// `PROFILE_SCHEMA_VERSION` without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 3;
+pub const PROFILE_SCHEMA_VERSION: i32 = 4;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -140,6 +141,8 @@ pub const PROFILE_TABLES: &[&str] = &[
     "tool_audit",
     // 13. tool_rules — persisted Always grants (Q8); live-read on gating path
     "tool_rules",
+    // 14. classifier_settings — per-profile classifier thresholds (PLAN §11)
+    "classifier_settings",
 ];
 
 /// CREATE TABLE statements for per-profile DBs (in dependency order).
@@ -288,6 +291,16 @@ CREATE TABLE IF NOT EXISTS tool_rules (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_rules_tool ON tool_rules(tool_name);
+
+-- Per-profile classifier thresholds (PLAN §11 settings page). Single row
+-- (id=1); a missing row means "use defaults". Raw fusion thresholds are
+-- stored (the UI strictness/band mapping lives in Rust, ClassifierConfig).
+CREATE TABLE IF NOT EXISTS classifier_settings (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    tau_block   REAL NOT NULL,
+    tau_band    REAL NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);

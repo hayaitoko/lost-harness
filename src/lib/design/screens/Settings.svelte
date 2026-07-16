@@ -34,6 +34,9 @@
     deleteMemory,
     setMemoryPinned,
     type MemoryInfo,
+    getClassifierSettings,
+    setClassifierSettings,
+    resetClassifierSettings,
   } from "$lib/api/tauri";
 
   type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "appearance";
@@ -90,8 +93,13 @@
   let defaultBinding = $state("auto");
   let uncertainty = $state(true);
   let redaction = $state(false);
-  // privacy
+  // privacy — real per-profile classifier thresholds (PLAN §11), loaded live
   let guard = $state(true);
+  let classifierStrictness = $state(50);
+  let classifierBand = $state<"narrow" | "medium" | "wide">("medium");
+  let classifierLoading = $state(false);
+  let classifierError = $state<string | null>(null);
+  let classifierSaving = $state(false);
   // models
   let providerForm = $state<ProviderFormState | null>(null);
   let showProviderKey = $state(false);
@@ -164,6 +172,60 @@
         rulesLoading = false;
       });
   });
+
+  // Load the active profile's classifier thresholds when the Privacy guard
+  // pane opens (and re-load on profile change). The backend reads live per
+  // send, so a change here takes effect on the next message.
+  $effect(() => {
+    if (section !== "privacy") return;
+    const profile = $activeProfileId;
+    classifierLoading = true;
+    classifierError = null;
+    getClassifierSettings(profile)
+      .then((s) => {
+        classifierStrictness = s.strictness;
+        classifierBand = s.uncertainty_band;
+      })
+      .catch((err) => {
+        classifierError = String(err);
+      })
+      .finally(() => {
+        classifierLoading = false;
+      });
+  });
+
+  async function saveClassifierSettings() {
+    classifierSaving = true;
+    classifierError = null;
+    try {
+      const s = await setClassifierSettings(
+        $activeProfileId,
+        classifierStrictness,
+        classifierBand,
+      );
+      // Reflect any server-side normalization back into the controls.
+      classifierStrictness = s.strictness;
+      classifierBand = s.uncertainty_band;
+    } catch (err) {
+      classifierError = String(err);
+    } finally {
+      classifierSaving = false;
+    }
+  }
+
+  async function resetClassifier() {
+    classifierSaving = true;
+    classifierError = null;
+    try {
+      const s = await resetClassifierSettings($activeProfileId);
+      classifierStrictness = s.strictness;
+      classifierBand = s.uncertainty_band;
+    } catch (err) {
+      classifierError = String(err);
+    } finally {
+      classifierSaving = false;
+    }
+  }
 
   async function revokeRule(id: string) {
     // Two-click confirm, mirroring the provider-remove pattern above.
@@ -451,6 +513,66 @@
                 <Toggle checked={guard} onchange={(v) => (guard = v)} />
               {/snippet}
             </SettingRow>
+
+            {#if classifierError}
+              <div class="mt-1 text-[11.5px] text-blocked">{classifierError}</div>
+            {/if}
+
+            <SettingRow
+              title="Detection strictness"
+              desc="Higher is more paranoid — more borderline content stays on this Mac."
+            >
+              {#snippet control()}
+                <div class="flex flex-shrink-0 items-center gap-2.5">
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value={classifierStrictness}
+                    disabled={classifierLoading || classifierSaving}
+                    aria-label="Detection strictness"
+                    oninput={(e) =>
+                      (classifierStrictness = parseInt(e.currentTarget.value, 10))}
+                    onchange={saveClassifierSettings}
+                    class="w-[160px]"
+                    style="accent-color:var(--accent)"
+                  />
+                  <span
+                    class="w-[30px] shrink-0 rounded-[var(--r-sm)] bg-surface-2 px-[7px] py-0.5 text-center text-[10px] font-semibold text-text-2"
+                  >
+                    {classifierStrictness}
+                  </span>
+                </div>
+              {/snippet}
+            </SettingRow>
+
+            <SettingRow
+              title="Uncertainty band"
+              desc="How much borderline content is marked “uncertain” rather than “private” in the review panel. Both stay on this Mac."
+            >
+              {#snippet control()}
+                <SegmentedControl
+                  options={[
+                    { value: "narrow", label: "Narrow" },
+                    { value: "medium", label: "Medium" },
+                    { value: "wide", label: "Wide" },
+                  ]}
+                  value={classifierBand}
+                  onchange={(v) => {
+                    classifierBand = v as "narrow" | "medium" | "wide";
+                    saveClassifierSettings();
+                  }}
+                />
+              {/snippet}
+            </SettingRow>
+
+            <div class="mt-1">
+              <Button variant="ghost" onclick={resetClassifier} disabled={classifierSaving}>
+                Reset to defaults
+              </Button>
+            </div>
+
             <div class="{label} pb-1 pt-[18px]">
               Hard-block categories — never leave, any binding, no override
             </div>

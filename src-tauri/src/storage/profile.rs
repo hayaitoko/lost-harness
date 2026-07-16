@@ -1014,6 +1014,62 @@ impl ProfileDb {
             created_at: row.get(4)?,
         })
     }
+
+    // ── classifier_settings (PLAN §11 — per-profile thresholds) ───────────────
+    //
+    // A single row (id=1). Absence = defaults. Reads always `sanitize` so a
+    // corrupt/hand-edited row can only ever make the filter STRICTER, never
+    // leakier (see `ClassifierConfig::sanitized`).
+
+    /// The active classifier thresholds for this profile. Returns
+    /// [`ClassifierConfig::default`] when no row exists (never errors on
+    /// "unset"); a real DB error propagates.
+    pub fn classifier_config(&self) -> Result<crate::classifier::ClassifierConfig> {
+        use crate::classifier::ClassifierConfig;
+        let row: Option<(f64, f64)> = self
+            .conn
+            .query_row(
+                "SELECT tau_block, tau_band FROM classifier_settings WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .context("read classifier_settings row")?;
+        Ok(match row {
+            Some((tau_block, tau_band)) => ClassifierConfig {
+                tau_block: tau_block as f32,
+                tau_band: tau_band as f32,
+            }
+            .sanitized(),
+            None => ClassifierConfig::default(),
+        })
+    }
+
+    /// Persist this profile's classifier thresholds (upsert the single row).
+    /// The value is `sanitized` before storage so the table never holds an
+    /// out-of-range/leakier-than-valid threshold.
+    pub fn set_classifier_config(&self, cfg: &crate::classifier::ClassifierConfig) -> Result<()> {
+        let cfg = cfg.sanitized();
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO classifier_settings (id, tau_block, tau_band, updated_at)
+                 VALUES (1, ?1, ?2, ?3)",
+                params![cfg.tau_block as f64, cfg.tau_band as f64, now],
+            )
+            .context("insert classifier_settings row")?;
+        Ok(())
+    }
+
+    /// Clear this profile's classifier thresholds (revert to defaults). Returns
+    /// `true` if a row was actually removed.
+    pub fn reset_classifier_config(&self) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM classifier_settings WHERE id = 1", [])
+            .context("delete classifier_settings row")?;
+        Ok(n > 0)
+    }
 }
 
 fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {

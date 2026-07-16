@@ -14,9 +14,12 @@
 //!            128-token windows (stride 96, CLS/SEP-wrapped), and the MAX
 //!            probability of class 1 over all windows is the model's score — so
 //!            sensitive content past token 128 can't slip through.
-//!   layer 2  fusion: private if rules fired OR max(model probs) ≥ TAU_BAND.
-//!            TAU_BLOCK (0.5) only grades severity (Private vs the borderline
-//!            uncertainty band); both keep the text local at the gate.
+//!   layer 2  fusion: private if rules fired OR max(model probs) ≥ tau_band.
+//!            tau_block only grades severity (Private vs the borderline
+//!            uncertainty band); both keep the text local at the gate. The two
+//!            thresholds come from the per-profile [`ClassifierConfig`] passed
+//!            to [`Classifier::classify_with`] (default 0.5 / 0.05); the plain
+//!            [`Classifier::classify`] uses the defaults.
 //!
 //! Interchangeable with [`crate::classifier::RulesClassifier`] behind the
 //! `Classifier` trait: [`EnsembleClassifier::load`] returns an error when the
@@ -30,16 +33,11 @@
 
 use std::path::Path;
 
-use super::{Classification, Classifier, Label};
+use super::{Classification, Classifier, ClassifierConfig, Label};
 
 /// The two model subdirectories expected under a classifier model dir, in
 /// ensemble order. Each holds `model.int8.onnx` + `tokenizer.json`.
 pub const MODEL_SUBDIRS: [&str; 2] = ["tf_bge_scaled", "tf_distilbert_scaled"];
-
-/// Fusion thresholds, mirroring the reference server's env defaults
-/// (`PF_TAU_BLOCK` / `PF_TAU_BAND` in `serve.py`).
-const TAU_BLOCK: f32 = 0.5;
-const TAU_BAND: f32 = 0.05;
 
 #[cfg(feature = "onnx-classifier")]
 pub use onnx::EnsembleClassifier;
@@ -273,9 +271,18 @@ mod onnx {
 
     impl Classifier for EnsembleClassifier {
         fn classify(&self, text: &str) -> Classification {
+            self.classify_with(text, &ClassifierConfig::default())
+        }
+
+        fn classify_with(&self, text: &str, cfg: &ClassifierConfig) -> Classification {
+            // Defence in depth: never let a corrupt/hand-edited threshold widen
+            // the filter. `sanitized` fails toward stricter (lower thresholds).
+            let cfg = cfg.sanitized();
+
             // Layer 0: deterministic rules first. Any span → Private @ 1.0,
             // short-circuit (no transformer inference), and carry the spans for
-            // the annotated-redaction UI.
+            // the annotated-redaction UI. Rules are the un-tunable floor — the
+            // per-profile thresholds never apply here.
             let ruled = self.rules.classify(text);
             if !ruled.spans.is_empty() {
                 return Classification {
@@ -309,11 +316,12 @@ mod onnx {
             }
             let max_prob = probs.iter().cloned().fold(0.0f32, f32::max);
 
-            // Layer 2: fusion. ≥ TAU_BLOCK → Private; in [TAU_BAND, TAU_BLOCK)
-            // → Uncertain (borderline, still local); below → Public.
-            let (label, confidence) = if max_prob >= TAU_BLOCK {
+            // Layer 2: fusion. ≥ tau_block → Private; in [tau_band, tau_block)
+            // → Uncertain (borderline, still local); below → Public. Thresholds
+            // are the profile's (sanitized above).
+            let (label, confidence) = if max_prob >= cfg.tau_block {
                 (Label::Private, max_prob)
-            } else if max_prob >= TAU_BAND {
+            } else if max_prob >= cfg.tau_band {
                 (Label::Uncertain, max_prob)
             } else {
                 (Label::Public, 1.0 - max_prob)

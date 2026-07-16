@@ -129,7 +129,7 @@ impl<R: Runtime> TestLoop<R> {
         conversation_id: String,
     ) -> Result<String, String> {
         let is_cloud = !crate::agent::egress::is_private_endpoint(&provider.base_url);
-        let decision = self.gate.check(&binding, content, is_cloud);
+        let decision = self.gate.check(&binding, content, is_cloud, &crate::classifier::ClassifierConfig::default());
         let message_hash = sha256_hex(content.as_bytes());
         self.log_trm(&conversation_id, &decision, &message_hash)
             .map_err(|e| e.to_string())?;

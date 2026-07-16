@@ -468,14 +468,71 @@ export interface ClassificationExplanation {
 
 /**
  * Classify `text` and return the label + annotated spans, so the UI can show
- * *why* a message was held/redacted (PLAN §11). In browser dev mode (no Tauri
- * shell) returns an empty, public explanation.
+ * *why* a message was held/redacted (PLAN §11). Pass the active `profile` so the
+ * explanation uses that profile's classifier thresholds (matches the real
+ * routing decision). In browser dev mode (no Tauri shell) returns an empty,
+ * public explanation.
  */
-export async function explainClassification(text: string): Promise<ClassificationExplanation> {
+export async function explainClassification(
+  text: string,
+  profile?: string,
+): Promise<ClassificationExplanation> {
   if (isTauri()) {
-    return tauriInvoke<ClassificationExplanation>("explain_classification", { args: { text } });
+    return tauriInvoke<ClassificationExplanation>("explain_classification", {
+      args: { text, profile: profile ?? null },
+    });
   }
   return { label: "public", confidence: 0, spans: [] };
+}
+
+// ── classifier settings (PLAN §11 — per-profile strictness) ─────────────────
+
+/** A profile's classifier tuning. Mirrors `ClassifierSettingsInfo` in `ipc/mod.rs`. */
+export interface ClassifierSettingsInfo {
+  /** Detection strictness, 0 (permissive) – 100 (paranoid). */
+  strictness: number;
+  /** How wide the "unsure — keep local" band is. */
+  uncertainty_band: "narrow" | "medium" | "wide";
+  /** Raw fusion thresholds (display/debug only). */
+  tau_block: number;
+  tau_band: number;
+}
+
+const DEFAULT_CLASSIFIER_SETTINGS: ClassifierSettingsInfo = {
+  strictness: 50,
+  uncertainty_band: "medium",
+  tau_block: 0.5,
+  tau_band: 0.05,
+};
+
+/** The active classifier settings for a profile (defaults when unset). */
+export async function getClassifierSettings(profile: string): Promise<ClassifierSettingsInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ClassifierSettingsInfo>("get_classifier_settings", { args: { profile } });
+  }
+  return { ...DEFAULT_CLASSIFIER_SETTINGS };
+}
+
+/** Persist a profile's classifier tuning. Returns the stored settings. */
+export async function setClassifierSettings(
+  profile: string,
+  strictness: number,
+  uncertaintyBand: "narrow" | "medium" | "wide",
+): Promise<ClassifierSettingsInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ClassifierSettingsInfo>("set_classifier_settings", {
+      args: { profile, strictness, uncertainty_band: uncertaintyBand },
+    });
+  }
+  return { ...DEFAULT_CLASSIFIER_SETTINGS, strictness, uncertainty_band: uncertaintyBand };
+}
+
+/** Revert a profile's classifier tuning to defaults. Returns the defaults. */
+export async function resetClassifierSettings(profile: string): Promise<ClassifierSettingsInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ClassifierSettingsInfo>("reset_classifier_settings", { args: { profile } });
+  }
+  return { ...DEFAULT_CLASSIFIER_SETTINGS };
 }
 
 // ── memory (PLAN §9) ────────────────────────────────────────────────────────

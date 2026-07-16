@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use crate::classifier::Classifier;
+use crate::classifier::{Classifier, ClassifierConfig};
 
 /// Per-conversation routing binding (spec §12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,14 +71,17 @@ impl PrivacyGate {
     /// Decide whether `text` may be sent to a cloud endpoint under `binding`.
     ///
     /// `is_cloud_endpoint` is the upstream-supplied signal for "this base URL
-    /// points off-device". `check` doesn't resolve the URL itself — it just
-    /// applies the binding/label policy. The actual egress control (allowing
-    /// or refusing the HTTP call) lives in `agent::egress::is_private_endpoint`.
+    /// points off-device". `cfg` carries the active profile's classifier
+    /// thresholds (only consulted on the `Auto` binding, where the classifier
+    /// runs). `check` doesn't resolve the URL itself — it just applies the
+    /// binding/label policy. The actual egress control (allowing or refusing the
+    /// HTTP call) lives in `agent::egress::is_private_endpoint`.
     pub fn check(
         &self,
         binding: &Binding,
         text: &str,
         is_cloud_endpoint: bool,
+        cfg: &ClassifierConfig,
     ) -> GateDecision {
         match binding {
             // User explicitly chose cloud for this conversation — bypass the
@@ -103,7 +106,7 @@ impl PrivacyGate {
             // matters when the label is Private or Uncertain — Public text
             // is always safe to send.
             Binding::Auto => {
-                let classification = self.classifier.classify(text);
+                let classification = self.classifier.classify_with(text, cfg);
                 match classification.label {
                     crate::classifier::Label::Public => GateDecision::Allow,
                     crate::classifier::Label::Private | crate::classifier::Label::Uncertain => {

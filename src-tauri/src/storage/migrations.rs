@@ -161,6 +161,21 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
         );
         CREATE INDEX IF NOT EXISTS idx_tool_rules_tool ON tool_rules(tool_name);",
     },
+    Migration {
+        version: 4,
+        // Per-profile classifier thresholds (PLAN §11 settings page). Single
+        // row (id=1); absence means "use defaults". Same dual-definition
+        // convention as v2/v3: the CREATE is IF NOT EXISTS and also lives in
+        // PROFILE_SCHEMA_SQL, so v4 is a no-op on a fresh install (v1 already
+        // created it) and a real upgrade on an existing v3 DB.
+        name: "classifier_settings_table",
+        sql: "CREATE TABLE IF NOT EXISTS classifier_settings (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            tau_block   REAL NOT NULL,
+            tau_band    REAL NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.

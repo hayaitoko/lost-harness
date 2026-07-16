@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
-use crate::classifier::{Classifier, HeuristicClassifier, Label};
+use crate::classifier::{Classifier, ClassifierConfig, HeuristicClassifier, Label};
 
 fn gate() -> PrivacyGate {
     PrivacyGate::new(Arc::new(HeuristicClassifier::new()))
@@ -22,7 +22,7 @@ fn gate() -> PrivacyGate {
 #[test]
 fn private_binding_blocks_cloud() {
     let g = gate();
-    let d = g.check(&Binding::Private, "any text at all", true);
+    let d = g.check(&Binding::Private, "any text at all", true, &ClassifierConfig::default());
     match d {
         GateDecision::Block(msg) => assert!(msg.contains("Private binding")),
         other => panic!("expected Block, got {:?}", other),
@@ -32,21 +32,21 @@ fn private_binding_blocks_cloud() {
 #[test]
 fn private_binding_allows_local() {
     let g = gate();
-    let d = g.check(&Binding::Private, "any text at all", false);
+    let d = g.check(&Binding::Private, "any text at all", false, &ClassifierConfig::default());
     assert_eq!(d, GateDecision::Allow);
 }
 
 #[test]
 fn public_binding_allows_cloud() {
     let g = gate();
-    let d = g.check(&Binding::Public, "any text at all", true);
+    let d = g.check(&Binding::Public, "any text at all", true, &ClassifierConfig::default());
     assert_eq!(d, GateDecision::Allow);
 }
 
 #[test]
 fn public_binding_allows_local() {
     let g = gate();
-    let d = g.check(&Binding::Public, "any text at all", false);
+    let d = g.check(&Binding::Public, "any text at all", false, &ClassifierConfig::default());
     assert_eq!(d, GateDecision::Allow);
 }
 
@@ -54,29 +54,29 @@ fn public_binding_allows_local() {
 fn public_binding_overrides_pii() {
     let g = gate();
     // Even with an SSN, a Public binding bypasses the classifier.
-    let d = g.check(&Binding::Public, "my SSN is 123-45-6789", true);
+    let d = g.check(&Binding::Public, "my SSN is 123-45-6789", true, &ClassifierConfig::default());
     assert_eq!(d, GateDecision::Allow);
 }
 
 #[test]
 fn auto_private_text_routes_local_on_cloud() {
     let g = gate();
-    let d = g.check(&Binding::Auto, "my SSN is 123-45-6789", true);
+    let d = g.check(&Binding::Auto, "my SSN is 123-45-6789", true, &ClassifierConfig::default());
     assert_eq!(d, GateDecision::RouteLocal);
 }
 
 #[test]
 fn auto_private_text_allowed_on_local() {
     let g = gate();
-    let d = g.check(&Binding::Auto, "my SSN is 123-45-6789", false);
+    let d = g.check(&Binding::Auto, "my SSN is 123-45-6789", false, &ClassifierConfig::default());
     assert_eq!(d, GateDecision::Allow);
 }
 
 #[test]
 fn auto_clean_text_allowed_everywhere() {
     let g = gate();
-    let d_cloud = g.check(&Binding::Auto, "what's the capital of france?", true);
-    let d_local = g.check(&Binding::Auto, "what's the capital of france?", false);
+    let d_cloud = g.check(&Binding::Auto, "what's the capital of france?", true, &ClassifierConfig::default());
+    let d_local = g.check(&Binding::Auto, "what's the capital of france?", false, &ClassifierConfig::default());
     assert_eq!(d_cloud, GateDecision::Allow);
     assert_eq!(d_local, GateDecision::Allow);
 }
@@ -90,7 +90,7 @@ fn auto_uncertain_text_routes_local_on_cloud() {
     let c = HeuristicClassifier.classify(text);
     assert_eq!(c.label, Label::Uncertain);
 
-    let d = g.check(&Binding::Auto, text, true);
+    let d = g.check(&Binding::Auto, text, true, &ClassifierConfig::default());
     assert_eq!(d, GateDecision::RouteLocal);
 }
 
@@ -98,7 +98,7 @@ fn auto_uncertain_text_routes_local_on_cloud() {
 fn auto_uncertain_text_allowed_on_local() {
     let g = gate();
     let text = "I was diagnosed with the flu last week";
-    let d = g.check(&Binding::Auto, text, false);
+    let d = g.check(&Binding::Auto, text, false, &ClassifierConfig::default());
     assert_eq!(d, GateDecision::Allow);
 }
 
@@ -114,6 +114,60 @@ fn log_decision_emits_tracing_event() {
         "conv-1",
     );
     g.log_decision(&GateDecision::RouteLocal, "deadbeef", "conv-1");
+}
+
+// --- per-profile thresholds actually change the egress decision ------------
+
+/// A classifier that grades a fixed model score against whatever config it's
+/// handed — lets us prove the profile's thresholds reach the gate and flip the
+/// routing decision (the whole point of the strictness knob).
+#[derive(Debug)]
+struct ScoreClassifier(f32);
+impl Classifier for ScoreClassifier {
+    fn classify(&self, text: &str) -> crate::classifier::Classification {
+        self.classify_with(text, &ClassifierConfig::default())
+    }
+    fn classify_with(
+        &self,
+        _text: &str,
+        cfg: &ClassifierConfig,
+    ) -> crate::classifier::Classification {
+        let label = if self.0 >= cfg.tau_block {
+            Label::Private
+        } else if self.0 >= cfg.tau_band {
+            Label::Uncertain
+        } else {
+            Label::Public
+        };
+        crate::classifier::Classification {
+            label,
+            confidence: self.0,
+            raw_output: vec![self.0],
+            spans: Vec::new(),
+        }
+    }
+}
+
+#[test]
+fn strictness_config_flips_the_gate_egress_decision() {
+    // A borderline model score of 0.03 on a cloud endpoint under Auto binding.
+    // Under the DEFAULT config (tau_band 0.05) it's Public → Allow (goes cloud).
+    // Under a STRICT profile config (strictness 100 → tau_band ≈ 0.005) it's
+    // Uncertain → RouteLocal (kept on device). This is the behavior the whole
+    // Round-1 strictness control exists to deliver — proof the knob works.
+    let g = PrivacyGate::new(Arc::new(ScoreClassifier(0.03)));
+    let default_cfg = ClassifierConfig::default();
+    let strict_cfg = ClassifierConfig::from_ui(100, "medium");
+    assert_eq!(
+        g.check(&Binding::Auto, "borderline", true, &default_cfg),
+        GateDecision::Allow,
+        "default thresholds send borderline content to cloud"
+    );
+    assert_eq!(
+        g.check(&Binding::Auto, "borderline", true, &strict_cfg),
+        GateDecision::RouteLocal,
+        "a strict profile keeps the same borderline content local"
+    );
 }
 
 // --- is_private_endpoint ---------------------------------------------------

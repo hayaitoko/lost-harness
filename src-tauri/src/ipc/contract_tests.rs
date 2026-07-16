@@ -102,6 +102,9 @@ fn test_app() -> App<MockRuntime> {
             ipc::add_provider,
             ipc::remove_provider,
             ipc::list_models,
+            ipc::get_classifier_settings,
+            ipc::set_classifier_settings,
+            ipc::reset_classifier_settings,
         ])
         .build(mock_context(noop_assets()))
         .expect("failed to build mock app");
@@ -405,4 +408,75 @@ fn list_models_old_broken_shape_is_rejected() {
     // And must NOT be the domain error — proves it never reached
     // `ModelManager::list_models_for`.
     assert!(!msg.contains("unknown provider"), "leaked into command body: {msg}");
+}
+
+// ── classifier settings (PLAN §11) ─────────────────────────────────────
+
+#[test]
+fn classifier_settings_round_trip_through_real_ipc() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // Defaults for a fresh profile (strictness 50, medium).
+    let got: Value = call(
+        &webview,
+        "get_classifier_settings",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("get_classifier_settings must dispatch")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(got["strictness"], 50);
+    assert_eq!(got["uncertainty_band"], "medium");
+
+    // Set a strict config, then read it back through a fresh get.
+    let set: Value = call(
+        &webview,
+        "set_classifier_settings",
+        json!({"args": {"profile": "personal", "strictness": 100, "uncertainty_band": "wide"}}),
+    )
+    .expect("set_classifier_settings must dispatch")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(set["strictness"], 100);
+    assert_eq!(set["uncertainty_band"], "wide");
+
+    let reget: Value = call(
+        &webview,
+        "get_classifier_settings",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("get after set")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(reget["strictness"], 100, "persisted strictness must survive a re-read");
+    assert_eq!(reget["uncertainty_band"], "wide");
+
+    // Reset → back to defaults.
+    let reset: Value = call(
+        &webview,
+        "reset_classifier_settings",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("reset_classifier_settings must dispatch")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(reset["strictness"], 50);
+    assert_eq!(reset["uncertainty_band"], "medium");
+}
+
+#[test]
+fn set_classifier_settings_old_broken_shape_is_rejected() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // Flat, camelCase, no `args` wrapper — the pre-fix bridge shape.
+    let body = json!({"profile": "personal", "strictness": 80, "uncertaintyBand": "narrow"});
+    let res = call(&webview, "set_classifier_settings", body);
+    let err = res.expect_err("flat/unwrapped args must NOT dispatch");
+    let msg = err.as_str().unwrap_or_default();
+    assert!(
+        is_ipc_arg_rejection(msg),
+        "expected an IPC-level arg-deserialization rejection, got: {msg}"
+    );
 }

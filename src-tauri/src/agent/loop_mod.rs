@@ -190,7 +190,18 @@ impl AgentLoop {
         let is_cloud = !is_private_endpoint(&provider.base_url);
 
         // ── 2. Privacy gate ──────────────────────────────────────────────
-        let decision = self.gate.check(&binding, &content, is_cloud);
+        // Load the active profile's classifier thresholds (PLAN §11). A read
+        // error or missing settings falls back to defaults — a settings read
+        // must never block the send path, and defaults match pre-tunable
+        // behavior. `classifier_config` already sanitizes.
+        let classifier_cfg = self
+            .storage
+            .open_profile(&profile)
+            .and_then(|db| db.classifier_config())
+            .unwrap_or_default();
+        let decision = self
+            .gate
+            .check(&binding, &content, is_cloud, &classifier_cfg);
 
         // Log + stream every decision. We always log (the spec says
         // "always log the decision"), even when Allow — that gives the

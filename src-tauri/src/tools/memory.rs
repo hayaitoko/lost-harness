@@ -172,7 +172,16 @@ impl Tool for RememberMemoryTool {
                     )
                 }
             };
-            let classification = self.classifier.classify(&content);
+            // Classify under the active profile's own thresholds so the agent's
+            // save routes to the same sensitivity bucket the profile's gate (and
+            // the manual `save_memory` IPC) would pick for identical content. A
+            // settings read error falls back to defaults (never blocks a save).
+            let cfg = self
+                .storage
+                .open_profile(&ctx.profile)
+                .and_then(|db| db.classifier_config())
+                .unwrap_or_default();
+            let classification = self.classifier.classify_with(&content, &cfg);
             let bucket = match route_memory_sensitivity(&classification) {
                 MemoryRoute::NeverPersist => {
                     return ToolResult::Ok(json!({
@@ -359,6 +368,79 @@ mod tests {
             storage.global().search_memory("123 45 6789", true, 10).unwrap().len(),
             1
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A model-scored classifier used to prove `remember` applies the active
+    /// profile's thresholds (not the hardcoded defaults). `classify` uses the
+    /// default config; `classify_with` grades the fixed score against `cfg`.
+    #[derive(Debug)]
+    struct ScoreFake(f32);
+    impl crate::classifier::Classifier for ScoreFake {
+        fn classify(&self, text: &str) -> Classification {
+            self.classify_with(text, &crate::classifier::ClassifierConfig::default())
+        }
+        fn classify_with(
+            &self,
+            _text: &str,
+            cfg: &crate::classifier::ClassifierConfig,
+        ) -> Classification {
+            let label = if self.0 >= cfg.tau_block {
+                Label::Private
+            } else if self.0 >= cfg.tau_band {
+                Label::Uncertain
+            } else {
+                Label::Public
+            };
+            Classification {
+                label,
+                confidence: self.0,
+                raw_output: vec![self.0],
+                spans: Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_applies_the_profiles_classifier_thresholds() {
+        // A borderline score of 0.03: under the DEFAULT config (tau_band 0.05)
+        // it's Public → Shared; under a STRICT profile config (strictness 100,
+        // tau_band ≈ 0.005) it's Uncertain → PrivateLocal. Proves the tool reads
+        // and applies the per-profile thresholds, not a hardcoded default.
+        let (storage, root) = temp_storage();
+        let tool = RememberMemoryTool::new(storage.clone(), Arc::new(ScoreFake(0.03)));
+        let ctx = ExecCtx {
+            conversation_id: "c".into(),
+            profile: "personal".into(),
+            reads: None,
+        };
+
+        // Default profile (no settings row) → Shared.
+        match tool
+            .run(ToolInput::new(json!({ "content": "a borderline note" })), &ctx)
+            .await
+        {
+            ToolResult::Ok(v) => assert_eq!(v["sensitivity"], "shared", "default cfg ⇒ shared"),
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        }
+
+        // Now store a strict config for the profile and remember again.
+        storage
+            .open_profile("personal")
+            .unwrap()
+            .set_classifier_config(&crate::classifier::ClassifierConfig::from_ui(100, "medium"))
+            .unwrap();
+        match tool
+            .run(ToolInput::new(json!({ "content": "another borderline note" })), &ctx)
+            .await
+        {
+            ToolResult::Ok(v) => assert_eq!(
+                v["sensitivity"], "private_local",
+                "strict profile cfg must route the same borderline content local"
+            ),
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -73,9 +73,10 @@ fn schema_version_is_current_after_init_global() {
 }
 
 #[test]
-fn schema_version_is_three_after_init_profile() {
-    // Profile schema version is now 3 (item 5 added `tool_audit` at v2, Q8
-    // added `tool_rules` at v3); global stays at 1. The two are tracked
+fn schema_version_is_four_after_init_profile() {
+    // Profile schema version is now 4 (item 5 added `tool_audit` at v2, Q8
+    // added `tool_rules` at v3, the classifier-settings round added
+    // `classifier_settings` at v4); global stays at 2. The two are tracked
     // independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
@@ -83,7 +84,7 @@ fn schema_version_is_three_after_init_profile() {
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 3);
+    assert_eq!(v, 4);
 }
 
 #[test]
@@ -462,6 +463,51 @@ fn tool_rules_round_trip_and_delete() {
     assert!(!db.delete_tool_rule("r1").unwrap(), "deleting a gone rule returns false");
     assert!(db.list_tool_rules_for("write_file").unwrap().is_empty());
     assert_eq!(db.list_tool_rules().unwrap().len(), 1);
+}
+
+#[test]
+fn classifier_config_defaults_when_unset_and_round_trips() {
+    use crate::classifier::ClassifierConfig;
+    let db = ProfileDb::open_in_memory("personal").unwrap();
+
+    // No row → defaults, no error.
+    assert_eq!(db.classifier_config().unwrap(), ClassifierConfig::default());
+
+    // Persist a stricter config and read it back.
+    let strict = ClassifierConfig::from_ui(90, "wide");
+    db.set_classifier_config(&strict).unwrap();
+    let got = db.classifier_config().unwrap();
+    assert!((got.tau_block - strict.tau_block).abs() < 1e-6);
+    assert!((got.tau_band - strict.tau_band).abs() < 1e-6);
+
+    // Upsert (single row) overwrites, never piles up.
+    let loose = ClassifierConfig::from_ui(10, "narrow");
+    db.set_classifier_config(&loose).unwrap();
+    let got2 = db.classifier_config().unwrap();
+    assert!((got2.tau_block - loose.tau_block).abs() < 1e-6);
+
+    // Reset → back to defaults; second reset returns false (nothing to remove).
+    assert!(db.reset_classifier_config().unwrap());
+    assert_eq!(db.classifier_config().unwrap(), ClassifierConfig::default());
+    assert!(!db.reset_classifier_config().unwrap());
+}
+
+#[test]
+fn classifier_config_read_sanitizes_a_corrupt_row() {
+    // A hand-edited/corrupt row must never yield a leakier-than-valid config:
+    // the read path sanitizes (fails toward stricter).
+    use crate::classifier::ClassifierConfig;
+    let db = ProfileDb::open_in_memory("personal").unwrap();
+    db.raw()
+        .execute(
+            "INSERT OR REPLACE INTO classifier_settings (id, tau_block, tau_band, updated_at)
+             VALUES (1, 9.0, -3.0, 0)",
+            [],
+        )
+        .unwrap();
+    let got = db.classifier_config().unwrap();
+    // 9.0 is out of range → default tau_block; -3.0 → default tau_band.
+    assert_eq!(got, ClassifierConfig::default());
 }
 
 #[test]
