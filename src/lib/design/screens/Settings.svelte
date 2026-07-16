@@ -24,11 +24,14 @@
   } from "$lib/stores/providers.svelte";
   import { modelsForProvider } from "$lib/stores/provider-catalog";
   import { theme, applyTheme, type Theme } from "$lib/stores/settings";
+  import { activeProfileId } from "$lib/stores/profiles";
+  import { listToolRules, deleteToolRule, type ToolRule } from "$lib/api/tauri";
 
-  type Section = "routing" | "privacy" | "models" | "memory" | "appearance";
+  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "appearance";
   const SECTIONS: [Section, string][] = [
     ["routing", "Routing"],
     ["privacy", "Privacy guard"],
+    ["permissions", "Permissions"],
     ["models", "Models"],
     ["memory", "Memory"],
     ["appearance", "Appearance"],
@@ -115,6 +118,12 @@
   let density = $state("cozy");
   let fontSize = $state(13.5);
   let motion = $state(true);
+  // permissions — persisted "Always allow" tool rules (Q8), read live from the
+  // active profile's SQLite `tool_rules`. Revoking re-prompts on the next call.
+  let toolRules = $state<ToolRule[]>([]);
+  let rulesLoading = $state(false);
+  let rulesError = $state<string | null>(null);
+  let confirmRevokeId = $state<string | null>(null);
 
   let mems = $derived(memories[memProfile] ?? []);
   let activeLabel = $derived(SECTIONS.find(([id]) => id === section)![1]);
@@ -141,6 +150,51 @@
       });
     }
   });
+
+  // Load the active profile's persisted rules whenever the Permissions pane is
+  // open (and re-load if the profile changes under it). SqlitePolicySource reads
+  // live on the backend, so a revoke here re-prompts on the tool's next call.
+  $effect(() => {
+    if (section !== "permissions") return;
+    const profile = $activeProfileId;
+    rulesLoading = true;
+    rulesError = null;
+    listToolRules(profile)
+      .then((rules) => {
+        toolRules = rules;
+      })
+      .catch((err) => {
+        rulesError = String(err);
+      })
+      .finally(() => {
+        rulesLoading = false;
+      });
+  });
+
+  async function revokeRule(id: string) {
+    // Two-click confirm, mirroring the provider-remove pattern above.
+    if (confirmRevokeId !== id) {
+      confirmRevokeId = id;
+      setTimeout(() => {
+        if (confirmRevokeId === id) confirmRevokeId = null;
+      }, 3000);
+      return;
+    }
+    confirmRevokeId = null;
+    try {
+      await deleteToolRule($activeProfileId, id);
+      toolRules = toolRules.filter((r) => r.id !== id);
+    } catch (err) {
+      rulesError = String(err);
+    }
+  }
+
+  function formatRuleDate(epochSeconds: number): string {
+    return new Date(epochSeconds * 1000).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    });
+  }
 
   function modelsFor(p: Provider): string[] {
     const fetched = modelsByProvider[p.id];
@@ -377,6 +431,54 @@
             <div class="mt-3">
               <Button variant="ghost">Add category…</Button>
             </div>
+          {:else if section === "permissions"}
+            <div class="{label} pb-2">
+              Standing tool permissions — the "Always allow" grants you've made in this profile
+            </div>
+            {#if rulesLoading && toolRules.length === 0}
+              <p
+                class="rounded-[var(--r-lg)] border border-dashed border-border-strong px-3 py-6 text-center text-[12.5px] text-text-3"
+              >
+                Loading permissions…
+              </p>
+            {:else if rulesError}
+              <p
+                class="rounded-[var(--r-lg)] border border-dashed border-border-strong px-3 py-6 text-center text-[12.5px] text-blocked"
+              >
+                Couldn't load permissions: {rulesError}
+              </p>
+            {:else if toolRules.length > 0}
+              {#each toolRules as rule (rule.id)}
+                <SettingRow
+                  title={rule.tool_name}
+                  desc={rule.pattern === "*"
+                    ? "Any input · always allowed"
+                    : `${rule.pattern} · always allowed`}
+                  dotColor="var(--accent)"
+                >
+                  {#snippet control()}
+                    <div class="flex flex-shrink-0 items-center gap-2.5">
+                      <span class="text-[11px] text-text-3">{formatRuleDate(rule.created_at)}</span>
+                      <Button variant="ghost" onclick={() => revokeRule(rule.id)}>
+                        {confirmRevokeId === rule.id ? "Confirm?" : "Revoke"}
+                      </Button>
+                    </div>
+                  {/snippet}
+                </SettingRow>
+              {/each}
+              <p class="px-0.5 pt-3 text-[11px] text-text-3">
+                Revoking takes effect immediately — the next time that tool runs, Lost
+                Harness asks again. Risky tools can never earn a standing grant, so they
+                never appear here.
+              </p>
+            {:else}
+              <p
+                class="rounded-[var(--r-lg)] border border-dashed border-border-strong px-3 py-8 text-center text-[12.5px] text-text-3"
+              >
+                No standing permissions yet. When you choose “Always allow” on a tool
+                request, it appears here so you can take it back.
+              </p>
+            {/if}
           {:else if section === "models"}
             {#if providersStore.loading && providersStore.providers.length === 0}
               <p
