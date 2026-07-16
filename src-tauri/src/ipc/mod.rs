@@ -782,32 +782,10 @@ fn to_memory_info(fact: crate::storage::MemoryFact, bucket: crate::storage::Memo
     }
 }
 
-/// Where a memory write should go (PLAN §9's 3-bucket model).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryRoute {
-    Shared,
-    PrivateLocal,
-    /// Truly ephemeral secret (credential) — dropped, never written anywhere.
-    NeverPersist,
-}
-
-/// Route a fact by the classifier's read of it: a credential span → never
-/// persist; otherwise Private/Uncertain → private-local, Public → shared.
-fn route_memory_sensitivity(c: &crate::classifier::Classification) -> MemoryRoute {
-    use crate::classifier::rules::RuleCategory;
-    use crate::classifier::Label;
-    if c
-        .spans
-        .iter()
-        .any(|s| s.category == RuleCategory::Credential)
-    {
-        return MemoryRoute::NeverPersist;
-    }
-    match c.label {
-        Label::Public => MemoryRoute::Shared,
-        Label::Private | Label::Uncertain => MemoryRoute::PrivateLocal,
-    }
-}
+// Sensitivity routing lives in `tools::memory` (canonical), so a manual add
+// here and an agent `remember` call route identically. Re-exported so the
+// in-module tests reach it via `use super::*`.
+pub use crate::tools::memory::{route_memory_sensitivity, MemoryRoute};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListMemoryArgs {

@@ -278,11 +278,17 @@ fn build_tool_dispatcher(
     registry.register(Box::new(EditFileTool::new(&workspace)));
     registry.register(Box::new(DeleteFileTool::new(workspace)));
 
-    // Memory: the always-available "pinned search tool" (PLAN §9). Read-only
-    // (Safe → pre-trusted); searches the SHARED store only, so it can never
-    // surface a private-local fact back into a model's context.
+    // Memory tools (PLAN §9). `recall_memory` is the always-available pinned
+    // search tool — read-only (Safe → pre-trusted), searches the SHARED store
+    // only so it can never surface a private-local fact into model context.
+    // `remember` saves a fact routed by sensitivity — Write-risk, so it goes
+    // through the approval spine (non-silent, gated).
     registry.register(Box::new(crate::tools::memory::RecallMemoryTool::new(
         storage.clone(),
+    )));
+    registry.register(Box::new(crate::tools::memory::RememberMemoryTool::new(
+        storage.clone(),
+        Arc::clone(&classifier),
     )));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
