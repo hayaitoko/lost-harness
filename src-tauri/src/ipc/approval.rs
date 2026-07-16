@@ -43,6 +43,14 @@ pub struct ToolApprovalRequestPayload {
     /// The action fingerprint — informational for the UI; the grant target is
     /// resolved server-side from the parked request, not from this value.
     pub fingerprint: String,
+    /// The tool's risk class, lowercase ("safe"|"write"|"external"|"dangerous").
+    /// Server-derived from `Tool::risk()`. The dialog badges it and offers only
+    /// the matrix-legal grant buttons; the server (`resolve_grant`) enforces, so
+    /// this is legibility, not the gate.
+    pub risk: String,
+    /// For `External` tools, where the call goes — the consent to surface.
+    /// `None` for non-egress tools (all current tools).
+    pub destination: Option<String>,
 }
 
 /// A parked approval awaiting the user's answer.
@@ -151,6 +159,8 @@ impl ApprovalPrompter for TauriApprovalPrompter {
                 prompt: req.prompt,
                 by: req.by,
                 fingerprint: req.fingerprint,
+                risk: req.risk.as_str().to_string(),
+                destination: req.destination,
             },
         ) {
             tracing::warn!(error = %e, "failed to emit tool approval request");

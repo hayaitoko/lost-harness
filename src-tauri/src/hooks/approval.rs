@@ -275,6 +275,17 @@ pub struct ApprovalRequest {
     pub prompt: String,
     /// Which hook raised the Ask ("permission" | "first_use_confirm").
     pub by: String,
+    /// The tool's risk class — server-derived from `Tool::risk()`, never
+    /// client-supplied. Drives the dialog's risk badge and which grant
+    /// buttons are offered (`Dangerous` hides Session/Always; `External`
+    /// hides whole-tool standing). The dialog is convenience only — the
+    /// server (`resolve_grant`) is the enforcement, so a bypassed button
+    /// still can't widen the grant.
+    pub risk: RiskClass,
+    /// For `External` tools, where the call goes (domain/recipient) — the
+    /// consent the dialog must surface. Server-derived from the call, never
+    /// from client input. `None` until the first real `External` tool ships.
+    pub destination: Option<String>,
 }
 
 /// The user's answer.

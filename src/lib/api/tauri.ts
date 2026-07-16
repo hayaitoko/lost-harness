@@ -132,7 +132,19 @@ export interface ToolApprovalRequest {
   /** Which hook raised it: "permission" | "first_use_confirm". */
   by: string;
   fingerprint: string;
+  /**
+   * The tool's risk class — server-derived. Drives the risk badge and which
+   * grant buttons are offered (Dangerous hides session/always; External hides
+   * whole-tool standing). The server (`resolve_grant`) is the enforcement; the
+   * button layout is legibility, not the gate.
+   */
+  risk: RiskClass;
+  /** For External tools, where the call goes. `null` for non-egress tools. */
+  destination: string | null;
 }
+
+/** Tool risk class — mirrors `RiskClass::as_str()` in Rust. */
+export type RiskClass = "safe" | "write" | "external" | "dangerous";
 
 /** Callback shape for `onToolApprovalRequest`. */
 export type ToolApprovalCallback = (payload: ToolApprovalRequest) => void;

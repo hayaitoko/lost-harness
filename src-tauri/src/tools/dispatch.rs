@@ -437,6 +437,14 @@ impl ToolDispatcher {
                         // `by` is cloned (not moved) so the forced-Once
                         // piggyback below can read it after this await.
                         by: by.clone(),
+                        // Server-derived risk drives the dialog's badge +
+                        // matrix-legal buttons; the server still enforces via
+                        // `resolve_grant`, so this is UX, not the gate.
+                        risk: tool.risk(),
+                        // No `External` tool ships a destination yet; a future
+                        // egress tool surfaces one here (server-derived from the
+                        // call, never client input).
+                        destination: None,
                     };
                     // NOTE (known, deferred): `process_message` holds the agent
                     // loop's stream lock across this await, so while a prompt is

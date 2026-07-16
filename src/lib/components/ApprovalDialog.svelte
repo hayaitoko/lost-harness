@@ -9,15 +9,21 @@
   // core via `resolveToolApproval`, which unblocks the parked dispatch. If the
   // user never answers, the backend times out and denies by default.
   //
-  // Scopes offered here are "once" (this exact action) and "session" (any call
-  // to this tool until restart). "Always" (persist across restarts) is
-  // deliberately not offered yet — it needs the persistent policy store that
-  // lands with M4.
+  // The buttons offered are driven by the tool's RISK class (Q8 grant×risk
+  // matrix), served server-side on each request:
+  //   - dangerous → Deny + Allow once only (never a standing grant — inv. #8)
+  //   - external  → Deny + Allow once only (no whole-tool standing for egress)
+  //   - write/safe → Deny + Allow once + Allow for this session
+  // The server (`resolve_grant`) is the enforcement; hiding a button only stops
+  // us from training a habit the matrix would then have to break — a bypassed
+  // button still can't widen the grant. "Always" (persist across restarts)
+  // lands with the SQLite tool_rules store (Q8 commit 3).
 
   import { onMount } from "svelte";
   import {
     onToolApprovalRequest,
     resolveToolApproval,
+    type RiskClass,
     type ToolApprovalRequest,
   } from "$lib/api/tauri";
 
@@ -26,6 +32,25 @@
   // Guards against a double-click resolving the same request twice while the
   // async round-trip is in flight.
   let resolving = $state(false);
+
+  // Risk → label + badge colors. Unknown/absent risk falls back to a neutral
+  // treatment (a server that predates the risk field, or a future variant).
+  const RISK_META: Record<RiskClass, { label: string; badge: string }> = {
+    safe: { label: "Safe", badge: "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" },
+    write: { label: "Write", badge: "border-sky-500/40 bg-sky-500/10 text-sky-300" },
+    external: { label: "External", badge: "border-amber-500/40 bg-amber-500/10 text-amber-300" },
+    dangerous: { label: "Dangerous", badge: "border-red-500/50 bg-red-500/15 text-red-300" },
+  };
+  const riskMeta = $derived(
+    (current && RISK_META[current.risk]) ?? {
+      label: "Unknown",
+      badge: "border-neutral-600 bg-neutral-800 text-neutral-300",
+    },
+  );
+  // Only reversible, on-machine mutations get a whole-tool session grant.
+  // Egress (external) and irreversible (dangerous) never do — every call
+  // re-confirms.
+  const allowSession = $derived(current?.risk === "write" || current?.risk === "safe");
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
@@ -100,6 +125,10 @@
         <h2 id="approval-title" class="text-sm font-semibold text-neutral-100">
           Allow this tool to run?
         </h2>
+        <span
+          class="ml-auto rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide {riskMeta.badge}"
+          data-testid="approval-risk-badge"
+          title="Risk class — decides what standing approval is allowed">{riskMeta.label}</span>
       </div>
 
       <p class="mb-2 text-sm text-neutral-300">
@@ -112,6 +141,12 @@
       <pre
         class="mb-3 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-neutral-900 p-2 text-[11px] leading-snug text-neutral-300"
         data-testid="approval-command">{current.command}</pre>
+      {#if current.destination}
+        <!-- Where an egress call goes IS the consent — surface it prominently. -->
+        <p class="mb-3 text-xs text-amber-300" data-testid="approval-destination">
+          Sends to <span class="font-medium">{current.destination}</span>
+        </p>
+      {/if}
       <p class="mb-4 text-xs text-neutral-500">{current.prompt}</p>
 
       <div class="flex flex-wrap justify-end gap-2">
@@ -124,18 +159,23 @@
         >
           Deny
         </button>
-        <!-- Secondary (broadest): allow every call to this tool this session. -->
-        <button
-          type="button"
-          onclick={() => answer("approve", "session", "tool")}
-          disabled={resolving}
-          class="rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-300 transition hover:bg-neutral-900 disabled:opacity-50"
-          data-testid="approval-session"
-        >
-          Allow for this session
-        </button>
+        {#if allowSession}
+          <!-- Secondary: allow every call to this tool this session. Offered
+               only for reversible on-machine mutations (write/safe) — the
+               matrix refuses whole-tool standing for external/dangerous. -->
+          <button
+            type="button"
+            onclick={() => answer("approve", "session", "tool")}
+            disabled={resolving}
+            class="rounded-md border border-neutral-700 px-3 py-1.5 text-xs text-neutral-300 transition hover:bg-neutral-900 disabled:opacity-50"
+            data-testid="approval-session"
+          >
+            Allow for this session
+          </button>
+        {/if}
         <!-- Primary (narrowest): just this one call. The default, so a hurried
-             click grants the least. -->
+             click grants the least. For dangerous/external this is the ONLY
+             approve option. -->
         <button
           type="button"
           onclick={() => answer("approve", "once", "action")}

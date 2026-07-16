@@ -223,6 +223,20 @@ pub enum RiskClass {
     Dangerous,
 }
 
+impl RiskClass {
+    /// Lowercase stable discriminant for the frontend (the approval dialog's
+    /// risk badge + matrix-driven button layout key off this). Distinct from
+    /// the `Debug`/capitalized form the audit column stores.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RiskClass::Safe => "safe",
+            RiskClass::Write => "write",
+            RiskClass::External => "external",
+            RiskClass::Dangerous => "dangerous",
+        }
+    }
+}
+
 // ── Tool trait ───────────────────────────────────────────────────────────
 
 /// Something the agent can invoke. `run()` returns a boxed future so the
