@@ -78,8 +78,16 @@ pub enum ExecError {
 /// contained. Implementations MUST return `Err(ExecError::SandboxApply)` —
 /// never a bare `Command::new(...)` — if the profile can't be built or
 /// applied.
+///
+/// Returns the spawned child plus any temp files (e.g. the Seatbelt profile)
+/// that `run_guarded` must delete once the child has been reaped — deleting
+/// after `wait()` is race-free (`sandbox-exec` has finished reading the
+/// profile by the time its process exits).
 pub trait SandboxedSpawn: Send + Sync {
-    fn spawn(&self, spec: &ExecSpec) -> Result<tokio::process::Child, ExecError>;
+    fn spawn(
+        &self,
+        spec: &ExecSpec,
+    ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError>;
 }
 
 // ── platform helpers (process-group kill + sandbox-failure detection) ────────
@@ -90,7 +98,19 @@ mod platform {
 
     /// Kill the whole process group (`pgid == child pid`, because the spawner
     /// set `.process_group(0)` and nothing calls `setpgid`). One `kill(-pgid)`
-    /// reaps `sandbox-exec` → its fork → any grandchild.
+    /// reaps `sandbox-exec` → its fork → any grandchild that stayed in the
+    /// group.
+    ///
+    /// **Known limitation (bounded, not a containment break):** a descendant
+    /// that deliberately detaches into its own session/group (`setsid(2)`)
+    /// escapes this group kill and survives past the timeout as an orphan.
+    /// It stays fully Seatbelt-confined (no network, writes only to
+    /// workspace/tmp), so the blast radius is a runaway *sandboxed* process
+    /// (CPU/disk within the sandbox), never an escape or exfiltration. The
+    /// durable fix is VM/container isolation (`Virtualization.framework` /
+    /// `Containerization`) behind this same trait — deferred per Fable's
+    /// decision. Enumerating and killing the pid tree (sysctl `KERN_PROC`) is
+    /// a possible best-effort hardening, not done here.
     pub fn kill_group(pgid: i32) {
         // SAFETY: `kill(2)` with a negative pid targets the process group. A
         // missing group (already-exited) just returns ESRCH, which we ignore.
@@ -104,10 +124,19 @@ mod platform {
     /// `import system.sb`-omission crash → SIGABRT (signal 6); and a profile
     /// syntax / unknown-operation error → exit code 65 with a `sandbox-exec: `
     /// stderr prefix. Only consulted when WE didn't kill the child for timeout.
-    pub fn is_sandbox_apply_failure(status: &ExitStatus, stderr: &str) -> bool {
+    ///
+    /// The exit-65 form ALSO requires empty stdout: a genuine apply failure
+    /// never let the target process execute, so it can't have produced stdout.
+    /// That guard stops a command that legitimately exits 65 while also
+    /// happening to print `sandbox-exec: ` to its own stderr from being
+    /// misclassified as an apply failure (which would silently discard its
+    /// real output).
+    pub fn is_sandbox_apply_failure(status: &ExitStatus, stdout: &str, stderr: &str) -> bool {
         use std::os::unix::process::ExitStatusExt;
         status.signal() == Some(libc::SIGABRT)
-            || (status.code() == Some(65) && stderr.starts_with("sandbox-exec: "))
+            || (status.code() == Some(65)
+                && stderr.starts_with("sandbox-exec: ")
+                && stdout.is_empty())
     }
 }
 
@@ -118,7 +147,7 @@ mod platform {
     // platforms is `UnsupportedSandbox`, which errors before a child exists,
     // so these are unreachable in practice — they exist only to compile.
     pub fn kill_group(_pgid: i32) {}
-    pub fn is_sandbox_apply_failure(_status: &ExitStatus, _stderr: &str) -> bool {
+    pub fn is_sandbox_apply_failure(_status: &ExitStatus, _stdout: &str, _stderr: &str) -> bool {
         false
     }
 }
@@ -199,7 +228,7 @@ pub async fn run_guarded(
     let start = std::time::Instant::now();
     // Propagates a sandbox-apply failure immediately, hard, before anything
     // runs — there is no fall-through to an unsandboxed spawn.
-    let mut child = spawner.spawn(spec)?;
+    let (mut child, cleanup_paths) = spawner.spawn(spec)?;
     let pgid = child
         .id()
         .map(|p| p as i32)
@@ -230,12 +259,19 @@ pub async fn run_guarded(
     let stderr = err_handle.await.unwrap_or_default().render();
     let duration_ms = start.elapsed().as_millis();
 
+    // The child has been reaped — delete any spawner temp files (e.g. the
+    // Seatbelt .sb profile). Race-free now: sandbox-exec read it at startup,
+    // long before exit. Best-effort; a failed unlink just leaves a temp file.
+    for p in &cleanup_paths {
+        let _ = std::fs::remove_file(p);
+    }
+
     match status {
         Some(status) => {
             // Only meaningful when we did NOT kill it for timeout: catch a
             // silent Seatbelt failure so it can't be misreported as "the
             // command exited weird."
-            if platform::is_sandbox_apply_failure(&status, &stderr) {
+            if platform::is_sandbox_apply_failure(&status, &stdout, &stderr) {
                 return Err(ExecError::SandboxApply(stderr));
             }
             Ok(ExecOutput {
@@ -267,7 +303,10 @@ pub struct MacSeatbeltSpawn;
 
 #[cfg(target_os = "macos")]
 impl SandboxedSpawn for MacSeatbeltSpawn {
-    fn spawn(&self, spec: &ExecSpec) -> Result<tokio::process::Child, ExecError> {
+    fn spawn(
+        &self,
+        spec: &ExecSpec,
+    ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
 
         // Both roots must be canonical absolute paths for the Seatbelt
         // `subpath` rules to match the process's real cwd/writes.
@@ -304,8 +343,11 @@ impl SandboxedSpawn for MacSeatbeltSpawn {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         cmd.process_group(0);
-        cmd.spawn()
-            .map_err(|e| ExecError::Io(format!("spawning sandbox-exec: {e}")))
+        let child = cmd
+            .spawn()
+            .map_err(|e| ExecError::Io(format!("spawning sandbox-exec: {e}")))?;
+        // run_guarded deletes the profile once the child is reaped.
+        Ok((child, vec![profile_path]))
     }
 }
 
@@ -352,7 +394,10 @@ pub struct UnsupportedSandbox;
 
 #[cfg(not(target_os = "macos"))]
 impl SandboxedSpawn for UnsupportedSandbox {
-    fn spawn(&self, _spec: &ExecSpec) -> Result<tokio::process::Child, ExecError> {
+    fn spawn(
+        &self,
+        _spec: &ExecSpec,
+    ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
         Err(ExecError::SandboxApply(
             "no sandbox backend for this platform yet".to_string(),
         ))
@@ -475,7 +520,10 @@ mod tests {
     /// between `spawn()` erroring and returning).
     struct AlwaysFailSpawn;
     impl SandboxedSpawn for AlwaysFailSpawn {
-        fn spawn(&self, _spec: &ExecSpec) -> Result<tokio::process::Child, ExecError> {
+        fn spawn(
+            &self,
+            _spec: &ExecSpec,
+        ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
             Err(ExecError::SandboxApply("test: apply failed".to_string()))
         }
     }
@@ -547,7 +595,10 @@ mod tests {
     struct PlainUnixSpawn;
     #[cfg(unix)]
     impl SandboxedSpawn for PlainUnixSpawn {
-        fn spawn(&self, spec: &ExecSpec) -> Result<tokio::process::Child, ExecError> {
+        fn spawn(
+            &self,
+            spec: &ExecSpec,
+        ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
             let mut cmd = tokio::process::Command::new("/bin/sh");
             cmd.arg("-c")
                 .arg(&spec.command)
@@ -556,7 +607,8 @@ mod tests {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             cmd.process_group(0);
-            cmd.spawn().map_err(|e| ExecError::Io(e.to_string()))
+            let child = cmd.spawn().map_err(|e| ExecError::Io(e.to_string()))?;
+            Ok((child, Vec::new()))
         }
     }
 
@@ -569,6 +621,24 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout.contains("hello"), "stdout: {}", out.stdout);
         assert!(!out.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_65_with_stdout_is_not_misreported_as_sandbox_failure() {
+        // Regression (review MED): a command that legitimately exits 65 AND
+        // prints `sandbox-exec: ` on its own stderr with real stdout must be a
+        // normal ExecOutput, not a FALSE SandboxApply that discards its output.
+        // The `&& stdout.is_empty()` guard is what distinguishes this from a
+        // genuine apply failure (which never lets the target run).
+        let out = run_guarded(
+            &PlainUnixSpawn,
+            &spec("echo real-output; echo 'sandbox-exec: not really' >&2; exit 65"),
+        )
+        .await
+        .expect("must be a normal Ok, not a false SandboxApply Err");
+        assert_eq!(out.exit_code, Some(65));
+        assert!(out.stdout.contains("real-output"), "stdout must be preserved: {}", out.stdout);
     }
 
     #[cfg(unix)]

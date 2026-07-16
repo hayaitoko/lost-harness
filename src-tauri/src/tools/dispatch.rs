@@ -121,6 +121,12 @@ pub enum TurnOutcome {
         call: ToolCall,
         prior_sections: Vec<String>,
         remaining: Vec<ParsedToolCall>,
+        /// Turn-local budget/cascade state live at the split point, so the
+        /// continuation resumes the SAME turn's accounting (the per-turn
+        /// ceiling keeps counting; a prior user-deny's cascade keeps
+        /// protecting the calls after the reroute).
+        turn_call_count: usize,
+        cascade_active: bool,
     },
 }
 
@@ -540,7 +546,8 @@ impl ToolDispatcher {
         if parsed.is_empty() {
             return TurnOutcome::NoToolCalls;
         }
-        self.drive(Vec::new(), parsed, ctx, binding, is_cloud).await
+        self.drive(Vec::new(), parsed, ctx, binding, is_cloud, 0, false)
+            .await
     }
 
     /// The shared driver behind `run_turn` and the two reroute-continuation
@@ -572,6 +579,7 @@ impl ToolDispatcher {
     /// detection) lives in `self.run_state`, which persists across every
     /// `drive` call in the run. So a reroute never widens the real ceiling,
     /// only the per-turn courtesy stop.
+    #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
         mut sections: Vec<String>,
@@ -579,10 +587,17 @@ impl ToolDispatcher {
         ctx: &ExecCtx,
         binding: Binding,
         is_cloud: bool,
+        // Turn-local budget/cascade state carried IN so a reroute continuation
+        // resumes the SAME turn's accounting instead of restarting it. `run_turn`
+        // seeds (0, false); the reroute continuations pass the values live at
+        // the split point (see `TurnOutcome::NeedsLocalReroute`). A "turn" spans
+        // the whole run_turn drive-chain (one model output), so the cascade must
+        // survive the reroute but must NOT leak across user messages — carrying
+        // it in the payload (not `run_state`) gives exactly that scope.
+        mut turn_call_count: usize,
+        mut cascade_active: bool,
     ) -> TurnOutcome {
         let total = calls.len();
-        let mut turn_call_count: usize = 0;
-        let mut cascade_active = false;
         let mut iter = calls.into_iter();
         let mut idx = 0usize;
 
@@ -712,6 +727,8 @@ impl ToolDispatcher {
                             call,
                             prior_sections: sections,
                             remaining: iter.collect(),
+                            turn_call_count,
+                            cascade_active,
                         };
                     }
                     if matches!(&outcome, ToolOutcome::Denied { by, .. } if by == "user") {
@@ -741,13 +758,26 @@ impl ToolDispatcher {
         ctx: &ExecCtx,
         binding: Binding,
         is_cloud: bool,
+        turn_call_count: usize,
+        cascade_active: bool,
     ) -> TurnOutcome {
+        // The reroute call is formatted as the hard-deny (NOT re-dispatched) and
+        // was already counted on the cloud pass, so drive `remaining` with the
+        // same turn state — the cascade a prior user-deny set stays live.
         prior_sections.push(format_outcome(
             &call.name,
             ToolOutcome::NeedsLocalReroute { reason },
         ));
-        self.drive(prior_sections, remaining, ctx, binding, is_cloud)
-            .await
+        self.drive(
+            prior_sections,
+            remaining,
+            ctx,
+            binding,
+            is_cloud,
+            turn_call_count,
+            cascade_active,
+        )
+        .await
     }
 
     /// The caller has committed to a local endpoint for the rest of this turn.
@@ -755,19 +785,45 @@ impl ToolDispatcher {
     /// cannot hit the reroute branch again) then keep driving `remaining` on
     /// the same endpoint. Always settles in one pass (can never itself need a
     /// reroute), so it hands back the finished message directly.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resume_after_local_switch(
         &self,
         call: ToolCall,
         remaining: Vec<ParsedToolCall>,
-        prior_sections: Vec<String>,
+        mut prior_sections: Vec<String>,
         ctx: &ExecCtx,
         binding: Binding,
+        turn_call_count: usize,
+        cascade_active: bool,
     ) -> ChatMessage {
-        let mut calls = vec![ParsedToolCall::Call(call)];
-        calls.extend(remaining);
-        match self.drive(prior_sections, calls, ctx, binding, false).await {
+        // Dispatch the rerouted call DIRECTLY (bypassing drive's budget/repeat
+        // bookkeeping): it was already counted against the per-run ceiling +
+        // repeat ring on the cloud pass, so re-entering the accounting for it
+        // would double-book one execution. It already cleared the cascade gate
+        // on that pass (it reached dispatch), so no re-check is needed here.
+        let name = call.name.clone();
+        let outcome = self.dispatch(&call, ctx, binding, false).await;
+        let mut cascade_active = cascade_active;
+        if matches!(&outcome, ToolOutcome::Denied { by, .. } if by == "user") {
+            cascade_active = true;
+        }
+        prior_sections.push(format_outcome(&name, outcome));
+        // Then drive the REST normally (counted), carrying the turn state so the
+        // per-turn ceiling keeps counting and the cascade keeps protecting.
+        match self
+            .drive(
+                prior_sections,
+                remaining,
+                ctx,
+                binding,
+                false,
+                turn_call_count,
+                cascade_active,
+            )
+            .await
+        {
             TurnOutcome::Feedback(msg) => msg,
-            _ => unreachable!("is_cloud=false can't reroute; calls is non-empty"),
+            _ => unreachable!("is_cloud=false can't reroute"),
         }
     }
 }
@@ -1215,6 +1271,8 @@ mod tests {
                 &ctx(),
                 Binding::Auto,
                 true,
+                0,
+                false,
             )
             .await;
         let expected = format_outcome("echo", ToolOutcome::NeedsLocalReroute { reason });
@@ -1247,6 +1305,8 @@ mod tests {
                 vec![],
                 &ctx(),
                 Binding::Auto,
+                0,
+                false,
             )
             .await;
         assert!(msg.content.contains("→ ok"), "content: {}", msg.content);
@@ -1266,6 +1326,8 @@ mod tests {
                 prior,
                 &ctx(),
                 Binding::Public,
+                0,
+                false,
             )
             .await;
         let marker = msg.content.find("PRIOR_SECTION_MARKER").expect("prior section present");
@@ -1277,6 +1339,53 @@ mod tests {
             "resumed call + remaining call both run: {}",
             msg.content
         );
+    }
+
+    #[tokio::test]
+    async fn cascade_survives_a_reroute_continuation() {
+        // Regression (review HIGH): a user-deny's cascade must keep protecting
+        // the calls AFTER a reroute split. Given cascade_active=true and a
+        // non-Safe remaining call, resume_after_local_switch must cascade-skip
+        // it. Pre-fix, drive() reset cascade to false on re-entry, so the call
+        // would reach the chain (and, if covered by a standing grant, run).
+        let ran_c = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool)); // the (Safe) rerouted call
+        registry.register(Box::new(TaggedSpyTool {
+            name: "write_c".to_string(),
+            risk: RiskClass::Write,
+            ran: ran_c.clone(),
+        }));
+        let chain = build_pretooluse_chain_with_confirmed(
+            gate(),
+            Box::new(allow_policy(&["echo"])),
+            &["echo"],
+        );
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty());
+
+        let msg = dispatcher
+            .resume_after_local_switch(
+                call("echo", serde_json::json!({"n": 1})), // the rerouted Safe call
+                vec![ParsedToolCall::Call(call("write_c", serde_json::json!({"v": 2})))],
+                vec![],
+                &ctx(),
+                Binding::Public,
+                1,    // turn_call_count as if an earlier call was already counted
+                true, // cascade_active from an earlier user-deny in this turn
+            )
+            .await;
+
+        assert!(
+            msg.content.contains("[tool echo → ok]"),
+            "the Safe rerouted call still runs: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("[tool write_c → denied by batch]"),
+            "the non-Safe remaining call must be cascade-skipped after the reroute: {}",
+            msg.content
+        );
+        assert!(!ran_c.load(Ordering::SeqCst), "write_c must never run under an active cascade");
     }
 
     #[tokio::test]
@@ -2598,7 +2707,8 @@ mod tests {
         fn spawn(
             &self,
             _spec: &crate::tools::exec::ExecSpec,
-        ) -> Result<tokio::process::Child, crate::tools::exec::ExecError> {
+        ) -> Result<(tokio::process::Child, Vec<std::path::PathBuf>), crate::tools::exec::ExecError>
+        {
             Err(crate::tools::exec::ExecError::SandboxApply("test: never spawns".to_string()))
         }
     }

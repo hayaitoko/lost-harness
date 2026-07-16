@@ -133,9 +133,16 @@ pub fn mcp_capabilities(tier: McpTrustTier, declared: &[Capability]) -> Vec<Capa
 }
 
 /// Sanitize one namespace segment (a server name or a tool name): keep ASCII
-/// alnum + `-`/`.`/`_`, collapse any run of other chars (whitespace,
-/// backticks, newlines, …) to a single `_`, trim leading/trailing `_`, fall
-/// back to `"unnamed"` if empty.
+/// alnum + `-`/`.`, collapse any run of other chars — INCLUDING literal `_`
+/// and whitespace/backticks/newlines — to a single `_`, trim leading/trailing
+/// `_`, fall back to `"unnamed"` if empty.
+///
+/// **Underscores are collapsed on purpose**, so a sanitized segment can never
+/// contain `__`. That makes the `mcp__{server}__{tool}` separator
+/// collision-free: without it, a literal `__` surviving inside a raw server or
+/// tool name would be indistinguishable from the separator, letting two
+/// different `(server, tool)` pairs (e.g. `("a","b__c")` and `("a__b","c")`)
+/// produce the byte-identical final name — an MCP-vs-MCP registry collision.
 ///
 /// The tool name is server-controlled and feeds three trust-sensitive sinks —
 /// the `ToolRegistry` lookup key, the Sandbox/Permission `command_text`
@@ -145,10 +152,12 @@ pub fn sanitize_name_segment(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut last_was_underscore = false;
     for c in raw.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
             out.push(c);
-            last_was_underscore = c == '_';
+            last_was_underscore = false;
         } else if !last_was_underscore {
+            // Any other char — including a literal `_` — becomes a single
+            // collapsed `_`, so no segment ever contains `__`.
             out.push('_');
             last_was_underscore = true;
         }
@@ -391,6 +400,28 @@ mod tests {
             capabilities: vec![],
         };
         assert!(mcp_capabilities(cfg.tier, &cfg.capabilities).is_empty());
+    }
+
+    #[test]
+    fn namespace_separator_is_collision_free() {
+        // Two different (server, tool) pairs whose raw underscores would, under
+        // a naive sanitizer that kept `_`, collide to the same final name.
+        let a = unwired(
+            &McpServerConfig::new("a"),
+            &descriptor("b__c", McpToolAnnotations::default()),
+        );
+        let b = unwired(
+            &McpServerConfig::new("a__b"),
+            &descriptor("c", McpToolAnnotations::default()),
+        );
+        assert_ne!(
+            a.name(),
+            b.name(),
+            "distinct (server,tool) pairs must never produce the same namespaced name"
+        );
+        // Concretely: `__` inside a segment is collapsed to `_`.
+        assert_eq!(a.name(), "mcp__a__b_c");
+        assert_eq!(b.name(), "mcp__a_b__c");
     }
 
     #[test]

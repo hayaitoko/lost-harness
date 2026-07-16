@@ -578,6 +578,8 @@ async fn resolve_turn_outcome_reroutes_to_local_and_hides_reason() {
         call: ToolCall { name: "echo".to_string(), args: serde_json::json!({"x": 1}) },
         prior_sections: vec![],
         remaining: vec![],
+        turn_call_count: 0,
+        cascade_active: false,
     };
 
     let fired = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
@@ -634,6 +636,8 @@ async fn resolve_turn_outcome_no_local_candidate_stays_cloud_with_hard_deny() {
         call: ToolCall { name: "echo".to_string(), args: serde_json::json!({"x": 1}) },
         prior_sections: vec![],
         remaining: vec![],
+        turn_call_count: 0,
+        cascade_active: false,
     };
 
     let fired = Arc::new(AtomicUsize::new(0));

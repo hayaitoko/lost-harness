@@ -634,6 +634,8 @@ pub(crate) async fn resolve_turn_outcome(
                 call,
                 prior_sections,
                 remaining,
+                turn_call_count,
+                cascade_active,
             } => {
                 steps += 1;
                 if steps > MAX_REROUTE_STEPS {
@@ -662,6 +664,8 @@ pub(crate) async fn resolve_turn_outcome(
                                 prior_sections,
                                 exec_ctx,
                                 binding,
+                                turn_call_count,
+                                cascade_active,
                             )
                             .await;
                         // Reason-free banner only — see the doc comment.
@@ -689,6 +693,8 @@ pub(crate) async fn resolve_turn_outcome(
                                 exec_ctx,
                                 binding,
                                 is_cloud,
+                                turn_call_count,
+                                cascade_active,
                             )
                             .await;
                     }
