@@ -357,6 +357,12 @@ impl ToolDispatcher {
             let mut ev = EventContext::pre_tool_use(call.name.as_str())
                 .with_input(ToolInput::new(call.args.clone()))
                 .with_content(canonical.clone())
+                // The pattern-matching hooks (Sandbox denylist, Permission
+                // rules) see the tool's `match_text`, which for `shell_exec` is
+                // the bare decoded command, not the JSON envelope — item 7.
+                // This touches only `command_text`, NOT `content` (what the
+                // privacy filter reads).
+                .with_command_text(tool.match_text(&call.args))
                 .with_binding(binding)
                 .with_cloud(is_cloud)
                 .with_conversation_id(ctx.conversation_id.as_str());
@@ -435,6 +441,22 @@ impl ToolDispatcher {
                     // concurrency-model refactor deferred past this round.
                     match approver.request(req).await {
                         ApprovalDecision::Approve(scope, target) => {
+                            // Item 7: a `Dangerous` tool can NEVER be covered
+                            // by a standing grant. Whatever scope/target the
+                            // answer carried (e.g. "Allow for this session"),
+                            // collapse it to `Once` + this exact fingerprint —
+                            // the call still runs (the human just approved it,
+                            // in person), only the STANDING coverage is refused.
+                            // A minimal slice of Q8's grant×risk matrix, pulled
+                            // forward because `shell_exec` exists now.
+                            let (scope, target) = if tool.risk() == RiskClass::Dangerous {
+                                (
+                                    GrantScope::Once,
+                                    GrantTarget::Fingerprint(fingerprint.clone()),
+                                )
+                            } else {
+                                (scope, target)
+                            };
                             self.ledger.grant(target, scope);
                             // The protected-paths floor is Once-only by
                             // construction (it checks `covers_once`, not
@@ -2527,6 +2549,155 @@ mod tests {
                 .any(|e| e.tool_name == "tool_a" && e.gate_by.as_deref() == Some("user")),
             "tool_a's dispatch()-routed user-deny row must also be present"
         );
+    }
+
+    // ── item 7: shell_exec / Dangerous gating ────────────────────────────
+
+    /// A gating hook that records the `command_text` the chain sees, then
+    /// denies (so no tool actually runs). Lets a test assert what string the
+    /// pattern-matching hooks received.
+    struct RecordingHook {
+        seen: Arc<Mutex<String>>,
+    }
+    impl crate::hooks::GatingHook for RecordingHook {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn on_event(&self, ctx: &mut crate::hooks::EventContext) -> crate::hooks::HookResult {
+            *self.seen.lock().unwrap() = ctx.command_text.clone();
+            crate::hooks::HookResult::Deny("recorded".to_string())
+        }
+    }
+
+    /// A tool that overrides `match_text` to the bare `command` arg (like
+    /// `shell_exec`), used to prove the chain sees the decoded command.
+    struct MatchTextTool;
+    impl Tool for MatchTextTool {
+        fn name(&self) -> &str {
+            "cmd_tool"
+        }
+        fn requires(&self) -> &[Capability] {
+            &[]
+        }
+        fn match_text(&self, args: &serde_json::Value) -> String {
+            args.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        }
+        fn run<'a>(
+            &'a self,
+            input: ToolInput,
+            _ctx: &'a ExecCtx,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+            Box::pin(async move { ToolResult::Ok(input.args) })
+        }
+    }
+
+    /// A `SandboxedSpawn` for tests that never actually spawns — proves the
+    /// sandbox denylist fires before the executor is ever reached.
+    struct NeverSpawn;
+    impl crate::tools::exec::SandboxedSpawn for NeverSpawn {
+        fn spawn(
+            &self,
+            _spec: &crate::tools::exec::ExecSpec,
+        ) -> Result<tokio::process::Child, crate::tools::exec::ExecError> {
+            Err(crate::tools::exec::ExecError::SandboxApply("test: never spawns".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn dangerous_tool_never_gets_standing_session_coverage() {
+        // The counterpart to `a_session_tool_grant_is_not_re_prompted`: for a
+        // Dangerous tool, even an "Allow for this session" answer is collapsed
+        // to Once, so a SECOND (different-args) call re-prompts (calls == 2).
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaggedSpyTool {
+            name: "dangerous_tool".to_string(),
+            risk: RiskClass::Dangerous,
+            ran: ran.clone(),
+        }));
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("dangerous_tool", PermissionMode::Ask);
+        let chain = build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger), None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prompter = Arc::new(MockPrompter {
+            response: MockResponse::ApproveSessionTool,
+            calls: calls.clone(),
+        });
+        let dispatcher =
+            ToolDispatcher::new(registry, chain, BodyEnv::empty()).with_approval(ledger, Some(prompter));
+
+        let o1 = dispatcher
+            .dispatch(&call("dangerous_tool", serde_json::json!({"v": 1})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(o1, ToolOutcome::Ok(_)), "call 1 should run after approval, got {o1:?}");
+        let o2 = dispatcher
+            .dispatch(&call("dangerous_tool", serde_json::json!({"v": 2})), &ctx(), Binding::Public, false)
+            .await;
+        assert!(matches!(o2, ToolOutcome::Ok(_)), "call 2 should also run after RE-approval, got {o2:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a Dangerous tool must re-prompt every call — no session/tool coverage"
+        );
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn command_text_uses_tool_match_text_not_json_envelope() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut chain = HookChain::new();
+        chain.register_gating(Box::new(RecordingHook { seen: seen.clone() }));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MatchTextTool));
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty());
+
+        let _ = dispatcher
+            .dispatch(
+                &call("cmd_tool", serde_json::json!({"command": "rm -rf /"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            "rm -rf /",
+            "the chain must see the decoded command via match_text, not the JSON envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_denylist_still_denies_shell_exec_end_to_end() {
+        // The real ShellExecTool, whole-tool Allow'd, dispatching `rm -rf /`:
+        // the non-overridable sandbox floor must deny it (matching the bare
+        // command via match_text) before the executor is ever reached.
+        use crate::tools::exec::ShellExecTool;
+        let root = std::env::temp_dir().join(format!("lhp-shell-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ShellExecTool::new(
+            root.clone(),
+            root.clone(),
+            Arc::new(NeverSpawn),
+            std::time::Duration::from_secs(5),
+        )));
+        let chain = build_pretooluse_chain(gate(), Box::new(allow_policy(&["shell_exec"])));
+        let dispatcher =
+            ToolDispatcher::new(registry, chain, BodyEnv::app_default());
+
+        let outcome = dispatcher
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"command": "rm -rf /"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        match outcome {
+            ToolOutcome::Denied { by, .. } => assert_eq!(by, "sandbox"),
+            other => panic!("shell_exec `rm -rf /` must be sandbox-denied, got {other:?}"),
+        }
     }
 }
 

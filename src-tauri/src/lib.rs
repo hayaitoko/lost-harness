@@ -250,6 +250,32 @@ fn build_tool_dispatcher(
     registry.register(Box::new(EditFileTool::new(&workspace)));
     registry.register(Box::new(DeleteFileTool::new(workspace)));
 
+    // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
+    // scratch dir, network off by default, killed on timeout, OS-sandboxed via
+    // Seatbelt on macOS (UnsupportedSandbox — a hard error — elsewhere until a
+    // Linux/Windows backend lands). RiskClass::Dangerous, so every call
+    // re-prompts (no standing grant — see dispatch's Approve arm).
+    let tmp_root = base_path.join("tmp");
+    if let Err(e) = std::fs::create_dir_all(&tmp_root) {
+        tracing::warn!(
+            error = %e,
+            path = %tmp_root.display(),
+            "failed to create the tool tmp scratch dir"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    let spawner: Arc<dyn crate::tools::exec::SandboxedSpawn> =
+        Arc::new(crate::tools::exec::MacSeatbeltSpawn);
+    #[cfg(not(target_os = "macos"))]
+    let spawner: Arc<dyn crate::tools::exec::SandboxedSpawn> =
+        Arc::new(crate::tools::exec::UnsupportedSandbox);
+    registry.register(Box::new(crate::tools::exec::ShellExecTool::new(
+        hook_workspace_root.clone(),
+        tmp_root,
+        spawner,
+        std::time::Duration::from_secs(120),
+    )));
+
     // Policy DERIVED from each tool's RiskClass, so adding a tool can't
     // accidentally skip the gate: read-only (Safe) tools are whole-tool
     // `Allow`ed AND pre-trusted (no prompt); every state-changing tool is

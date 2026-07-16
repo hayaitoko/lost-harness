@@ -43,6 +43,12 @@ url = "2"
 # sha256 for the TRM message-hash audit log (spec §3: never log plaintext).
 sha2 = "0.10"
 
+# Unix-only: process-group kill (`libc::kill(-pgid, SIGKILL)`) for the guarded
+# subprocess executor (item 7). POSIX-general, reused by a future Linux
+# backend; the macOS Seatbelt wrapping lives above `tokio::process::Command`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # tauri::test::{mock_app, mock_builder, MockRuntime} — only used by the
 # M1 agent-loop integration tests. Keeps the test-only symbol out of

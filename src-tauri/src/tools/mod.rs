@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 pub mod calling;
 pub mod dispatch;
+pub mod exec;
 pub mod fs;
 
 pub use calling::ToolCall;
@@ -255,6 +256,17 @@ pub trait Tool: Send + Sync {
     /// of two capabilities is present") can override this.
     fn available(&self, env: &BodyEnv) -> bool {
         env.has_all(self.requires())
+    }
+
+    /// Text used for pattern/denylist matching (the `SandboxHook` floor,
+    /// `PermissionHook` rules) — NOT necessarily what's shown to the user for
+    /// approval. Defaults to the canonical `"{name} {args}"` form. Override
+    /// when a tool's args wrap something that should be matched in decoded
+    /// form rather than its JSON envelope (e.g. `shell_exec`'s `command`
+    /// string) — quotes/escaping inside JSON create needless mismatch surface
+    /// for a substring-based denylist.
+    fn match_text(&self, args: &serde_json::Value) -> String {
+        format!("{} {}", self.name(), args)
     }
 
     /// Execute the tool. Async-compatible via a boxed future so the trait
