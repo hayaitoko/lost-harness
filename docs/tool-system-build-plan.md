@@ -1566,16 +1566,32 @@ dispatch re-run loop). This is invariant #8 made structural.
   destination-pattern *authoring* machinery beyond the refusal; the first real `External` tool
   (web-fetch / email, M4+) drives the authoring UX.
 
-### Suggested commit order
+### Suggested commit order — ALL DONE (2026-07-16)
 
-1. **Matrix core (in-memory, no schema).** `resolve_grant` + `GrantOutcome` + tests; swap the dispatch
-   hack for it; force `Once⇒Fingerprint` + log. Fully green before touching storage.
+1. **Matrix core (in-memory, no schema).** `resolve_grant` + tests; swap the dispatch hack for it;
+   force `Once⇒Fingerprint` + log. **DONE — `06826ca`.**
 2. **Risk-badged dialog.** Payload/type gain `risk`/`destination`; dialog badge + matrix buttons.
-   (Persisted "Always" button lands in commit 3 — until then the dialog offers Once/Session per risk.)
+   **DONE — `79fe853`.**
 3. **Persisted `tool_rules`.** Schema/migration + `ProfileDb` CRUD + profile-aware `PolicySource` +
    `SqlitePolicySource`/`LayeredPolicySource` + `EventContext.profile` + `Persist` decision + resolve
-   `always` + dialog "Always" button. Round-trip + isolation + durability tests.
-4. **(stretch) Settings revoke UI** + `list_tool_rules`/`delete_tool_rule` commands.
+   `always` + dialog "Always" button. **DONE — `28ac84e` (3a storage) · `385c045` (3b read) ·
+   `1cd79b5` (3c write).**
+4. **Settings revoke commands** — `list_tool_rules`/`delete_tool_rule`. **DONE (backend) — `a651002`.**
+   The Settings "Permissions" *pane* consuming them is the one remaining follow-up.
+
+**Extra fix folded into 3c (surfaced by the e2e test, not in the original spec):** a persisted
+allow-rule satisfied `PermissionHook` but NOT `FirstUseConfirmHook`, so "Always allow" would still
+prompt once per session. `PermissionHook` now sets `ctx.policy_allowed` on an explicit Allow and
+`FirstUseConfirmHook` honors it — via the shared `ctx`, NOT a chain short-circuit, so the
+Sandbox/ProtectedPath floors (which run earlier) are untouched. "Always allow" now means ZERO prompts.
+
+**Review (2026-07-16):** a 4-lens adversarial review of `bf6612f..a651002`, each finding verified
+against source, confirmed exactly **1 LOW** — a spec/code doc mismatch (the persist-failure addendum
+said "degrade to Session"; the code fails SAFE to run-once). Reconciled by amending the spec (fail-safe
+is correct). No invariant broke; the other three lenses found nothing real. **Visual QA:** the dialog
+was driven live in the browser and screenshotted for all three risk states — Write (WRITE badge +
+Deny/Always/Session/Once), Dangerous (red badge + Deny/Once only), External (amber badge + "Sends to
+{destination}" + Deny/Once only). All matrix-correct.
 
 ### Critique fixes folded in (2026-07-16, adversarial spec review — 4 lenses + synthesis)
 
@@ -1655,6 +1671,7 @@ Status legend: `todo` · `in-progress` · `done` · `blocked`.
 | 4 | Crash-recovery + interrupted event | done | 8fe04aa | New `agent/crash_recovery.rs` with `CrashRecoveryReport`, `run_boot_pass(&Storage)` (per-profile, log-and-skip on `open_profile` OR `reconcile_profile_db` failure), and `reconcile_profile_db(&ProfileDb)` (single transaction, holds the `Transaction` handle across `add_message` / `list_conversations` / `list_messages_by_conversation` since all three execute on `self.raw()` — same pattern as `migrations::run_migrations`). Detection rule: last message `role == "assistant"` AND `content` contains an opening ```` ```tool ```` fence line; non-matching states (plain final answer, completed tool round, dangling user message) are explicitly non-goals and have regression tests. Repair row: `role="tool"`, `error=Some("interrupted_by_crash")`, `aborted=true`, `routing_decision=Some("crash_recovery")`, content = the documented `[tool interrupted]` banner, `model`/`provider_id`/`thinking_content` = `None`. Idempotent by construction — the new last message is `role="tool"`, so a second pass returns `Vec::new()` and inserts nothing; no "already_reconciled" marker. New `contains_open_tool_fence(&str) -> bool` in `tools/calling.rs` (pure structural check, no JSON parsing, never feeds dispatch — stays independent of `OwnOutput`/`parse_tool_calls`'s contract; `FENCE_OPEN` widened to `pub(crate)`). `lib.rs::run` calls `run_boot_pass` between `Storage::open` and the provider-hydration comment; deliberately NOT `?`-propagated — a reconciliation failure must not brick app boot. `hooks/approval.rs` module doc gained the "No half-durability" paragraph (why `Once`/`Session` living only in the in-memory ledger is correct, not a gap; how crash_recovery terminalizes the *turn* left hanging by the force-quit-between-Allow-and-run scenario, but has nothing to do for approvals specifically until a real persisted artifact exists). 11 new tests (7 in `crash_recovery_tests.rs` — 5 reconcile rule cases + 2 `run_boot_pass` integration; 4 in `calling.rs`). 269 total green, 76 warnings (all pre-existing). Next agent: Item 6 (NeedsLocalReroute + loop plumbing). |
 | 6 | NeedsLocalReroute + loop plumbing | done | e03999b | `ToolOutcome::NeedsLocalReroute{reason}` replaces the hard `Denied` for a must-stay-local call on cloud. `run_turn` now returns `TurnOutcome` (NoToolCalls/Feedback/NeedsLocalReroute) via a shared `drive()` that PRESERVES the item-2/5 budget/repeat/cascade/audit pipeline (per-turn ceiling uses `cur_idx` bumped before any `continue`; per-run ceiling + repeat via the persistent `self.run_state`; per-turn ceiling & cascade are turn-local and restart on a reroute continuation — documented, the real bound is per-run). `deny_and_continue_turn` (no local candidate → byte-identical hard-deny text, no re-dispatch) + `resume_after_local_switch` (local endpoint, is_cloud=false can't reroute again). Loop: `resolve_turn_outcome` (free fn, testable, never calls stream_chat) consults `enforce_local_routing`; switches provider/client/is_cloud/routing_decision for the rest of the turn with a reason-FREE `reroute_banner` + ephemeral `stream:local_reroute` event (the detailed reason travels only through the `on_reroute` closure, never into replayed content). `on_reroute: &(dyn Fn + Send + Sync)` so the Tauri future stays Send. audit.rs `outcome_label`/`outcome_gate_by` got the new variant. Invariant #2 preserved (never runs on cloud). 287 tests (+9). Next: item 7. |
 | 7 | Guarded executor + shell_exec | done | bd20f38 | New `tools/exec.rs`: the ONLY subprocess spawn path, behind `SandboxedSpawn`. `MacSeatbeltSpawn` = `sandbox-exec -f <profile> /bin/sh -c` with the empirically-verified profile (keeps `(import "system.sb")`; cwd at spawn; `.process_group(0)`). `run_guarded` drains stdout/stderr concurrently (no pipe deadlock), races wait vs timeout, `libc::kill(-pgid, SIGKILL)` reaps the whole group, upgrades a silent Seatbelt failure (SIGABRT / exit-65-with-`sandbox-exec:`) to a hard `ExecError::SandboxApply` — never runs unsandboxed. `UnsupportedSandbox` (non-macOS) hard-errors. `ShellExecTool` = Dangerous, `Capability::Shell`, `match_text` = bare decoded command, nonzero-exit/timeout = Ok (data), only apply-failure = Err, timeout config-capped (120s, model can only shorten). `Tool::match_text` default added; dispatch's EventContext uses it for `command_text` (not `content`); Approve arm collapses ANY grant on a Dangerous tool to Once+Fingerprint (no standing coverage). lib wires `tmp/` + platform spawner. 299 tests (+12, incl. REAL macOS Seatbelt: workspace-confined / network-off / out-of-workspace-denied / group-kill-on-timeout / head-tail-elision). Next: item 8. |
+| Q8 | Grant×risk matrix + persisted rules + risk-badged dialog | done | 06826ca 79fe853 28ac84e 385c045 1cd79b5 a651002 | **First Part-2/M4 item — full spec in "Part 2A".** (1) `resolve_grant` matrix in `hooks/approval.rs` is the single server-side enforcement of the grant×risk matrix — Dangerous collapses ALL standing to `(Once,fp)` (invariant #8 now structural), External is fp-pinned only, `Once` always per-action; replaced the item-7 dispatch hack. (2) Risk-badged dialog: server-derived `risk`/`destination` on the payload; dialog shows a colored badge + only matrix-legal buttons. (3a) Per-profile `tool_rules` SQLite table (PROFILE v2→v3) + CRUD. (3b) `rules_for` gains `profile`; live-read `SqlitePolicySource` + `LayeredPolicySource`; `EventContext.profile`. (3c) `ApprovalDecision::Persist` + `persist_rule_allowed` (Write-only) + `ToolRuleWriter`/`StorageToolRuleWriter` seam; persist fails SAFE (no standing grant on write err); `ctx.policy_allowed` makes an explicit allow bypass FirstUseConfirm (floor-safe, "Always allow" = zero prompts). (4) `list_tool_rules`/`delete_tool_rule` IPC. 315 → **332 tests**. Adversarial review clean (1 LOW doc-nit, reconciled). Dialog visually QA'd live. **Follow-up:** the Settings "Permissions" pane (the revoke UI). |
 | 8 | MCP into registry | done | e63bca8 | New `tools/mcp.rs`: `McpTool` folds into the registry/gating/format_outcome path with ZERO dispatch/lib changes. Namespacing `mcp__{server}__{tool}` with `sanitize_name_segment` (the whole anti-shadowing defense). `mcp_risk` (foreign hint only RAISES; only `trusted_read_only` LOWERS; `destructive_hint`→Dangerous unconditionally). `mcp_capabilities` (Remote always forces Network). Descriptions neutralized + capped (500 chars); raw tool name kept for the wire call. `McpTransport` trait + inert `UnwiredTransport` (fails loud — no real client, separate work). `McpTrustTier::default()==Remote` (compile-time). `render_tool_catalog` now neutralizes EVERY tool's name+description. Module is intentional dead code (`#![allow(dead_code)]`) until a transport/registration surface lands. 312 tests (+13). **All 8 do-now items complete.** |
 
 ### ⚠ Review findings — 2026-07-15 (adversarial review of items 1–5 + routing fix)
@@ -1734,6 +1751,20 @@ preserves the budget/cascade/audit pipeline.
   same name. Fix: collapse `_` runs too, so no segment contains `__`. Test: `namespace_separator_is_collision_free`.
 
 **Log narrative** (append newest first — one line per meaningful step, so a fresh model sees the trail):
+- 2026-07-16 — **Q8 (first Part-2/M4 item) — grant×risk matrix + persisted rules + risk-badged
+  dialog — DONE end-to-end.** Wrote the full "Part 2A" spec first, ran a 4-lens design critique
+  (folded its fixes in: fingerprint-threaded `resolve_grant`, refuse-all-External-persist v1,
+  `ToolRuleWriter` seam, fail-safe persist, live `SqlitePolicySource`, corrected durability test,
+  migration coupling, documented profile-blind-ledger limitation), then implemented in 6 commits:
+  matrix core (`06826ca`) → risk-badged dialog (`79fe853`) → per-profile `tool_rules` storage
+  (`28ac84e`) → profile-aware live read path (`385c045`) → `Persist` write path + the
+  `policy_allowed` FirstUseConfirm fix (`1cd79b5`) → list/revoke IPC (`a651002`). 315 → 332 tests,
+  clippy clean (no new), frontend check+build clean. Drove the dialog live in the browser and
+  screenshotted Write/Dangerous/External (all matrix-correct). 4-lens adversarial code review →
+  1 LOW (spec/code doc mismatch on persist-failure, reconciled to the fail-safe run-once behavior);
+  the other 3 lenses found nothing. **Next Part-2 items:** native tool-use + `Tool::schema()` (Q1),
+  `UserPromptSubmit` + permission modes (Q11), reroute auto-switch UX (Q6). Plus the Settings
+  "Permissions" pane (the Q8 revoke UI). Then memory + skills + ONNX classifier.
 - 2026-07-16 — Built items 6, 7, 8 (all remaining do-now items) + reviewed. Implemented sequentially (heavy file
   overlap on dispatch.rs/tools/mod.rs precludes parallel). **Item 6** (`e03999b`): `NeedsLocalReroute`/`TurnOutcome`
   via a `drive()` that preserves the item-2/5 budget pipeline; `resolve_turn_outcome` in the loop consults
