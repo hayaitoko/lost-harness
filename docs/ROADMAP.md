@@ -27,7 +27,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 333 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 336 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -84,10 +84,17 @@ Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-featu
    `onnx-classifier` feature (rules-only fallback with `--no-default-features`). Models
    installed live at `~/Documents/Lost-Harness/models/classifier/` (98 MB); parity test
    passes on them. **Remaining:** (a) the annotated-redaction right-sidebar UX (PLAN
-   §11) — the `/redact` `safe_text` flow (merge spans → `[REDACTED:CODE]` → re-classify
-   → send only if clean) has no UI yet; (b) OPTIONAL cosmetic `gate.rs`/`PrivacyGate`/
-   "§7" → "privacy filter" renames (deferred as low-value/high-churn; `gate.rs` cleanly
-   delegates to the `Classifier` trait and didn't need rewriting).
+   §11) — **backend done** (`explain_classification` IPC, `9bff6c2`: label + spans with
+   char offsets, category, friendly label, hard-block flag; `tauri.ts` wrapper; 3
+   tests). **Frontend TODO:** wire `WhyPanel`/`PrivacyEventBar` to it in the live message
+   flow (build the annotated `<mark class="span">` markup from char offsets; open the
+   sidebar from the "why routed here?" trigger on a held message) — heads-up:
+   MainScreen's current right panel is bespoke inline chrome, not the `WhyPanel`
+   component. Then the redact-and-send-safe-parts flow (`/redact` `safe_text`: merge
+   spans → `[REDACTED:CODE]` → re-classify → send only if clean) + the per-profile
+   classifier settings page (strictness/band/redaction/hard-block). (b) OPTIONAL cosmetic
+   `gate.rs`/`PrivacyGate`/"§7" → "privacy filter" renames (deferred as
+   low-value/high-churn; `gate.rs` cleanly delegates to the `Classifier` trait).
 4. **[ ] Native tool-use + `Tool::schema()` (Q1, M4)** — per-endpoint capability flag;
    native `tool_use` path for models that support it; fenced dialect stays the fallback;
    fingerprint-parity regression test across transports. Needs a native-tool-capable
