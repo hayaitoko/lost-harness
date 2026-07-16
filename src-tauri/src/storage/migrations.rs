@@ -67,6 +67,24 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_tool_audit_conversation ON tool_audit(conversation_id);
         CREATE INDEX IF NOT EXISTS idx_tool_audit_created ON tool_audit(ts);",
     },
+    Migration {
+        version: 3,
+        // Persisted Always grants (Q8). Per-profile, live-read on the gating
+        // path. Same dual-definition convention as v2: the CREATE is
+        // IF NOT EXISTS and also lives in PROFILE_SCHEMA_SQL, so v3 is a no-op
+        // on a fresh install (v1 already created it) and a real upgrade on an
+        // existing v2 DB.
+        name: "tool_rules_table",
+        sql: "CREATE TABLE IF NOT EXISTS tool_rules (
+            id          TEXT PRIMARY KEY,
+            tool_name   TEXT NOT NULL,
+            pattern     TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            UNIQUE(tool_name, pattern)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_rules_tool ON tool_rules(tool_name);",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.

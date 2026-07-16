@@ -169,6 +169,26 @@ pub struct TagDefinition {
     pub created_at: i64,
 }
 
+/// A persisted tool-permission rule (Q8 `Always` grant) — the durable half of
+/// the approval spine. Lives in the PER-PROFILE DB, so a rule written in one
+/// profile physically never applies in another (the walled-profile principle,
+/// applied conservatively to standing tool authorizations). Read live by
+/// `hooks::SqlitePolicySource` on the gating path and resolved through the same
+/// `PermissionHook` deny>ask>allow / most-specific-wins path as an in-memory
+/// `ToolRule`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRuleRow {
+    pub id: String,
+    pub tool_name: String,
+    /// Glob pattern matched against the call's `command_text` (`"*"` = whole
+    /// tool). Same vocabulary as `hooks::ToolRule`.
+    pub pattern: String,
+    /// "allow" | "ask" | "deny". The dialog only ever writes "allow"; "ask"/
+    /// "deny" are reachable via Settings-authored rules.
+    pub action: String,
+    pub created_at: i64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ProfileDb
 // ─────────────────────────────────────────────────────────────────────────────
@@ -925,6 +945,74 @@ impl ProfileDb {
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("query tool_audit rows")?;
         Ok(rows)
+    }
+
+    // ── tool_rules (Q8 — persisted Always grants) ─────────────────────────
+    //
+    // Unlike tool_audit this is NOT append-only: a rule is a live policy the
+    // user can revoke. `UNIQUE(tool_name, pattern)` + `INSERT OR REPLACE`
+    // makes re-adding the same (tool, pattern) idempotent (updates the action
+    // + timestamp instead of piling duplicate rows).
+
+    /// Upsert a tool rule (keyed on `(tool_name, pattern)`). Returns `Err` on
+    /// a real DB failure — the caller MUST surface it (a rule is an
+    /// authorization the user relies on, never best-effort telemetry).
+    pub fn add_tool_rule(&self, row: &ToolRuleRow) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO tool_rules
+                 (id, tool_name, pattern, action, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![row.id, row.tool_name, row.pattern, row.action, row.created_at],
+            )
+            .context("insert tool_rules row")?;
+        Ok(())
+    }
+
+    /// All rules for one tool, newest-first. The hot read path
+    /// (`SqlitePolicySource::rules_for`) — one indexed lookup per gating pass.
+    pub fn list_tool_rules_for(&self, tool_name: &str) -> Result<Vec<ToolRuleRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, tool_name, pattern, action, created_at
+             FROM tool_rules WHERE tool_name = ?1 ORDER BY created_at DESC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![tool_name], Self::map_tool_rule)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("query tool_rules rows for tool")?;
+        Ok(rows)
+    }
+
+    /// Every rule in this profile, newest-first — for the Settings pane.
+    pub fn list_tool_rules(&self) -> Result<Vec<ToolRuleRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, tool_name, pattern, action, created_at
+             FROM tool_rules ORDER BY created_at DESC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::map_tool_rule)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("query all tool_rules rows")?;
+        Ok(rows)
+    }
+
+    /// Revoke a rule by id. Returns `true` if a row was actually removed.
+    pub fn delete_tool_rule(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM tool_rules WHERE id = ?1", params![id])
+            .context("delete tool_rules row")?;
+        Ok(n > 0)
+    }
+
+    fn map_tool_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolRuleRow> {
+        Ok(ToolRuleRow {
+            id: row.get(0)?,
+            tool_name: row.get(1)?,
+            pattern: row.get(2)?,
+            action: row.get(3)?,
+            created_at: row.get(4)?,
+        })
     }
 }
 

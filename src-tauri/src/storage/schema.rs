@@ -14,9 +14,9 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 1;
 /// Returns the current schema version for each PROFILE database.
 /// Bump when adding a new per-profile migration. Profile and global
 /// track versions independently: an item that only adds a per-profile
-/// table (e.g. `tool_audit` in item 5) bumps `PROFILE_SCHEMA_VERSION`
-/// without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 2;
+/// table (e.g. `tool_audit` in item 5, `tool_rules` in Q8) bumps
+/// `PROFILE_SCHEMA_VERSION` without touching `GLOBAL_SCHEMA_VERSION`.
+pub const PROFILE_SCHEMA_VERSION: i32 = 3;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -138,6 +138,8 @@ pub const PROFILE_TABLES: &[&str] = &[
     "session_tags",
     // 12. tool_audit — append-only per-dispatch record (item 5, Q9)
     "tool_audit",
+    // 13. tool_rules — persisted Always grants (Q8); live-read on gating path
+    "tool_rules",
 ];
 
 /// CREATE TABLE statements for per-profile DBs (in dependency order).
@@ -275,6 +277,17 @@ CREATE TABLE IF NOT EXISTS tool_audit (
 
 CREATE INDEX IF NOT EXISTS idx_tool_audit_conversation ON tool_audit(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_tool_audit_created ON tool_audit(ts);
+
+CREATE TABLE IF NOT EXISTS tool_rules (
+    id          TEXT PRIMARY KEY,
+    tool_name   TEXT NOT NULL,
+    pattern     TEXT NOT NULL,
+    action      TEXT NOT NULL,        -- 'allow' | 'ask' | 'deny'
+    created_at  INTEGER NOT NULL,
+    UNIQUE(tool_name, pattern)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_rules_tool ON tool_rules(tool_name);
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);

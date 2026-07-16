@@ -56,7 +56,7 @@ fn fresh_in_memory_profile_has_all_tables() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. schema_version lands at the expected version per store (global=1, profile=2)
+// 5. schema_version lands at the expected version per store (global=1, profile=3)
 //    (and survives reopening)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -72,16 +72,17 @@ fn schema_version_is_one_after_init_global() {
 }
 
 #[test]
-fn schema_version_is_two_after_init_profile() {
-    // Profile schema version is now 2 (item 5 added `tool_audit`); global
-    // stays at 1. The two are tracked independently.
+fn schema_version_is_three_after_init_profile() {
+    // Profile schema version is now 3 (item 5 added `tool_audit` at v2, Q8
+    // added `tool_rules` at v3); global stays at 1. The two are tracked
+    // independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 2);
+    assert_eq!(v, 3);
 }
 
 #[test]
@@ -425,6 +426,104 @@ fn storage_open_creates_dirs_and_persists() {
     // list_profile_names should pick it up.
     let names = storage.list_profile_names().unwrap();
     assert_eq!(names, vec!["personal".to_string()]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tool_rules (Q8) — round-trip, upsert idempotency, delete, cross-profile
+// isolation, and REAL on-disk durability (close_profile + reopen)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn rule(id: &str, tool: &str, pattern: &str, action: &str) -> ToolRuleRow {
+    ToolRuleRow {
+        id: id.into(),
+        tool_name: tool.into(),
+        pattern: pattern.into(),
+        action: action.into(),
+        created_at: 1_700_000_000,
+    }
+}
+
+#[test]
+fn tool_rules_round_trip_and_delete() {
+    let db = ProfileDb::open_in_memory("personal").unwrap();
+    assert!(db.list_tool_rules().unwrap().is_empty());
+
+    db.add_tool_rule(&rule("r1", "write_file", "*", "allow")).unwrap();
+    db.add_tool_rule(&rule("r2", "read_file", "secrets/*", "deny")).unwrap();
+
+    let wf = db.list_tool_rules_for("write_file").unwrap();
+    assert_eq!(wf.len(), 1);
+    assert_eq!(wf[0].action, "allow");
+    assert_eq!(db.list_tool_rules_for("read_file").unwrap().len(), 1);
+    assert_eq!(db.list_tool_rules().unwrap().len(), 2);
+
+    assert!(db.delete_tool_rule("r1").unwrap(), "deleting an existing rule returns true");
+    assert!(!db.delete_tool_rule("r1").unwrap(), "deleting a gone rule returns false");
+    assert!(db.list_tool_rules_for("write_file").unwrap().is_empty());
+    assert_eq!(db.list_tool_rules().unwrap().len(), 1);
+}
+
+#[test]
+fn tool_rules_upsert_is_idempotent_on_tool_and_pattern() {
+    // Re-adding the same (tool, pattern) updates the action instead of piling
+    // a duplicate row (UNIQUE(tool_name, pattern) + INSERT OR REPLACE).
+    let db = ProfileDb::open_in_memory("personal").unwrap();
+    db.add_tool_rule(&rule("r1", "write_file", "*", "allow")).unwrap();
+    db.add_tool_rule(&rule("r2", "write_file", "*", "deny")).unwrap();
+    let rows = db.list_tool_rules_for("write_file").unwrap();
+    assert_eq!(rows.len(), 1, "same (tool, pattern) must not duplicate");
+    assert_eq!(rows[0].action, "deny", "re-add updates the action");
+}
+
+#[test]
+fn tool_rules_are_isolated_per_profile() {
+    // The whole point of per-profile placement: a rule written to `work` must
+    // NOT appear in `personal` (physical separation via separate DB files).
+    let dir = tempdir();
+    let storage = Storage::open(&dir).unwrap();
+
+    storage
+        .open_profile("work")
+        .unwrap()
+        .add_tool_rule(&rule("r1", "shell_exec", "kubectl *", "allow"))
+        .unwrap();
+
+    assert_eq!(
+        storage.open_profile("work").unwrap().list_tool_rules().unwrap().len(),
+        1
+    );
+    assert!(
+        storage
+            .open_profile("personal")
+            .unwrap()
+            .list_tool_rules()
+            .unwrap()
+            .is_empty(),
+        "a rule in `work` must never leak into `personal`"
+    );
+}
+
+#[test]
+fn tool_rules_survive_a_real_disk_reopen() {
+    // Genuine durability: write to a temp-FILE DB, drop the cached handle
+    // (close_profile), reopen from disk, and confirm the rule is still there.
+    // `open_in_memory` can't test this (the DB dies with the connection), and
+    // `open_profile` returns a memoized Arc unless close_profile is called.
+    let dir = tempdir();
+    let storage = Storage::open(&dir).unwrap();
+
+    storage
+        .open_profile("personal")
+        .unwrap()
+        .add_tool_rule(&rule("r1", "write_file", "notes/*", "allow"))
+        .unwrap();
+
+    assert!(storage.close_profile("personal"), "handle should have been cached");
+    let reopened = storage.open_profile("personal").unwrap();
+    let rows = reopened.list_tool_rules_for("write_file").unwrap();
+    assert_eq!(rows.len(), 1, "the rule must survive a real on-disk reopen");
+    assert_eq!(rows[0].pattern, "notes/*");
+    assert_eq!(rows[0].action, "allow");
 }
 
 #[test]
