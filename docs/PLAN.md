@@ -598,6 +598,29 @@ Two things deliberately **not** in v1:
   project, date. A real graph structure could come later if it ever proves
   necessary, but it's not a v1 feature.
 
+**The embedder is the app's own, bundled and settings-gated (decided
+2026-07-17).** The meaning lane runs a small on-device embedding model
+(bge-small-en-v1.5 INT8, `src-tauri/src/embedder.rs`). Two rules about it:
+
+- **It ships *inside* the app, not installed out-of-band.** The model is
+  the product's own component — it is bundled into the shipped app package
+  (the same way the classifier models and the ONNX Runtime dylib get bundled
+  at packaging, M9), never a dependency on some external server or a
+  user-managed download. A model running in the user's LM Studio (or any
+  other served endpoint) is explicitly **not** what memory embeds with —
+  local-first means the app carries its own brain. *(Current dev state: the
+  code loads the model from `~/Documents/Lost-Harness/models/embedder/` if
+  present and falls back to keyword-only if absent — that's the graceful
+  dev/fallback path; bundling it into the packaged app is the M9 task, same
+  bucket as the classifier + ORT dylib.)*
+- **It loads only when the user's memory settings enable it.** Semantic
+  memory search is a setting the user controls; when it's off, the embedder
+  isn't loaded and memory search runs keyword-only (which already works and
+  degrades cleanly). This keeps the model's memory + startup cost opt-in and
+  gives the privacy-minded user a hard off switch for "compute a meaning
+  fingerprint of everything I save." The toggle lives with the rest of the
+  memory settings (per-profile, consistent with the classifier settings).
+
 ### Search — hybrid, on demand
 
 Every search runs two kinds of matching together and merges the results:

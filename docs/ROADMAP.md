@@ -160,11 +160,16 @@ embedder live test passes on the installed model).
    ≈0.54+ unrelated); **FTS stopword-filtered** so the injection relevance gate stops firing
    on "the"/"is"; **boot-time backfill** embeds facts saved before the model was installed.
    Model at `~/Documents/Lost-Harness/models/embedder/` (34 MB, not in git; keyword-only if
-   absent). **Remaining:** **curated-summary snapshot at turn 1** (currently re-read live each
-   turn — PLAN §9 wants it frozen per conversation for cache stability); **pre-compaction
-   flush + new-chat nudge** write triggers (flush is moot until context compaction exists at
-   all); an inline **"remembered" save event** (recall has its banner; saves surface only via
-   the approval prompt); **walled-profile DB routing** (§7 toggle → the profile's own memory DB).
+   absent — the dev/fallback path). **Remaining:** **embedder bundled into the app + a memory
+   settings toggle** (decided 2026-07-17, PLAN §9 — the model is the app's OWN bundled
+   component, NOT a user download or a served endpoint like LM Studio's nomic model; it loads
+   only when the user enables semantic memory search, else keyword-only. Bundling itself is
+   the M9 packaging task alongside the classifier + ORT dylib; the settings toggle is
+   near-term); **curated-summary snapshot at turn 1** (currently re-read live each turn —
+   PLAN §9 wants it frozen per conversation for cache stability); **pre-compaction flush +
+   new-chat nudge** write triggers (flush is moot until context compaction exists at all); an
+   inline **"remembered" save event** (recall has its banner; saves surface only via the
+   approval prompt); **walled-profile DB routing** (§7 toggle → the profile's own memory DB).
    Design: PLAN §9 (incl. the 2026-07-15 refinements).
 6. **[ ] Rest of M4** — model seats, usage ledger + budget governor (per-profile),
    cache-shaped prompt assembly, capability registry that refuses; then the skills &
@@ -172,6 +177,16 @@ embedder live test passes on the installed model).
 7. **[ ] Remaining core tools** — headless browser, delegate, ask-human, system status,
    cron management, session search (PLAN §8 M3 item 10 leftovers; each rides the
    existing approval spine).
+
+**Explicitly slated for the NEXT round (small, agreed 2026-07-17):**
+- **Native-tool UI checkbox** — the `supports_native_tools` flag persists + hydrates and the
+  live test uses it, but the add-provider Settings form has no control to set it, so everyday
+  chat still uses the fenced fallback even against a native-capable endpoint (qwen3.6). Add a
+  checkbox to the add-provider UI (+ thread it into the `addProvider` store call). Then a
+  provider marked native actually uses the native path in normal use.
+- **Embedder bundling + memory settings toggle** — see item 5 / PLAN §9: ship the bge-small
+  model inside the app (M9 packaging) and gate its load on a memory setting; until then it's
+  the dev-path load from `~/Documents/...`.
 
 **Also queued in M4/later (pointers in build plan Part 2):** `UserPromptSubmit` hook +
 permission modes (Q11), reroute auto-switch UX (Q6), persisted action journal +
