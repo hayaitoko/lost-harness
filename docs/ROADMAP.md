@@ -5,6 +5,12 @@ next."* When Lukas asks for a status, answer from here. Keep it honest: update t
 **Stage** line and the checklists every time a work round lands, and move items
 between sections rather than duplicating them.
 
+> **ACTIVE DIRECTIVE (2026-07-17): build everything spec'd, then prove it.** The
+> ordered build backlog for that is **[`BUILD-MANIFEST.md`](BUILD-MANIFEST.md)** —
+> wave-by-wave, parallelizable, tiered — meant for a multi-agent (ultracode) run.
+> This ROADMAP stays the human-facing status board; the manifest is the machine-facing
+> work queue. Keep both current as waves land.
+
 Where things live: design decisions → [`PLAN.md`](PLAN.md) (source of truth);
 implementation detail → [`codebase/README.md`](codebase/README.md); the executable
 specs for tool-system work → [`tool-system-build-plan.md`](tool-system-build-plan.md);

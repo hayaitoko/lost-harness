@@ -4,12 +4,21 @@
 **Electron prototype (reference only, abandoned)**: `/Users/hayai/Desktop/lost-harness-app/` — read-only UX reference. Do NOT build new features here.
 **Spec source**: `/Volumes/SSD-Nas/Obsidian/Obsidian/lab/Projects/lost-harness-product/` (architecture.md, planning.md, spec.md, milestones.md) — the original binding spec. Where it disagrees with `docs/PLAN.md`, **PLAN.md wins**.
 
+> **ACTIVE DIRECTIVE (Lukas, 2026-07-17): build EVERYTHING spec'd, then prove it.**
+> The build phase runs against **[`docs/BUILD-MANIFEST.md`](docs/BUILD-MANIFEST.md)** — the
+> dependency-ordered, wave-by-wave, parallelizable backlog of every spec'd-but-unbuilt item
+> (M4→M10 + the server twin), written for a multi-agent (ultracode) run. **This is where a
+> fresh build run starts.** The "prove it works" end-to-end campaign is the NEXT directive,
+> after the manifest is drained — not now. Lukas fires ultracode at the manifest; keep
+> ROADMAP + HANDOFF updated after each wave.
+
 **Read this first, in this order:**
 1. This file — current state, what's next, gotchas.
-2. [`docs/ROADMAP.md`](docs/ROADMAP.md) — the **stage tracker / status board**: what milestone we're at, what's left in what order, what's blocked. When Lukas asks "where are we," answer from there. Keep it updated as you land work.
-3. [`docs/PLAN.md`](docs/PLAN.md) — the **source of truth**. Everything decided lives here: what the product is, the architecture, the build order, the open decisions. Now includes full Memory system and Skills system sections.
-4. [`docs/codebase/README.md`](docs/codebase/README.md) — the **code-as-it-actually-is guide**: architecture map, one doc per subsystem (with `file:line`), the cross-cutting load-bearing invariants, how-to-run/test, toolchain gotchas, and a watch-items list. Read this when you're about to *change code* (PLAN is the design; this is the implementation).
-5. [`docs/server-companion.md`](docs/server-companion.md), [`docs/tooling-and-skills.md`](docs/tooling-and-skills.md), [`docs/argos-review.md`](docs/argos-review.md) — deeper reasoning behind specific PLAN.md decisions. Read these when you need the "why," not the "what."
+2. [`docs/BUILD-MANIFEST.md`](docs/BUILD-MANIFEST.md) — the **build backlog** (active directive): every spec'd-but-unbuilt item in dependency-ordered waves, tiered (build-directly vs design-pass-first), for the ultracode build phase.
+3. [`docs/ROADMAP.md`](docs/ROADMAP.md) — the **stage tracker / status board**: what milestone we're at, what's left in what order, what's blocked. When Lukas asks "where are we," answer from there. Keep it updated as you land work.
+4. [`docs/PLAN.md`](docs/PLAN.md) — the **source of truth**. Everything decided lives here: what the product is, the architecture, the build order, the open decisions. Now includes full Memory system and Skills system sections.
+5. [`docs/codebase/README.md`](docs/codebase/README.md) — the **code-as-it-actually-is guide**: architecture map, one doc per subsystem (with `file:line`), the cross-cutting load-bearing invariants, how-to-run/test, toolchain gotchas, and a watch-items list. Read this when you're about to *change code* (PLAN is the design; this is the implementation).
+6. [`docs/server-companion.md`](docs/server-companion.md), [`docs/tooling-and-skills.md`](docs/tooling-and-skills.md), [`docs/argos-review.md`](docs/argos-review.md) — deeper reasoning behind specific PLAN.md decisions. Read these when you need the "why," not the "what."
 
 ---
 
@@ -17,7 +26,7 @@
 
 This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The Electron app was a prototype to validate UX decisions; it's now a read-only reference. All new work goes in the Tauri project.
 
-**Current milestone:** **M3 is COMPLETE; M4 well underway.** As of 2026-07-17: Q8 + its Permissions pane done, the entire classifier integration round done (ONNX ensemble + "why" sidebar + per-profile thresholds + redact-and-send), and **memory is LIVE in conversations** (auto-injection + endpoint-aware private recall + non-silent recall banner). Everything is committed to `main` — nothing uncommitted or in-progress to pick up. **Next open front: memory's meaning lane (local embedder choice)**; native tool-use (Q1) is blocked on Lukas configuring a native-tool-capable endpoint. The live stage tracker is [`docs/ROADMAP.md`](docs/ROADMAP.md).
+**Current milestone:** **M3 COMPLETE; M4 well underway.** As of 2026-07-17: Q8 + Permissions pane, the full classifier round (ONNX ensemble + "why" sidebar + per-profile thresholds + redact-and-send), **memory HYBRID + live** (meaning lane: bge-small embedder + RRF keyword+semantic search), and **native tool-use DONE + PROVEN LIVE** (Q1, verified 3× vs LM Studio qwen3.6-35b-a3b) all landed. Everything committed to `main`, nothing in-progress. **The directive is now to BUILD EVERYTHING SPEC'D** (see the manifest banner above) — the ordered backlog is [`docs/BUILD-MANIFEST.md`](docs/BUILD-MANIFEST.md); live status is [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 | Subsystem | Status |
 |---|---|
