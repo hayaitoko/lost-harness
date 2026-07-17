@@ -23,17 +23,18 @@ the status board sitting on top of all of them.
 > runtime/install/fallback as the classifier) powers sqlite-vec semantic search
 > fused with the keyword lane by rank; the private vector index is physically
 > separate (cloud turns never query it); gates calibrated on the live model;
-> boot-time backfill embeds old facts. **Native tool-use (Q1) is built** — a
-> per-endpoint `supports_native_tools` flag picks the native structured
+> boot-time backfill embeds old facts. **Native tool-use (Q1) is DONE + PROVEN
+> LIVE** — a per-endpoint `supports_native_tools` flag picks the native structured
 > `tool_calls` transport (fenced dialect stays the fallback), both normalizing to
-> one transport-blind pipeline; fingerprint parity across transports is tested.
-> **The one thing left to prove native tool-use LIVE:** point it at a
-> native-capable endpoint — Lukas's LM Studio (qwen3.6-35b-a3b) is up but has
-> **"require API token" ON (HTTP 401)**; disable that toggle (or supply a token)
-> and run the env-gated live test. **Next engineering fronts:** memory's
+> one transport-blind pipeline; fingerprint parity across transports is tested;
+> and it's **verified end-to-end against LM Studio qwen3.6-35b-a3b** (2026-07-17,
+> three clean runs — the model chose the tool, streamed native `tool_calls`, our
+> parser reconstructed the call). **Next engineering fronts:** memory's
 > curated-summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB
-> routing; then the rest of M4 (model seats, usage ledger). **Skills** remains
-> fully designed, zero code.
+> routing; then the rest of M4 (model seats, usage ledger, budget governor). Also
+> ripe: mark real endpoints `supports_native_tools` in the UI (add-provider
+> checkbox) so day-to-day chat uses the native path. **Skills** remains fully
+> designed, zero code.
 
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
@@ -70,7 +71,7 @@ embedder live test passes on the installed model).
 | **M1** — vertical slice | message → classify → route → model → stream → save | ✅ **Done + verified** (contract tests at the real IPC boundary) |
 | **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
-| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) built 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested. Live proof pending a native-capable endpoint (LM Studio auth toggle). Not started: model seats, usage ledger, budget governor, cache-shaped prompts, skills & agents. |
+| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). Not started: model seats, usage ledger, budget governor, cache-shaped prompts, skills & agents. |
 | **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Remaining:** curated-summary snapshot-at-turn-1 (currently re-read live each turn); pre-compaction/new-chat write triggers (flush moot until compaction exists); walled-profile per-profile DB routing; an inline "remembered" save event. Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
 | **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **DONE (item 3 complete)** — trained bge-small + distilbert INT8 ONNX ensemble in-process via `ort` (fused with layer-0 rules, parity-verified), the "why this was routed" annotated sidebar, **per-profile runtime thresholds** (settings page), AND **partial-delegation redact-and-send** (rule-value spans blacked out → re-classified → safe remainder to cloud → rehydrated; per-profile toggle). Only optional cosmetic `gate.rs` §7 renames remain (deferred, low-value). |
@@ -132,7 +133,7 @@ embedder live test passes on the installed model).
    goes to cloud → reply rehydrated; per-profile toggle); (b) per-profile classifier
    settings page — DONE (`819df8c`, see above); (c) OPTIONAL cosmetic `gate.rs` §7
    renames stay deferred (low-value/high-churn).
-4. **[~] Native tool-use + `Tool::schema()` (Q1, M4)** — **BUILT 2026-07-17** (`d203a9a`).
+4. **[x] Native tool-use + `Tool::schema()` (Q1, M4)** — **DONE + PROVEN LIVE 2026-07-17** (`d203a9a`).
    Per-endpoint `supports_native_tools` flag (endpoints v4 column, threads through
    Provider/ProviderInfo/AddProviderArgs, persisted + hydrated); `Tool::schema()` →
    `dispatcher.native_tools_spec()` (OpenAI function-call array, name/desc neutralized);
@@ -140,9 +141,11 @@ embedder live test passes on the installed model).
    `assemble_native_calls` normalizes to the same `ParsedToolCall` as the fenced path;
    the loop picks transport per round and NEVER runs the fenced parser on a native turn
    (invariant #5 structural). Fenced dialect stays the fallback. **Fingerprint parity
-   across transports is tested**, plus SSE wire decode + assembly unit tests. **Only the
-   LIVE end-to-end proof remains** — blocked on a native-capable endpoint being reachable
-   (see Blocked). Env-gated `live_native_tool_call_roundtrip` is ready to run once it is.
+   across transports is tested**, plus SSE wire decode + assembly unit tests. **LIVE proof
+   DONE** — `live_native_tool_call_roundtrip` ran green 3× against LM Studio qwen3.6-35b-a3b
+   (2026-07-17): the model chose `get_weather`, streamed native `tool_calls`, our parser
+   reconstructed `get_weather(city=…)`. Remaining polish (not blocking): an add-provider UI
+   checkbox to set `supports_native_tools` so day-to-day chat uses the native path.
 5. **[~] Memory system — HYBRID + LIVE** (`3ee9790`→`bfb5721`). Built and live: the
    full earlier stack (storage buckets in physically-separate stores, FTS5 keyword search,
    curated-summary pinning, Settings "Memory" tab, `recall_memory`/`remember` tools,
@@ -178,15 +181,9 @@ idempotency keys (Q3 deferred half), headless approval queue (Q5, server-track p
 
 ## Blocked / waiting on something
 
-- **Native tool-use LIVE proof** — the code is built + unit/wire tested (item 4), but
-  the end-to-end proof against a real model needs a native-tool-capable endpoint that's
-  actually reachable. Lukas's LM Studio (qwen3.6-35b-a3b, `127.0.0.1:1234`) is running
-  but has **"require API token" ON** — every request returns **HTTP 401**. Unblock by
-  either flipping that toggle OFF in LM Studio → Server Settings, or supplying the token.
-  Then: mark the provider `supports_native_tools` and run the env-gated
-  `live_native_tool_call_roundtrip` test (command in the health-check block above). The
-  401 was on a request our code shaped correctly (tools array accepted), so this is an
-  auth gate, not a code problem.
+- **Nothing.** (The native-tool-use live proof — previously blocked on LM Studio's
+  require-API-token toggle — was cleared 2026-07-17: Lukas turned auth off, the live test
+  passed 3× against qwen3.6-35b-a3b. Item 4 is fully done.)
 
 ## Accepted quirks (documented, not bugs to fix)
 
