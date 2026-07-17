@@ -15,25 +15,30 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-16 (evening): M3 COMPLETE. M4 in progress. Near-term items 1, 2,
-> and 3 are DONE; memory (item 5) is LIVE in conversations.**
-> The classifier round is **fully closed**: trained INT8 ONNX ensemble in-process
-> (parity-verified), the annotated "why" sidebar, per-profile runtime-tunable
-> thresholds (Settings "Privacy guard"), and partial-delegation redact-and-send.
-> Memory is **live in real turns**: curated summary + relevance-gated FTS snippet
-> injection (guard-wrapped, profile-scoped), endpoint-aware private recall (private
-> facts readable only on non-cloud, same-profile turns), and a non-silent recall
-> banner. Item 4 (native tool-use, Q1) is **blocked** on configuring a
-> native-tool-capable model endpoint — a Lukas action, not code. **The next open
-> engineering front is memory's meaning lane: choosing + wiring a small local
-> embedder so search matches meaning, not just keywords** (then: summary
-> snapshot-at-turn-1, write-trigger backstops, walled-profile DB routing). **Skills**
-> remains fully designed, zero code.
+> **As of 2026-07-17: M3 COMPLETE. M4 well underway. Near-term items 1–5 all
+> landed.**
+> Classifier round **fully closed** (INT8 ONNX ensemble + "why" sidebar +
+> per-profile thresholds + redact-and-send). **Memory is now HYBRID** — the
+> meaning lane shipped: a stock bge-small-en-v1.5 INT8 embedder (same ONNX
+> runtime/install/fallback as the classifier) powers sqlite-vec semantic search
+> fused with the keyword lane by rank; the private vector index is physically
+> separate (cloud turns never query it); gates calibrated on the live model;
+> boot-time backfill embeds old facts. **Native tool-use (Q1) is built** — a
+> per-endpoint `supports_native_tools` flag picks the native structured
+> `tool_calls` transport (fenced dialect stays the fallback), both normalizing to
+> one transport-blind pipeline; fingerprint parity across transports is tested.
+> **The one thing left to prove native tool-use LIVE:** point it at a
+> native-capable endpoint — Lukas's LM Studio (qwen3.6-35b-a3b) is up but has
+> **"require API token" ON (HTTP 401)**; disable that toggle (or supply a token)
+> and run the env-gated live test. **Next engineering fronts:** memory's
+> curated-summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB
+> routing; then the rest of M4 (model seats, usage ledger). **Skills** remains
+> fully designed, zero code.
 
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 369 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 385 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -42,8 +47,18 @@ cd .../src-tauri && LHP_CLASSIFIER_MODELS_DIR="$HOME/Documents/Lost-Harness/mode
 cd .../src-tauri && cargo build --lib --no-default-features
 ```
 
-Last verified: 2026-07-16 evening (independent audit after the memory-live round:
-**369 passed**, frontend build + svelte-check clean, git tree clean).
+Optional env-gated live/model tests (not part of the 385; run manually):
+```bash
+# Memory embedder sanity + gate calibration on the live INT8 model:
+LHP_EMBEDDER_MODELS_DIR="$HOME/Documents/Lost-Harness/models/embedder" cargo test --lib embedder::
+# Native tool-use against a live endpoint (needs a native-capable server, auth off or token set):
+LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35b-a3b" \
+  cargo test --lib live_native_tool_call_roundtrip -- --nocapture
+```
+
+Last verified: 2026-07-17 (meaning lane + native tool-use landed: **385 passed**,
+`--no-default-features` builds clean, frontend build + svelte-check clean, tree clean;
+embedder live test passes on the installed model).
 
 ---
 
@@ -55,8 +70,8 @@ Last verified: 2026-07-16 evening (independent audit after the memory-live round
 | **M1** — vertical slice | message → classify → route → model → stream → save | ✅ **Done + verified** (contract tests at the real IPC boundary) |
 | **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
-| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. Everything else not started. |
-| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **LIVE in conversations (2026-07-16).** Storage foundation + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools (all earlier), PLUS now: **endpoint-aware `ExecCtx`** (`allow_private_memory`) so recall reads private-local facts only on a non-cloud, same-profile turn; **curated summary + relevance-gated FTS injection** into each turn (guard-wrapped, endpoint-aware, profile-scoped); **non-silent `memory:event`** → transient recall banner. Cross-profile private-recall leak found in review + fixed (private scoped to the active profile; shared stays cross-profile). **Remaining:** the sqlite-vec **meaning lane** (needs a local embedder — the open choice); curated-summary snapshot-at-turn-1 (currently re-injected live each turn); pre-compaction/new-chat write triggers; walled-profile per-profile DB routing; an inline "remembered" save event (the approval prompt already surfaces saves). Design: PLAN §9. |
+| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) built 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested. Live proof pending a native-capable endpoint (LM Studio auth toggle). Not started: model seats, usage ledger, budget governor, cache-shaped prompts, skills & agents. |
+| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Remaining:** curated-summary snapshot-at-turn-1 (currently re-read live each turn); pre-compaction/new-chat write triggers (flush moot until compaction exists); walled-profile per-profile DB routing; an inline "remembered" save event. Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
 | **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **DONE (item 3 complete)** — trained bge-small + distilbert INT8 ONNX ensemble in-process via `ort` (fused with layer-0 rules, parity-verified), the "why this was routed" annotated sidebar, **per-profile runtime thresholds** (settings page), AND **partial-delegation redact-and-send** (rule-value spans blacked out → re-classified → safe remainder to cloud → rehydrated; per-profile toggle). Only optional cosmetic `gate.rs` §7 renames remain (deferred, low-value). |
 | **M5** — computer use | cross-platform screen control, the flagship | ⬜ **Not started** (stubs in `src-tauri/src/platform/`) |
@@ -117,30 +132,36 @@ Last verified: 2026-07-16 evening (independent audit after the memory-live round
    goes to cloud → reply rehydrated; per-profile toggle); (b) per-profile classifier
    settings page — DONE (`819df8c`, see above); (c) OPTIONAL cosmetic `gate.rs` §7
    renames stay deferred (low-value/high-churn).
-4. **[ ] Native tool-use + `Tool::schema()` (Q1, M4)** — per-endpoint capability flag;
-   native `tool_use` path for models that support it; fenced dialect stays the fallback;
-   fingerprint-parity regression test across transports. Needs a native-tool-capable
-   endpoint configured to prove end-to-end.
-5. **[~] Memory system — LIVE in conversations** (`3ee9790`→`6115eb9`). Built and
-   live: storage foundation (sensitivity buckets in physically-separate stores, FTS5
-   keyword search, curated-summary pinning); IPC + the Settings "Memory" tab
-   (add/forget/pin + "on device only" badges); the **`recall_memory`** tool
-   (Safe/pre-trusted) and **`remember`** tool (Write/approval-gated,
-   sensitivity-routed); **endpoint-aware private recall** (`ExecCtx.allow_private_memory`
-   stamped by the dispatcher — private-local facts readable only on a non-cloud,
-   *same-profile* turn; a cross-profile private-recall leak was caught in review and
-   fixed); **automatic injection** (`assemble_memory_context`: curated summary + ≤3
-   FTS-matched snippets per turn, guard-wrapped as untrusted, profile-scoped; a storage
-   error never blocks the send); **non-silent recall** (`memory:event` → transient
-   MainScreen banner). **Remaining:** the sqlite-vec **meaning lane** — needs a small
-   local **embedder** (the classifier's bge is a *classification* head, not an
-   embedder; picking the embed model is the open decision) which upgrades injection +
-   recall from keyword-only to true hybrid; **curated-summary snapshot at turn 1**
-   (currently re-read live each turn — PLAN §9 wants it frozen per conversation for
-   cache stability); **pre-compaction flush + new-chat nudge** write triggers (flush
-   is moot until context compaction exists at all); an inline **"remembered" save
-   event** (recall has its banner; saves currently surface only via the approval
-   prompt); **walled-profile DB routing** (§7 toggle → the profile's own memory DB).
+4. **[~] Native tool-use + `Tool::schema()` (Q1, M4)** — **BUILT 2026-07-17** (`d203a9a`).
+   Per-endpoint `supports_native_tools` flag (endpoints v4 column, threads through
+   Provider/ProviderInfo/AddProviderArgs, persisted + hydrated); `Tool::schema()` →
+   `dispatcher.native_tools_spec()` (OpenAI function-call array, name/desc neutralized);
+   `ChatRequest.tools` + `stream_chat_with_tools`; SSE decodes `delta.tool_calls` →
+   `assemble_native_calls` normalizes to the same `ParsedToolCall` as the fenced path;
+   the loop picks transport per round and NEVER runs the fenced parser on a native turn
+   (invariant #5 structural). Fenced dialect stays the fallback. **Fingerprint parity
+   across transports is tested**, plus SSE wire decode + assembly unit tests. **Only the
+   LIVE end-to-end proof remains** — blocked on a native-capable endpoint being reachable
+   (see Blocked). Env-gated `live_native_tool_call_roundtrip` is ready to run once it is.
+5. **[~] Memory system — HYBRID + LIVE** (`3ee9790`→`bfb5721`). Built and live: the
+   full earlier stack (storage buckets in physically-separate stores, FTS5 keyword search,
+   curated-summary pinning, Settings "Memory" tab, `recall_memory`/`remember` tools,
+   endpoint-aware private recall, auto-injection, non-silent recall banner) PLUS the
+   **meaning lane** (2026-07-17): a stock **bge-small-en-v1.5 INT8** embedder (`embedder.rs`,
+   same ONNX runtime/install/fallback as the classifier — deliberately NOT the classifier's
+   bge, which is a fine-tuned classification head with no general-purpose embeddings);
+   **hybrid keyword+semantic search fused by Reciprocal Rank Fusion**; the **private vector
+   index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never
+   queries it (same wall as the fact tables); distance gates **calibrated on the live model**
+   (inject 0.38 / recall 0.48, from real measured bands ≈0.33 related / ≈0.43 adjacent /
+   ≈0.54+ unrelated); **FTS stopword-filtered** so the injection relevance gate stops firing
+   on "the"/"is"; **boot-time backfill** embeds facts saved before the model was installed.
+   Model at `~/Documents/Lost-Harness/models/embedder/` (34 MB, not in git; keyword-only if
+   absent). **Remaining:** **curated-summary snapshot at turn 1** (currently re-read live each
+   turn — PLAN §9 wants it frozen per conversation for cache stability); **pre-compaction
+   flush + new-chat nudge** write triggers (flush is moot until context compaction exists at
+   all); an inline **"remembered" save event** (recall has its banner; saves surface only via
+   the approval prompt); **walled-profile DB routing** (§7 toggle → the profile's own memory DB).
    Design: PLAN §9 (incl. the 2026-07-15 refinements).
 6. **[ ] Rest of M4** — model seats, usage ledger + budget governor (per-profile),
    cache-shaped prompt assembly, capability registry that refuses; then the skills &
@@ -157,9 +178,15 @@ idempotency keys (Q3 deferred half), headless approval queue (Q5, server-track p
 
 ## Blocked / waiting on something
 
-- **Nothing.** (The ONNX ensemble export — previously the only blocker — was run on
-  2026-07-16; artifacts are produced and preserved. Item 3's remaining work is
-  ordinary Rust wiring, no external dependency.)
+- **Native tool-use LIVE proof** — the code is built + unit/wire tested (item 4), but
+  the end-to-end proof against a real model needs a native-tool-capable endpoint that's
+  actually reachable. Lukas's LM Studio (qwen3.6-35b-a3b, `127.0.0.1:1234`) is running
+  but has **"require API token" ON** — every request returns **HTTP 401**. Unblock by
+  either flipping that toggle OFF in LM Studio → Server Settings, or supplying the token.
+  Then: mark the provider `supports_native_tools` and run the env-gated
+  `live_native_tool_call_roundtrip` test (command in the health-check block above). The
+  401 was on a request our code shaped correctly (tools array accepted), so this is an
+  auth gate, not a code problem.
 
 ## Accepted quirks (documented, not bugs to fix)
 
