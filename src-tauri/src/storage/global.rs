@@ -82,7 +82,28 @@ impl MemoryBucket {
             MemoryBucket::PrivateLocal => "memory_facts_private_fts",
         }
     }
+    /// The bucket's embedding table — physically separate per bucket for the
+    /// same reason the fact tables are: a cloud-bound semantic search never
+    /// even queries the private vector index.
+    fn vectors_table(self) -> &'static str {
+        match self {
+            MemoryBucket::Shared => "memory_vectors",
+            MemoryBucket::PrivateLocal => "memory_vectors_private",
+        }
+    }
 }
+
+/// Semantic-lane relevance gates (cosine *distance*, i.e. `1 − similarity`,
+/// on L2-normalized bge-small vectors — lower is nearer). Calibrated against
+/// the live INT8 model (`embedder::live_gate_calibration`, 2026-07-16):
+/// clearly-related pairs measure ≈0.33, adjacent-topic ≈0.43, unrelated
+/// ≈0.54+. Tune with real usage (PLAN §9 "the genuinely hard part").
+///
+/// Auto-injection must stay quiet on most turns: admit clearly-related only.
+pub const SEMANTIC_MAX_DIST_INJECT: f64 = 0.38;
+/// An explicit `recall_memory` search casts wider — the user/agent asked —
+/// admitting adjacent-topic matches but still excluding unrelated.
+pub const SEMANTIC_MAX_DIST_RECALL: f64 = 0.48;
 
 /// A memory search hit: the fact, which bucket it came from, and its keyword
 /// relevance (lower bm25 = better; kept as the raw score for the caller to
@@ -112,16 +133,62 @@ fn row_to_memory_fact(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFact> {
 /// text can't break the query or inject syntax), and OR them for recall.
 /// Returns `None` when the query has no usable tokens.
 fn fts_match_expr(query: &str) -> Option<String> {
+    /// English function words that would otherwise make the OR-recall keyword
+    /// lane match nearly every fact ("the", "is", …) — turning the automatic
+    /// injection's "shares search tokens" relevance gate into a fire-always.
+    /// Content words only; a query that is ALL stopwords gets no keyword lane
+    /// (the meaning lane, when installed, can still match it).
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "did", "do", "does", "for",
+        "from", "had", "has", "have", "how", "i", "if", "in", "is", "it", "its", "me", "my",
+        "no", "not", "of", "on", "or", "our", "so", "that", "the", "their", "them", "then",
+        "there", "these", "they", "this", "to", "was", "we", "were", "what", "when", "where",
+        "which", "who", "why", "will", "with", "would", "you", "your",
+    ];
     let tokens: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"", t.to_lowercase()))
+        .map(|t| t.to_lowercase())
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .map(|t| format!("\"{t}\""))
         .collect();
     if tokens.is_empty() {
         None
     } else {
         Some(tokens.join(" OR "))
     }
+}
+
+/// Reciprocal Rank Fusion over the keyword and semantic result lists: each
+/// list contributes `1 / (60 + rank)` per fact (rank 1-based; 60 is the
+/// standard RRF constant), scores summed across lists, deduped by fact id,
+/// sorted best-first (HIGHER fused score = better), capped at `limit`. Rank
+/// fusion sidesteps ever comparing bm25 against cosine distance directly —
+/// the two scales share nothing.
+fn rrf_fuse(
+    keyword: Vec<MemorySearchHit>,
+    semantic: Vec<MemorySearchHit>,
+    limit: usize,
+) -> Vec<MemorySearchHit> {
+    const K: f64 = 60.0;
+    let mut fused: Vec<MemorySearchHit> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for list in [keyword, semantic] {
+        for (rank, mut hit) in list.into_iter().enumerate() {
+            let contribution = 1.0 / (K + rank as f64 + 1.0);
+            match index.get(&hit.fact.id) {
+                Some(&i) => fused[i].score += contribution,
+                None => {
+                    index.insert(hit.fact.id.clone(), fused.len());
+                    hit.score = contribution;
+                    fused.push(hit);
+                }
+            }
+        }
+    }
+    fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    fused.truncate(limit);
+    fused
 }
 
 #[derive(Debug, Clone)]
@@ -670,7 +737,181 @@ impl GlobalDb {
         Ok(rows)
     }
 
+    // ── hybrid search (keyword + meaning, PLAN §9) ──────────────────────────
+
+    /// Hybrid variant of [`search_memory_scoped`] — the automatic-injection
+    /// path. When `query_vec` is `Some` (an embedder is installed), the
+    /// keyword (FTS) lane and the meaning (sqlite-vec) lane run together and
+    /// are fused by Reciprocal Rank Fusion; `None` degrades to keyword-only.
+    /// The semantic lane is gated at `max_dist` so injection stays quiet
+    /// unless a fact is genuinely near. Hit `score` is the RRF score
+    /// (HIGHER = better — unlike the raw-bm25 keyword functions).
+    pub fn search_memory_scoped_hybrid(
+        &self,
+        query: &str,
+        query_vec: Option<&[f32]>,
+        profile: &str,
+        allow_private: bool,
+        max_dist: f64,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchHit>> {
+        let keyword = self.search_memory_scoped(query, profile, allow_private, limit)?;
+        let semantic = match query_vec {
+            Some(qv) => {
+                let mut s =
+                    self.semantic_search_bucket(MemoryBucket::Shared, qv, Some(profile), max_dist, limit)?;
+                if allow_private {
+                    s.extend(self.semantic_search_bucket(
+                        MemoryBucket::PrivateLocal,
+                        qv,
+                        Some(profile),
+                        max_dist,
+                        limit,
+                    )?);
+                }
+                s.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+                s.truncate(limit);
+                s
+            }
+            None => Vec::new(),
+        };
+        Ok(rrf_fuse(keyword, semantic, limit))
+    }
+
+    /// Hybrid variant of [`search_memory_for_recall`] — the `recall_memory`
+    /// tool. Same bucket/profile scoping as the keyword version (shared =
+    /// cross-profile; private-local = active profile only, and only when
+    /// `allow_private`); same RRF fusion + `max_dist` gate as
+    /// [`search_memory_scoped_hybrid`].
+    pub fn search_memory_for_recall_hybrid(
+        &self,
+        query: &str,
+        query_vec: Option<&[f32]>,
+        profile: &str,
+        allow_private: bool,
+        max_dist: f64,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchHit>> {
+        let keyword = self.search_memory_for_recall(query, profile, allow_private, limit)?;
+        let semantic = match query_vec {
+            Some(qv) => {
+                let mut s =
+                    self.semantic_search_bucket(MemoryBucket::Shared, qv, None, max_dist, limit)?;
+                if allow_private {
+                    s.extend(self.semantic_search_bucket(
+                        MemoryBucket::PrivateLocal,
+                        qv,
+                        Some(profile),
+                        max_dist,
+                        limit,
+                    )?);
+                }
+                s.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+                s.truncate(limit);
+                s
+            }
+            None => Vec::new(),
+        };
+        Ok(rrf_fuse(keyword, semantic, limit))
+    }
+
+    /// Nearest facts in one bucket by cosine distance, best first, gated at
+    /// `max_dist`. `profile` restricts to that profile's facts. The
+    /// `length(...)` guard skips any row whose blob isn't this embedder's
+    /// dimension (a stale/corrupt row must not error the whole query). Hit
+    /// `score` here is the raw cosine DISTANCE (lower = nearer).
+    fn semantic_search_bucket(
+        &self,
+        bucket: MemoryBucket,
+        query_vec: &[f32],
+        profile: Option<&str>,
+        max_dist: f64,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchHit>> {
+        let blob = crate::embedder::vec_to_blob(query_vec);
+        let profile_clause = if profile.is_some() {
+            "AND f.origin_profile = ?4"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT f.id, f.content, f.origin_profile, f.tags, f.created_at, f.pinned,
+                    vec_distance_cosine(v.embedding, ?1) AS dist
+             FROM {vec} v
+             JOIN {tbl} f ON f.id = v.fact_id
+             WHERE length(v.embedding) = ?2 {profile_clause}
+             ORDER BY dist LIMIT ?3",
+            vec = bucket.vectors_table(),
+            tbl = bucket.table(),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_hit = |r: &rusqlite::Row<'_>| {
+            Ok(MemorySearchHit {
+                fact: row_to_memory_fact(r)?,
+                bucket,
+                score: r.get(6)?,
+            })
+        };
+        let blob_len = blob.len() as i64;
+        let rows = match profile {
+            Some(p) => stmt
+                .query_map(params![blob, blob_len, limit as i64, p], map_hit)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![blob, blob_len, limit as i64], map_hit)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows.into_iter().filter(|h| h.score <= max_dist).collect())
+    }
+
     // ── memory_vectors ─────────────────────────────────────────────────────
+
+    /// Store `fact_id`'s embedding in its bucket's vector table, replacing any
+    /// previous embedding for that fact (re-saving/re-embedding is idempotent).
+    pub fn upsert_memory_embedding(
+        &self,
+        bucket: MemoryBucket,
+        fact_id: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
+        let blob = crate::embedder::vec_to_blob(embedding);
+        self.conn.execute(
+            &format!("DELETE FROM {} WHERE fact_id = ?1", bucket.vectors_table()),
+            params![fact_id],
+        )?;
+        self.conn.execute(
+            &format!(
+                "INSERT INTO {} (fact_id, embedding) VALUES (?1, ?2)",
+                bucket.vectors_table()
+            ),
+            params![fact_id, blob],
+        )?;
+        Ok(())
+    }
+
+    /// Facts in `bucket` that have no embedding yet — the boot-time backfill
+    /// worklist (facts saved before the embedder was installed, or whose
+    /// embed-on-save failed).
+    pub fn facts_missing_embedding(
+        &self,
+        bucket: MemoryBucket,
+        limit: usize,
+    ) -> Result<Vec<MemoryFact>> {
+        let sql = format!(
+            "SELECT f.id, f.content, f.origin_profile, f.tags, f.created_at, f.pinned
+             FROM {tbl} f
+             LEFT JOIN {vec} v ON v.fact_id = f.id
+             WHERE v.id IS NULL
+             ORDER BY f.created_at DESC LIMIT ?1",
+            tbl = bucket.table(),
+            vec = bucket.vectors_table(),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![limit as i64], row_to_memory_fact)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 
     pub fn insert_memory_vector(&self, v: &MemoryVector) -> Result<i64> {
         self.conn.execute(

@@ -104,6 +104,27 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
                 VALUES (new.rowid, new.content);
         END;",
     },
+    Migration {
+        version: 3,
+        // Meaning lane of hybrid memory search (PLAN §9): embedding vectors
+        // for the PRIVATE-LOCAL bucket live in their own PHYSICALLY SEPARATE
+        // table, mirroring the memory_facts / memory_facts_private split — a
+        // cloud-bound semantic search never even queries the private vector
+        // index, so the wall holds structurally (same principle as v2).
+        // The shared bucket keeps the original `memory_vectors` (v1) table.
+        // ON DELETE CASCADE works because run_migrations turns
+        // PRAGMA foreign_keys ON for every connection.
+        name: "memory_vectors_private",
+        sql: "
+        CREATE TABLE IF NOT EXISTS memory_vectors_private (
+            id          INTEGER PRIMARY KEY,
+            fact_id     TEXT NOT NULL,
+            embedding   BLOB NOT NULL,
+            FOREIGN KEY(fact_id) REFERENCES memory_facts_private(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_vectors_private_fact
+            ON memory_vectors_private(fact_id);",
+    },
 ];
 
 /// All per-profile DB migrations, in order.

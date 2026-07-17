@@ -141,6 +141,9 @@ pub struct AgentLoop {
     /// The tool spine: registry + gating chain + body capabilities. Every
     /// tool call the agent makes goes through this (§3.3 `tools::dispatch`).
     tools: Arc<ToolDispatcher>,
+    /// Memory's meaning-lane embedder (PLAN §9), when its model is installed.
+    /// `None` ⇒ the automatic memory injection runs keyword-only.
+    embedder: Option<Arc<dyn crate::embedder::TextEmbedder>>,
     stream_lock: tokio::sync::Mutex<()>,
 }
 
@@ -162,8 +165,19 @@ impl AgentLoop {
             model_manager,
             storage,
             tools,
+            embedder: None,
             stream_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Attach the memory embedder (meaning-lane hybrid search). Builder-style
+    /// so existing constructions stay valid; `None` keeps keyword-only.
+    pub fn with_embedder(
+        mut self,
+        embedder: Option<Arc<dyn crate::embedder::TextEmbedder>>,
+    ) -> Self {
+        self.embedder = embedder;
+        self
     }
 
     /// Process one user message and return the final assistant text.
@@ -419,10 +433,12 @@ impl AgentLoop {
     /// inject. Reads are best-effort — a storage error yields no injection, it
     /// never blocks the send.
     ///
-    /// The relevance "gate" is currently the keyword (FTS) lane: a snippet is
-    /// injected only if the message shares search tokens with a saved fact,
-    /// capped at [`AUTO_RECALL_LIMIT`]. A real relevance threshold and the
-    /// sqlite-vec meaning lane are follow-ups (see ROADMAP).
+    /// The relevance gate is the HYBRID search (PLAN §9): the keyword (FTS)
+    /// lane — a snippet must share search tokens with the message — fused with
+    /// the meaning (sqlite-vec) lane, which is distance-gated at
+    /// [`crate::storage::SEMANTIC_MAX_DIST_INJECT`] so only genuinely-near
+    /// facts inject, capped at `AUTO_RECALL_LIMIT`. Without an installed
+    /// embedder the meaning lane is skipped (keyword-only, as before).
     pub(crate) fn assemble_memory_context(
         &self,
         profile: &str,
@@ -437,8 +453,18 @@ impl AgentLoop {
         let summary = global
             .curated_summary(profile, allow_private, SUMMARY_LIMIT)
             .unwrap_or_default();
+        // Meaning-lane query vector, when the embedder is installed. Any
+        // failure degrades to keyword-only — never blocks the send.
+        let query_vec = self.embedder.as_ref().and_then(|e| e.embed_query(content).ok());
         let hits = global
-            .search_memory_scoped(content, profile, allow_private, AUTO_RECALL_LIMIT)
+            .search_memory_scoped_hybrid(
+                content,
+                query_vec.as_deref(),
+                profile,
+                allow_private,
+                crate::storage::SEMANTIC_MAX_DIST_INJECT,
+                AUTO_RECALL_LIMIT,
+            )
             .unwrap_or_default();
 
         // Don't repeat a fact that's already in the always-loaded summary.

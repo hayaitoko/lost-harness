@@ -14,6 +14,7 @@
 
 mod agent; // M1: agent loop, §7 gate, tool dispatch
 mod classifier; // M1: privacy classifier (heuristic + trained model)
+mod embedder; // PLAN §9: on-device text embedder (memory's meaning-search lane)
 mod audio; // M6: Audio engine, VAD, TTS pipeline
 mod hooks; // M3: Hook chain — privacy filter + permission + sandbox + first-use
 mod ipc; // M1: Tauri command handlers
@@ -106,6 +107,42 @@ pub fn run() {
                     }
                 };
 
+            // Memory's meaning-lane embedder (PLAN §9): stock bge-small-en-v1.5
+            // INT8 ONNX from <storage>/models/embedder/ — same runtime, install
+            // pattern, and graceful-absence shape as the classifier above.
+            // Missing model ⇒ memory search runs keyword-only, nothing breaks.
+            let embedder_models = base_path.join("models").join("embedder");
+            let embedder: Option<Arc<dyn crate::embedder::TextEmbedder>> =
+                match crate::embedder::OnnxEmbedder::load(&embedder_models) {
+                    Ok(e) => {
+                        tracing::info!(
+                            target: "lhp::memory",
+                            path = %embedder_models.display(),
+                            "loaded memory embedder (meaning-lane search active)"
+                        );
+                        Some(Arc::new(e))
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            target: "lhp::memory",
+                            reason = %e,
+                            "memory embedder unavailable — keyword-only memory search"
+                        );
+                        None
+                    }
+                };
+
+            // Boot-time backfill: embed any fact saved before the embedder was
+            // installed (or whose embed-on-save failed). Best-effort on a
+            // blocking thread — inference is sync CPU work; a failure only
+            // means those facts stay keyword-only until the next boot.
+            if let Some(emb) = embedder.clone() {
+                let storage_bf = Arc::clone(&storage);
+                tauri::async_runtime::spawn_blocking(move || {
+                    backfill_memory_embeddings(&storage_bf, &emb);
+                });
+            }
+
             // §7 Privacy Gate for message egress.
             let gate = PrivacyGate::new(Arc::clone(&classifier));
 
@@ -134,14 +171,18 @@ pub fn run() {
                 Arc::clone(&ledger),
                 Some(Arc::clone(&prompter)),
                 (*storage).clone(),
+                embedder.clone(),
             ));
 
-            let agent_loop = Arc::new(AgentLoop::new(
-                gate,
-                Arc::clone(&model_manager),
-                Arc::clone(&storage),
-                tools,
-            ));
+            let agent_loop = Arc::new(
+                AgentLoop::new(
+                    gate,
+                    Arc::clone(&model_manager),
+                    Arc::clone(&storage),
+                    tools,
+                )
+                .with_embedder(embedder.clone()),
+            );
 
             let state = AppState {
                 agent_loop,
@@ -149,6 +190,7 @@ pub fn run() {
                 storage,
                 approvals,
                 classifier: Arc::clone(&classifier),
+                embedder,
             };
             app.manage(state);
 
@@ -243,12 +285,52 @@ fn hydrate_providers_from_storage(
 /// read-only tools (read/list/search) are whole-tool `Allow`ed + pre-trusted,
 /// while state-changing tools (write/edit/delete) are `Ask` and route through
 /// the approval spine (the confirmation dialog).
+/// Embed any memory fact that has no vector yet (saved before the embedder was
+/// installed, or whose embed-on-save failed) — the meaning lane's catch-up
+/// pass, run once per boot on a blocking thread. Bounded per bucket per boot
+/// so a huge archive can't stall anything; the remainder catches up next boot.
+fn backfill_memory_embeddings(
+    storage: &crate::storage::Storage,
+    embedder: &Arc<dyn crate::embedder::TextEmbedder>,
+) {
+    use crate::storage::MemoryBucket;
+    const BACKFILL_CAP_PER_BUCKET: usize = 512;
+
+    for bucket in [MemoryBucket::Shared, MemoryBucket::PrivateLocal] {
+        let pending = match storage.global().facts_missing_embedding(bucket, BACKFILL_CAP_PER_BUCKET) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(target: "lhp::memory", error = %e, "embedding backfill: listing failed");
+                continue;
+            }
+        };
+        if pending.is_empty() {
+            continue;
+        }
+        let total = pending.len();
+        let mut done = 0usize;
+        for fact in pending {
+            match embedder.embed_passage(&fact.content) {
+                Ok(v) => match storage.global().upsert_memory_embedding(bucket, &fact.id, &v) {
+                    Ok(()) => done += 1,
+                    Err(e) => tracing::warn!(target: "lhp::memory", error = %e, fact = %fact.id,
+                        "embedding backfill: store failed"),
+                },
+                Err(e) => tracing::warn!(target: "lhp::memory", error = %e, fact = %fact.id,
+                    "embedding backfill: embed failed"),
+            }
+        }
+        tracing::info!(target: "lhp::memory", ?bucket, done, total, "embedding backfill pass");
+    }
+}
+
 fn build_tool_dispatcher(
     base_path: &std::path::Path,
     classifier: Arc<dyn crate::classifier::Classifier>,
     ledger: Arc<crate::hooks::ApprovalLedger>,
     approver: Option<Arc<dyn crate::hooks::ApprovalPrompter>>,
     storage: crate::storage::Storage,
+    embedder: Option<Arc<dyn crate::embedder::TextEmbedder>>,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -287,13 +369,14 @@ fn build_tool_dispatcher(
     // only so it can never surface a private-local fact into model context.
     // `remember` saves a fact routed by sensitivity — Write-risk, so it goes
     // through the approval spine (non-silent, gated).
-    registry.register(Box::new(crate::tools::memory::RecallMemoryTool::new(
-        storage.clone(),
-    )));
-    registry.register(Box::new(crate::tools::memory::RememberMemoryTool::new(
-        storage.clone(),
-        Arc::clone(&classifier),
-    )));
+    registry.register(Box::new(
+        crate::tools::memory::RecallMemoryTool::new(storage.clone())
+            .with_embedder(embedder.clone()),
+    ));
+    registry.register(Box::new(
+        crate::tools::memory::RememberMemoryTool::new(storage.clone(), Arc::clone(&classifier))
+            .with_embedder(embedder),
+    ));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
     // scratch dir, network off by default, killed on timeout, OS-sandboxed via

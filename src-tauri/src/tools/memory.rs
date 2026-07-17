@@ -20,11 +20,36 @@ use serde_json::json;
 
 use crate::classifier::rules::RuleCategory;
 use crate::classifier::{Classification, Classifier, Label};
-use crate::storage::{MemoryBucket, MemoryFact, Storage};
+use crate::embedder::TextEmbedder;
+use crate::storage::{MemoryBucket, MemoryFact, Storage, SEMANTIC_MAX_DIST_RECALL};
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
 /// How many matches `recall_memory` returns (PLAN §9: "only the top handful").
 const RECALL_LIMIT: usize = 5;
+
+/// Best-effort embed-and-index of a just-saved fact into its bucket's vector
+/// table — the meaning lane of hybrid search. Canonical here so the agent's
+/// `remember` and the manual `save_memory` IPC index identically. Failure is
+/// logged, never propagated: the fact is already saved, and the boot-time
+/// backfill (`facts_missing_embedding`) re-tries any fact left unindexed.
+pub fn embed_fact_best_effort(
+    storage: &Storage,
+    embedder: Option<&Arc<dyn TextEmbedder>>,
+    bucket: MemoryBucket,
+    fact: &MemoryFact,
+) {
+    let Some(emb) = embedder else { return };
+    match emb.embed_passage(&fact.content) {
+        Ok(v) => {
+            if let Err(e) = storage.global().upsert_memory_embedding(bucket, &fact.id, &v) {
+                tracing::warn!(target: "lhp::memory", error = %e, fact = %fact.id,
+                    "failed to store memory embedding (backfill will retry)");
+            }
+        }
+        Err(e) => tracing::warn!(target: "lhp::memory", error = %e, fact = %fact.id,
+            "failed to embed memory fact (backfill will retry)"),
+    }
+}
 
 /// Where a memory write should go — PLAN §9's 3-bucket sensitivity model.
 /// Canonical here; the `save_memory` IPC uses it too, so a manual add and an
@@ -53,14 +78,25 @@ pub fn route_memory_sensitivity(c: &Classification) -> MemoryRoute {
     }
 }
 
-/// The agent's memory-search tool. Holds a `Storage` handle (cheap Arc clone).
+/// The agent's memory-search tool. Holds a `Storage` handle (cheap Arc clone)
+/// and, when the embedding model is installed, the embedder that powers the
+/// meaning lane of the hybrid search (keyword-only otherwise).
 pub struct RecallMemoryTool {
     storage: Storage,
+    embedder: Option<Arc<dyn TextEmbedder>>,
 }
 
 impl RecallMemoryTool {
     pub fn new(storage: Storage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            embedder: None,
+        }
+    }
+
+    pub fn with_embedder(mut self, embedder: Option<Arc<dyn TextEmbedder>>) -> Self {
+        self.embedder = embedder;
+        self
     }
 }
 
@@ -96,15 +132,29 @@ impl Tool for RecallMemoryTool {
                     )
                 }
             };
+            // Hybrid search: keyword (FTS) + meaning (sqlite-vec) fused by
+            // rank, when the embedder is installed; keyword-only otherwise. An
+            // embed failure degrades to keyword-only rather than failing the
+            // recall.
+            let query_vec = self.embedder.as_ref().and_then(|e| {
+                e.embed_query(&query)
+                    .map_err(|err| {
+                        tracing::warn!(target: "lhp::memory", error = %err,
+                            "query embedding failed — keyword-only recall");
+                    })
+                    .ok()
+            });
             // Private-local facts are readable ONLY on a non-cloud turn
             // (`allow_private_memory`, set by the dispatcher to `!is_cloud`) AND
             // only from the ACTIVE profile — shared facts are cross-profile (one
             // coherent memory, §7), but a private-local fact never crosses the
             // profile boundary. A cloud turn stays shared-only.
-            match self.storage.global().search_memory_for_recall(
+            match self.storage.global().search_memory_for_recall_hybrid(
                 &query,
+                query_vec.as_deref(),
                 &ctx.profile,
                 ctx.allow_private_memory,
+                SEMANTIC_MAX_DIST_RECALL,
                 RECALL_LIMIT,
             ) {
                 Ok(hits) => {
@@ -133,6 +183,7 @@ impl Tool for RecallMemoryTool {
 pub struct RememberMemoryTool {
     storage: Storage,
     classifier: Arc<dyn Classifier>,
+    embedder: Option<Arc<dyn TextEmbedder>>,
 }
 
 impl RememberMemoryTool {
@@ -140,7 +191,13 @@ impl RememberMemoryTool {
         Self {
             storage,
             classifier,
+            embedder: None,
         }
+    }
+
+    pub fn with_embedder(mut self, embedder: Option<Arc<dyn TextEmbedder>>) -> Self {
+        self.embedder = embedder;
+        self
     }
 }
 
@@ -208,7 +265,9 @@ impl Tool for RememberMemoryTool {
                 pinned: false,
             };
             match self.storage.global().insert_memory_fact_in(bucket, &fact) {
-                Ok(()) => ToolResult::Ok(json!({
+                Ok(()) => {
+                    embed_fact_best_effort(&self.storage, self.embedder.as_ref(), bucket, &fact);
+                    ToolResult::Ok(json!({
                     "saved": true,
                     "sensitivity": if bucket == MemoryBucket::PrivateLocal {
                         "private_local"
@@ -216,7 +275,8 @@ impl Tool for RememberMemoryTool {
                         "shared"
                     },
                     "id": fact.id,
-                })),
+                    }))
+                }
                 Err(e) => ToolResult::Err(format!("remember failed: {e}")),
             }
         })
@@ -504,6 +564,83 @@ mod tests {
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod hybrid_tests {
+    use super::*;
+    use crate::embedder::FakeEmbedder;
+    use crate::storage::MemoryBucket;
+    use serde_json::json;
+
+    fn temp_storage() -> (Storage, std::path::PathBuf) {
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-mem-hybrid-{}", uuid::Uuid::new_v4()));
+        let storage = Storage::open(&root).unwrap();
+        (storage, root)
+    }
+
+    /// The headline PLAN §9 behavior: "a search for 'that thing about the
+    /// deploy key' finds a fact that was phrased completely differently."
+    #[tokio::test]
+    async fn recall_finds_a_differently_phrased_fact_via_the_meaning_lane() {
+        let (storage, root) = temp_storage();
+        // Fake semantics: both phrasings land on axis 0.
+        let fake: Arc<dyn TextEmbedder> =
+            Arc::new(FakeEmbedder(vec![("vault", 0), ("sign-in secret", 0)]));
+
+        let fact = MemoryFact {
+            id: "f".into(),
+            content: "the vault on artoo holds the door code".into(),
+            origin_profile: "personal".into(),
+            tags: None,
+            created_at: 1,
+            pinned: false,
+        };
+        storage.global().insert_memory_fact_in(MemoryBucket::Shared, &fact).unwrap();
+        embed_fact_best_effort(&storage, Some(&fake), MemoryBucket::Shared, &fact);
+
+        let tool = RecallMemoryTool::new(storage.clone()).with_embedder(Some(fake));
+        // Zero keyword overlap with the fact (and stopwords don't count).
+        match tool
+            .run(ToolInput::new(json!({ "query": "sign-in secret" })), &ExecCtx::default())
+            .await
+        {
+            ToolResult::Ok(v) => {
+                let matches = v["matches"].as_array().unwrap();
+                assert_eq!(matches.len(), 1, "meaning lane must surface the fact");
+                assert!(matches[0]["content"].as_str().unwrap().contains("door code"));
+            }
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn remember_with_embedder_indexes_the_saved_fact() {
+        let (storage, root) = temp_storage();
+        let fake: Arc<dyn TextEmbedder> = Arc::new(FakeEmbedder(vec![("standup", 1)]));
+        let tool = RememberMemoryTool::new(
+            storage.clone(),
+            Arc::new(crate::classifier::RulesClassifier::new()),
+        )
+        .with_embedder(Some(fake));
+
+        let saved_id = match tool
+            .run(
+                ToolInput::new(json!({ "content": "the standup is at 10am" })),
+                &ExecCtx::default(),
+            )
+            .await
+        {
+            ToolResult::Ok(v) => v["id"].as_str().unwrap().to_string(),
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        };
+        let vecs = storage.global().list_vectors_for_fact(&saved_id).unwrap();
+        assert_eq!(vecs.len(), 1, "remember must index the fact for the meaning lane");
+        assert_eq!(vecs[0].embedding.len(), 8 * 4, "8-dim f32 blob");
         let _ = std::fs::remove_dir_all(root);
     }
 }

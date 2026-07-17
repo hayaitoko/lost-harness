@@ -825,3 +825,54 @@ fn assemble_memory_context_is_endpoint_aware_and_profile_scoped() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn assemble_memory_context_uses_the_meaning_lane_with_a_relevance_gate() {
+    use crate::embedder::{FakeEmbedder, TextEmbedder};
+    use crate::storage::{MemoryBucket, MemoryFact};
+    use std::sync::Arc;
+
+    let (agent, storage, dir) = redaction_loop();
+    let fake: Arc<dyn TextEmbedder> =
+        Arc::new(FakeEmbedder(vec![("heater", 2), ("furnace", 2), ("groceries", 3)]));
+    let g = storage.global();
+    let mk = |id: &str, content: &str| MemoryFact {
+        id: id.into(),
+        content: content.into(),
+        origin_profile: "personal".into(),
+        tags: None,
+        created_at: 1,
+        pinned: false,
+    };
+    // Fill the always-loaded summary with pinned facts so the relevance
+    // snippets below are genuinely NEW to the turn (the injection path dedups
+    // against the summary).
+    for i in 0..8 {
+        let mut f = mk(&format!("pin{i}"), &format!("pinned filler fact number {i}"));
+        f.pinned = true;
+        g.insert_memory_fact_in(MemoryBucket::Shared, &f).unwrap();
+    }
+    // Related-by-meaning fact (axis 2 via "heater") and an unrelated one (axis 3).
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("h", "the heater was repaired in March")).unwrap();
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("g", "groceries are delivered on Sundays")).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "h", &fake.embed_passage("the heater was repaired in March").unwrap()).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "g", &fake.embed_passage("groceries are delivered on Sundays").unwrap()).unwrap();
+
+    let agent = agent.with_embedder(Some(fake));
+
+    // "furnace" shares no keyword with either fact, but its vector sits on the
+    // heater fact's axis → that one (and only that one) injects. The summary
+    // also carries facts, so assert on the relevance section by count: strip
+    // the summary by checking the unrelated fact is absent from the relevance
+    // wording. Simplest robust check: the block contains the heater fact.
+    let (block, recalled) = agent
+        .assemble_memory_context("personal", "when did we fix the furnace?", false)
+        .expect("context expected");
+    assert!(block.contains("heater"), "meaning-lane match must inject");
+    // recalled counts only relevance snippets (not the always-loaded summary):
+    // exactly the heater fact — the groceries fact is past the distance gate
+    // and shares no keywords.
+    assert_eq!(recalled, 1, "only the semantically-near fact clears the inject gate");
+
+    let _ = std::fs::remove_dir_all(dir);
+}

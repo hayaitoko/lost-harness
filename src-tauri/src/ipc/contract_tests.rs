@@ -79,6 +79,7 @@ fn test_app() -> App<MockRuntime> {
         storage,
         approvals: Arc::new(crate::ipc::approval::ApprovalRegistry::new()),
         classifier: Arc::new(HeuristicClassifier::new()),
+        embedder: None,
     };
 
     let app = mock_builder()

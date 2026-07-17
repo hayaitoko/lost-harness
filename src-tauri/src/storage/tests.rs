@@ -62,14 +62,15 @@ fn fresh_in_memory_profile_has_all_tables() {
 
 #[test]
 fn schema_version_is_current_after_init_global() {
-    // Global schema is now v2 (the memory system added buckets + FTS5 at v2).
+    // Global schema is now v3 (v2 added memory buckets + FTS5; v3 added the
+    // private-bucket vector table for the meaning lane).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 2);
+    assert_eq!(v, 3);
 }
 
 #[test]
@@ -1085,4 +1086,198 @@ fn sqlite_vec_extension_loads_and_does_knn() {
         .expect("KNN query must run");
 
     assert_eq!(nearest, vec![1, 3], "nearest-match ordering must be 1 then 3");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hybrid memory search — the sqlite-vec meaning lane (PLAN §9)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A unit vector on `axis` of an 8-dim space (mirrors the FakeEmbedder's shape).
+fn axis_vec(axis: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; 8];
+    v[axis] = 1.0;
+    v
+}
+
+#[test]
+fn semantic_lane_finds_meaning_matches_without_keyword_overlap() {
+    let g = GlobalDb::open_in_memory().unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("a", "the vault holds the door code", "personal", false),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("b", "the standup moved to Tuesdays", "personal", false),
+    )
+    .unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "a", &axis_vec(0)).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "b", &axis_vec(1)).unwrap();
+
+    // The query shares ZERO tokens with fact "a" — keyword-only finds nothing —
+    // but its vector sits on fact "a"'s axis (distance 0), so the meaning lane
+    // surfaces it. Fact "b" is at distance 1.0, past the gate.
+    let hits = g
+        .search_memory_scoped_hybrid(
+            "where is the passcode kept",
+            Some(&axis_vec(0)),
+            "personal",
+            false,
+            SEMANTIC_MAX_DIST_INJECT,
+            3,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1, "only the near-by-meaning fact clears the gate");
+    assert_eq!(hits[0].fact.id, "a");
+
+    // Without a query vector (no embedder installed) the same query finds
+    // nothing — graceful keyword-only degradation.
+    let none = g
+        .search_memory_scoped_hybrid(
+            "where is the passcode kept",
+            None,
+            "personal",
+            false,
+            SEMANTIC_MAX_DIST_INJECT,
+            3,
+        )
+        .unwrap();
+    assert!(none.is_empty(), "keyword-only lane has no match for this phrasing");
+}
+
+#[test]
+fn semantic_lane_respects_private_wall_profile_scope_and_dim_guard() {
+    let g = GlobalDb::open_in_memory().unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::PrivateLocal,
+        &mem_fact("p", "my insulin dose is 12 units nightly", "personal", false),
+    )
+    .unwrap();
+    g.upsert_memory_embedding(MemoryBucket::PrivateLocal, "p", &axis_vec(2)).unwrap();
+
+    // Cloud turn (allow_private=false): even an exact vector match must not
+    // surface the private fact — the private vector table is never queried.
+    let cloud = g
+        .search_memory_for_recall_hybrid(
+            "zzz nothing keyword",
+            Some(&axis_vec(2)),
+            "personal",
+            false,
+            SEMANTIC_MAX_DIST_RECALL,
+            5,
+        )
+        .unwrap();
+    assert!(cloud.is_empty(), "cloud turn must never see the private vector index");
+
+    // Local turn, same profile: found.
+    let local = g
+        .search_memory_for_recall_hybrid(
+            "zzz nothing keyword",
+            Some(&axis_vec(2)),
+            "personal",
+            true,
+            SEMANTIC_MAX_DIST_RECALL,
+            5,
+        )
+        .unwrap();
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].fact.id, "p");
+    assert_eq!(local[0].bucket, MemoryBucket::PrivateLocal);
+
+    // Local turn, DIFFERENT profile: the private-local bucket never crosses
+    // the profile boundary.
+    let other = g
+        .search_memory_for_recall_hybrid(
+            "zzz nothing keyword",
+            Some(&axis_vec(2)),
+            "work",
+            true,
+            SEMANTIC_MAX_DIST_RECALL,
+            5,
+        )
+        .unwrap();
+    assert!(other.is_empty(), "private-local must not cross the profile boundary");
+
+    // Dimension guard: a stale 3-dim blob must be skipped, not error the query.
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("stale", "an old fact with a stale vector", "personal", false),
+    )
+    .unwrap();
+    g.insert_memory_vector(&MemoryVector {
+        id: 0,
+        fact_id: "stale".into(),
+        embedding: vec![1.0f32, 0.0, 0.0].into_iter().flat_map(|f| f.to_le_bytes()).collect(),
+    })
+    .unwrap();
+    let ok = g
+        .search_memory_for_recall_hybrid(
+            "zzz nothing keyword",
+            Some(&axis_vec(0)),
+            "personal",
+            false,
+            SEMANTIC_MAX_DIST_RECALL,
+            5,
+        )
+        .unwrap();
+    assert!(ok.is_empty(), "a wrong-dimension row is skipped, never an error");
+}
+
+#[test]
+fn hybrid_fuses_keyword_and_semantic_lanes() {
+    let g = GlobalDb::open_in_memory().unwrap();
+    // "both": keyword AND meaning match. "kw": keyword only. "sem": meaning only.
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("both", "the deploy key lives in the vault", "personal", false),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("kw", "a deploy checklist for fridays", "personal", false),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("sem", "credentials are stored in the password manager", "personal", false),
+    )
+    .unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "both", &axis_vec(0)).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "kw", &axis_vec(1)).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "sem", &axis_vec(0)).unwrap();
+
+    let hits = g
+        .search_memory_scoped_hybrid(
+            "deploy key",
+            Some(&axis_vec(0)),
+            "personal",
+            false,
+            SEMANTIC_MAX_DIST_INJECT,
+            3,
+        )
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.fact.id.as_str()).collect();
+    assert!(ids.contains(&"both") && ids.contains(&"kw") && ids.contains(&"sem"),
+        "hybrid must union both lanes, got {ids:?}");
+    assert_eq!(ids[0], "both", "a fact matching BOTH lanes must rank first (RRF)");
+}
+
+#[test]
+fn facts_missing_embedding_backfill_worklist() {
+    let g = GlobalDb::open_in_memory().unwrap();
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("e1", "embedded fact", "p", false)).unwrap();
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("e2", "not yet embedded", "p", false)).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "e1", &axis_vec(0)).unwrap();
+
+    let missing = g.facts_missing_embedding(MemoryBucket::Shared, 10).unwrap();
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].id, "e2");
+
+    g.upsert_memory_embedding(MemoryBucket::Shared, "e2", &axis_vec(1)).unwrap();
+    assert!(g.facts_missing_embedding(MemoryBucket::Shared, 10).unwrap().is_empty());
+
+    // Upsert replaces: re-embedding e1 leaves exactly one vector row.
+    g.upsert_memory_embedding(MemoryBucket::Shared, "e1", &axis_vec(3)).unwrap();
+    assert_eq!(g.list_vectors_for_fact("e1").unwrap().len(), 1, "upsert must replace, not stack");
 }

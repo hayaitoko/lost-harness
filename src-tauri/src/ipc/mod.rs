@@ -63,6 +63,9 @@ pub struct AppState {
     /// shared with the §7 gate. Backs `explain_classification` for the
     /// annotated-redaction "why" sidebar (PLAN §11).
     pub classifier: Arc<dyn crate::classifier::Classifier>,
+    /// Memory's meaning-lane embedder (PLAN §9) when its model is installed;
+    /// `None` ⇒ saves are keyword-indexed only (backfill embeds them later).
+    pub embedder: Option<Arc<dyn crate::embedder::TextEmbedder>>,
 }
 
 // ── Response types ───────────────────────────────────────────────────────
@@ -1012,6 +1015,13 @@ pub fn save_memory(
         .global()
         .insert_memory_fact_in(bucket, &fact)
         .map_err(|e| e.to_string())?;
+    // Meaning-lane index (best-effort; identical to the agent's `remember`).
+    crate::tools::memory::embed_fact_best_effort(
+        &state.storage,
+        state.embedder.as_ref(),
+        bucket,
+        &fact,
+    );
     Ok(SaveMemoryResult {
         sensitivity: bucket_str(bucket).to_string(),
         fact: Some(to_memory_info(fact, bucket)),
