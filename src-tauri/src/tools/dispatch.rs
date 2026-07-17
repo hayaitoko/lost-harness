@@ -313,6 +313,55 @@ impl ToolDispatcher {
         render_tool_catalog(&self.registry.available_tools(&self.env))
     }
 
+    /// The OpenAI function-call `tools` array for this body's available tools
+    /// (Q1 native transport): `[{type:"function", function:{name, description,
+    /// parameters: <Tool::schema()>}}]`. `None` when no tools are available.
+    /// Name/description are neutralized with the same guard used by the
+    /// fenced catalog — a foreign (MCP) tool's server-controlled description
+    /// must not smuggle live control text into the request either way.
+    pub fn native_tools_spec(&self) -> Option<serde_json::Value> {
+        let tools = self.registry.available_tools(&self.env);
+        if tools.is_empty() {
+            return None;
+        }
+        let arr: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": neutralize_untrusted(t.name()),
+                        "description": neutralize_untrusted(t.description()),
+                        "parameters": t.schema(),
+                    }
+                })
+            })
+            .collect();
+        Some(serde_json::Value::Array(arr))
+    }
+
+    /// Native-transport twin of [`run_turn`] (Q1): the calls arrive already
+    /// structured from the provider's API (`tool_calls` deltas assembled by
+    /// the model client) instead of being parsed out of the model's text.
+    /// On a native turn the fenced parser NEVER runs — a typed call block is
+    /// something read content cannot mint, and this keeps it that way by not
+    /// listening for fences at all. Everything downstream (budgets, repeat
+    /// detection, deny-cascade, hook chain, audit) is the shared `drive`
+    /// pipeline — transport-blind by construction.
+    pub async fn run_turn_native(
+        &self,
+        calls: Vec<ParsedToolCall>,
+        ctx: &ExecCtx,
+        binding: Binding,
+        is_cloud: bool,
+    ) -> TurnOutcome {
+        if calls.is_empty() {
+            return TurnOutcome::NoToolCalls;
+        }
+        self.drive(Vec::new(), calls, ctx, binding, is_cloud, 0, false)
+            .await
+    }
+
     /// Dispatch one already-parsed tool call: resolve → availability →
     /// gating chain → execute.
     ///

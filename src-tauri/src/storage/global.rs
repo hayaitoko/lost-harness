@@ -33,6 +33,8 @@ pub struct Endpoint {
     pub api_key_encrypted: Option<Vec<u8>>,
     pub kind: String,
     pub created_at: i64,
+    /// Q1: this endpoint's API supports OpenAI-style structured tool calls.
+    pub supports_native_tools: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -306,15 +308,16 @@ impl GlobalDb {
 
     pub fn insert_endpoint(&self, ep: &Endpoint) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO endpoints (id, name, base_url, api_key_encrypted, kind, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO endpoints (id, name, base_url, api_key_encrypted, kind, created_at, supports_native_tools)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 ep.id,
                 ep.name,
                 ep.base_url,
                 ep.api_key_encrypted,
                 ep.kind,
-                ep.created_at
+                ep.created_at,
+                ep.supports_native_tools as i64
             ],
         )?;
         Ok(())
@@ -324,7 +327,7 @@ impl GlobalDb {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, name, base_url, api_key_encrypted, kind, created_at
+                "SELECT id, name, base_url, api_key_encrypted, kind, created_at, supports_native_tools
                  FROM endpoints WHERE id = ?1",
                 params![id],
                 row_to_endpoint,
@@ -334,7 +337,7 @@ impl GlobalDb {
 
     pub fn list_endpoints(&self) -> Result<Vec<Endpoint>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, base_url, api_key_encrypted, kind, created_at
+            "SELECT id, name, base_url, api_key_encrypted, kind, created_at, supports_native_tools
              FROM endpoints ORDER BY name",
         )?;
         let rows = stmt
@@ -1037,5 +1040,6 @@ fn row_to_endpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<Endpoint> {
         api_key_encrypted: r.get(3)?,
         kind: r.get(4)?,
         created_at: r.get(5)?,
+        supports_native_tools: r.get::<_, i64>(6)? != 0,
     })
 }

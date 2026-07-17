@@ -44,6 +44,11 @@ pub struct Provider {
     pub api_key: Option<String>,
     /// What kind of endpoint this is. Used by the UI to group endpoints.
     pub kind: ProviderKind,
+    /// Q1: the endpoint's API supports OpenAI-style structured tool calls
+    /// (`tools` request param + `tool_calls` deltas). When true the agent
+    /// loop uses the native transport; otherwise the fenced dialect.
+    #[serde(default)]
+    pub supports_native_tools: bool,
 }
 
 impl Provider {
@@ -63,7 +68,14 @@ impl Provider {
             base_url: base_url.into(),
             api_key,
             kind,
+            supports_native_tools: false,
         }
+    }
+
+    /// Builder: mark this endpoint as supporting native structured tool calls.
+    pub fn with_native_tools(mut self, supported: bool) -> Self {
+        self.supports_native_tools = supported;
+        self
     }
 
     /// A provider is "local" if its `kind` is `Local`. Use `is_private` for

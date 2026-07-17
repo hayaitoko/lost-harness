@@ -273,6 +273,15 @@ pub trait Tool: Send + Sync {
         RiskClass::Safe
     }
 
+    /// JSON Schema for this tool's `args` (Q1). Native tool-use endpoints
+    /// consume it verbatim as the function's `parameters`; the fenced-dialect
+    /// catalog can render it as arg docs. Default = permissive object, so a
+    /// tool without a schema still works on both transports. Validation
+    /// remains a dispatch-boundary concern — `ToolInput.args` stays bare JSON.
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "additionalProperties": true })
+    }
+
     /// The capabilities this tool needs from its running environment.
     fn requires(&self) -> &[Capability];
 

@@ -62,15 +62,15 @@ fn fresh_in_memory_profile_has_all_tables() {
 
 #[test]
 fn schema_version_is_current_after_init_global() {
-    // Global schema is now v3 (v2 added memory buckets + FTS5; v3 added the
-    // private-bucket vector table for the meaning lane).
+    // Global schema is now v4 (v2 memory buckets + FTS5; v3 private-bucket
+    // vector table for the meaning lane; v4 endpoints.supports_native_tools).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 3);
+    assert_eq!(v, 4);
 }
 
 #[test]
@@ -636,11 +636,13 @@ fn global_endpoints_and_memory_round_trip() {
         api_key_encrypted: Some(b"fake-encrypted-bytes".to_vec()),
         kind: "anthropic".into(),
         created_at: now,
+        supports_native_tools: true,
     })
     .unwrap();
     let eps = g.list_endpoints().unwrap();
     assert_eq!(eps.len(), 1);
     assert_eq!(eps[0].name, "Anthropic");
+    assert!(eps[0].supports_native_tools, "the native-tools flag must round-trip through storage");
     assert_eq!(
         eps[0].api_key_encrypted.as_deref(),
         Some(b"fake-encrypted-bytes".as_slice())

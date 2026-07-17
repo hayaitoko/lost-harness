@@ -269,7 +269,8 @@ fn hydrate_providers_from_storage(
         let api_key = ep
             .api_key_encrypted
             .and_then(|b| String::from_utf8(b).ok());
-        let provider = Provider::new(ep.id, ep.name, ep.base_url, api_key, kind);
+        let provider = Provider::new(ep.id, ep.name, ep.base_url, api_key, kind)
+            .with_native_tools(ep.supports_native_tools);
         mm.add_provider(provider);
     }
     tracing::info!(count = mm.list_providers().len(), "hydrated providers from storage");

@@ -125,6 +125,14 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
         CREATE INDEX IF NOT EXISTS idx_memory_vectors_private_fact
             ON memory_vectors_private(fact_id);",
     },
+    Migration {
+        version: 4,
+        // Q1 native tool-use: per-endpoint capability flag. An endpoint whose
+        // API supports OpenAI-style structured tool calls gets the native
+        // transport; everything else keeps the fenced dialect.
+        name: "endpoints_native_tools_flag",
+        sql: "ALTER TABLE endpoints ADD COLUMN supports_native_tools INTEGER NOT NULL DEFAULT 0;",
+    },
 ];
 
 /// All per-profile DB migrations, in order.

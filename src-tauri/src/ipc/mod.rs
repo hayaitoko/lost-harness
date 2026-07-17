@@ -95,6 +95,7 @@ pub struct ProviderInfo {
     pub base_url: String,
     pub kind: ProviderKind,
     pub is_private: bool,
+    pub supports_native_tools: bool,
 }
 
 impl From<Provider> for ProviderInfo {
@@ -108,6 +109,7 @@ impl From<Provider> for ProviderInfo {
             base_url: p.base_url,
             kind: p.kind,
             is_private,
+            supports_native_tools: p.supports_native_tools,
         }
     }
 }
@@ -198,6 +200,9 @@ pub struct AddProviderArgs {
     pub api_key: Option<String>,
     /// "local" | "cloud" | "custom"
     pub kind: String,
+    /// Q1: endpoint supports OpenAI-style native structured tool calls.
+    #[serde(default)]
+    pub supports_native_tools: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -331,8 +336,23 @@ pub fn add_provider(
         args.base_url,
         args.api_key,
         kind,
-    );
+    )
+    .with_native_tools(args.supports_native_tools);
     state.model_manager.add_provider(provider.clone());
+    // Persist so the flag (and the endpoint) survive a restart and hydrate
+    // back on next boot. Best-effort: a storage failure logs but the
+    // in-memory provider still works for this session.
+    if let Err(e) = state.storage.global().insert_endpoint(&crate::storage::Endpoint {
+        id: id.clone(),
+        name: provider.name.clone(),
+        base_url: provider.base_url.clone(),
+        api_key_encrypted: provider.api_key.as_ref().map(|k| k.as_bytes().to_vec()),
+        kind: args.kind.clone(),
+        created_at: chrono::Utc::now().timestamp(),
+        supports_native_tools: provider.supports_native_tools,
+    }) {
+        tracing::warn!(error = %e, "failed to persist endpoint (in-memory only this session)");
+    }
     Ok(provider.into())
 }
 

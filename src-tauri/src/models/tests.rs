@@ -287,3 +287,117 @@ async fn manager_list_models_for_unknown_id_errors() {
     assert!(res.is_err());
     assert!(res.unwrap_err().to_string().contains("unknown provider"));
 }
+
+// ── Native tool-call streaming (Q1) ──────────────────────────────────────────
+
+/// The real OpenAI wire shape for a streamed tool call: the first delta
+/// carries the function name + an empty/opening args fragment, subsequent
+/// deltas carry `arguments` string fragments, then `finish_reason:"tool_calls"`.
+/// Proves `SseStream::next_event` decodes `delta.tool_calls` into
+/// `SseEvent::ToolCalls` fragments end-to-end through the production parser.
+#[tokio::test]
+async fn sse_decodes_native_tool_call_deltas() {
+    let chunks = vec![
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n".to_vec(),
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n".to_vec(),
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]}}]}\n".to_vec(),
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n".to_vec(),
+        b"data: [DONE]\n".to_vec(),
+    ];
+    let events = collect(stream_from_chunks(chunks)).await;
+
+    // Gather every fragment the parser surfaced, in order.
+    let frags: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SseEvent::ToolCalls(f) => Some(f.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(!frags.is_empty(), "expected tool-call fragments, got {events:?}");
+
+    // The full round-trip: assemble the fragments into a concrete call.
+    let calls = crate::tools::calling::assemble_native_calls(frags);
+    assert_eq!(calls.len(), 1);
+    match &calls[0] {
+        crate::tools::calling::ParsedToolCall::Call(c) => {
+            assert_eq!(c.name, "read_file");
+            assert_eq!(c.args, serde_json::json!({"path": "a.txt"}));
+        }
+        other => panic!("expected an assembled call, got {other:?}"),
+    }
+}
+
+/// LIVE native-tool-use test against a running OpenAI-compatible endpoint
+/// (LM Studio, etc.). Opt-in — set `LHP_NATIVE_ENDPOINT` (e.g.
+/// `http://127.0.0.1:1234/v1`), optionally `LHP_NATIVE_MODEL` and
+/// `LHP_NATIVE_TOKEN`. Sends a real `tools` spec and a prompt that should
+/// elicit a tool call, then asserts the endpoint streams back native
+/// `tool_calls` we can assemble. This is the end-to-end proof that a given
+/// local model actually honors the native transport.
+#[tokio::test]
+async fn live_native_tool_call_roundtrip() {
+    let Some(base) = std::env::var_os("LHP_NATIVE_ENDPOINT") else {
+        eprintln!("skipping live native-tool test — set LHP_NATIVE_ENDPOINT to run");
+        return;
+    };
+    let base = base.to_string_lossy().to_string();
+    let model = std::env::var("LHP_NATIVE_MODEL").unwrap_or_else(|_| "local-model".to_string());
+    let token = std::env::var("LHP_NATIVE_TOKEN").ok();
+
+    let provider = crate::models::Provider::new(
+        "live",
+        "Live",
+        base,
+        token,
+        crate::models::ProviderKind::Local,
+    )
+    .with_native_tools(true);
+    let client = crate::models::ModelClient::new(provider).unwrap();
+
+    let tools = serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"]
+            }
+        }
+    }]);
+    let messages = vec![
+        ChatMessage::system("You have tools. When asked about weather, call get_weather."),
+        ChatMessage::user("What's the weather in Paris right now? Use the tool."),
+    ];
+
+    let mut sse = client
+        .stream_chat_with_tools(&model, messages, Some(&tools))
+        .await
+        .expect("stream_chat_with_tools to the live endpoint");
+    let mut frags = Vec::new();
+    let mut text = String::new();
+    while let Some(ev) = sse.next_event().await {
+        match ev {
+            SseEvent::ToolCalls(f) => frags.extend(f),
+            SseEvent::Delta(t) => text.push_str(&t),
+            SseEvent::Error(e) => panic!("endpoint error: {e}"),
+            _ => {}
+        }
+    }
+    let calls = crate::tools::calling::assemble_native_calls(frags);
+    eprintln!("live endpoint returned {} tool call(s); text={text:?}", calls.len());
+    assert!(
+        !calls.is_empty(),
+        "the model did not emit a native tool call (text was {text:?})"
+    );
+    match &calls[0] {
+        crate::tools::calling::ParsedToolCall::Call(c) => {
+            assert_eq!(c.name, "get_weather", "unexpected tool name");
+            assert!(c.args.get("city").is_some(), "expected a city arg, got {}", c.args);
+        }
+        other => panic!("expected a well-formed call, got {other:?}"),
+    }
+}

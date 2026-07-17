@@ -643,14 +643,28 @@ impl AgentLoop {
         // then enforces ceilings and cascades inside `run_turn`.
         self.tools.begin_run();
 
+        // Q1: the native tools spec is rendered once; whether a given round
+        // USES it depends on the round's current provider (a mid-turn local
+        // reroute may land on a fenced-dialect endpoint).
+        let native_spec = self.tools.native_tools_spec();
+
         for round in 0..=MAX_TOOL_ROUNDS {
             let assistant_id = Uuid::new_v4().to_string();
+            // Per-round transport: native structured tool calls when this
+            // round's endpoint supports them (and any tools exist), the
+            // fenced dialect otherwise.
+            let native_mode = provider.supports_native_tools && native_spec.is_some();
             let mut sse = client
-                .stream_chat(&model, history.clone())
+                .stream_chat_with_tools(
+                    &model,
+                    history.clone(),
+                    if native_mode { native_spec.as_ref() } else { None },
+                )
                 .await
                 .with_context(|| format!("stream_chat to provider {}", provider.id))?;
 
             let mut assembled = String::new();
+            let mut native_frags: Vec<crate::models::sse::ToolCallFragment> = Vec::new();
             while let Some(event) = sse.next_event().await {
                 match event {
                     crate::models::sse::SseEvent::Delta(delta) => {
@@ -662,6 +676,21 @@ impl AgentLoop {
                         };
                         if let Err(e) = app.emit("stream:token", payload) {
                             tracing::warn!(error = %e, "failed to emit stream:token");
+                        }
+                    }
+                    crate::models::sse::SseEvent::ToolCalls(frags) => {
+                        if native_mode {
+                            native_frags.extend(frags);
+                        } else {
+                            // A server we didn't flag as native-capable sent
+                            // structured calls anyway. We don't run them —
+                            // the flag is the user-set capability contract —
+                            // but say so loudly instead of silently dropping.
+                            tracing::warn!(
+                                target: "lhp::tools",
+                                provider = %provider.id,
+                                "endpoint streamed native tool_calls but supports_native_tools is off — ignored"
+                            );
                         }
                     }
                     crate::models::sse::SseEvent::Error(msg) => {
@@ -725,18 +754,34 @@ impl AgentLoop {
                 break;
             }
 
-            // Run any tool calls the model made in ITS OWN output. Passing
-            // only `own_output` here (typed `&OwnOutput`, never a tool result
-            // or prior turn) is the "parse only your own current output"
-            // safety rule — enforced at the type level. A call that must stay
-            // on-device on this (cloud) endpoint is resolved by
-            // `resolve_turn_outcome`, which may switch
+            // Run the tool calls the model made THIS TURN. Two transports,
+            // one downstream pipeline (Q1):
+            //   - native: the provider attributed structured `tool_calls` to
+            //     the assistant; we assemble the streamed fragments and NEVER
+            //     run the fenced parser — a typed call block is something read
+            //     content can't mint, so on a native turn there's no second
+            //     listener for a forged fence.
+            //   - fenced: `parse_tool_calls` reads ONLY `own_output` (typed
+            //     `&OwnOutput`, never a tool result or prior turn) — the
+            //     "parse only your own current output" rule, enforced at the
+            //     type level.
+            // A call that must stay on-device on this (cloud) endpoint is
+            // resolved by `resolve_turn_outcome`, which may switch
             // provider/client/is_cloud/routing_decision to a local endpoint
             // for the rest of this turn.
-            let turn_outcome = self
-                .tools
-                .run_turn(&own_output, &exec_ctx, binding, is_cloud)
-                .await;
+            let turn_outcome = if native_mode {
+                let calls = crate::tools::calling::assemble_native_calls(native_frags);
+                if !calls.is_empty() {
+                    tracing::debug!(target: "lhp::tools", n = calls.len(), "native tool-use turn");
+                }
+                self.tools
+                    .run_turn_native(calls, &exec_ctx, binding, is_cloud)
+                    .await
+            } else {
+                self.tools
+                    .run_turn(&own_output, &exec_ctx, binding, is_cloud)
+                    .await
+            };
             let conv_id = conversation_id.clone();
             let (tool_feedback, new_provider, new_client, new_is_cloud, new_routing_decision) =
                 resolve_turn_outcome(
@@ -790,7 +835,16 @@ impl AgentLoop {
                         .context("persist tool message")?;
 
                     // Extend the working history and loop for another round.
-                    history.push(ChatMessage::assistant(assembled));
+                    // In native mode a tool-only turn can stream no text — a
+                    // blank assistant message trips some strict servers, so
+                    // substitute a short placeholder that keeps the turn
+                    // coherent without inventing model content.
+                    let assistant_turn = if assembled.trim().is_empty() {
+                        "[called tools]".to_string()
+                    } else {
+                        assembled
+                    };
+                    history.push(ChatMessage::assistant(assistant_turn));
                     history.push(tool_feedback);
                 }
                 // No tool calls — this turn is the final answer.

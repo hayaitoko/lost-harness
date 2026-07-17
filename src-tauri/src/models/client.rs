@@ -76,12 +76,16 @@ impl OwnOutput {
     }
 }
 
-/// Body of a `POST /chat/completions` request.
+/// Body of a `POST /chat/completions` request. `tools` (OpenAI function-call
+/// spec, Q1 native transport) is omitted from the JSON entirely when `None`
+/// so non-tool-capable servers never see the field.
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a serde_json::Value>,
 }
 
 /// Response body of `GET /models` and `POST /chat/completions` (non-stream).
@@ -167,6 +171,19 @@ impl ModelClient {
         model: &str,
         messages: Vec<ChatMessage>,
     ) -> Result<SseStream> {
+        self.stream_chat_with_tools(model, messages, None).await
+    }
+
+    /// `stream_chat` with an optional native `tools` array (Q1). Pass the
+    /// dispatcher-rendered OpenAI function-call spec on endpoints whose
+    /// `supports_native_tools` flag is set; `None` behaves exactly like
+    /// `stream_chat` (the field never appears on the wire).
+    pub async fn stream_chat_with_tools(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<SseStream> {
         let url = format!(
             "{}/chat/completions",
             self.provider.base_url.trim_end_matches('/')
@@ -175,6 +192,7 @@ impl ModelClient {
             model,
             messages: &messages,
             stream: true,
+            tools,
         };
         let mut req = self.client.post(&url).json(&body);
         if let Some(key) = &self.provider.api_key {
@@ -208,6 +226,7 @@ impl ModelClient {
             model,
             messages: &messages,
             stream: false,
+            tools: None,
         };
         let mut req = self.client.post(&url).json(&body);
         if let Some(key) = &self.provider.api_key {

@@ -42,6 +42,19 @@ pub enum SseEvent {
     /// The payload contained an `error` field. The string is the provider's
     /// error message when available.
     Error(String),
+    /// Native tool-call deltas from `choices[0].delta.tool_calls` (Q1). Each
+    /// fragment carries the call slot it belongs to (`index`) plus whatever
+    /// pieces this chunk streamed (the name arrives once; `arguments` arrives
+    /// as string fragments to be concatenated per slot by the caller).
+    ToolCalls(Vec<ToolCallFragment>),
+}
+
+/// One streamed piece of a native tool call (OpenAI `delta.tool_calls[i]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallFragment {
+    pub index: usize,
+    pub name: Option<String>,
+    pub arguments: String,
 }
 
 /// Incremental SSE stream parser. Construct via `SseStream::new` and call
@@ -186,6 +199,14 @@ impl SseStream {
                 return SseEvent::Delta(text);
             }
         }
+        // Native tool-call deltas (Q1). Content and tool_calls never share a
+        // chunk in practice; content wins above if a server ever mixes them
+        // (the tool fragments of such a chunk would be re-sent by no server
+        // we target — accepted limitation, logged at the assembler).
+        let fragments = parsed.tool_call_fragments();
+        if !fragments.is_empty() {
+            return SseEvent::ToolCalls(fragments);
+        }
         // No content and no error — keep-alive-like, e.g. a `role` chunk.
         SseEvent::KeepAlive
     }
@@ -222,6 +243,25 @@ struct SseChoice {
 struct SseMessage {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<SseToolCallDelta>>,
+}
+
+/// Wire shape of one `delta.tool_calls[i]` entry (OpenAI streaming).
+#[derive(Debug, Deserialize)]
+struct SseToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    function: Option<SseToolCallFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SseToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 impl SsePayload {
@@ -260,5 +300,34 @@ impl SsePayload {
             }
         }
         choice.text.as_ref().filter(|s| !s.is_empty()).cloned()
+    }
+
+    /// Extract native tool-call fragments from `choices[0].delta.tool_calls`
+    /// (falling back to `message.tool_calls` for non-streaming-shaped
+    /// providers). Missing `index` defaults to slot 0 (single-call servers).
+    fn tool_call_fragments(&self) -> Vec<ToolCallFragment> {
+        let Some(choice) = self.choices.first() else {
+            return Vec::new();
+        };
+        let deltas = choice
+            .delta
+            .as_ref()
+            .and_then(|d| d.tool_calls.as_ref())
+            .or_else(|| choice.message.as_ref().and_then(|m| m.tool_calls.as_ref()));
+        let Some(deltas) = deltas else {
+            return Vec::new();
+        };
+        deltas
+            .iter()
+            .map(|d| ToolCallFragment {
+                index: d.index.unwrap_or(0),
+                name: d.function.as_ref().and_then(|f| f.name.clone()),
+                arguments: d
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.arguments.clone())
+                    .unwrap_or_default(),
+            })
+            .collect()
     }
 }

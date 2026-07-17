@@ -49,6 +49,51 @@ pub enum ParsedToolCall {
     Malformed { raw: String, error: String },
 }
 
+/// Assemble native streamed tool-call fragments (Q1) into the same
+/// `ParsedToolCall` list the fenced parser produces — the normalization point
+/// where both transports meet. Fragments are folded per call slot (`index`):
+/// the name arrives once, `arguments` arrives as string fragments concatenated
+/// in stream order. Un-parseable arguments become `Malformed` (fed back to the
+/// model to retry, exactly like a bad fenced block); so does a slot that never
+/// received a name.
+pub fn assemble_native_calls(
+    fragments: Vec<crate::models::sse::ToolCallFragment>,
+) -> Vec<ParsedToolCall> {
+    use std::collections::BTreeMap;
+    let mut slots: BTreeMap<usize, (Option<String>, String)> = BTreeMap::new();
+    for f in fragments {
+        let slot = slots.entry(f.index).or_default();
+        if let Some(name) = f.name {
+            slot.0 = Some(name);
+        }
+        slot.1.push_str(&f.arguments);
+    }
+    slots
+        .into_values()
+        .map(|(name, raw_args)| {
+            let Some(name) = name else {
+                return ParsedToolCall::Malformed {
+                    raw: raw_args,
+                    error: "native tool call streamed no function name".to_string(),
+                };
+            };
+            // An empty arguments stream means "no args" — normalize to {}.
+            let args_src = if raw_args.trim().is_empty() { "{}" } else { raw_args.as_str() };
+            match serde_json::from_str::<serde_json::Value>(args_src) {
+                Ok(args) if args.is_object() => ParsedToolCall::Call(ToolCall { name, args }),
+                Ok(_) => ParsedToolCall::Malformed {
+                    raw: format!("{name} {raw_args}"),
+                    error: "native tool call arguments must be a JSON object".to_string(),
+                },
+                Err(e) => ParsedToolCall::Malformed {
+                    raw: format!("{name} {raw_args}"),
+                    error: format!("native tool call arguments failed to parse: {e}"),
+                },
+            }
+        })
+        .collect()
+}
+
 /// The opening fence, matched case-insensitively after trimming. Accepts
 /// ```` ```tool ```` only — not ```` ```json ```` or prose fences — so
 /// ordinary fenced code the model writes is never mistaken for a call.
@@ -430,6 +475,108 @@ mod tests {
         assert!(
             catalog.contains("'''tool"),
             "the description's fence should be defanged to '''tool: {catalog}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_transport_tests {
+    use super::*;
+    use crate::models::sse::ToolCallFragment;
+
+    fn frag(index: usize, name: Option<&str>, args: &str) -> ToolCallFragment {
+        ToolCallFragment {
+            index,
+            name: name.map(String::from),
+            arguments: args.to_string(),
+        }
+    }
+
+    #[test]
+    fn assembles_streamed_fragments_into_one_call() {
+        // The name arrives once, arguments arrive in fragments (as OpenAI streams).
+        let calls = assemble_native_calls(vec![
+            frag(0, Some("read_file"), "{\"pa"),
+            frag(0, None, "th\": \"a."),
+            frag(0, None, "txt\"}"),
+        ]);
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            ParsedToolCall::Call(c) => {
+                assert_eq!(c.name, "read_file");
+                assert_eq!(c.args, serde_json::json!({"path": "a.txt"}));
+            }
+            other => panic!("expected a parsed call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assembles_multiple_parallel_calls_by_slot() {
+        let calls = assemble_native_calls(vec![
+            frag(0, Some("read_file"), "{\"path\":\"a.txt\"}"),
+            frag(1, Some("list_dir"), "{\"path\":\".\"}"),
+        ]);
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(&calls[0], ParsedToolCall::Call(c) if c.name == "read_file"));
+        assert!(matches!(&calls[1], ParsedToolCall::Call(c) if c.name == "list_dir"));
+    }
+
+    #[test]
+    fn empty_arguments_normalize_to_empty_object() {
+        let calls = assemble_native_calls(vec![frag(0, Some("system_status"), "")]);
+        match &calls[0] {
+            ParsedToolCall::Call(c) => assert_eq!(c.args, serde_json::json!({})),
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bad_arguments_or_missing_name_become_malformed() {
+        // Un-parseable JSON args → Malformed (fed back for retry, like a bad fence).
+        assert!(matches!(
+            &assemble_native_calls(vec![frag(0, Some("t"), "{not json")])[0],
+            ParsedToolCall::Malformed { .. }
+        ));
+        // A slot that never got a name → Malformed.
+        assert!(matches!(
+            &assemble_native_calls(vec![frag(0, None, "{}")])[0],
+            ParsedToolCall::Malformed { .. }
+        ));
+        // Non-object JSON args → Malformed (args must be an object).
+        assert!(matches!(
+            &assemble_native_calls(vec![frag(0, Some("t"), "[1,2,3]")])[0],
+            ParsedToolCall::Malformed { .. }
+        ));
+    }
+
+    /// The load-bearing Q1 property: the SAME action produces the SAME approval
+    /// fingerprint whether it came through the fenced dialect or the native
+    /// transport — so a grant/pin made under one transport still covers the
+    /// action under the other. (`canonical(args)` sorts keys, so even a
+    /// different key order across transports fingerprints identically.)
+    #[test]
+    fn fingerprint_is_stable_across_transports() {
+        use crate::hooks::ActionFingerprint;
+
+        // Fenced: parsed out of the model's text.
+        let fenced = parse_tool_calls(&crate::models::OwnOutput::from_stream_assembly(
+            "```tool\n{\"name\": \"write_file\", \"args\": {\"path\": \"a.txt\", \"content\": \"x\"}}\n```".to_string(),
+        ));
+        // Native: streamed structured, with the keys in a DIFFERENT order.
+        let native = assemble_native_calls(vec![frag(
+            0,
+            Some("write_file"),
+            "{\"content\": \"x\", \"path\": \"a.txt\"}",
+        )]);
+
+        let fp = |c: &ParsedToolCall| match c {
+            ParsedToolCall::Call(tc) => ActionFingerprint::of(&tc.name, &tc.args),
+            other => panic!("expected a call, got {other:?}"),
+        };
+        assert_eq!(
+            fp(&fenced[0]),
+            fp(&native[0]),
+            "same action via both transports must fingerprint identically"
         );
     }
 }
