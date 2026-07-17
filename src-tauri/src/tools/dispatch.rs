@@ -421,9 +421,14 @@ impl ToolDispatcher {
                     }
                     // Inject the shared read-tracking handle so the fs tools'
                     // read-before-write guard sees reads recorded on earlier
-                    // turns of this same conversation.
+                    // turns of this same conversation. Also stamp the endpoint's
+                    // memory-privacy: only a non-cloud turn may read private-local
+                    // facts (PLAN §9). `is_cloud` is the CURRENT value (it can
+                    // flip on a mid-turn reroute), so a tool called after a
+                    // reroute-to-local correctly gains private access.
                     let run_ctx = ExecCtx {
                         reads: Some(Arc::clone(&self.reads)),
+                        allow_private_memory: !is_cloud,
                         ..ctx.clone()
                     };
                     return match tool.run(ev.input.clone(), &run_ctx).await {
@@ -967,6 +972,7 @@ mod tests {
             conversation_id: "conv-1".to_string(),
             profile: "personal".to_string(),
             reads: None,
+            allow_private_memory: false,
         }
     }
 

@@ -29,6 +29,7 @@
   import { activeProfileId } from "$lib/stores/profiles";
   import {
     explainClassification,
+    onMemoryEvent,
     type ClassificationExplanation,
     type ClassificationSpan,
   } from "$lib/api/tauri";
@@ -78,6 +79,25 @@
     whyOpen = true;
     panelTab = t;
   };
+
+  // ── Non-silent memory signal (PLAN §9): a transient "recalled N notes" line
+  // when the agent injects relevance-gated memory for the current answer.
+  let memoryNote = $state<string | null>(null);
+  let memoryNoteTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    const un = onMemoryEvent((e) => {
+      if (e.kind !== "recalled" || e.count < 1) return;
+      // Only surface the banner for the conversation being viewed.
+      if (e.conversation_id !== $activeConversation?.id) return;
+      memoryNote = `Recalled ${e.count} saved note${e.count === 1 ? "" : "s"} for this answer`;
+      if (memoryNoteTimer) clearTimeout(memoryNoteTimer);
+      memoryNoteTimer = setTimeout(() => (memoryNote = null), 6000);
+    });
+    return () => {
+      un.then((f) => f());
+      if (memoryNoteTimer) clearTimeout(memoryNoteTimer);
+    };
+  });
 
   // ── "Why this was routed" — real classifier explanation of the last user
   // message (PLAN §11: censorship surfaced, never silent + the annotated view).
@@ -414,6 +434,19 @@
         {/each}
       </div>
     </div>
+
+    {#if memoryNote}
+      <div class="flex-shrink-0 px-5">
+        <div
+          class="mx-auto flex max-w-[700px] items-center gap-1.5 text-[11.5px] text-text-3"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M12 8v4l3 3M12 3a9 9 0 100 18 9 9 0 000-18z" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          {memoryNote}
+        </div>
+      </div>
+    {/if}
 
     <div class="flex-shrink-0 px-5 pb-4 pt-1">
       <div

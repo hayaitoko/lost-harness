@@ -555,6 +555,7 @@ fn exec_ctx() -> crate::tools::ExecCtx {
         conversation_id: "c1".to_string(),
         profile: "personal".to_string(),
         reads: None,
+        allow_private_memory: false,
     }
 }
 
@@ -780,6 +781,47 @@ fn conversation_is_cloud_safe_blocks_on_a_prior_private_turn() {
         !agent.conversation_is_cloud_safe("personal", "c-private", &cfg),
         "a prior private turn makes the conversation unsafe for cloud replay"
     );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn assemble_memory_context_is_endpoint_aware_and_profile_scoped() {
+    use crate::storage::{MemoryBucket, MemoryFact};
+    let (agent, storage, dir) = redaction_loop();
+    let g = storage.global();
+    let mk = |id: &str, content: &str, profile: &str| MemoryFact {
+        id: id.into(),
+        content: content.into(),
+        origin_profile: profile.into(),
+        tags: None,
+        created_at: 1,
+        pinned: false,
+    };
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("s", "the deploy key lives in the vault", "personal")).unwrap();
+    g.insert_memory_fact_in(MemoryBucket::PrivateLocal, &mk("p", "home address is 123 Oak Street", "personal")).unwrap();
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("w", "work standup is at 9am", "work")).unwrap();
+
+    // CLOUD turn (is_cloud=true): the always-loaded summary carries the shared
+    // fact, the private-local fact is NEVER queried, and it's guard-wrapped.
+    let (block, _recalled) = agent
+        .assemble_memory_context("personal", "where is the deploy key", true)
+        .expect("some context to inject");
+    assert!(block.contains("deploy key"), "shared fact is loaded on a cloud turn");
+    assert!(!block.contains("Oak Street"), "cloud turn must NOT surface a private-local fact");
+    assert!(block.contains("UNTRUSTED TOOL OUTPUT"), "injected memory is guard-wrapped as untrusted");
+    // Profile scope: another profile's fact never appears.
+    assert!(!block.contains("work standup"), "another profile's fact must not leak in");
+
+    // LOCAL turn (is_cloud=false): the private-local fact MAY appear.
+    let (block_local, _) = agent
+        .assemble_memory_context("personal", "what is my home address", false)
+        .expect("some context");
+    assert!(block_local.contains("Oak Street"), "a local turn may surface private-local memory");
+    assert!(!block_local.contains("work standup"));
+
+    // A profile with no facts injects nothing.
+    assert!(agent.assemble_memory_context("school", "anything", true).is_none());
 
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -553,12 +553,72 @@ impl GlobalDb {
         allow_private: bool,
         limit: usize,
     ) -> Result<Vec<MemorySearchHit>> {
+        self.search_memory_impl(query, None, allow_private, limit)
+    }
+
+    /// Like [`search_memory`], but restricted to facts whose `origin_profile`
+    /// matches `profile`. Used by the automatic relevance-gated injection
+    /// (PLAN §9), which must not surface one profile's facts into another
+    /// profile's turn. (The `recall_memory` tool stays cross-profile — shared
+    /// facts are one coherent memory of the user across profiles, §7.)
+    pub fn search_memory_scoped(
+        &self,
+        query: &str,
+        profile: &str,
+        allow_private: bool,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchHit>> {
+        self.search_memory_impl(query, Some(profile), allow_private, limit)
+    }
+
+    /// Search for the `recall_memory` tool: **shared** facts across ALL profiles
+    /// (one coherent memory of the user, §7) plus the ACTIVE profile's
+    /// **private-local** facts, and only when `allow_private` (a non-cloud turn).
+    /// A private-local fact from a *different* profile is never surfaced — that
+    /// would cross the profile boundary for the most sensitive bucket.
+    pub fn search_memory_for_recall(
+        &self,
+        query: &str,
+        profile: &str,
+        allow_private: bool,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchHit>> {
         let Some(match_expr) = fts_match_expr(query) else {
             return Ok(Vec::new());
         };
-        let mut hits = self.search_bucket(MemoryBucket::Shared, &match_expr, limit)?;
+        // Shared: cross-profile. Private-local: scoped to the active profile.
+        let mut hits = self.search_bucket(MemoryBucket::Shared, &match_expr, None, limit)?;
         if allow_private {
-            hits.extend(self.search_bucket(MemoryBucket::PrivateLocal, &match_expr, limit)?);
+            hits.extend(self.search_bucket(
+                MemoryBucket::PrivateLocal,
+                &match_expr,
+                Some(profile),
+                limit,
+            )?);
+        }
+        hits.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    fn search_memory_impl(
+        &self,
+        query: &str,
+        profile: Option<&str>,
+        allow_private: bool,
+        limit: usize,
+    ) -> Result<Vec<MemorySearchHit>> {
+        let Some(match_expr) = fts_match_expr(query) else {
+            return Ok(Vec::new());
+        };
+        let mut hits = self.search_bucket(MemoryBucket::Shared, &match_expr, profile, limit)?;
+        if allow_private {
+            hits.extend(self.search_bucket(
+                MemoryBucket::PrivateLocal,
+                &match_expr,
+                profile,
+                limit,
+            )?);
         }
         // Lower bm25 = more relevant. Stable sort across the merged buckets.
         hits.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -570,30 +630,43 @@ impl GlobalDb {
         &self,
         bucket: MemoryBucket,
         match_expr: &str,
+        profile: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemorySearchHit>> {
         // Reference the FTS table by its real name (not an alias) — FTS5's
-        // bm25() aux function requires it.
+        // bm25() aux function requires it. When `profile` is set, restrict to
+        // that profile's facts (the injection path); otherwise all profiles.
+        let profile_clause = if profile.is_some() {
+            "AND f.origin_profile = ?3"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT f.id, f.content, f.origin_profile, f.tags, f.created_at, f.pinned,
                     bm25({fts}) AS score
              FROM {fts}
              JOIN {tbl} f ON f.rowid = {fts}.rowid
-             WHERE {fts} MATCH ?1
+             WHERE {fts} MATCH ?1 {profile_clause}
              ORDER BY score LIMIT ?2",
             fts = bucket.fts_table(),
             tbl = bucket.table(),
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![match_expr, limit as i64], |r| {
-                Ok(MemorySearchHit {
-                    fact: row_to_memory_fact(r)?,
-                    bucket,
-                    score: r.get(6)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let map_hit = |r: &rusqlite::Row<'_>| {
+            Ok(MemorySearchHit {
+                fact: row_to_memory_fact(r)?,
+                bucket,
+                score: r.get(6)?,
+            })
+        };
+        let rows = match profile {
+            Some(p) => stmt
+                .query_map(params![match_expr, limit as i64, p], map_hit)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => stmt
+                .query_map(params![match_expr, limit as i64], map_hit)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
         Ok(rows)
     }
 

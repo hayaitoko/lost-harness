@@ -204,6 +204,12 @@ pub struct ExecCtx {
     pub conversation_id: String,
     pub profile: String,
     pub reads: Option<Arc<ConversationReads>>,
+    /// Whether this turn's endpoint may read private-local memory (PLAN §9).
+    /// `true` only on a local/private endpoint; the dispatcher sets it to
+    /// `!is_cloud` at the `tool.run` boundary. **Safe default is `false`** — an
+    /// unset/`Default` context (tests, unknown endpoint) never surfaces a
+    /// private-local fact into model context. `recall_memory` reads this.
+    pub allow_private_memory: bool,
 }
 
 // ── RiskClass ──────────────────────────────────────────────────────────────

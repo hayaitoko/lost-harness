@@ -750,6 +750,49 @@ fn memory_search_keyword_and_bucket_isolation() {
 }
 
 #[test]
+fn search_memory_scoped_restricts_to_one_profile() {
+    // The automatic-injection search must not surface another profile's facts.
+    let g = GlobalDb::open_in_memory().unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("s1", "the deploy runbook lives in the wiki", "personal", false),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("s2", "the deploy pipeline runs on Fridays", "work", false),
+    )
+    .unwrap();
+
+    // Unscoped search sees both profiles' shared facts (recall_memory behavior).
+    assert_eq!(g.search_memory("deploy", false, 10).unwrap().len(), 2);
+    // Scoped search sees only the named profile's facts.
+    let personal = g.search_memory_scoped("deploy", "personal", false, 10).unwrap();
+    assert_eq!(personal.len(), 1);
+    assert_eq!(personal[0].fact.id, "s1");
+    let work = g.search_memory_scoped("deploy", "work", false, 10).unwrap();
+    assert_eq!(work.len(), 1);
+    assert_eq!(work[0].fact.id, "s2");
+
+    // Scoped search still honors the private wall on a cloud-bound (false) call.
+    g.insert_memory_fact_in(
+        MemoryBucket::PrivateLocal,
+        &mem_fact("p1", "deploy key is 123 Oak Street vault", "personal", false),
+    )
+    .unwrap();
+    assert_eq!(
+        g.search_memory_scoped("deploy", "personal", false, 10).unwrap().len(),
+        1,
+        "cloud-bound scoped search must not surface the private-local fact"
+    );
+    assert_eq!(
+        g.search_memory_scoped("deploy", "personal", true, 10).unwrap().len(),
+        2,
+        "local scoped search reaches the private-local fact"
+    );
+}
+
+#[test]
 fn curated_summary_pins_first_and_gates_private() {
     let g = GlobalDb::open_in_memory().unwrap();
     g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("a", "oldest note", "personal", false))

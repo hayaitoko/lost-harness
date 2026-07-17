@@ -1,14 +1,16 @@
 //! Memory tools — the agent's read access to its saved memory (PLAN §9).
 //!
 //! `recall_memory` is the always-available "pinned search tool": keyword-search
-//! the saved archive for facts relevant to a query. It searches the SHARED
-//! store only (`allow_private = false`), so a private-local fact can never be
-//! surfaced back into any model's context — cloud or local. Endpoint-aware
-//! private access (a local turn may safely read private facts) waits for
-//! `ExecCtx` to carry the turn's endpoint kind; until then the cloud-proof
-//! default holds regardless of endpoint. Read-only ⇒ `RiskClass::Safe` ⇒
-//! pre-trusted (no approval prompt), matching the design's "always-available,
-//! pinned search tool the agent can reach for."
+//! the saved archive for facts relevant to a query. It's **endpoint-aware AND
+//! profile-aware** (PLAN §9/§7): a cloud turn searches the SHARED store only, so
+//! a private-local fact can never leak into a cloud model's context; a
+//! local/private turn (`ExecCtx::allow_private_memory`, set by the dispatcher to
+//! `!is_cloud`) may also read the ACTIVE profile's private-local facts — never
+//! another profile's (shared facts stay cross-profile — one coherent memory of
+//! the user, §7 — but the private-local bucket never crosses the profile
+//! boundary). The safe default is shared-only — an unset context never surfaces
+//! private facts. Read-only ⇒ `RiskClass::Safe` ⇒ pre-trusted (no approval
+//! prompt), matching the design's "always-available, pinned search tool."
 
 use std::future::Future;
 use std::pin::Pin;
@@ -83,7 +85,7 @@ impl Tool for RecallMemoryTool {
     fn run<'a>(
         &'a self,
         input: ToolInput,
-        _ctx: &'a ExecCtx,
+        ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let query = match input.args.get("query").and_then(|v| v.as_str()) {
@@ -94,13 +96,17 @@ impl Tool for RecallMemoryTool {
                     )
                 }
             };
-            // SHARED store only — never surface a private-local fact into model
-            // context (the cloud-proof default; see the module docs).
-            match self
-                .storage
-                .global()
-                .search_memory(&query, false, RECALL_LIMIT)
-            {
+            // Private-local facts are readable ONLY on a non-cloud turn
+            // (`allow_private_memory`, set by the dispatcher to `!is_cloud`) AND
+            // only from the ACTIVE profile — shared facts are cross-profile (one
+            // coherent memory, §7), but a private-local fact never crosses the
+            // profile boundary. A cloud turn stays shared-only.
+            match self.storage.global().search_memory_for_recall(
+                &query,
+                &ctx.profile,
+                ctx.allow_private_memory,
+                RECALL_LIMIT,
+            ) {
                 Ok(hits) => {
                     let matches: Vec<_> = hits
                         .into_iter()
@@ -278,8 +284,9 @@ mod tests {
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
 
-        // A private-only term returns NOTHING — recall never touches the private
-        // store, so a private-local fact can't leak back into model context.
+        // On a CLOUD turn (`ctx` default: allow_private_memory=false) a
+        // private-only term returns NOTHING — the private store is never queried,
+        // so a private-local fact can't leak into a cloud model's context.
         match tool
             .run(
                 ToolInput::new(json!({ "query": "Oak Street home address" })),
@@ -290,9 +297,62 @@ mod tests {
             ToolResult::Ok(v) => {
                 assert!(
                     v["matches"].as_array().unwrap().is_empty(),
-                    "recall must never surface a private-local fact"
+                    "a cloud turn must never surface a private-local fact"
                 );
             }
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        }
+
+        // On a LOCAL turn (allow_private_memory=true) in the SAME profile the
+        // query DOES surface the private fact — a local model may read the active
+        // profile's private-local memory.
+        let local_ctx = ExecCtx {
+            profile: "personal".into(),
+            allow_private_memory: true,
+            ..ExecCtx::default()
+        };
+        match tool
+            .run(
+                ToolInput::new(json!({ "query": "Oak Street home address" })),
+                &local_ctx,
+            )
+            .await
+        {
+            ToolResult::Ok(v) => {
+                let matches = v["matches"].as_array().unwrap();
+                assert_eq!(matches.len(), 1, "a local turn may read private-local memory");
+                assert!(matches[0]["content"].as_str().unwrap().contains("Oak Street"));
+            }
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        }
+
+        // Cross-profile isolation (regression): a DIFFERENT profile's local turn
+        // must NOT recall "personal"'s private-local fact — but shared facts are
+        // cross-profile, so it still sees the shared one.
+        let other_ctx = ExecCtx {
+            profile: "work".into(),
+            allow_private_memory: true,
+            ..ExecCtx::default()
+        };
+        match tool
+            .run(ToolInput::new(json!({ "query": "Oak Street home address" })), &other_ctx)
+            .await
+        {
+            ToolResult::Ok(v) => assert!(
+                v["matches"].as_array().unwrap().is_empty(),
+                "a private-local fact must never cross the profile boundary"
+            ),
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        }
+        match tool
+            .run(ToolInput::new(json!({ "query": "deploy key vault" })), &other_ctx)
+            .await
+        {
+            ToolResult::Ok(v) => assert_eq!(
+                v["matches"].as_array().unwrap().len(),
+                1,
+                "shared facts stay cross-profile"
+            ),
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
 
@@ -313,6 +373,7 @@ mod tests {
             conversation_id: "c".into(),
             profile: "personal".into(),
             reads: None,
+            allow_private_memory: false,
         };
 
         // Benign → shared, saved.
@@ -414,6 +475,7 @@ mod tests {
             conversation_id: "c".into(),
             profile: "personal".into(),
             reads: None,
+            allow_private_memory: false,
         };
 
         // Default profile (no settings row) → Shared.

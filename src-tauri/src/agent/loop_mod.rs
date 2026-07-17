@@ -79,6 +79,18 @@ pub struct LocalReroutePayload {
     pub to_provider: String,
 }
 
+/// Payload of the `memory:event` event — the non-silent memory signal (PLAN
+/// §9). Emitted when the agent recalls saved notes for an answer. Carries only
+/// a kind + count, never the recalled content itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryEventPayload {
+    pub conversation_id: String,
+    /// "recalled" (relevance-gated notes injected for this turn).
+    pub kind: &'static str,
+    /// How many notes were recalled.
+    pub count: usize,
+}
+
 // ── Model streamer abstraction ───────────────────────────────────────────
 
 /// The slice of `ModelClient` the agent loop needs. Trait-ified so tests
@@ -396,6 +408,74 @@ impl AgentLoop {
         })
     }
 
+    /// Assemble this turn's memory context (PLAN §9): the always-loaded curated
+    /// summary plus up to a few relevance-gated snippets for the current
+    /// message, **guard-wrapped as untrusted content** (a poisoned memory can't
+    /// forge an instruction). Endpoint-aware — private-local facts are included
+    /// only on a non-cloud turn (`allow_private = !is_cloud`); a cloud turn
+    /// never queries the private store. Profile-scoped for the relevance
+    /// snippets. Returns the wrapped block + the number of relevance snippets
+    /// (for the non-silent "recalled" event), or `None` when there's nothing to
+    /// inject. Reads are best-effort — a storage error yields no injection, it
+    /// never blocks the send.
+    ///
+    /// The relevance "gate" is currently the keyword (FTS) lane: a snippet is
+    /// injected only if the message shares search tokens with a saved fact,
+    /// capped at [`AUTO_RECALL_LIMIT`]. A real relevance threshold and the
+    /// sqlite-vec meaning lane are follow-ups (see ROADMAP).
+    pub(crate) fn assemble_memory_context(
+        &self,
+        profile: &str,
+        content: &str,
+        is_cloud: bool,
+    ) -> Option<(String, usize)> {
+        const SUMMARY_LIMIT: usize = 8;
+        const AUTO_RECALL_LIMIT: usize = 3;
+        let allow_private = !is_cloud;
+        let global = self.storage.global();
+
+        let summary = global
+            .curated_summary(profile, allow_private, SUMMARY_LIMIT)
+            .unwrap_or_default();
+        let hits = global
+            .search_memory_scoped(content, profile, allow_private, AUTO_RECALL_LIMIT)
+            .unwrap_or_default();
+
+        // Don't repeat a fact that's already in the always-loaded summary.
+        let summary_ids: Vec<&str> = summary.iter().map(|f| f.id.as_str()).collect();
+        let fresh: Vec<_> = hits
+            .into_iter()
+            .filter(|h| !summary_ids.contains(&h.fact.id.as_str()))
+            .collect();
+
+        if summary.is_empty() && fresh.is_empty() {
+            return None;
+        }
+
+        let mut block = String::new();
+        if !summary.is_empty() {
+            block.push_str("What you remember about the user:\n");
+            for f in &summary {
+                block.push_str("- ");
+                block.push_str(f.content.trim());
+                block.push('\n');
+            }
+        }
+        if !fresh.is_empty() {
+            if !block.is_empty() {
+                block.push('\n');
+            }
+            block.push_str("Possibly relevant saved notes for this message:\n");
+            for h in &fresh {
+                block.push_str("- ");
+                block.push_str(h.fact.content.trim());
+                block.push('\n');
+            }
+        }
+        let wrapped = crate::tools::calling::guard_wrap("your saved memory", block.trim());
+        Some((wrapped, fresh.len()))
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────
 
     /// Find the first registered provider that is both `Local` *and*
@@ -479,6 +559,17 @@ impl AgentLoop {
         if !catalog.is_empty() {
             history.push(ChatMessage::system(catalog));
         }
+        // Memory context (PLAN §9): the always-loaded curated summary plus any
+        // relevance-gated snippets for THIS message, guard-wrapped as untrusted
+        // content, endpoint-aware (private-local facts only on a non-cloud turn)
+        // and profile-scoped. Injected right after the tool catalog so it's a
+        // stable prefix. A recall fires a non-silent `memory:event`.
+        if let Some((block, recalled)) = self.assemble_memory_context(&profile, &content, is_cloud) {
+            history.push(ChatMessage::system(block));
+            if recalled > 0 {
+                emit_memory_event(&app, &conversation_id, "recalled", recalled);
+            }
+        }
         for m in profile_db
             .list_messages_by_conversation(&conversation_id)
             .context("load conversation history")?
@@ -505,11 +596,15 @@ impl AgentLoop {
         }
 
         // `reads` is injected by the dispatcher (which owns the shared handle),
-        // so the loop leaves it `None` here.
+        // so the loop leaves it `None` here. `allow_private_memory` mirrors the
+        // endpoint: private-local facts are readable only on a non-cloud turn
+        // (the dispatcher re-stamps this per call with the CURRENT is_cloud, so
+        // a mid-turn reroute-to-local is honored — this is the base value).
         let exec_ctx = ExecCtx {
             conversation_id: conversation_id.clone(),
             profile: profile.clone(),
             reads: None,
+            allow_private_memory: !is_cloud,
         };
 
         // Bound the tool loop so a model that keeps calling tools can't run
@@ -722,6 +817,19 @@ impl AgentLoop {
 }
 
 // ── free fns ─────────────────────────────────────────────────────────────
+
+/// Emit the non-silent memory signal (`memory:event`). Content-free: only a
+/// kind + count, so a recalled fact's text never rides the event.
+fn emit_memory_event(app: &AppHandle, conversation_id: &str, kind: &'static str, count: usize) {
+    let payload = MemoryEventPayload {
+        conversation_id: conversation_id.to_string(),
+        kind,
+        count,
+    };
+    if let Err(e) = app.emit("memory:event", payload) {
+        tracing::warn!(error = %e, "failed to emit memory:event");
+    }
+}
 
 fn emit_error(app: &AppHandle, conversation_id: &str, error: String, source: &'static str) {
     let payload = StreamErrorPayload {

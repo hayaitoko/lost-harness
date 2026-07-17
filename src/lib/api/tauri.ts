@@ -175,6 +175,15 @@ const isTauri = (): boolean =>
 export const STREAM_TOKEN_EVENT = "stream:token";
 export const STREAM_ERROR_EVENT = "stream:error";
 export const TOOL_APPROVAL_REQUEST_EVENT = "tool:approval_request";
+export const MEMORY_EVENT = "memory:event";
+
+/** Payload of `memory:event`. Mirrors `MemoryEventPayload` in `loop_mod.rs`. */
+export interface MemoryEvent {
+  conversation_id: string;
+  /** "recalled" — relevance-gated notes were injected for this answer. */
+  kind: "recalled";
+  count: number;
+}
 
 // ── Command functions ───────────────────────────────────────────────────────
 
@@ -371,6 +380,22 @@ export async function onStreamError(
     const i = browserErrorListeners.indexOf(callback);
     if (i >= 0) browserErrorListeners.splice(i, 1);
   };
+}
+
+/**
+ * Subscribes to `memory:event` — the non-silent memory signal (PLAN §9),
+ * raised when the agent recalls saved notes for an answer. Returns an unlisten
+ * function. In browser mode this is a no-op (the mock backend has no memory).
+ */
+export async function onMemoryEvent(
+  callback: (e: MemoryEvent) => void,
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<MemoryEvent>(MEMORY_EVENT, (event) => {
+      callback(event.payload);
+    });
+  }
+  return () => {};
 }
 
 // ── Tool approval ───────────────────────────────────────────────────────────

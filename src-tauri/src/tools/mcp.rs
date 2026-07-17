@@ -538,6 +538,7 @@ mod tests {
             conversation_id: "c1".to_string(),
             profile: "personal".to_string(),
             reads: None,
+            allow_private_memory: false,
         };
         let out = dispatcher
             .run_turn(&OwnOutput::from_stream_assembly(output), &ctx, Binding::Public, false)

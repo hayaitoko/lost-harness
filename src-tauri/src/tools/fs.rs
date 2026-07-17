@@ -726,6 +726,7 @@ mod tests {
             conversation_id: "conv-1".to_string(),
             profile: "personal".to_string(),
             reads: Some(Arc::new(ConversationReads::new())),
+            allow_private_memory: false,
         }
     }
 
