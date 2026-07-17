@@ -17,7 +17,7 @@
 
 This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The Electron app was a prototype to validate UX decisions; it's now a read-only reference. All new work goes in the Tauri project.
 
-**Current milestone:** **M3 is COMPLETE; M4 has begun** (its first item, Q8, landed 2026-07-16). M0 and M1 are done and verified. Everything is committed to `main` — there is nothing uncommitted or in-progress to pick up. The live stage tracker is [`docs/ROADMAP.md`](docs/ROADMAP.md).
+**Current milestone:** **M3 is COMPLETE; M4 in progress.** As of 2026-07-16 evening: Q8 + its Permissions pane done, the entire classifier integration round done (ONNX ensemble + "why" sidebar + per-profile thresholds + redact-and-send), and **memory is LIVE in conversations** (auto-injection + endpoint-aware private recall + non-silent recall banner). Everything is committed to `main` — nothing uncommitted or in-progress to pick up. **Next open front: memory's meaning lane (local embedder choice)**; native tool-use (Q1) is blocked on Lukas configuring a native-tool-capable endpoint. The live stage tracker is [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 | Subsystem | Status |
 |---|---|
@@ -34,10 +34,11 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | M3 — Crash-recovery boot pass + tool.interrupted event (item 4) | **Done** (commit `8fe04aa`). On app launch, terminalizes any conversation left mid-tool-call by writing a `role="tool"`, `error="interrupted_by_crash"`, `aborted=true` repair row. Idempotent. `contains_open_tool_fence` pure check. "No half-durability" doc in `approval.rs`. |
 | Frontend — design-system port + backend wiring | **Done** (2026-07-15). Sidebar, MainScreen (chat loop + routing badge), and Settings wired to real backend. Routing-badge fix: `send_message` returns real `routing_decision` from the persisted row (commit `7ecf2d8`). Email/Files/Whiteboard/Scheduled-jobs/Editor/Onboarding/EmptyState still visual-only. |
 | sqlite-vec (semantic memory search engine) | Wired + proven — registered on every DB open, a smoke test does a real nearest-neighbour query |
-| Memory system (hybrid keyword+meaning search, curated summary + archive) | **Designed in full, not built.** See PLAN.md §"Memory system." |
+| Privacy classifier (rules + trained ONNX ensemble + redaction UX) | **DONE** (2026-07-16): INT8 ensemble live via `ort` (parity-verified), "why" annotated sidebar, per-profile thresholds settings, redact-and-send partial delegation. |
+| Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **342 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean.
+**Tests:** `cargo test --lib` → **369 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean. (Last independently audited 2026-07-16 evening.)
 
 **2026-07-16 (latest): near-term items 1–3-core DONE — the trained privacy classifier is LIVE.** Three landings this session: (1) the Q8 **Permissions pane** (`f38fd2c`) — Settings tab lists/revokes persisted "Always allow" `tool_rules`, verified live in the browser preview; (2) **frontend housekeeping** (`6dfcf12`) — deleted the 5 superseded components, removed the dev screen-switcher + theme toggle, and fixed the `ModelPicker` name collision (options now carry a composite `providerId::name` key — verified live with two `default` models); (3) the **classifier ONNX integration** (`283789b`) — ran the bundle's `export_onnx.py` (both encoders → fp32 + INT8), then wired `classifier/engine.rs` to run the real INT8 ensemble via `ort`, mirroring `serve.py` (rules layer-0 short-circuit → sliding-128-window max-prob over both encoders → fusion at 0.5/0.05). Behind a default-on `onnx-classifier` feature (rules-only fallback with `--no-default-features`, both build clean). Models installed live at `~/Documents/Lost-Harness/models/classifier/` (98 MB, NOT in git). **Gotcha caught:** the exported `tokenizer.json` bakes in Fixed(128) padding/truncation — left on, it feeds the model garbage (distilbert scored 0.999 on "capital of France"); disabled on load. An env-gated parity test (`LHP_CLASSIFIER_MODELS_DIR`) loads the live INT8 models and matches the Python reference probs (`docs/classifier-parity.json`). **Remaining in item 3:** the annotated-redaction sidebar UX (PLAN §11 — the engine's there, no UI); the `gate.rs`/§7 cosmetic renames were judged low-value/high-churn and deferred (gate.rs cleanly delegates to the `Classifier` trait, no rewrite needed).
 
@@ -114,7 +115,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 332 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 369 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -230,7 +231,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 332 tests
+cd src-tauri && cargo test --lib   # 369 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
@@ -324,3 +325,13 @@ Full repo health audit (requested by Lukas: "what's left, what's missing, what's
 - **Annotated PLAN.md** §8's round-1 M3 status block with a completion note (M3 done 2026-07-16) and marked the §12 parity gaps that have since closed (protected paths, shell guardrails).
 - **Findings worth acting on** (all now in the roadmap): the Settings "Permissions" pane is the one unfinished piece of Q8 (users can grant standing permissions but can't see/revoke them); the ONNX ensemble is blocked only on running `export_onnx.py` from the classifier bundle — an action, not code; `CommandPalette.svelte` is ported but mounted nowhere (M2 leftover).
 - No product code touched — docs-only session.
+
+## Session log — 2026-07-16 evening (classifier tail + memory-live rounds, then second audit)
+
+Three feature rounds landed after the afternoon's memory-foundation work (they updated the ROADMAP milestone board but not this file — this entry closes that gap), then a second independent audit + docs reconciliation.
+
+- **Per-profile classifier thresholds + settings page** (`819df8c`) — `ClassifierConfig` (tau_block/tau_band) runtime-tunable per profile (migration v4, `classifier_settings` table), live Settings "Privacy guard" section (strictness slider + uncertainty band + reset). Review caught that strictness must drive `tau_band` (the actual egress line); 5 findings fixed. Follow-up documented: the tool-action gate still uses default thresholds.
+- **Partial-delegation redact-and-send** (`7d7dae5`) — the last big §11 UX decision made real: rule-value spans blacked out, redacted text re-classified, only a clean remainder goes to cloud, reply rehydrated; per-profile toggle. **The classifier integration round is now fully closed** (only cosmetic `gate.rs` renames remain, deferred).
+- **Memory LIVE in conversations** (`6115eb9`) — `ExecCtx.allow_private_memory` stamped by the dispatcher (honors mid-turn reroute): private-local facts readable ONLY on a non-cloud, same-profile turn (a cross-profile private-recall leak was caught in review and fixed); `assemble_memory_context` injects the curated summary + ≤3 FTS-matched snippets per turn (guard-wrapped, profile-scoped, storage errors never block the send); non-silent `memory:event` recall banner in MainScreen. This was "Round A" of the memory plan — memory went from write-only storage to a live, visible capability.
+- **Second audit (this entry):** 369 tests / build / check independently verified green, tree clean. Reconciled ROADMAP (Stage line, items 3+5, Last-verified) and this file with the landed work.
+- **Where that leaves memory (the active conversation with Lukas):** remaining = the sqlite-vec meaning lane (open decision: which small local embedder — the classifier's bge is a classification head, not an embedder), curated-summary snapshot-at-turn-1, pre-compaction/new-chat write triggers (flush moot until compaction exists), an inline "remembered" save event, and walled-profile DB routing.

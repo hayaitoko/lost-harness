@@ -15,21 +15,20 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-16: M3 COMPLETE. M4 in progress. Near-term items 1, 2, 3, and the
-> memory-system foundation (item 5) have all had major landings this session.**
-> Done + verified: the Q8 Permissions pane; the frontend housekeeping; the trained
-> bge-small + distilbert INT8 ONNX ensemble running in-process via `ort`
-> (parity-verified), fused with the rules layer; the annotated "why this was routed"
-> sidebar wired to the real classifier; and the **memory storage foundation**
-> (sensitivity buckets in physically-separate stores + FTS5 keyword search + curated
-> summary) — now **usable end-to-end**: IPC + the Settings "Memory" tab wired to real
-> facts, plus the `recall_memory` (Safe/pre-trusted, shared-only) and `remember`
-> (Write/approval-gated, sensitivity-routed) agent tools. Item 4 (native tool-use, Q1)
-> is **blocked** on configuring a native-tool-capable model endpoint. Open fronts:
-> item 3's tail (partial-delegation + classifier settings) and the rest of memory
-> (meaning-search lane needs an embedder; automatic injection / curated-summary-at-start
-> / write-triggers / non-silent events are agent-loop work). **Skills** remains fully
-> designed, zero code.
+> **As of 2026-07-16 (evening): M3 COMPLETE. M4 in progress. Near-term items 1, 2,
+> and 3 are DONE; memory (item 5) is LIVE in conversations.**
+> The classifier round is **fully closed**: trained INT8 ONNX ensemble in-process
+> (parity-verified), the annotated "why" sidebar, per-profile runtime-tunable
+> thresholds (Settings "Privacy guard"), and partial-delegation redact-and-send.
+> Memory is **live in real turns**: curated summary + relevance-gated FTS snippet
+> injection (guard-wrapped, profile-scoped), endpoint-aware private recall (private
+> facts readable only on non-cloud, same-profile turns), and a non-silent recall
+> banner. Item 4 (native tool-use, Q1) is **blocked** on configuring a
+> native-tool-capable model endpoint — a Lukas action, not code. **The next open
+> engineering front is memory's meaning lane: choosing + wiring a small local
+> embedder so search matches meaning, not just keywords** (then: summary
+> snapshot-at-turn-1, write-trigger backstops, walled-profile DB routing). **Skills**
+> remains fully designed, zero code.
 
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
@@ -43,8 +42,8 @@ cd .../src-tauri && LHP_CLASSIFIER_MODELS_DIR="$HOME/Documents/Lost-Harness/mode
 cd .../src-tauri && cargo build --lib --no-default-features
 ```
 
-Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-feature +
-`--no-default-features` builds clean; parity test passes on the live INT8 models).
+Last verified: 2026-07-16 evening (independent audit after the memory-live round:
+**369 passed**, frontend build + svelte-check clean, git tree clean).
 
 ---
 
@@ -82,8 +81,10 @@ Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-featu
    collision (options now carry a composite `providerId::name` key — two same-named
    models list & select independently, verified live with LM Studio + Anthropic
    `default`). CSS bundle dropped 63.6 → 56.4 kB.
-3. **[~] Classifier integration round** — **per-profile settings page DONE
-   2026-07-16** (the classifier-settings round): `ClassifierConfig` (tau_block /
+3. **[x] Classifier integration round — DONE 2026-07-16** (all three sub-rounds:
+   ONNX wiring `283789b`, settings page `819df8c`, redact-and-send `7d7dae5`; only
+   the optional cosmetic `gate.rs` §7 renames remain, deferred as low-value).
+   **Per-profile settings page** (the classifier-settings round): `ClassifierConfig` (tau_block /
    tau_band) is now per-profile runtime-tunable via a back-compat `classify_with`
    trait method, a per-profile `classifier_settings` table (migration v4),
    `get/set/reset_classifier_settings` IPC, and a live Settings "Privacy guard"
@@ -110,35 +111,37 @@ Last verified: 2026-07-16 (classifier ONNX ensemble wired: 333 green; full-featu
    `explain_classification` IPC (`9bff6c2`) + MainScreen's routing panel wired to it
    (`914ac74`) — the last user message renders with detected spans marked inline (amber
    soft / red hard-block), a "what tripped the guard" legend (category · hard-flag ·
-   rule/model layer), verdict-driven heading, browser-QA'd end-to-end. **Remaining
-   (item-3 tail):** (a) partial-delegation redact-and-send flow (`serve.py /redact`
-   `safe_text`: merge spans → `[REDACTED:CODE]` → re-classify → send only if clean +
-   rehydrate — a deeper agent-loop change); (b) the per-profile classifier settings page
-   (strictness/band/redaction/hard-block — needs runtime-tunable thresholds, currently
-   hardcoded `TAU_BLOCK=0.5`/`TAU_BAND=0.05`); (c) OPTIONAL cosmetic `gate.rs` §7 renames
-   (deferred, low-value/high-churn).
+   rule/model layer), verdict-driven heading, browser-QA'd end-to-end. **The item-3
+   tail is now closed:** (a) partial-delegation redact-and-send — DONE (`7d7dae5`:
+   rule-value spans blacked out → redacted text re-classified → only a clean remainder
+   goes to cloud → reply rehydrated; per-profile toggle); (b) per-profile classifier
+   settings page — DONE (`819df8c`, see above); (c) OPTIONAL cosmetic `gate.rs` §7
+   renames stay deferred (low-value/high-churn).
 4. **[ ] Native tool-use + `Tool::schema()` (Q1, M4)** — per-endpoint capability flag;
    native `tool_use` path for models that support it; fenced dialect stays the fallback;
    fingerprint-parity regression test across transports. Needs a native-tool-capable
    endpoint configured to prove end-to-end.
-5. **[~] Memory system** — **usable end-to-end** (`3ee9790`→`cdc8d6f`): storage
-   foundation (sensitivity buckets, physically-separate private store, FTS5 keyword
-   search, curated-summary pinning); IPC + the Settings "Memory" tab wired to real facts
+5. **[~] Memory system — LIVE in conversations** (`3ee9790`→`6115eb9`). Built and
+   live: storage foundation (sensitivity buckets in physically-separate stores, FTS5
+   keyword search, curated-summary pinning); IPC + the Settings "Memory" tab
    (add/forget/pin + "on device only" badges); the **`recall_memory`** tool
-   (Safe/pre-trusted, shared-only — can't leak private facts into model context) and the
-   **`remember`** tool (Write/approval-gated, sensitivity-routed — credential dropped,
-   private→local, benign→shared); routing hoisted canonical in `tools::memory`. All
-   tested. **Remaining:** the sqlite-vec **meaning lane** (needs a local embedder — the
-   classifier's bge is a *classification* head, not an embedder, so a separate small
-   embed model is the open choice); **automatic relevance-gated injection** + loading the
-   **curated summary at conversation start** (agent-loop / context assembly — also the
-   home of the pre-compaction/new-chat write triggers); **non-silent memory events** (the
-   event-bar language); **endpoint-aware private recall** (needs `ExecCtx` to carry the
-   turn's endpoint kind — until then recall is conservatively shared-only); walled-profile
-   DB routing (§7 toggle → per-profile memory DB). Design complete
-   (PLAN §9 incl. the 2026-07-15 refinements: 3 sensitivity buckets, relevance-gated
-   injection, non-silent memory events). Storage schema branches on the per-profile
-   privacy toggle (decided 2026-07-08).
+   (Safe/pre-trusted) and **`remember`** tool (Write/approval-gated,
+   sensitivity-routed); **endpoint-aware private recall** (`ExecCtx.allow_private_memory`
+   stamped by the dispatcher — private-local facts readable only on a non-cloud,
+   *same-profile* turn; a cross-profile private-recall leak was caught in review and
+   fixed); **automatic injection** (`assemble_memory_context`: curated summary + ≤3
+   FTS-matched snippets per turn, guard-wrapped as untrusted, profile-scoped; a storage
+   error never blocks the send); **non-silent recall** (`memory:event` → transient
+   MainScreen banner). **Remaining:** the sqlite-vec **meaning lane** — needs a small
+   local **embedder** (the classifier's bge is a *classification* head, not an
+   embedder; picking the embed model is the open decision) which upgrades injection +
+   recall from keyword-only to true hybrid; **curated-summary snapshot at turn 1**
+   (currently re-read live each turn — PLAN §9 wants it frozen per conversation for
+   cache stability); **pre-compaction flush + new-chat nudge** write triggers (flush
+   is moot until context compaction exists at all); an inline **"remembered" save
+   event** (recall has its banner; saves currently surface only via the approval
+   prompt); **walled-profile DB routing** (§7 toggle → the profile's own memory DB).
+   Design: PLAN §9 (incl. the 2026-07-15 refinements).
 6. **[ ] Rest of M4** — model seats, usage ledger + budget governor (per-profile),
    cache-shaped prompt assembly, capability registry that refuses; then the skills &
    agents track (do the one-queue-model unification pass before locking its schemas).
