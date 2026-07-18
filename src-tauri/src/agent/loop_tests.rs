@@ -926,3 +926,44 @@ fn curated_summary_is_snapshotted_per_conversation() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn curated_summary_prefix_is_byte_stable_across_turns() {
+    // Wave 3.3 cache-shaped assembly: the curated-summary block must be
+    // byte-identical turn-over-turn for the same conversation + endpoint so the
+    // KV/prompt-cache prefix is reused. This is what the deterministic
+    // guard_wrap_stable(seed = conversation id) buys.
+    use crate::storage::{MemoryBucket, MemoryFact};
+    let (agent, storage, dir) = redaction_loop();
+    let g = storage.global();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &MemoryFact {
+            id: "s".into(),
+            content: "the deploy key lives in the vault".into(),
+            origin_profile: "personal".into(),
+            tags: None,
+            created_at: 1,
+            pinned: false,
+        },
+    )
+    .unwrap();
+
+    let a = agent
+        .assemble_curated_summary("cv1", "personal", true)
+        .expect("summary");
+    let b = agent
+        .assemble_curated_summary("cv1", "personal", true)
+        .expect("summary");
+    assert_eq!(a, b, "same conversation + endpoint ⇒ byte-identical summary prefix");
+    // A different conversation ⇒ a different nonce ⇒ different bytes, even though
+    // the content is the same (the wrap is seeded by conversation id).
+    let c = agent
+        .assemble_curated_summary("cv2", "personal", true)
+        .expect("summary");
+    assert_ne!(a, c, "the stable nonce is scoped per conversation");
+    // The volatile snippet block, by contrast, uses the random-nonce wrap.
+    assert!(a.contains("UNTRUSTED TOOL OUTPUT"), "summary is guard-wrapped");
+
+    let _ = std::fs::remove_dir_all(dir);
+}

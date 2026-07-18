@@ -456,7 +456,110 @@ impl AgentLoop {
     /// [`crate::storage::SEMANTIC_MAX_DIST_INJECT`] so only genuinely-near
     /// facts inject, capped at `AUTO_RECALL_LIMIT`. Without an installed
     /// embedder the meaning lane is skipped (keyword-only, as before).
+    /// Combined memory context — the always-loaded curated summary plus the
+    /// per-message relevance snippets, as one guard-wrapped block. Retained as a
+    /// thin composition of the two split assemblers ([`Self::assemble_curated_summary`]
+    /// + [`Self::assemble_relevance_snippets`]); the live loop uses the split
+    /// pieces directly (Wave 3.3 cache-shaped assembly: summary → stable prefix,
+    /// snippets → volatile tail), while this keeps the pre-split callers/tests
+    /// intact. `recalled` counts ONLY the relevance snippets.
     pub(crate) fn assemble_memory_context(
+        &self,
+        conversation_id: &str,
+        profile: &str,
+        content: &str,
+        is_cloud: bool,
+    ) -> Option<(String, usize)> {
+        let summary = self.assemble_curated_summary(conversation_id, profile, is_cloud);
+        let snippets = self.assemble_relevance_snippets(conversation_id, profile, content, is_cloud);
+        match (summary, snippets) {
+            (None, None) => None,
+            (Some(s), None) => Some((s, 0)),
+            (None, Some((sn, n))) => Some((sn, n)),
+            (Some(s), Some((sn, n))) => Some((format!("{s}\n\n{sn}"), n)),
+        }
+    }
+
+    /// The frozen curated-summary candidate set for a conversation (Wave 1.3
+    /// snapshot) — endpoint-INdependent (the per-turn cloud/local filter is the
+    /// caller's job). Shared by [`Self::assemble_curated_summary`] and
+    /// [`Self::assemble_relevance_snippets`] (the latter needs the summary's
+    /// fact ids to dedup). Best-effort: a storage error yields an empty set,
+    /// never blocks the send. Bounded cache (clear-and-re-freeze on overflow).
+    fn frozen_summary_facts(
+        &self,
+        conversation_id: &str,
+        profile: &str,
+    ) -> Vec<(MemoryFact, MemoryBucket)> {
+        const SUMMARY_LIMIT: usize = 8;
+        const SUMMARY_CACHE_CAP: usize = 512;
+        let Ok(mem) = self.storage.memory_db_for_profile(profile) else {
+            return Vec::new();
+        };
+        let mut cache = self.summary_cache.lock();
+        if let Some(c) = cache.get(conversation_id) {
+            return c.clone();
+        }
+        if cache.len() >= SUMMARY_CACHE_CAP {
+            cache.clear();
+        }
+        let c = mem
+            .curated_summary_with_buckets(profile, SUMMARY_LIMIT)
+            .unwrap_or_default();
+        cache.insert(conversation_id.to_string(), c.clone());
+        c
+    }
+
+    /// The always-loaded curated summary as a guard-wrapped system block, or
+    /// `None` when the profile has no summary facts to show this turn. The
+    /// frozen snapshot (Wave 1.3) is filtered per turn by endpoint — a cloud
+    /// turn drops private-local facts (the wall), a local turn keeps them. Wrapped
+    /// with the DETERMINISTIC [`guard_wrap_stable`](crate::tools::calling::guard_wrap_stable)
+    /// (seed = conversation id) so the block is byte-identical across a
+    /// conversation's turns — the stable prompt PREFIX for KV/prompt-cache reuse.
+    pub(crate) fn assemble_curated_summary(
+        &self,
+        conversation_id: &str,
+        profile: &str,
+        is_cloud: bool,
+    ) -> Option<String> {
+        const SUMMARY_LIMIT: usize = 8;
+        let allow_private = !is_cloud;
+        let candidates = self.frozen_summary_facts(conversation_id, profile);
+        // Per-turn privacy filter over the frozen set: this only ever REMOVES
+        // facts, so the wall holds even though the snapshot froze the full set.
+        let summary: Vec<&MemoryFact> = candidates
+            .iter()
+            .filter(|(_, b)| allow_private || *b == MemoryBucket::Shared)
+            .map(|(f, _)| f)
+            .take(SUMMARY_LIMIT)
+            .collect();
+        if summary.is_empty() {
+            return None;
+        }
+        let mut block = String::from("What you remember about the user:\n");
+        for f in &summary {
+            block.push_str("- ");
+            block.push_str(f.content.trim());
+            block.push('\n');
+        }
+        // Deterministic wrap so the same conversation's summary is byte-stable
+        // turn-over-turn (cache-shaped prefix). Seed = conversation id (an
+        // unguessable uuid a fact author never saw; neutralize still strips
+        // forged markers regardless of the nonce).
+        Some(crate::tools::calling::guard_wrap_stable(
+            "your saved memory",
+            block.trim(),
+            conversation_id,
+        ))
+    }
+
+    /// The per-message relevance snippets as a guard-wrapped block plus their
+    /// count, or `None` when nothing clears the relevance gate. Volatile (differs
+    /// per message) → lives in the TAIL, next to the current turn, NOT in the
+    /// cache-stable prefix. Deduped against the always-loaded summary so a fact
+    /// isn't shown twice. Ordinary (random-nonce) `guard_wrap` is fine here.
+    pub(crate) fn assemble_relevance_snippets(
         &self,
         conversation_id: &str,
         profile: &str,
@@ -466,53 +569,20 @@ impl AgentLoop {
         const SUMMARY_LIMIT: usize = 8;
         const AUTO_RECALL_LIMIT: usize = 3;
         let allow_private = !is_cloud;
-        // Route to the right memory store: the shared global.db, or a walled
-        // profile's own physically-separate DB (§7 / Wave 1.5). On any error we
-        // skip memory injection entirely — never block the send.
         let mem = self.storage.memory_db_for_profile(profile).ok()?;
 
-        // Curated summary — SNAPSHOTTED per conversation (Wave 1.3). Freeze the
-        // full candidate set (both buckets) once at the conversation's first
-        // turn, then reuse it. A mid-conversation `remember` therefore doesn't
-        // rewrite the summary already loaded into this conversation; it shows up
-        // starting the NEXT conversation (PLAN §9). The private-local facts in
-        // the frozen set are filtered out per turn below on a cloud turn.
-        // Bound the snapshot cache so a very long-lived process with thousands of
-        // conversations can't grow it without limit (review finding). The
-        // snapshot is cheap to recompute, so on overflow we clear and re-freeze —
-        // only the pathological >CAP-conversations case is affected, and only by
-        // re-snapshotting (still correct, just not the original freeze).
-        const SUMMARY_CACHE_CAP: usize = 512;
-        let candidates = {
-            let mut cache = self.summary_cache.lock();
-            if let Some(c) = cache.get(conversation_id) {
-                c.clone()
-            } else {
-                if cache.len() >= SUMMARY_CACHE_CAP {
-                    cache.clear();
-                }
-                let c = mem
-                    .curated_summary_with_buckets(profile, SUMMARY_LIMIT)
-                    .unwrap_or_default();
-                cache.insert(conversation_id.to_string(), c.clone());
-                c
-            }
-        };
-        // Per-turn privacy filter over the frozen set: a cloud turn drops the
-        // private-local facts (they never enter a cloud prompt), a local turn
-        // keeps them. This only ever REMOVES facts, so the wall holds even
-        // though the snapshot froze the full set.
-        let summary: Vec<&MemoryFact> = candidates
+        // The summary fact ids (post endpoint-filter) to dedup against.
+        let candidates = self.frozen_summary_facts(conversation_id, profile);
+        let summary_ids: Vec<String> = candidates
             .iter()
             .filter(|(_, b)| allow_private || *b == MemoryBucket::Shared)
-            .map(|(f, _)| f)
+            .map(|(f, _)| f.id.clone())
             .take(SUMMARY_LIMIT)
             .collect();
 
         // Meaning-lane query vector — only when semantic search is enabled for
-        // this profile (Wave 1.2) AND the embedder loads. Either off ⇒ the
-        // relevance search runs keyword-only. Any failure degrades to
-        // keyword-only; never blocks the send.
+        // this profile (Wave 1.2) AND the embedder loads. Either off ⇒ keyword
+        // only. Any failure degrades to keyword-only; never blocks the send.
         let embedder = if self.semantic_search_enabled(profile) {
             self.embedder.as_ref().and_then(|h| h.get())
         } else {
@@ -530,39 +600,38 @@ impl AgentLoop {
             )
             .unwrap_or_default();
 
-        // Don't repeat a fact that's already in the always-loaded summary.
-        let summary_ids: Vec<&str> = summary.iter().map(|f| f.id.as_str()).collect();
         let fresh: Vec<_> = hits
             .into_iter()
-            .filter(|h| !summary_ids.contains(&h.fact.id.as_str()))
+            .filter(|h| !summary_ids.iter().any(|id| id == &h.fact.id))
             .collect();
-
-        if summary.is_empty() && fresh.is_empty() {
+        if fresh.is_empty() {
             return None;
         }
-
-        let mut block = String::new();
-        if !summary.is_empty() {
-            block.push_str("What you remember about the user:\n");
-            for f in &summary {
-                block.push_str("- ");
-                block.push_str(f.content.trim());
-                block.push('\n');
-            }
-        }
-        if !fresh.is_empty() {
-            if !block.is_empty() {
-                block.push('\n');
-            }
-            block.push_str("Possibly relevant saved notes for this message:\n");
-            for h in &fresh {
-                block.push_str("- ");
-                block.push_str(h.fact.content.trim());
-                block.push('\n');
-            }
+        let mut block = String::from("Possibly relevant saved notes for this message:\n");
+        for h in &fresh {
+            block.push_str("- ");
+            block.push_str(h.fact.content.trim());
+            block.push('\n');
         }
         let wrapped = crate::tools::calling::guard_wrap("your saved memory", block.trim());
         Some((wrapped, fresh.len()))
+    }
+
+    /// Wave 3.5 seam. Called right before a compacted send drops the `trimmed`
+    /// older turns from the model-facing history. In Wave 3.3 this only logs the
+    /// event; Wave 3.5's pre-compaction flush replaces the body to sweep
+    /// `trimmed` for durable facts and save them (gated by the profile's
+    /// approval setting) BEFORE they're lost — the "context is filling up"
+    /// write-trigger (PLAN §9). Kept as a method so 3.5 is a body swap with no
+    /// change to the compaction plumbing or the call site.
+    fn on_pre_compaction(&self, conversation_id: &str, profile: &str, trimmed: &[ChatMessage]) {
+        tracing::debug!(
+            target: "lhp::compaction",
+            conversation_id = %conversation_id,
+            profile = %profile,
+            trimmed = trimmed.len(),
+            "pre-compaction: older turns about to be trimmed from the model-facing history"
+        );
     }
 
     /// Whether this profile has the meaning-lane (semantic memory search)
@@ -657,28 +726,38 @@ impl AgentLoop {
         // the model as "user" — the fenced dialect carries tool results as
         // plain text, so we avoid the native "tool" role that OpenAI-compatible
         // servers reject without a matching tool_call_id.
+        // Cache-shaped assembly (Wave 3.3, PLAN §3): a byte-stable PREFIX
+        // (catalog + curated summary) for KV/prompt-cache reuse, then the
+        // trimmable prior turns, then the VOLATILE tail (relevance snippets +
+        // the current turn). Tool-result rows are persisted with role "tool" but
+        // replayed to the model as "user" (the fenced dialect carries tool
+        // results as plain text; avoids the native "tool" role OpenAI-compatible
+        // servers reject without a matching tool_call_id).
         let mut history: Vec<ChatMessage> = Vec::new();
+        // Tier 0 (stable prefix): the tool catalog.
         let catalog = self.tools.catalog();
         if !catalog.is_empty() {
             history.push(ChatMessage::system(catalog));
         }
-        // Memory context (PLAN §9): the always-loaded curated summary plus any
-        // relevance-gated snippets for THIS message, guard-wrapped as untrusted
-        // content, endpoint-aware (private-local facts only on a non-cloud turn)
-        // and profile-scoped. Injected right after the tool catalog so it's a
-        // stable prefix. A recall fires a non-silent `memory:event`.
-        if let Some((block, recalled)) =
-            self.assemble_memory_context(&conversation_id, &profile, &content, is_cloud)
+        // Tier 1 (stable prefix): the always-loaded curated summary. Byte-stable
+        // across the conversation's turns (deterministic wrap, frozen snapshot),
+        // so the prompt prefix is reused turn-over-turn. Endpoint-aware
+        // (private-local facts dropped on a cloud turn) + profile-scoped.
+        if let Some(summary) =
+            self.assemble_curated_summary(&conversation_id, &profile, is_cloud)
         {
-            history.push(ChatMessage::system(block));
-            if recalled > 0 {
-                emit_memory_event(&app, &conversation_id, "recalled", recalled);
-            }
+            history.push(ChatMessage::system(summary));
         }
+        // The trimmable middle: prior turns — every persisted message EXCEPT the
+        // current user message (it rides the tail below with its sent_content, so
+        // the model sees the redacted remainder, not the stored original).
         for m in profile_db
             .list_messages_by_conversation(&conversation_id)
             .context("load conversation history")?
         {
+            if m.id == user_message.id {
+                continue;
+            }
             let role = if m.role == "tool" {
                 "user".to_string()
             } else {
@@ -686,19 +765,37 @@ impl AgentLoop {
             };
             history.push(ChatMessage { role, content: m.content });
         }
-        // The persisted copy of the current user message may differ from the
-        // live `content` by whitespace; make the last user turn authoritative.
-        // When redacting, the model sees the redacted remainder — never the
-        // original sensitive spans — even though the transcript kept the original.
+        // Tail (volatile): the current user turn. When redacting, the model
+        // sees the redacted remainder — never the original sensitive spans —
+        // even though the transcript kept the original. The per-message
+        // relevance snippets (if any) are PREPENDED into this same user message
+        // as a guard-wrapped block, so (a) there are never two consecutive
+        // user-role messages on the wire, and (b) the snippets + question are
+        // one pinned unit. A recall fires a non-silent `memory:event`.
         let sent_content = redaction
             .as_ref()
             .map(|r| r.redacted_text.clone())
             .unwrap_or_else(|| content.clone());
-        if let Some(last_user) = history.iter_mut().rev().find(|m| m.role == "user") {
-            last_user.content = sent_content;
-        } else {
-            history.push(ChatMessage::user(sent_content));
-        }
+        let current_turn = match self.assemble_relevance_snippets(
+            &conversation_id,
+            &profile,
+            &content,
+            is_cloud,
+        ) {
+            Some((snippets, recalled)) => {
+                if recalled > 0 {
+                    emit_memory_event(&app, &conversation_id, "recalled", recalled);
+                }
+                format!("{snippets}\n\n{sent_content}")
+            }
+            None => sent_content,
+        };
+        history.push(ChatMessage::user(current_turn));
+        // Wave 3.3: the index of the current user turn. Compaction pins
+        // everything from here forward (the question + whatever the tool loop
+        // appends), so the user's actual request can never be trimmed no matter
+        // how deep the tool loop goes.
+        let pinned_from = history.len() - 1;
 
         // `reads` is injected by the dispatcher (which owns the shared handle),
         // so the loop leaves it `None` here. `allow_private_memory` mirrors the
@@ -737,10 +834,36 @@ impl AgentLoop {
             // round's endpoint supports them (and any tools exist), the
             // fenced dialect otherwise.
             let native_mode = provider.supports_native_tools && native_spec.is_some();
+            // Wave 3.3: compact the model-facing history to a char budget before
+            // each send. Deterministic + prefix-stable (catalog + summary kept
+            // byte-identical); the stored transcript is untouched. Runs EVERY
+            // round, so the AGGREGATE history growth across a tool loop is
+            // bounded (older rounds trim as it grows). `history` itself is left
+            // intact for the loop's own appends. NOTE: the budget is a target,
+            // not a hard cap — the pinned tail (the current turn onward) and any
+            // single oversized recent message are kept WHOLE (never sliced, to
+            // avoid bisecting a guard-wrap/redaction frame), so one huge tool
+            // result can still exceed the budget on its own round.
+            //
+            // `keep_recent` is raised to cover the current user turn forward
+            // (`pinned_from`), so the actual question is never trimmed however
+            // deep the tool loop goes.
+            let keep_recent = crate::agent::compaction::KEEP_RECENT_MESSAGES
+                .max(history.len().saturating_sub(pinned_from));
+            let compaction = crate::agent::compaction::compact_history(
+                &history,
+                crate::agent::compaction::COMPACT_BUDGET_CHARS,
+                keep_recent,
+            );
+            if !compaction.trimmed.is_empty() {
+                // Wave 3.5 seam: about-to-be-trimmed turns are swept for durable
+                // facts here BEFORE they leave the wire. 3.3 only logs.
+                self.on_pre_compaction(&conversation_id, &profile, &compaction.trimmed);
+            }
             let mut sse = client
                 .stream_chat_with_tools(
                     &model,
-                    history.clone(),
+                    compaction.sent,
                     if native_mode { native_spec.as_ref() } else { None },
                 )
                 .await

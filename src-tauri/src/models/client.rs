@@ -20,7 +20,7 @@ use super::sse::SseStream;
 /// wire level (`"system" | "user" | "assistant" | "tool"`); we keep it as a
 /// string here so non-OpenAI extensions (e.g. Anthropic-via-proxy) can
 /// round-trip without translation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,

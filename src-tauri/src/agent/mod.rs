@@ -8,6 +8,7 @@
 //!
 //! The tool registry comes in later milestones.
 
+pub mod compaction;
 pub mod crash_recovery;
 pub mod egress;
 pub mod gate;
