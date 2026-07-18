@@ -676,6 +676,92 @@ pub fn delete_skill(state: State<'_, AppState>, args: DeleteSkillArgs) -> Result
         .map_err(|e| e.to_string())
 }
 
+/// A per-profile model-seat binding for the Settings → Models "Seats" view.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeatBindingInfo {
+    pub seat: String,
+    pub provider_id: String,
+    pub model: String,
+    pub updated_at: i64,
+}
+
+impl From<crate::storage::SeatBinding> for SeatBindingInfo {
+    fn from(b: crate::storage::SeatBinding) -> Self {
+        Self {
+            seat: b.seat,
+            provider_id: b.provider_id,
+            model: b.model,
+            updated_at: b.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListSeatsArgs {
+    pub profile: String,
+}
+
+/// List a profile's model-seat bindings (Wave 3.1). Seats are per-profile.
+#[tauri::command]
+pub fn list_seat_bindings(
+    state: State<'_, AppState>,
+    args: ListSeatsArgs,
+) -> Result<Vec<SeatBindingInfo>, String> {
+    state
+        .storage
+        .open_profile(&args.profile)
+        .and_then(|db| db.list_seat_bindings())
+        .map(|v| v.into_iter().map(Into::into).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSeatArgs {
+    pub profile: String,
+    pub seat: String,
+    pub provider_id: String,
+    pub model: String,
+}
+
+/// Bind a (user-defined) seat name to a provider+model for this profile.
+#[tauri::command]
+pub fn set_seat_binding(state: State<'_, AppState>, args: SetSeatArgs) -> Result<(), String> {
+    let seat = args.seat.trim();
+    if seat.is_empty() {
+        return Err("seat name must not be empty".to_string());
+    }
+    if seat.eq_ignore_ascii_case("inherit") {
+        return Err("\"inherit\" is reserved (it means \"use the caller's model\")".to_string());
+    }
+    if args.provider_id.trim().is_empty() || args.model.trim().is_empty() {
+        return Err("a seat binding needs both a provider and a model".to_string());
+    }
+    state
+        .storage
+        .open_profile(&args.profile)
+        .and_then(|db| db.set_seat_binding(seat, args.provider_id.trim(), args.model.trim()))
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteSeatArgs {
+    pub profile: String,
+    pub seat: String,
+}
+
+/// Unbind a seat (it then resolves to the caller's model). Returns whether a row went.
+#[tauri::command]
+pub fn delete_seat_binding(
+    state: State<'_, AppState>,
+    args: DeleteSeatArgs,
+) -> Result<bool, String> {
+    state
+        .storage
+        .open_profile(&args.profile)
+        .and_then(|db| db.delete_seat_binding(&args.seat))
+        .map_err(|e| e.to_string())
+}
+
 /// Whether autonomous skill drafting (Wave 4.2) is on. Global (skills are global).
 #[tauri::command]
 pub fn get_skill_reflect_enabled(state: State<'_, AppState>) -> Result<bool, String> {

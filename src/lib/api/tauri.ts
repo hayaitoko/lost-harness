@@ -549,6 +549,44 @@ export async function deleteSkill(id: string): Promise<boolean> {
   return false;
 }
 
+/** A per-profile model-seat binding. Mirrors `SeatBindingInfo` in `ipc/mod.rs`. */
+export interface SeatBinding {
+  seat: string;
+  provider_id: string;
+  model: string;
+  updated_at: number;
+}
+
+/** List a profile's model-seat bindings (Wave 3.1). Seats are per-profile. */
+export async function listSeatBindings(profile: string): Promise<SeatBinding[]> {
+  if (isTauri()) {
+    return tauriInvoke<SeatBinding[]>("list_seat_bindings", { args: { profile } });
+  }
+  return [];
+}
+
+/** Bind a (user-defined) seat name to a provider+model for this profile. */
+export async function setSeatBinding(
+  profile: string,
+  seat: string,
+  providerId: string,
+  model: string,
+): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("set_seat_binding", {
+      args: { profile, seat, provider_id: providerId, model },
+    });
+  }
+}
+
+/** Unbind a seat (it then resolves to the caller's model). */
+export async function deleteSeatBinding(profile: string, seat: string): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("delete_seat_binding", { args: { profile, seat } });
+  }
+  return false;
+}
+
 /** Is autonomous skill drafting (Wave 4.2) on? Global; default off. */
 export async function getSkillReflectEnabled(): Promise<boolean> {
   if (isTauri()) {

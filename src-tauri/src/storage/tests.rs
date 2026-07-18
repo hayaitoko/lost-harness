@@ -75,18 +75,41 @@ fn schema_version_is_current_after_init_global() {
 }
 
 #[test]
-fn schema_version_is_eight_after_init_profile() {
-    // Profile schema version is now 8 (v2 tool_audit, v3 tool_rules, v4
+fn schema_version_is_nine_after_init_profile() {
+    // Profile schema version is now 9 (v2 tool_audit, v3 tool_rules, v4
     // classifier_settings, v5 the classifier_settings.redaction_enabled column,
-    // v6 memory_settings, v7 usage_events, v8 work_items); global stays at its
-    // own version. The two are tracked independently.
+    // v6 memory_settings, v7 usage_events, v8 work_items, v9 seat_bindings);
+    // global stays at its own version. The two are tracked independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 8);
+    assert_eq!(v, 9);
+}
+
+#[test]
+fn seat_bindings_crud_roundtrip() {
+    let db = ProfileDb::open_in_memory("personal").unwrap();
+    assert!(db.list_seat_bindings().unwrap().is_empty());
+    assert!(db.get_seat_binding("Coding").unwrap().is_none());
+
+    db.set_seat_binding("Coding", "lmstudio", "qwen3-14b").unwrap();
+    db.set_seat_binding("Reviewer", "cloudco", "gpt-x").unwrap();
+    // Upsert: re-binding replaces, doesn't duplicate.
+    db.set_seat_binding("Coding", "lmstudio", "qwen3-30b").unwrap();
+
+    let all = db.list_seat_bindings().unwrap();
+    assert_eq!(all.len(), 2, "two distinct seats, Coding upserted not duplicated");
+    let coding = db.get_seat_binding("  Coding  ").unwrap().unwrap(); // name trimmed
+    assert_eq!(coding.model, "qwen3-30b");
+    assert_eq!(coding.provider_id, "lmstudio");
+
+    assert!(db.delete_seat_binding("Coding").unwrap());
+    assert!(!db.delete_seat_binding("Coding").unwrap(), "second delete is a no-op");
+    assert!(db.get_seat_binding("Coding").unwrap().is_none());
+    assert_eq!(db.list_seat_bindings().unwrap().len(), 1);
 }
 
 #[test]

@@ -18,7 +18,7 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 5;
 /// `classifier_settings` in the classifier settings round,
 /// `memory_settings` in Wave 1 memory) bumps `PROFILE_SCHEMA_VERSION`
 /// without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 8;
+pub const PROFILE_SCHEMA_VERSION: i32 = 9;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -351,6 +351,17 @@ CREATE TABLE IF NOT EXISTS work_items (
     created_at              INTEGER NOT NULL,
     started_at              INTEGER,
     finished_at             INTEGER
+);
+
+-- Wave 3.1: per-profile model-seat bindings. `seat` is a user-defined name (any
+-- string), resolved to (provider_id, model) at run time; an unbound seat
+-- inherits the caller's model. No FK to endpoints — a binding may outlive a
+-- deleted provider, and resolve_seat falls back when it does.
+CREATE TABLE IF NOT EXISTS seat_bindings (
+    seat         TEXT PRIMARY KEY,
+    provider_id  TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);

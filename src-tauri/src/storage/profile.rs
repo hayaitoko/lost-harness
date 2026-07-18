@@ -1372,6 +1372,77 @@ impl ProfileDb {
             .context("upsert memory_settings")?;
         Ok(())
     }
+
+    // ── seat_bindings (Wave 3.1 — per-profile model seats) ───────────────────
+
+    /// Bind a (user-defined) seat name to a concrete provider+model for THIS
+    /// profile. Upsert — re-binding a seat just changes what it resolves to.
+    pub fn set_seat_binding(&self, seat: &str, provider_id: &str, model: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO seat_bindings (seat, provider_id, model, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(seat) DO UPDATE SET
+                     provider_id = excluded.provider_id,
+                     model = excluded.model,
+                     updated_at = excluded.updated_at",
+                params![seat.trim(), provider_id, model, now],
+            )
+            .context("upsert seat_binding")?;
+        Ok(())
+    }
+
+    /// The binding for `seat` in this profile, if any. A missing row is normal
+    /// (an unbound seat inherits the caller's model — see `resolve_seat`).
+    pub fn get_seat_binding(&self, seat: &str) -> Result<Option<SeatBinding>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seat, provider_id, model, updated_at FROM seat_bindings WHERE seat = ?1",
+                params![seat.trim()],
+                row_to_seat_binding,
+            )
+            .optional()
+            .context("get_seat_binding")?)
+    }
+
+    /// Every seat binding for this profile (for the Settings → Seats view).
+    pub fn list_seat_bindings(&self) -> Result<Vec<SeatBinding>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seat, provider_id, model, updated_at FROM seat_bindings ORDER BY seat",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_seat_binding)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Unbind a seat (it then resolves to `inherit`). Returns whether a row went.
+    pub fn delete_seat_binding(&self, seat: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM seat_bindings WHERE seat = ?1", params![seat.trim()])?;
+        Ok(n > 0)
+    }
+}
+
+fn row_to_seat_binding(r: &rusqlite::Row<'_>) -> rusqlite::Result<SeatBinding> {
+    Ok(SeatBinding {
+        seat: r.get(0)?,
+        provider_id: r.get(1)?,
+        model: r.get(2)?,
+        updated_at: r.get(3)?,
+    })
+}
+
+/// A per-profile model-seat binding (Wave 3.1). `seat` is a user-defined name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatBinding {
+    pub seat: String,
+    pub provider_id: String,
+    pub model: String,
+    pub updated_at: i64,
 }
 
 /// Per-profile memory toggles (Wave 1). Defaults preserve the pre-Wave-1

@@ -48,6 +48,10 @@
     getSkillReflectEnabled,
     setSkillReflectEnabled,
     type SkillInfo,
+    listSeatBindings,
+    setSeatBinding,
+    deleteSeatBinding,
+    type SeatBinding,
   } from "$lib/api/tauri";
 
   type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "usage" | "appearance";
@@ -158,6 +162,14 @@
   let expandedSkillId = $state<string | null>(null);
   let skillReflectEnabled = $state(false);
   let skillReflectSaving = $state(false);
+  // seats — per-profile model-seat bindings (Wave 3.1)
+  let seatBindings = $state<SeatBinding[]>([]);
+  let seatName = $state("");
+  let seatProviderId = $state("");
+  let seatModel = $state("");
+  let seatError = $state<string | null>(null);
+  let seatSaving = $state(false);
+  let confirmUnbindSeat = $state<string | null>(null);
 
   let activeLabel = $derived(SECTIONS.find(([id]) => id === section)![1]);
 
@@ -244,6 +256,19 @@
         skillReflectEnabled = v;
       })
       .catch(() => {});
+  });
+
+  // Load this profile's seat bindings when the Models pane opens (+ on profile change).
+  $effect(() => {
+    if (section !== "models") return;
+    const profile = $activeProfileId;
+    listSeatBindings(profile)
+      .then((rows) => {
+        seatBindings = rows;
+      })
+      .catch((err) => {
+        seatError = String(err);
+      });
   });
 
   // Load the active profile's classifier thresholds when the Privacy guard
@@ -560,6 +585,45 @@
 
   function toggleSkillExpanded(id: string) {
     expandedSkillId = expandedSkillId === id ? null : id;
+  }
+
+  async function addSeat() {
+    const name = seatName.trim();
+    if (!name || !seatProviderId || !seatModel.trim()) {
+      seatError = "A seat needs a name, a provider, and a model.";
+      return;
+    }
+    seatSaving = true;
+    seatError = null;
+    try {
+      await setSeatBinding($activeProfileId, name, seatProviderId, seatModel.trim());
+      seatBindings = await listSeatBindings($activeProfileId);
+      seatName = "";
+      seatModel = "";
+      seatProviderId = "";
+    } catch (err) {
+      seatError = String(err);
+    } finally {
+      seatSaving = false;
+    }
+  }
+
+  async function unbindSeat(seat: string) {
+    // Two-click confirm, mirroring the memory/skill-delete pattern.
+    if (confirmUnbindSeat !== seat) {
+      confirmUnbindSeat = seat;
+      setTimeout(() => {
+        if (confirmUnbindSeat === seat) confirmUnbindSeat = null;
+      }, 3000);
+      return;
+    }
+    confirmUnbindSeat = null;
+    await deleteSeatBinding($activeProfileId, seat);
+    seatBindings = seatBindings.filter((b) => b.seat !== seat);
+  }
+
+  function providerName(id: string): string {
+    return providersStore.providers.find((p) => p.id === id)?.name ?? id;
   }
 
   async function toggleSkillReflect(next: boolean) {
@@ -1007,6 +1071,82 @@
                 </span>
               </button>
             {/if}
+
+            <!-- Seats (Wave 3.1): named roles → a model, per profile -->
+            <div class="mb-2 mt-6 flex items-center gap-2.5">
+              <span class="text-[12px] font-[550] text-text">Seats</span>
+              <span class="text-[11.5px] text-text-3">
+                Name a role (e.g. “Coding”), point it at a model — this profile only
+              </span>
+            </div>
+            {#if seatError}
+              <div class="mb-2 text-[11.5px] text-blocked" data-testid="seat-error">{seatError}</div>
+            {/if}
+            <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border" data-testid="seats-list">
+              {#if seatBindings.length === 0}
+                <div class="px-3 py-6 text-center text-[12px] text-text-3">
+                  No seats yet. Unbound seats fall back to the model the conversation is already using.
+                </div>
+              {:else}
+                {#each seatBindings as b (b.seat)}
+                  <div class="flex items-center gap-2 border-b border-border py-[9px] pl-3 pr-2.5" data-testid="seat-row">
+                    <span class="min-w-0 flex-1">
+                      <span class="block text-[12.5px] font-[550] text-text">{b.seat}</span>
+                      <span class="block truncate text-[11.5px] text-text-3">{providerName(b.provider_id)} · {b.model}</span>
+                    </span>
+                    <button
+                      type="button"
+                      aria-label="Unbind this seat"
+                      title={confirmUnbindSeat === b.seat ? "Click again to unbind" : "Unbind"}
+                      onclick={() => unbindSeat(b.seat)}
+                      class="grid h-6 w-6 flex-shrink-0 place-items-center rounded-[var(--r)] border-0 bg-transparent
+                        {confirmUnbindSeat === b.seat ? 'text-blocked' : 'text-text-3'} hover:bg-surface-hover hover:text-text"
+                    >
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M6 6l12 12M18 6 6 18" />
+                      </svg>
+                    </button>
+                  </div>
+                {/each}
+              {/if}
+              <form
+                class="flex flex-wrap items-center gap-1.5 px-2.5 py-2"
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  addSeat();
+                }}
+              >
+                <input
+                  bind:value={seatName}
+                  placeholder="Seat name"
+                  class="min-w-[100px] flex-1 rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12.5px]
+                    text-text outline-none placeholder:text-text-3 focus:border-accent"
+                />
+                <select
+                  bind:value={seatProviderId}
+                  class="rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12.5px] text-text outline-none focus:border-accent"
+                >
+                  <option value="" disabled>Provider…</option>
+                  {#each providersStore.providers as p (p.id)}
+                    <option value={p.id}>{p.name}</option>
+                  {/each}
+                </select>
+                <input
+                  bind:value={seatModel}
+                  placeholder="Model"
+                  class="min-w-[100px] flex-1 rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12.5px]
+                    text-text outline-none placeholder:text-text-3 focus:border-accent"
+                />
+                <Button variant="primary" type="submit" disabled={seatSaving}>
+                  {seatSaving ? "Saving…" : "Bind"}
+                </Button>
+              </form>
+              <div class="px-3 py-2 text-[11px] text-text-3">
+                An agent that asks for a seat gets its bound model — rebind here to change
+                that with no code change. A seat can prefer a cloud model, but a
+                must-stay-local turn is still routed to a local one by the privacy guard.
+              </div>
+            </div>
           {:else if section === "memory"}
             {#if memSettingsError}
               <div class="mt-1 text-[11.5px] text-blocked">{memSettingsError}</div>

@@ -301,6 +301,26 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_claim ON work_items(claim_key) WHERE claim_key IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_work_items_state_sched ON work_items(state, scheduled_at);",
     },
+    Migration {
+        version: 9,
+        // Per-profile model-seat bindings (Wave 3.1). A seat is a USER-DEFINED
+        // name (any string — not an enumerated set) that resolves to a concrete
+        // (provider, model) at run time; kept PER-PROFILE so a profile can point
+        // a seat at a different (e.g. forced-local) model than another profile.
+        // An unbound seat resolves to the caller's own model (`inherit`), so a
+        // missing row is normal. Same dual-definition convention: the CREATE is
+        // IF NOT EXISTS and also lives in PROFILE_SCHEMA_SQL, so v9 is a no-op on
+        // a fresh install and a real upgrade on a v8 DB. No FK to the (global)
+        // endpoints table — a binding may outlive a deleted provider, and
+        // `resolve_seat` detects the dangling id at run time and falls back.
+        name: "seat_bindings_table",
+        sql: "CREATE TABLE IF NOT EXISTS seat_bindings (
+            seat         TEXT PRIMARY KEY,
+            provider_id  TEXT NOT NULL,
+            model        TEXT NOT NULL,
+            updated_at   INTEGER NOT NULL
+        );",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.

@@ -15,6 +15,7 @@ pub mod provider;
 pub mod client;
 pub mod manager;
 pub mod pricing;
+pub mod seat;
 pub mod sse;
 
 #[cfg(test)]
@@ -23,3 +24,4 @@ mod tests;
 pub use client::{ChatMessage, ModelClient, OwnOutput};
 pub use manager::ModelManager;
 pub use provider::{Provider, ProviderKind};
+pub use seat::resolve_seat;
