@@ -11,6 +11,62 @@ fn registry() -> ToolRegistry {
     r
 }
 
+fn allow(names: &[&str]) -> std::collections::HashSet<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+// ── Wave 4.3b — bounded toolbelt intersection (a SECURITY boundary) ───────────
+
+#[test]
+fn restricted_to_excludes_every_tool_not_in_the_allowlist() {
+    // A persona allowed only "echo" cannot SEE or LOOK UP the others — they're
+    // physically absent from the sub-registry, so neither the catalog
+    // (available_tools) nor a direct dispatch (get) can reach them.
+    let sub = registry().restricted_to(&allow(&["echo"]));
+    assert!(sub.get("echo").is_some());
+    assert!(sub.get("screenshot").is_none(), "a tool outside the belt is not lookupable");
+    assert!(sub.get("sync_file").is_none());
+    let names: Vec<&str> = sub
+        .available_tools(&BodyEnv::app_default())
+        .into_iter()
+        .map(|t| t.name())
+        .collect();
+    assert_eq!(names, vec!["echo"], "only the allowed tool is listable");
+}
+
+#[test]
+fn restricted_to_is_an_intersection_never_a_widening() {
+    // An allowlist naming a tool that isn't registered yields nothing for it —
+    // a persona can never gain a capability the parent body doesn't have.
+    let sub = registry().restricted_to(&allow(&["echo", "shell_exec", "ghost_tool"]));
+    assert!(sub.get("echo").is_some());
+    assert!(sub.get("shell_exec").is_none(), "not registered → not granted");
+    assert!(sub.get("ghost_tool").is_none());
+    assert_eq!(sub.len(), 1, "only the intersection with the registered set survives");
+}
+
+#[test]
+fn restricted_to_still_applies_the_env_capability_filter() {
+    // Being in the allowlist is necessary but not sufficient: a tool still needs
+    // its capabilities satisfied by the environment. sync_file (Filesystem+
+    // Network) is allowed but an env with neither can't offer it.
+    let sub = registry().restricted_to(&allow(&["echo", "sync_file"]));
+    let bare = BodyEnv::empty();
+    let names: Vec<&str> = sub.available_tools(&bare).into_iter().map(|t| t.name()).collect();
+    assert_eq!(names, vec!["echo"], "sync_file is allowed but ungranted by this env");
+    // With the capabilities present, the allowed tool becomes available.
+    let full = BodyEnv::new([Capability::Filesystem, Capability::Network]);
+    let names2: Vec<&str> = sub.available_tools(&full).into_iter().map(|t| t.name()).collect();
+    assert!(names2.contains(&"sync_file") && names2.contains(&"echo"));
+}
+
+#[test]
+fn restricted_to_empty_allowlist_yields_an_empty_belt() {
+    let sub = registry().restricted_to(&allow(&[]));
+    assert_eq!(sub.len(), 0);
+    assert!(sub.available_tools(&BodyEnv::app_default()).is_empty());
+}
+
 #[test]
 fn no_requirements_tool_available_everywhere() {
     let r = registry();

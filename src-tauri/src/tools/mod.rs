@@ -335,10 +335,12 @@ pub trait Tool: Send + Sync {
 // ── ToolRegistry ─────────────────────────────────────────────────────────
 
 /// Holds every registered tool (native + — later — MCP-provided) and
-/// filters them by environment capability.
+/// filters them by environment capability. Tools are held behind `Arc` so a
+/// bounded sub-registry (Wave 4.3 agent toolbelts) can SHARE the same tool
+/// instances via [`ToolRegistry::restricted_to`] without re-constructing them.
 #[derive(Default)]
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<std::sync::Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -347,9 +349,29 @@ impl ToolRegistry {
     }
 
     /// Register a tool. Order of registration is preserved and reflected
-    /// in `available_tools()`'s output order.
+    /// in `available_tools()`'s output order. Takes a `Box` (callers keep using
+    /// `register(Box::new(MyTool))`); it's converted to `Arc` internally.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+        self.tools.push(std::sync::Arc::from(tool));
+    }
+
+    /// A bounded sub-registry: exactly the registered tools whose name is in
+    /// `allowed`, sharing the same `Arc`'d tool instances (no rebuild). This is
+    /// the structural chokepoint for a Wave-4.3 agent's toolbelt — the effective
+    /// belt is `allowed ∩ registered`, an INTERSECTION never a widening: a name
+    /// in `allowed` but not registered simply yields nothing, and a registered
+    /// tool not in `allowed` is physically absent from the result, so it can't be
+    /// listed (`available_tools`/catalog) OR looked up (`get`) — enforcement is
+    /// the registry's contents, not a filter that some call site might skip.
+    pub fn restricted_to(&self, allowed: &std::collections::HashSet<String>) -> ToolRegistry {
+        ToolRegistry {
+            tools: self
+                .tools
+                .iter()
+                .filter(|t| allowed.contains(t.name()))
+                .cloned()
+                .collect(),
+        }
     }
 
     /// How many tools are registered, regardless of availability.
