@@ -21,8 +21,21 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-17: M3 COMPLETE. M4 well underway. WAVE 1 of the build manifest
-> COMPLETE — the started subsystems are finished.**
+> **As of 2026-07-17: M3 COMPLETE. M4 well underway. WAVE 1 COMPLETE; WAVE 2 in
+> progress (permission modes landed).**
+> **Wave 2.2 — permission modes** (`5bf3c37`): a session-wide `SessionMode`
+> (normal / plan / accept-edits) enforced by a `SessionModeHook` placed after the
+> danger/protected-path floors and before `PermissionHook`, so it's *structurally*
+> matrix-bounded — plan is read-only (denies risk > Safe), accept-edits
+> auto-approves `Write` only (never `External`/`Dangerous`). Threaded through
+> `send_message` → loop → `ExecCtx` → dispatcher, with a chat-header mode pill.
+> Full-chain tests prove a mode can't widen Dangerous. 390 → **396 tests**. The
+> `UserPromptSubmit` hook half of 2.2 is deferred (Q11 rates it structural /
+> zero-coverage-gain). **Wave 2 still open:** remaining core tools (system_status,
+> session_search, ask_human, headless browser, delegate, cron), reroute UX (2.3,
+> dep 3.1), headless approval queue (2.4), durability journal (2.5, dep 4.4).
+>
+> **Wave 1 (2026-07-17): started subsystems finished** —
 > Wave 1 (BUILD-MANIFEST.md) landed all its items: the **native-tool add-provider
 > UI checkbox** (1.1 — everyday chat can now use the native transport), a
 > **per-profile semantic-memory toggle** (1.2 — hard off switch for computing a
@@ -56,7 +69,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 389 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 396 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -74,7 +87,7 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 1 of the build manifest landed: **389 passed**,
+Last verified: 2026-07-17 (Wave 2.2 permission modes landed: **396 passed**,
 `--no-default-features` builds clean, `cargo clippy --lib` 0 errors, frontend build +
 svelte-check clean, tree clean; embedder live test passes on the installed model).
 

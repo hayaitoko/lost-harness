@@ -47,7 +47,7 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **390 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 1** of the build manifest.)
+**Tests:** `cargo test --lib` → **396 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 2.2** — permission modes.)
 
 **2026-07-16 (latest): near-term items 1–3-core DONE — the trained privacy classifier is LIVE.** Three landings this session: (1) the Q8 **Permissions pane** (`f38fd2c`) — Settings tab lists/revokes persisted "Always allow" `tool_rules`, verified live in the browser preview; (2) **frontend housekeeping** (`6dfcf12`) — deleted the 5 superseded components, removed the dev screen-switcher + theme toggle, and fixed the `ModelPicker` name collision (options now carry a composite `providerId::name` key — verified live with two `default` models); (3) the **classifier ONNX integration** (`283789b`) — ran the bundle's `export_onnx.py` (both encoders → fp32 + INT8), then wired `classifier/engine.rs` to run the real INT8 ensemble via `ort`, mirroring `serve.py` (rules layer-0 short-circuit → sliding-128-window max-prob over both encoders → fusion at 0.5/0.05). Behind a default-on `onnx-classifier` feature (rules-only fallback with `--no-default-features`, both build clean). Models installed live at `~/Documents/Lost-Harness/models/classifier/` (98 MB, NOT in git). **Gotcha caught:** the exported `tokenizer.json` bakes in Fixed(128) padding/truncation — left on, it feeds the model garbage (distilbert scored 0.999 on "capital of France"); disabled on load. An env-gated parity test (`LHP_CLASSIFIER_MODELS_DIR`) loads the live INT8 models and matches the Python reference probs (`docs/classifier-parity.json`). **Remaining in item 3:** the annotated-redaction sidebar UX (PLAN §11 — the engine's there, no UI); the `gate.rs`/§7 cosmetic renames were judged low-value/high-churn and deferred (gate.rs cleanly delegates to the `Classifier` trait, no rewrite needed).
 
@@ -418,3 +418,36 @@ high-churn; noted, not done.
 clean, `npm run build` + `svelte-check` clean, tree clean. Migration: PROFILE v6 (global stays
 v4). **Deferred to later waves:** embedder bundling into the packaged app (M9 / Wave 7.1);
 memory write-triggers need context compaction first (Wave 3.3 → 3.5); 1.6 rename cleanup.
+
+## Session log — 2026-07-17 (ultracode build — WAVE 2 begins: permission modes)
+
+Wave 2 of the build manifest ("remaining core tools + the tool-system Part-2 spine").
+Started with the highest-value, most self-contained, security-relevant item: **2.2 —
+permission modes**.
+
+- **2.2 — permission modes (plan / accept-edits), matrix-bounded** (`5bf3c37`). A new
+  session-wide `SessionMode { Normal, Plan, AcceptEdits }` (`hooks/session_mode.rs`),
+  applied by a `SessionModeHook` registered in `build_pretooluse_chain_full` **after** the
+  non-overridable floors (Sandbox danger denylist, ProtectedPath) and **before**
+  `PermissionHook`. That position makes the Q8-matrix bound structural: *Plan* denies any
+  tool with risk > Safe (read-only); *AcceptEdits* auto-approves `Write` only (sets
+  `ctx.policy_allowed` so first-use is satisfied too — zero prompts) while `External`/
+  `Dangerous` fall through to normal gating and are **never** widened; *Normal* is a no-op.
+  `EventContext` gained `risk` + `session_mode` (dispatcher stamps from the resolved tool +
+  `ExecCtx`); `ExecCtx` gained `session_mode`, threaded `send_message` (lenient parse →
+  Normal on unknown) → `process_message` → `stream_to_provider` (all 3 sites) → `ExecCtx`,
+  inherited by the dispatcher's `run_ctx` via `..ctx.clone()`. Frontend: a mode pill in the
+  chat header. **Tests 390 → 396** incl. full-chain integration tests proving accept-edits
+  can't widen Dangerous/External and plan denies every mutation. Bounded 2-lens adversarial
+  review (matrix-bound + threading) → **0 findings**. clippy 0 errors, `--no-default-features`
+  clean, frontend clean.
+  - **Deferred within 2.2:** the `UserPromptSubmit` hook — Q11 itself rates it "mostly
+    structural, small risk delta" (the inbound message path is *already* privacy-gated in the
+    loop; re-expressing it as a hook adds one-place-ness, not coverage). Not worth a risky
+    loop refactor for zero coverage gain; revisit when the hook chain is next open.
+
+**Wave 2 still open (deliberately ordered / deferred):** 2.1 remaining core tools —
+`system_status` + `session_search` (tractable, read-only, next), `ask_human` (needs a UI
+round-trip like the approval prompter), `headless browser` (a large subsystem, overlaps M5),
+`delegate` (dep 4.3 agent registry), `cron` (dep 4.4 queue model); 2.3 reroute UX (dep 3.1);
+2.4 headless approval queue (Q5, server-track prep); 2.5 durability journal (dep 4.4).
