@@ -80,7 +80,7 @@ impl ToolRule {
 /// none); everything else must match literally. Good enough for patterns
 /// like `"git commit:*"` or `"rm -rf:*"` without pulling in a regex/glob
 /// crate for a handful of profile-authored rules.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     if !pattern.contains('*') {
         return pattern == text;
     }
@@ -354,15 +354,28 @@ impl PermissionHook {
     /// specific matches), else the whole-tool mode, else `None`.
     fn resolve(&self, ctx: &EventContext) -> Option<PermissionMode> {
         let rules = self.policy.rules_for(&ctx.tool_name, &ctx.profile);
-        let matching = rules
-            .iter()
-            .filter(|r| glob_match(&r.pattern, &ctx.command_text));
+        let whole_tool = self.policy.mode_for(&ctx.tool_name);
+        resolve_effective_mode(&rules, whole_tool, &ctx.command_text)
+    }
+}
 
-        let best = matching.max_by_key(|r| (r.specificity(), r.action.priority()));
-        if let Some(rule) = best {
-            return Some(rule.action);
-        }
-        self.policy.mode_for(&ctx.tool_name)
+/// The canonical permission resolution — extracted so the headless
+/// pre-authorizer (`crate::hooks::headless`) applies the SAME precedence as the
+/// interactive `PermissionHook` and can never be more permissive than an
+/// attended path would be. Most-specific matching pattern wins; ties broken by
+/// action priority (deny > ask > allow); else the whole-tool mode; else `None`.
+pub(crate) fn resolve_effective_mode(
+    rules: &[ToolRule],
+    whole_tool: Option<PermissionMode>,
+    command_text: &str,
+) -> Option<PermissionMode> {
+    let best = rules
+        .iter()
+        .filter(|r| glob_match(&r.pattern, command_text))
+        .max_by_key(|r| (r.specificity(), r.action.priority()));
+    match best {
+        Some(rule) => Some(rule.action),
+        None => whole_tool,
     }
 }
 

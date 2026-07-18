@@ -70,6 +70,7 @@ use crate::tools::{RiskClass, ToolInput};
 pub mod approval;
 pub mod audit;
 pub mod first_use;
+pub mod headless;
 pub mod permission;
 pub mod privacy_filter;
 pub mod protected_path;
@@ -86,6 +87,7 @@ pub use audit::{
     CAPTURED_ARGS_CAP, StorageAuditWriter,
 };
 pub use first_use::FirstUseConfirmHook;
+pub use headless::{ApprovalQueue, QueuedApproval, QueueingPrompter};
 pub use permission::{
     InMemoryPolicySource, LayeredPolicySource, PermissionHook, PermissionMode, PolicySource,
     SqlitePolicySource, StorageToolRuleWriter, ToolRule, ToolRuleWriter,
