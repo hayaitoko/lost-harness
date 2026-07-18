@@ -420,6 +420,16 @@ fn build_tool_dispatcher(
             .with_embedder(embedder)
             .with_app_handle(app_handle),
     ));
+    // Wave 2.1: the agent's recall over past conversations (read-only, Safe,
+    // profile-scoped) — distinct from memory (`recall_memory`).
+    registry.register(Box::new(crate::tools::session_search::SessionSearchTool::new(
+        storage.clone(),
+    )));
+    // Wave 2.1: a read-only local status snapshot (OS/arch, profiles, model
+    // install state). Safe → pre-trusted.
+    registry.register(Box::new(crate::tools::system_status::SystemStatusTool::new(
+        storage.clone(),
+    )));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
     // scratch dir, network off by default, killed on timeout, OS-sandboxed via

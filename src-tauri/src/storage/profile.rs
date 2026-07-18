@@ -389,6 +389,46 @@ impl ProfileDb {
         Ok(rows)
     }
 
+    /// Search this profile's past conversation transcript for messages whose
+    /// content contains `query` (case-insensitive substring). Powers the
+    /// `session_search` tool — the agent's recall over past chats, distinct from
+    /// the memory archive. Only `user`/`assistant` turns are searched (tool/
+    /// system rows are noise). Most-recent first, capped at `limit`. LIKE
+    /// wildcards in `query` are escaped so a literal `%`/`_` matches literally.
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchHit>> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Escape LIKE metacharacters (order matters: backslash first).
+        let escaped = trimmed
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT m.conversation_id, c.name, m.role, m.content, m.created_at
+             FROM messages m
+             LEFT JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.role IN ('user', 'assistant')
+               AND m.content LIKE ?1 ESCAPE '\\'
+             ORDER BY m.created_at DESC, m.rowid DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], |r| {
+                Ok(SessionSearchHit {
+                    conversation_id: r.get(0)?,
+                    conversation_name: r.get(1)?,
+                    role: r.get(2)?,
+                    content: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Update a message. Used for: setting `aborted = 1` when a stream is
     /// interrupted, writing `error` after a failed model call, or appending
     /// `thinking_content` once a thinking model returns.
@@ -1178,6 +1218,19 @@ impl Default for MemorySettings {
             walled: false,
         }
     }
+}
+
+/// One match from [`ProfileDb::search_messages`] — a past transcript turn whose
+/// content contained the query.
+#[derive(Debug, Clone)]
+pub struct SessionSearchHit {
+    pub conversation_id: String,
+    /// The conversation's display name, if it still exists.
+    pub conversation_name: Option<String>,
+    /// `"user"` or `"assistant"`.
+    pub role: String,
+    pub content: String,
+    pub created_at: i64,
 }
 
 fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
