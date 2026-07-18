@@ -47,7 +47,11 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **445 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 3.2 real cost capture**.)
+**Tests:** `cargo test --lib` → **451 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 3.5 pre-compaction flush**.)
+
+**2026-07-18: Wave 3.5 pre-compaction flush (trigger #2)** (`f89536e`, `agent/memory_flush.rs` + loop wiring). When compaction drops old turns, a LOCAL model sweeps them for durable facts + saves via the exact sensitivity-routed path (secret→dropped, private→private-local, ordinary→shared); async/off the stream lock, at-most-once (content-hash high-water), untrusted content excluded, enabled only when a flush classifier is wired (`lib.rs`). Testable via the `DurableFactExtractor` trait (fake extractor) + the `take_unswept_for_flush` seam. Multi-agent designed (3-approach panel) + reviewed (fixed: guard-wrap the extractor input against injection; add the at-most-once test). **Deferred: trigger #3** (new-chat consolidation nudge) — reuse `run_flush` on `create_conversation` gated by a persisted per-conversation high-water marker.
+
+**⇒ Next session's best fronts (all in the manifest, none blocked on Lukas):** **Wave 4.4** one-queue-model unification (the "do first" gate → unblocks the whole skills/agents track: 4.1 skills, 4.2 learning loop, 4.3 agent registry → which unblocks `delegate` 2.1 + model-seats 3.1's consumer + 2.3 reroute UX); the 3.5 **new-chat nudge**; the 3.2 **budget governor** (needs an unattended-mode concept — server-track). 3.1 seats / 3.4 capability-registry remain speculative (no present consumer — don't build ahead of one).
 
 **2026-07-18 (build-manifest drain, session 2 cont'd): Wave 3.2 real cost capture** (`649f3fa`, `models/sse.rs` + `client.rs` + new `models/pricing.rs` + loop booking). The usage ledger now records REAL $ cost for priced cloud models: a new `SseEvent::Usage` decoded from the final stream chunk's `usage` object; `stream_options.include_usage` on non-private endpoints only; a small `pricing.rs` table (known cloud models → $/Mtok, most-specific-first substring match). Booking: local/private → $0; cloud+usage+known → real cost; else `None` (never guessed). Reviewed (focused adversarial): fixed a MEDIUM streaming-path regression — a typed `usage` field made a malformed usage object fail the whole SSE line's parse and drop co-located content; now parsed leniently (permissive `Value` + integer-or-absent), regression-tested. **Follow-ups:** the budget governor (halt UNATTENDED spend) needs an unattended-mode concept (server-track, like the QueueingPrompter); no end-to-end test drives Usage→cost→ledger through the real loop (unit-tested in pieces); the non-stream `complete` path (title/routing calls) isn't booked.
 
@@ -138,7 +142,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 445 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 451 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -254,7 +258,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 445 tests
+cd src-tauri && cargo test --lib   # 451 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
