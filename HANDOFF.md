@@ -47,7 +47,7 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **396 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 2.2** — permission modes.)
+**Tests:** `cargo test --lib` → **399 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 2.1** — session_search + system_status tools.)
 
 **2026-07-16 (latest): near-term items 1–3-core DONE — the trained privacy classifier is LIVE.** Three landings this session: (1) the Q8 **Permissions pane** (`f38fd2c`) — Settings tab lists/revokes persisted "Always allow" `tool_rules`, verified live in the browser preview; (2) **frontend housekeeping** (`6dfcf12`) — deleted the 5 superseded components, removed the dev screen-switcher + theme toggle, and fixed the `ModelPicker` name collision (options now carry a composite `providerId::name` key — verified live with two `default` models); (3) the **classifier ONNX integration** (`283789b`) — ran the bundle's `export_onnx.py` (both encoders → fp32 + INT8), then wired `classifier/engine.rs` to run the real INT8 ensemble via `ort`, mirroring `serve.py` (rules layer-0 short-circuit → sliding-128-window max-prob over both encoders → fusion at 0.5/0.05). Behind a default-on `onnx-classifier` feature (rules-only fallback with `--no-default-features`, both build clean). Models installed live at `~/Documents/Lost-Harness/models/classifier/` (98 MB, NOT in git). **Gotcha caught:** the exported `tokenizer.json` bakes in Fixed(128) padding/truncation — left on, it feeds the model garbage (distilbert scored 0.999 on "capital of France"); disabled on load. An env-gated parity test (`LHP_CLASSIFIER_MODELS_DIR`) loads the live INT8 models and matches the Python reference probs (`docs/classifier-parity.json`). **Remaining in item 3:** the annotated-redaction sidebar UX (PLAN §11 — the engine's there, no UI); the `gate.rs`/§7 cosmetic renames were judged low-value/high-churn and deferred (gate.rs cleanly delegates to the `Classifier` trait, no rewrite needed).
 
@@ -446,8 +446,18 @@ permission modes**.
     loop; re-expressing it as a hook adds one-place-ness, not coverage). Not worth a risky
     loop refactor for zero coverage gain; revisit when the hook chain is next open.
 
-**Wave 2 still open (deliberately ordered / deferred):** 2.1 remaining core tools —
-`system_status` + `session_search` (tractable, read-only, next), `ask_human` (needs a UI
-round-trip like the approval prompter), `headless browser` (a large subsystem, overlaps M5),
-`delegate` (dep 4.3 agent registry), `cron` (dep 4.4 queue model); 2.3 reroute UX (dep 3.1);
-2.4 headless approval queue (Q5, server-track prep); 2.5 durability journal (dep 4.4).
+- **2.1 (partial) — `session_search` + `system_status`** (`6a97695`). Two read-only
+  (`RiskClass::Safe` → auto-pre-trusted) core tools on the existing spine. `session_search`
+  is the agent's recall over PAST conversations — a substring search over the ACTIVE
+  profile's transcript, distinct from the memory archive; new `ProfileDb::search_messages`
+  (parameterized LIKE, wildcards escaped, user+assistant only, most-recent-first),
+  profile-scoped (another profile's chats never searched — tested), LIKE-literal-% tested.
+  `system_status` reports a local snapshot (OS/arch, storage root, profile count, model
+  install state). Both auto-register + auto-pre-trust via the risk-derived policy loop.
+  Tests 396 → **399**. Not heavily reviewed (read-only, parameterized, tested — low risk).
+
+**Wave 2 still open (deliberately ordered / deferred):** 2.1's remaining tools —
+`ask_human` (needs a UI round-trip like the approval prompter), `headless browser` (a large
+subsystem, overlaps M5), `delegate` (dep 4.3 agent registry), `cron` (dep 4.4 queue model);
+2.3 reroute UX (dep 3.1); 2.4 headless approval queue (Q5, server-track prep); 2.5 durability
+journal (dep 4.4). The `UserPromptSubmit` hook (2.2's other half) also remains (deferred).
