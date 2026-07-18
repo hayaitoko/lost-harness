@@ -37,11 +37,15 @@ the status board sitting on top of all of them.
 > (PROFILE v7→v8) with atomic claim (exactly-once via `claim_key`),
 > lifecycle-guarded finish, and crash `terminalize` (also settles the 2.5
 > durability journal). The scheduler + `WorkExecutor`/`ResultSink` traits arrive
-> with the first consumer. **453 → 458 tests.** **Next fronts (per the plan):**
-> the 4.4 scheduler+executor (needs the first consumer + the AppHandle-decoupling
-> `ResultSink`); 4.1 skills (a skill = a Tool riding the registry+gate chain);
-> 4.3 agent registry (needs 3.1 seats); then 4.2 (a near-copy of `memory_flush`)
-> + 4.5 packs. The 3.2 budget governor stays server-track.
+> with the first consumer. **Wave 4.1 skills core** (`814ff50`, GLOBAL v4→v5):
+> the `skills` stub grows into a real row; `search_skills` (Safe, approved-only,
+> guard-wrapped) + `save_skill` (**Dangerous** — an always-shown review immune to
+> accept_edits, per the cron precedent, caught by the review); a skill's body
+> re-gates whatever it drives. **453 → 462 tests.** **Next fronts (per the
+> plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
+> (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
+> scheduler+executor (needs the first consumer + the AppHandle-decoupling
+> `ResultSink`). The 3.2 budget governor stays server-track.
 > **Wave 2 core tools + queue (2026-07-17, `9008cfb`→`e5da77f`):** four more
 > items landed — **cron management** (2.1: `list_cron_jobs` Safe +
 > `manage_cron` Dangerous, profile-scoped, cron-string-validated), **`fetch_url`**
@@ -145,7 +149,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 458 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 462 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -163,8 +167,8 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 4.4 substrate landed:
-**458 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
+Last verified: 2026-07-17 (Wave 4.1 skills core landed:
+**462 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
 frontend build + svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---

@@ -47,7 +47,11 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **458 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 4.4 one-queue-model substrate**.)
+**Tests:** `cargo test --lib` → **462 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 4.1 skills core**.)
+
+**2026-07-18: WAVE 4 KICKED OFF (Skills & Agents).** A code-grounded implementation plan for the whole subsystem landed at **`docs/plans/2026-07-18-wave4-skills-agents.md`** (from a 4-agent mapping pass over PLAN §10/§4 + the spine — build order, invariants, concrete shapes, the consumer contract that de-speculates 4.4, + 9 open questions for Lukas). **READ IT FIRST before continuing Wave 4.** Then:
+- **4.4 one-queue-model substrate** (`a0b00ee`, new `src/queue/mod.rs` + PROFILE v7→v8 `work_items`): `WorkKind`/`WorkState` (checked lifecycle)/`WorkItem`; storage `insert_work_item` (OR IGNORE → exactly-once via `claim_key`), atomic `claim_next_due_work`, lifecycle-guarded `finish_work_item`, crash `terminalize_orphaned_work` (also the 2.5 durability journal). The scheduler + `WorkExecutor`/`ResultSink` traits arrive with the first consumer (a cron runner / the 4.3 `delegate`) + the `process_message`-AppHandle-decoupling refactor.
+- **4.1 skills core** (`814ff50`, GLOBAL v4→v5): `Skill`/`SkillApproval` (fail-closed to Pending) + CRUD + `search_skills`/`list_approved_skills`/`set_skill_approval`; tools `search_skills` (Safe, approved-only, guard-wrapped) + `save_skill` (**Dangerous** — review caught that Write would let accept_edits mint a skill unreviewed; a skill is standing/cross-profile/persistent). A skill's body re-gates whatever it drives. **Deferred:** the skill-as-Tool wrapper (skill → callable Tool w/ capability-gated `requires` + startup registration), Tier-3 script exec, the sqlite-vec meaning lane, a skills UI, the deeper lint. Skills are global by design (the Dangerous review gate protects the shared store).
 
 **2026-07-18: Wave 3.5 pre-compaction flush (trigger #2)** (`f89536e`, `agent/memory_flush.rs` + loop wiring). When compaction drops old turns, a LOCAL model sweeps them for durable facts + saves via the exact sensitivity-routed path (secret→dropped, private→private-local, ordinary→shared); async/off the stream lock, at-most-once (content-hash high-water), untrusted content excluded, enabled only when a flush classifier is wired (`lib.rs`). Testable via the `DurableFactExtractor` trait (fake extractor) + the `take_unswept_for_flush` seam. Multi-agent designed (3-approach panel) + reviewed (fixed: guard-wrap the extractor input against injection; add the at-most-once test). **Deferred: trigger #3** (new-chat consolidation nudge) — reuse `run_flush` on `create_conversation` gated by a persisted per-conversation high-water marker.
 
@@ -142,7 +146,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 458 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 462 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -258,7 +262,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 458 tests
+cd src-tauri && cargo test --lib   # 462 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
