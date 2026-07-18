@@ -47,7 +47,9 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **438 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 3.3 compaction + the cloud-history privacy fix**.)
+**Tests:** `cargo test --lib` → **445 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 3.2 real cost capture**.)
+
+**2026-07-18 (build-manifest drain, session 2 cont'd): Wave 3.2 real cost capture** (`649f3fa`, `models/sse.rs` + `client.rs` + new `models/pricing.rs` + loop booking). The usage ledger now records REAL $ cost for priced cloud models: a new `SseEvent::Usage` decoded from the final stream chunk's `usage` object; `stream_options.include_usage` on non-private endpoints only; a small `pricing.rs` table (known cloud models → $/Mtok, most-specific-first substring match). Booking: local/private → $0; cloud+usage+known → real cost; else `None` (never guessed). Reviewed (focused adversarial): fixed a MEDIUM streaming-path regression — a typed `usage` field made a malformed usage object fail the whole SSE line's parse and drop co-located content; now parsed leniently (permissive `Value` + integer-or-absent), regression-tested. **Follow-ups:** the budget governor (halt UNATTENDED spend) needs an unattended-mode concept (server-track, like the QueueingPrompter); no end-to-end test drives Usage→cost→ledger through the real loop (unit-tested in pieces); the non-stream `complete` path (title/routing calls) isn't booked.
 
 **2026-07-17 (build-manifest drain, session 2 cont'd): Wave 3.3 (cache-shaped assembly + context compaction) + a HIGH cloud-history privacy fix.** Ran under ultracode (multi-agent workflows): a 3-approach design panel, then a 5-lens find→verify adversarial review.
 - **Wave 3.3** (`f543250`, `src/agent/compaction.rs` + `loop_mod.rs` + `tools/calling.rs`). Cache-shaped assembly: the welded memory block was split — the curated summary is now a byte-stable system PREFIX (new `guard_wrap_stable(seed = conversation_id)` — deterministic nonce, so it's identical turn-over-turn for KV/prompt-cache reuse; the old random-nonce `guard_wrap` never was), and the relevance snippets moved INTO the current user turn at the tail (prepended, guard-wrapped — no two consecutive user messages). `assemble_memory_context` is now a thin compat wrapper over `assemble_curated_summary` + `assemble_relevance_snippets`. Compaction: pure deterministic `compact_history` at the stream-call seam (every round → bounds tool-loop growth), keeps the leading-system prefix + a PINNED recent tail (the current turn forward, via a dynamic `keep_recent` from `pinned_from`, so a deep tool loop can never trim the question), drops the oldest middle WHOLE (never sliced — protects redaction/guard frames) with one marker, returns `trimmed` as the **Wave 3.5 signal** (the new `on_pre_compaction` seam — swap its body for 3.5's flush). Stored transcript untouched. `ChatMessage` gained PartialEq/Eq. Review fixed: the question-trimmed-in-deep-loop defect (now pinned) + comment overstatements.
@@ -136,7 +138,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 438 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 445 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -252,7 +254,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 438 tests
+cd src-tauri && cargo test --lib   # 445 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 

@@ -64,9 +64,15 @@ the status board sitting on top of all of them.
 > per-profile `usage_events` cost ledger + booking landed (PROFILE schema v6→v7):
 > every model call books one row; local=$0, cloud=unknown-flagged (never a
 > guess — SUM skips NULLs, unknown count surfaced separately). Reviewed SHIP.
-> 423 → **425 tests**. **Rest of 3.2 (budget governor) deferred:** a cost-cap
-> that halts unattended spend needs real per-call cost capture first (SSE `usage`
-> tokens + pricing — cloud cost is "unknown" until then). **Other Wave 3 items
+> 423 → **425 tests**. **Cost capture DONE (2026-07-18, `649f3fa`):** the ledger
+> now records REAL cost — SSE `usage` parsing (`SseEvent::Usage`) +
+> `stream_options.include_usage` (non-private endpoints only) + a `pricing.rs`
+> table (known cloud models → $/Mtok); priced only when usage was reported AND
+> the model is known, else `None` (never a guess). Review fixed a MEDIUM
+> streaming regression (a malformed `usage` could drop co-located content —
+> now parsed leniently). **Rest of 3.2 (budget governor) deferred:** a cost-cap
+> that halts UNATTENDED spend needs an unattended-mode concept (server-track).
+> **Other Wave 3 items
 > (Tier-A ∥, not started):** model seats (3.1 — no consumer until the 4.3 agent
 > registry), cache-shaped prompt assembly + compaction (3.3), capability registry
 > that refuses (3.4 — native-tools has a valid fenced fallback, so no refusal
@@ -118,7 +124,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 438 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 445 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -136,8 +142,8 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 3.3 compaction + cloud-history privacy fix landed:
-**438 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
+Last verified: 2026-07-17 (Wave 3.3 compaction + cloud-history fix + Wave 3.2 cost capture landed:
+**445 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
 frontend build + svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---
