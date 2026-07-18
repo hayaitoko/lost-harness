@@ -430,6 +430,16 @@ fn build_tool_dispatcher(
     registry.register(Box::new(crate::tools::system_status::SystemStatusTool::new(
         storage.clone(),
     )));
+    // Wave 2.1: cron management — profile-scoped scheduled-job CRUD. Listing is
+    // read-only (Safe → pre-trusted); mutating (create/enable/disable/delete)
+    // is Write, so it routes through the approval spine. No scheduler runs these
+    // yet (that's the one-queue-model pass, Wave 4.4) — this is the intent CRUD.
+    registry.register(Box::new(crate::tools::cron::ListCronJobsTool::new(
+        storage.clone(),
+    )));
+    registry.register(Box::new(crate::tools::cron::ManageCronTool::new(
+        storage.clone(),
+    )));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
     // scratch dir, network off by default, killed on timeout, OS-sandboxed via

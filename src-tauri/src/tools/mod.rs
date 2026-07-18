@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 pub mod calling;
+pub mod cron;
 pub mod dispatch;
 pub mod exec;
 pub mod fs;
