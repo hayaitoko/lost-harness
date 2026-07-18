@@ -57,7 +57,9 @@ the status board sitting on top of all of them.
 > race (flush + reflect now run sequentially in one task), + 2 LOW parser bugs;
 > plus conservative walled-profile + empty-prior guards. (Surfaced a PRE-EXISTING
 > soundness debt — background tasks touch the `!Sync` connection concurrently with
-> the main loop; the `Mutex<Connection>` refactor is now a flagged follow-up.)
+> the main loop — now **FIXED** in `ff64b3a`: the `rusqlite::Connection` lives
+> behind a `parking_lot::Mutex` in `GlobalDb`/`ProfileDb`, all 4 `unsafe impl
+> Send+Sync` removed, the types genuinely thread-safe.)
 > **WAVE 3.1 COMPLETE — model seats** (`ec6c852`, PROFILE v8→v9): after Lukas
 > settled the spec-absent design (**seats are user-definable strings, per-profile,
 > unbound→inherit**), a per-profile `seat_bindings` table + `models::resolve_seat`
