@@ -45,7 +45,20 @@ the status board sitting on top of all of them.
 > (`4ea9dd3`): `list_skills`/`set_skill_approval`/`delete_skill` IPC + a review
 > surface (status badges, capability chips, an auto-escaped body expander,
 > approve/reject, two-click delete) — the review gate for the 4.2 draft-first
-> loop, browser-verified. **453 → 462 tests.** **Next fronts (per the
+> loop, browser-verified. **WAVE 4.2 COMPLETE** — the **draft-first learning
+> loop** (`e5537dd`, `agent/skill_reflect.rs`): on a new chat a LOCAL model
+> reflects the prior conversation into a skill draft, ALWAYS saved `Pending`
+> (inert until the human approves it — automation may propose, never mint), gated
+> by an opt-in `skill_reflect_enabled` toggle (default OFF, "Propose skills
+> automatically" in the Skills pane). Mirrors `memory_flush` (local-only,
+> guard-wrapped, at-most-once). Adversarially reviewed (4-lens/12-agent
+> find→verify): fixed a HIGH UTF-8 panic (`strip_label` byte-sliced the `&str` →
+> crashed on any non-English model output), a MEDIUM concurrent-`global.db`
+> race (flush + reflect now run sequentially in one task), + 2 LOW parser bugs;
+> plus conservative walled-profile + empty-prior guards. (Surfaced a PRE-EXISTING
+> soundness debt — background tasks touch the `!Sync` connection concurrently with
+> the main loop; the `Mutex<Connection>` refactor is now a flagged follow-up.)
+> **453 → 472 tests.** **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling

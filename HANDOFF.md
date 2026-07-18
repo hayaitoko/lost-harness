@@ -47,7 +47,9 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **462 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 4.1 skills core**.)
+**Tests:** `cargo test --lib` → **472 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 4.2 learning loop**.)
+
+**2026-07-18: Wave 4.2 — draft-first learning loop** (`e5537dd`, `agent/skill_reflect.rs`). On a new chat, a LOCAL model reflects the prior conversation into a skill draft, **always saved `Pending`** (inert until the human approves it in the Skills pane — automation may PROPOSE a skill but never MINT a usable one; this reconciles with the 4.1 `save_skill`=Dangerous decision). Opt-in via a global `skill_reflect_enabled` toggle (default OFF; "Propose skills automatically" switch). Mirrors `memory_flush`: `SkillDrafter` trait + `LocalModelDrafter` (local+private model ONLY, guard-wrapped excerpt), `parse_drafts`/`sanitize_draft` (shares `save_skill`'s caps), `run_reflect` (always Pending) + `run_new_chat_reflect`. Wired via `AgentLoop::with_skill_drafter`; the flush nudge + reflect now run **sequentially in ONE detached task** (not two concurrent tasks) so they can't both touch the `!Sync` `global.db` at once. **Adversarially reviewed** (4-lens/12-agent find→verify): fixed a HIGH `strip_label` UTF-8 panic (crashed on any non-English model output), the MEDIUM flush/reflect `global.db` race, 2 LOW parser bugs; conservative walled-profile skip + empty-prior mark fix. **⚠ Follow-up flagged (spawned task):** a PRE-EXISTING soundness debt — the `unsafe impl Sync for Storage` assumes single-writer via `Mutex<Storage>`, but ALL background tasks (3.5 flush + 4.2 reflect) bypass it and touch the bare `rusqlite::Connection` concurrently with the main loop. Needs the `Mutex<Connection>` refactor the SAFETY comment anticipates. **Wave 4 remaining:** 4.3 agent registry (needs 3.1 seats), 4.5 capability packs (needs 4.1+4.3), the 4.1 skill-as-Tool wrapper + hybrid search, the 4.4 scheduler+executor.
 
 **2026-07-18: WAVE 4 KICKED OFF (Skills & Agents).** A code-grounded implementation plan for the whole subsystem landed at **`docs/plans/2026-07-18-wave4-skills-agents.md`** (from a 4-agent mapping pass over PLAN §10/§4 + the spine — build order, invariants, concrete shapes, the consumer contract that de-speculates 4.4, + 9 open questions for Lukas). **READ IT FIRST before continuing Wave 4.** Then:
 - **4.4 one-queue-model substrate** (`a0b00ee`, new `src/queue/mod.rs` + PROFILE v7→v8 `work_items`): `WorkKind`/`WorkState` (checked lifecycle)/`WorkItem`; storage `insert_work_item` (OR IGNORE → exactly-once via `claim_key`), atomic `claim_next_due_work`, lifecycle-guarded `finish_work_item`, crash `terminalize_orphaned_work` (also the 2.5 durability journal). The scheduler + `WorkExecutor`/`ResultSink` traits arrive with the first consumer (a cron runner / the 4.3 `delegate`) + the `process_message`-AppHandle-decoupling refactor.
@@ -147,7 +149,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 462 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 472 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -263,7 +265,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 462 tests
+cd src-tauri && cargo test --lib   # 472 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
