@@ -152,6 +152,30 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
               ALTER TABLE skills ADD COLUMN version TEXT NOT NULL DEFAULT '0.1.0';
               ALTER TABLE skills ADD COLUMN embedding BLOB;",
     },
+    Migration {
+        version: 6,
+        // Wave 4.3 — declarative agent-type personas (a code reviewer, a research
+        // explorer): a bounded `tools_allowlist` (intersected with the running
+        // body's tools at dispatch, never widening), a Wave-3.1 `seat` name
+        // resolved per-profile, an `approval_status` trust gate mirroring skills,
+        // and a `source` marking 'builtin' seeds vs 'user'/pack types. New table,
+        // so dual-defined: the CREATE is IF NOT EXISTS and ALSO lives in
+        // GLOBAL_SCHEMA_SQL, so v6 is a no-op on a fresh install and a real
+        // upgrade on a v5 DB.
+        name: "agent_types_table",
+        sql: "CREATE TABLE IF NOT EXISTS agent_types (
+            id                TEXT PRIMARY KEY,
+            name              TEXT NOT NULL,
+            description       TEXT NOT NULL DEFAULT '',
+            system_prompt     TEXT NOT NULL DEFAULT '',
+            tools_allowlist   TEXT NOT NULL DEFAULT '[]',
+            seat              TEXT NOT NULL DEFAULT 'inherit',
+            trigger_examples  TEXT NOT NULL DEFAULT '[]',
+            approval_status   TEXT NOT NULL DEFAULT 'pending',
+            source            TEXT NOT NULL DEFAULT 'user',
+            created_at        INTEGER NOT NULL
+        );",
+    },
 ];
 
 /// All per-profile DB migrations, in order.

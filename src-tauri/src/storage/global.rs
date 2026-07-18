@@ -266,6 +266,123 @@ fn row_to_skill(r: &rusqlite::Row<'_>) -> rusqlite::Result<Skill> {
     })
 }
 
+/// A declarative agent-type persona (Wave 4.3). A named specialist with a
+/// bounded toolbelt (`tools_allowlist`, INTERSECTED with the running body's
+/// tools at dispatch — never a widening) and a Wave-3.1 `seat` name resolved to
+/// a concrete model per-profile at dispatch. `approval_status` is the trust gate
+/// (only `Approved` types may be dispatched); `source` marks built-in seeds.
+/// `tools_allowlist`/`trigger_examples` are stored as JSON name-string arrays so
+/// storage stays independent of the `tools` layer (the dispatcher parses them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentType {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub system_prompt: String,
+    pub tools_allowlist: Vec<String>,
+    pub seat: String,
+    pub trigger_examples: Vec<String>,
+    pub approval_status: AgentTypeApproval,
+    /// "builtin" | "user" | a pack id.
+    pub source: String,
+    pub created_at: i64,
+}
+
+/// The trust state of an agent type — mirrors [`SkillApproval`]. Only `Approved`
+/// types are dispatchable; `from_str` fails CLOSED to `Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTypeApproval {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl AgentTypeApproval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentTypeApproval::Pending => "pending",
+            AgentTypeApproval::Approved => "approved",
+            AgentTypeApproval::Rejected => "rejected",
+        }
+    }
+    pub fn from_str(s: &str) -> AgentTypeApproval {
+        match s {
+            "approved" => AgentTypeApproval::Approved,
+            "rejected" => AgentTypeApproval::Rejected,
+            _ => AgentTypeApproval::Pending,
+        }
+    }
+}
+
+fn row_to_agent_type(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentType> {
+    let tools_json: String = r.get(4)?;
+    let triggers_json: String = r.get(6)?;
+    let status: String = r.get(7)?;
+    Ok(AgentType {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        description: r.get(2)?,
+        system_prompt: r.get(3)?,
+        tools_allowlist: serde_json::from_str(&tools_json).unwrap_or_default(),
+        seat: r.get(5)?,
+        trigger_examples: serde_json::from_str(&triggers_json).unwrap_or_default(),
+        approval_status: AgentTypeApproval::from_str(&status),
+        source: r.get(8)?,
+        created_at: r.get(9)?,
+    })
+}
+
+/// The built-in agent-type personas seeded on first run. Deterministic ids make
+/// the seed idempotent (`INSERT OR IGNORE`). Each `tools_allowlist` names only
+/// tools that already exist, so the dispatch intersection is non-empty. Their
+/// `seat` names are user-definable (Wave 3.1) and simply `inherit` until bound.
+fn builtin_agent_types(now: i64) -> Vec<AgentType> {
+    let approved = AgentTypeApproval::Approved;
+    vec![
+        AgentType {
+            id: "builtin-code-reviewer".into(),
+            name: "Code reviewer".into(),
+            description: "Reviews code for bugs, clarity, and risks — read-only.".into(),
+            system_prompt: "You are a focused code reviewer. Inspect the code with the read/search tools, then report concrete issues (correctness, security, clarity) with file:line references. You cannot modify files.".into(),
+            tools_allowlist: vec![
+                "read_file".into(),
+                "search_files".into(),
+                "list_dir".into(),
+                "session_search".into(),
+            ],
+            seat: "Reviewer".into(),
+            trigger_examples: vec![
+                "review this change".into(),
+                "is this code correct?".into(),
+            ],
+            approval_status: approved,
+            source: "builtin".into(),
+            created_at: now,
+        },
+        AgentType {
+            id: "builtin-research-explorer".into(),
+            name: "Research explorer".into(),
+            description: "Explores a question across local files, memory, and the web.".into(),
+            system_prompt: "You are a research explorer. Gather relevant material with the search/read/recall/fetch tools, then synthesize a concise, sourced answer. Prefer local sources; fetch the web only when needed.".into(),
+            tools_allowlist: vec![
+                "search_files".into(),
+                "read_file".into(),
+                "recall_memory".into(),
+                "session_search".into(),
+                "fetch_url".into(),
+            ],
+            seat: "Research".into(),
+            trigger_examples: vec![
+                "look into this".into(),
+                "research X for me".into(),
+            ],
+            approval_status: approved,
+            source: "builtin".into(),
+            created_at: now,
+        },
+    ]
+}
+
 #[derive(Debug, Clone)]
 pub struct AppSetting {
     pub key: String,
@@ -1160,6 +1277,109 @@ impl GlobalDb {
             .lock()
             .execute("DELETE FROM skills WHERE id = ?1", params![id])?;
         Ok(n > 0)
+    }
+
+    // ── agent_types (Wave 4.3) ───────────────────────────────────────────────
+
+    pub fn insert_agent_type(&self, a: &AgentType) -> Result<()> {
+        let tools = serde_json::to_string(&a.tools_allowlist).unwrap_or_else(|_| "[]".into());
+        let triggers = serde_json::to_string(&a.trigger_examples).unwrap_or_else(|_| "[]".into());
+        self.conn.lock().execute(
+            "INSERT INTO agent_types
+             (id, name, description, system_prompt, tools_allowlist, seat, trigger_examples, approval_status, source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                a.id,
+                a.name,
+                a.description,
+                a.system_prompt,
+                tools,
+                a.seat,
+                triggers,
+                a.approval_status.as_str(),
+                a.source,
+                a.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_agent_type(&self, id: &str) -> Result<Option<AgentType>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT id, name, description, system_prompt, tools_allowlist, seat, trigger_examples, approval_status, source, created_at
+                 FROM agent_types WHERE id = ?1",
+                params![id],
+                row_to_agent_type,
+            )
+            .optional()?)
+    }
+
+    pub fn list_agent_types(&self) -> Result<Vec<AgentType>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, system_prompt, tools_allowlist, seat, trigger_examples, approval_status, source, created_at
+             FROM agent_types ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_agent_type)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// APPROVED agent types only — the set safe to dispatch (the trust boundary).
+    pub fn list_approved_agent_types(&self) -> Result<Vec<AgentType>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, system_prompt, tools_allowlist, seat, trigger_examples, approval_status, source, created_at
+             FROM agent_types WHERE approval_status = 'approved' ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_agent_type)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Move an agent type to a trust state (the review gate). Returns whether a row moved.
+    pub fn set_agent_type_approval(&self, id: &str, status: AgentTypeApproval) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE agent_types SET approval_status = ?1 WHERE id = ?2",
+            params![status.as_str(), id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn delete_agent_type(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .execute("DELETE FROM agent_types WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// Seed the built-in agent-type personas (idempotent — `INSERT OR IGNORE` by
+    /// id, so a user's edits to a same-id row are never clobbered and re-runs are
+    /// no-ops). Built-ins are `source='builtin'` + `approval_status='approved'`
+    /// (they ship trusted); their `tools_allowlist` names only tools that already
+    /// exist, so the dispatch intersection is non-empty from day one.
+    pub fn ensure_builtin_agent_types(&self, now: i64) -> Result<()> {
+        for a in builtin_agent_types(now) {
+            let tools = serde_json::to_string(&a.tools_allowlist).unwrap_or_else(|_| "[]".into());
+            let triggers =
+                serde_json::to_string(&a.trigger_examples).unwrap_or_else(|_| "[]".into());
+            self.conn.lock().execute(
+                "INSERT OR IGNORE INTO agent_types
+                 (id, name, description, system_prompt, tools_allowlist, seat, trigger_examples, approval_status, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    a.id, a.name, a.description, a.system_prompt, tools, a.seat, triggers,
+                    a.approval_status.as_str(), a.source, a.created_at
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     // ── app_settings ────────────────────────────────────────────────────────

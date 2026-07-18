@@ -62,16 +62,57 @@ fn fresh_in_memory_profile_has_all_tables() {
 
 #[test]
 fn schema_version_is_current_after_init_global() {
-    // Global schema is now v5 (v2 memory buckets + FTS5; v3 private-bucket
+    // Global schema is now v6 (v2 memory buckets + FTS5; v3 private-bucket
     // vector table for the meaning lane; v4 endpoints.supports_native_tools;
-    // v5 skills metadata columns — Wave 4.1).
+    // v5 skills metadata columns — Wave 4.1; v6 agent_types — Wave 4.3).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 5);
+    assert_eq!(v, 6);
+}
+
+#[test]
+fn agent_types_crud_and_builtin_seed() {
+    use crate::storage::{AgentType, AgentTypeApproval};
+    let db = GlobalDb::open_in_memory().unwrap();
+    assert!(db.list_agent_types().unwrap().is_empty());
+
+    // Seeding is idempotent — two runs leave exactly the built-ins.
+    db.ensure_builtin_agent_types(100).unwrap();
+    let after_first = db.list_agent_types().unwrap();
+    assert_eq!(after_first.len(), 2, "two built-ins seeded");
+    db.ensure_builtin_agent_types(200).unwrap();
+    assert_eq!(db.list_agent_types().unwrap().len(), 2, "re-seed is a no-op");
+    // Built-ins are approved + source=builtin, with a non-empty allowlist.
+    let reviewer = db.get_agent_type("builtin-code-reviewer").unwrap().unwrap();
+    assert_eq!(reviewer.approval_status, AgentTypeApproval::Approved);
+    assert_eq!(reviewer.source, "builtin");
+    assert!(reviewer.tools_allowlist.contains(&"read_file".to_string()));
+    assert_eq!(db.list_approved_agent_types().unwrap().len(), 2);
+
+    // A user-authored type lands pending and is filtered from the approved set.
+    db.insert_agent_type(&AgentType {
+        id: "u1".into(),
+        name: "My persona".into(),
+        description: "d".into(),
+        system_prompt: "sp".into(),
+        tools_allowlist: vec!["read_file".into()],
+        seat: "Coding".into(),
+        trigger_examples: vec![],
+        approval_status: AgentTypeApproval::Pending,
+        source: "user".into(),
+        created_at: 300,
+    })
+    .unwrap();
+    assert_eq!(db.list_agent_types().unwrap().len(), 3);
+    assert_eq!(db.list_approved_agent_types().unwrap().len(), 2, "pending is excluded");
+    assert!(db.set_agent_type_approval("u1", AgentTypeApproval::Approved).unwrap());
+    assert_eq!(db.list_approved_agent_types().unwrap().len(), 3);
+    assert!(db.delete_agent_type("u1").unwrap());
+    assert_eq!(db.list_agent_types().unwrap().len(), 2);
 }
 
 #[test]

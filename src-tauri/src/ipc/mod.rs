@@ -674,6 +674,47 @@ pub fn delete_skill(state: State<'_, AppState>, args: DeleteSkillArgs) -> Result
         .map_err(|e| e.to_string())
 }
 
+/// A declarative agent-type persona for the Settings view (Wave 4.3).
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentTypeInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub tools_allowlist: Vec<String>,
+    pub seat: String,
+    /// "pending" | "approved" | "rejected".
+    pub approval_status: String,
+    /// "builtin" | "user" | pack id.
+    pub source: String,
+    pub created_at: i64,
+}
+
+impl From<crate::storage::AgentType> for AgentTypeInfo {
+    fn from(a: crate::storage::AgentType) -> Self {
+        Self {
+            id: a.id,
+            name: a.name,
+            description: a.description,
+            tools_allowlist: a.tools_allowlist,
+            seat: a.seat,
+            approval_status: a.approval_status.as_str().to_string(),
+            source: a.source,
+            created_at: a.created_at,
+        }
+    }
+}
+
+/// List every agent-type persona (all statuses). Agent types are global.
+#[tauri::command]
+pub fn list_agent_types(state: State<'_, AppState>) -> Result<Vec<AgentTypeInfo>, String> {
+    state
+        .storage
+        .global()
+        .list_agent_types()
+        .map(|v| v.into_iter().map(Into::into).collect())
+        .map_err(|e| e.to_string())
+}
+
 /// A per-profile model-seat binding for the Settings → Models "Seats" view.
 #[derive(Debug, Clone, Serialize)]
 pub struct SeatBindingInfo {

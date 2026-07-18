@@ -74,6 +74,15 @@ pub fn run() {
                 Err(e) => tracing::error!(error = %e, "crash-recovery boot pass failed; continuing startup"),
             }
 
+            // Seed the built-in agent-type personas (Wave 4.3), idempotently.
+            // Best-effort: a seed failure must not brick boot.
+            if let Err(e) = storage
+                .global()
+                .ensure_builtin_agent_types(chrono::Utc::now().timestamp())
+            {
+                tracing::warn!(error = %e, "seeding built-in agent types failed; continuing");
+            }
+
             // Load persisted providers from global.db::endpoints and
             // hydrate the in-memory ModelManager.
             let model_manager = Arc::new(ModelManager::new());
@@ -233,6 +242,7 @@ pub fn run() {
             ipc::list_seat_bindings,
             ipc::set_seat_binding,
             ipc::delete_seat_binding,
+            ipc::list_agent_types,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,

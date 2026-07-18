@@ -9,7 +9,7 @@
 
 /// Returns the current schema version for the GLOBAL database.
 /// Bump when adding a new global migration.
-pub const GLOBAL_SCHEMA_VERSION: i32 = 5;
+pub const GLOBAL_SCHEMA_VERSION: i32 = 6;
 
 /// Returns the current schema version for each PROFILE database.
 /// Bump when adding a new per-profile migration. Profile and global
@@ -45,6 +45,8 @@ pub const GLOBAL_TABLES: &[&str] = &[
     "skills",
     // 7. app_settings — theme, update channel, etc.
     "app_settings",
+    // 8. agent_types — declarative agent-type personas (Wave 4.3), globally shared
+    "agent_types",
 ];
 
 /// CREATE TABLE statements for global.db (in dependency order).
@@ -104,6 +106,25 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
     updated_at  INTEGER NOT NULL
+);
+
+-- Wave 4.3: declarative agent-type personas (a code reviewer, a research
+-- explorer). `tools_allowlist` is a JSON array of tool-name strings; the
+-- effective belt is the INTERSECTION with the running body's tools, never a
+-- widening. `seat` is a Wave-3.1 seat NAME resolved per-profile at dispatch.
+-- `approval_status` mirrors skills' trust gate; `source` distinguishes
+-- 'builtin' seeds from 'user'-authored / pack-installed types.
+CREATE TABLE IF NOT EXISTS agent_types (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    description       TEXT NOT NULL DEFAULT '',
+    system_prompt     TEXT NOT NULL DEFAULT '',
+    tools_allowlist   TEXT NOT NULL DEFAULT '[]',
+    seat              TEXT NOT NULL DEFAULT 'inherit',
+    trigger_examples  TEXT NOT NULL DEFAULT '[]',
+    approval_status   TEXT NOT NULL DEFAULT 'pending',
+    source            TEXT NOT NULL DEFAULT 'user',
+    created_at        INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_facts_origin ON memory_facts(origin_profile);
