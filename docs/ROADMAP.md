@@ -58,7 +58,13 @@ the status board sitting on top of all of them.
 > plus conservative walled-profile + empty-prior guards. (Surfaced a PRE-EXISTING
 > soundness debt — background tasks touch the `!Sync` connection concurrently with
 > the main loop; the `Mutex<Connection>` refactor is now a flagged follow-up.)
-> **453 → 472 tests.** **Next fronts (per the
+> **WAVE 3.1 COMPLETE — model seats** (`ec6c852`, PROFILE v8→v9): after Lukas
+> settled the spec-absent design (**seats are user-definable strings, per-profile,
+> unbound→inherit**), a per-profile `seat_bindings` table + `models::resolve_seat`
+> (empty/`inherit`/unbound/dangling-provider → the caller's own model, so a seat
+> is a PREFERENCE the privacy gate still overrides) + a "Seats" pane in
+> Settings→Models. **This UNBLOCKS Wave 4.3** (agent registry: persona→seat).
+> **453 → 478 tests.** **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
