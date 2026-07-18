@@ -82,7 +82,9 @@ the status board sitting on top of all of them.
 > table (known cloud models → $/Mtok); priced only when usage was reported AND
 > the model is known, else `None` (never a guess). Review fixed a MEDIUM
 > streaming regression (a malformed `usage` could drop co-located content —
-> now parsed leniently). **Rest of 3.2 (budget governor) deferred:** a cost-cap
+> now parsed leniently). **Spend-so-far surface (`24cf6aa`):** `get_usage_summary`
+> IPC + a Settings "Usage" section (total calls, known $ cost, unpriced count) —
+> browser-verified. **Rest of 3.2 (budget governor) deferred:** a cost-cap
 > that halts UNATTENDED spend needs an unattended-mode concept (server-track).
 > **Other Wave 3 items
 > (Tier-A ∥, not started):** model seats (3.1 — no consumer until the 4.3 agent
