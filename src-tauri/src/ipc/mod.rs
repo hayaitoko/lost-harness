@@ -597,6 +597,85 @@ pub struct GetUsageSummaryArgs {
     pub profile: String,
 }
 
+/// A saved skill for the Settings "Skills" view. Mirrors `storage::Skill` (the
+/// body is included so the user can review what a skill actually does).
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub capabilities_required: Vec<String>,
+    /// "pending" | "approved" | "rejected".
+    pub approval_status: String,
+    pub version: String,
+    pub created_at: i64,
+}
+
+impl From<crate::storage::Skill> for SkillInfo {
+    fn from(s: crate::storage::Skill) -> Self {
+        Self {
+            id: s.id,
+            name: s.name,
+            description: s.description,
+            content: s.content,
+            capabilities_required: s.capabilities_required,
+            approval_status: s.approval_status.as_str().to_string(),
+            version: s.version,
+            created_at: s.created_at,
+        }
+    }
+}
+
+/// List every saved skill (all statuses) for the Settings "Skills" management +
+/// review view. Skills are global (not profile-scoped), so no profile arg.
+#[tauri::command]
+pub fn list_skills(state: State<'_, AppState>) -> Result<Vec<SkillInfo>, String> {
+    state
+        .storage
+        .global()
+        .list_skills()
+        .map(|v| v.into_iter().map(Into::into).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillApprovalArgs {
+    pub id: String,
+    /// "approved" | "rejected" | "pending".
+    pub status: String,
+}
+
+/// Set a skill's trust state (the review gate) — the Settings "Skills" pane's
+/// approve/reject. An unknown status string fails closed to `pending`.
+#[tauri::command]
+pub fn set_skill_approval(
+    state: State<'_, AppState>,
+    args: SkillApprovalArgs,
+) -> Result<bool, String> {
+    let status = crate::storage::SkillApproval::from_str(&args.status);
+    state
+        .storage
+        .global()
+        .set_skill_approval(&args.id, status)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteSkillArgs {
+    pub id: String,
+}
+
+/// Delete a saved skill (two-click confirm in the UI). Returns whether a row was removed.
+#[tauri::command]
+pub fn delete_skill(state: State<'_, AppState>, args: DeleteSkillArgs) -> Result<bool, String> {
+    state
+        .storage
+        .global()
+        .delete_skill(&args.id)
+        .map_err(|e| e.to_string())
+}
+
 /// Roll up a profile's model-call cost ledger for the Settings "Usage" view.
 #[tauri::command]
 pub fn get_usage_summary(

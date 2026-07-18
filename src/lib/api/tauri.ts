@@ -511,6 +511,44 @@ export async function getUsageSummary(profile: string): Promise<UsageSummary> {
   return { total_calls: 0, known_cost_usd: 0, unknown_cost_calls: 0 };
 }
 
+/** A saved skill. Mirrors `SkillInfo` in `ipc/mod.rs`. Skills are global, not
+ *  profile-scoped, so these calls take no profile argument. */
+export interface SkillInfo {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  capabilities_required: string[];
+  /** "pending" | "approved" | "rejected" — the review gate. */
+  approval_status: string;
+  version: string;
+  created_at: number;
+}
+
+/** Every saved skill (all statuses), for the Settings "Skills" review view. */
+export async function listSkills(): Promise<SkillInfo[]> {
+  if (isTauri()) {
+    return tauriInvoke<SkillInfo[]>("list_skills", {});
+  }
+  return [];
+}
+
+/** Approve / reject a skill (the review gate). An unknown status fails to "pending". */
+export async function setSkillApproval(id: string, status: string): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("set_skill_approval", { args: { id, status } });
+  }
+  return false;
+}
+
+/** Delete a saved skill. Returns true if a row was removed. */
+export async function deleteSkill(id: string): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("delete_skill", { args: { id } });
+  }
+  return false;
+}
+
 /** A persisted "Always allow" rule. Mirrors `ToolRuleInfo` in `ipc/mod.rs`. */
 export interface ToolRule {
   id: string;

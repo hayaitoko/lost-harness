@@ -42,15 +42,20 @@
     resetClassifierSettings,
     getUsageSummary,
     type UsageSummary,
+    listSkills,
+    setSkillApproval,
+    deleteSkill,
+    type SkillInfo,
   } from "$lib/api/tauri";
 
-  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "usage" | "appearance";
+  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "usage" | "appearance";
   const SECTIONS: [Section, string][] = [
     ["routing", "Routing"],
     ["privacy", "Privacy guard"],
     ["permissions", "Permissions"],
     ["models", "Models"],
     ["memory", "Memory"],
+    ["skills", "Skills"],
     ["usage", "Usage"],
     ["appearance", "Appearance"],
   ];
@@ -143,6 +148,12 @@
   let usageLoading = $state(false);
   let usageError = $state<string | null>(null);
   let confirmRevokeId = $state<string | null>(null);
+  // skills — the global saved-skills store + its review gate (Wave 4.1)
+  let skillItems = $state<SkillInfo[]>([]);
+  let skillsLoading = $state(false);
+  let skillsError = $state<string | null>(null);
+  let confirmDeleteSkillId = $state<string | null>(null);
+  let expandedSkillId = $state<string | null>(null);
 
   let activeLabel = $derived(SECTIONS.find(([id]) => id === section)![1]);
 
@@ -204,6 +215,25 @@
       })
       .finally(() => {
         usageLoading = false;
+      });
+  });
+
+  // Load every saved skill when the Skills pane opens. Skills are global (not
+  // profile-scoped), but re-run on profile change so the pane refreshes on nav.
+  $effect(() => {
+    if (section !== "skills") return;
+    void $activeProfileId;
+    skillsLoading = true;
+    skillsError = null;
+    listSkills()
+      .then((items) => {
+        skillItems = items;
+      })
+      .catch((err) => {
+        skillsError = String(err);
+      })
+      .finally(() => {
+        skillsLoading = false;
       });
   });
 
@@ -495,6 +525,32 @@
     const next = !m.pinned;
     await setMemoryPinned($activeProfileId, m.id, next);
     reloadMemory();
+  }
+
+  async function setSkillStatus(id: string, status: "approved" | "rejected") {
+    await setSkillApproval(id, status);
+    skillItems = skillItems.map((s) =>
+      s.id === id ? { ...s, approval_status: status } : s,
+    );
+  }
+
+  async function removeSkill(id: string) {
+    // Two-click confirm, mirroring the memory/provider-remove pattern.
+    if (confirmDeleteSkillId !== id) {
+      confirmDeleteSkillId = id;
+      setTimeout(() => {
+        if (confirmDeleteSkillId === id) confirmDeleteSkillId = null;
+      }, 3000);
+      return;
+    }
+    confirmDeleteSkillId = null;
+    await deleteSkill(id);
+    skillItems = skillItems.filter((s) => s.id !== id);
+    if (expandedSkillId === id) expandedSkillId = null;
+  }
+
+  function toggleSkillExpanded(id: string) {
+    expandedSkillId = expandedSkillId === id ? null : id;
   }
 
   function formatMemDate(epochSeconds: number): string {
@@ -1049,6 +1105,97 @@
               <div class="px-3 py-2 text-[11px] text-text-3">
                 Facts are routed by sensitivity: secrets are never saved, private
                 details stay on this Mac, and pinned facts load into every conversation.
+              </div>
+            </div>
+          {:else if section === "skills"}
+            {#if skillsError}
+              <div class="mb-2 text-[11.5px] text-blocked" data-testid="skills-error">{skillsError}</div>
+            {/if}
+            <div class="mb-2 mt-1 flex items-center gap-2.5">
+              <span class="text-[12px] font-[550] text-text">Saved skills</span>
+              <span class="text-[11.5px] text-text-3">
+                {skillItems.length}
+                {skillItems.length === 1 ? "skill" : "skills"} · shared across profiles
+              </span>
+              <div class="flex-1"></div>
+            </div>
+
+            <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border" data-testid="skills-list">
+              {#if skillsLoading && skillItems.length === 0}
+                <div class="px-3 py-6 text-center text-[12px] text-text-3">Loading…</div>
+              {:else if skillItems.length === 0}
+                <div class="px-3 py-8 text-center text-[12px] text-text-3">
+                  No skills yet. When the assistant saves a reusable routine — with your
+                  one-time approval — it appears here for you to review, revoke, or delete.
+                </div>
+              {:else}
+                {#each skillItems as s (s.id)}
+                  <div class="flex flex-col gap-1.5 border-b border-border py-[9px] pl-2.5 pr-2.5" data-testid="skill-row">
+                    <div class="flex items-center gap-2">
+                      <button
+                        type="button"
+                        aria-label={expandedSkillId === s.id ? "Hide skill body" : "Show skill body"}
+                        title={expandedSkillId === s.id ? "Hide what this skill does" : "Show what this skill does"}
+                        onclick={() => toggleSkillExpanded(s.id)}
+                        class="grid h-6 w-6 flex-shrink-0 place-items-center rounded-[var(--r)] border-0 bg-transparent
+                          text-text-3 transition hover:bg-surface-hover hover:text-text"
+                      >
+                        <svg
+                          width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+                          style="transform: rotate({expandedSkillId === s.id ? 90 : 0}deg); transition: transform .12s"
+                        >
+                          <path d="M9 6l6 6-6 6" />
+                        </svg>
+                      </button>
+                      <div class="min-w-0 flex-1">
+                        <div class="truncate text-[12.5px] font-[550] text-text">{s.name}</div>
+                        <div class="truncate text-[11.5px] text-text-3">{s.description}</div>
+                      </div>
+                      {#if s.approval_status === "approved"}
+                        <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">approved</span>
+                      {:else if s.approval_status === "pending"}
+                        <span class="flex-shrink-0 rounded-[8px] bg-warn-soft px-[7px] py-px text-[10px] text-warn">pending review</span>
+                      {:else}
+                        <span class="flex-shrink-0 rounded-[8px] bg-surface-2 px-[7px] py-px text-[10px] text-text-3">rejected</span>
+                      {/if}
+                      <button
+                        type="button"
+                        aria-label="Delete this skill"
+                        title={confirmDeleteSkillId === s.id ? "Click again to delete" : "Delete"}
+                        onclick={() => removeSkill(s.id)}
+                        class="grid h-6 w-6 flex-shrink-0 place-items-center rounded-[var(--r)] border-0 bg-transparent
+                          {confirmDeleteSkillId === s.id ? 'text-blocked' : 'text-text-3'} hover:bg-surface-hover hover:text-text"
+                      >
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <path d="M6 6l12 12M18 6 6 18" />
+                        </svg>
+                      </button>
+                    </div>
+                    {#if s.capabilities_required.length > 0}
+                      <div class="flex flex-wrap gap-1 pl-8">
+                        {#each s.capabilities_required as cap (cap)}
+                          <span class="rounded-[6px] bg-surface-2 px-[6px] py-px text-[10px] text-text-3">{cap}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                    {#if expandedSkillId === s.id}
+                      <pre class="ml-8 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-[var(--r)] border border-border bg-surface-2 px-2.5 py-2 text-[11.5px] text-text-2">{s.content}</pre>
+                      <div class="flex items-center gap-1.5 pl-8">
+                        {#if s.approval_status !== "approved"}
+                          <Button variant="primary" onclick={() => setSkillStatus(s.id, "approved")}>Approve</Button>
+                        {/if}
+                        {#if s.approval_status !== "rejected"}
+                          <Button variant="ghost" onclick={() => setSkillStatus(s.id, "rejected")}>Reject</Button>
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              {/if}
+              <div class="px-3 py-2 text-[11px] text-text-3">
+                A skill is a saved routine the assistant can reuse. Only <span class="text-text-2">approved</span>
+                skills are searchable and usable; saving one always requires your explicit
+                one-time approval, and its actions are still gated like any other tool.
               </div>
             </div>
           {:else if section === "usage"}
