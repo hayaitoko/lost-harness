@@ -173,9 +173,11 @@ pub struct AgentLoop {
     /// pre-3.5 behavior. `lib.rs` sets it in production.
     flush_classifier: Option<Arc<dyn crate::classifier::Classifier>>,
     /// Wave 3.5: per-conversation content-hash high-water set — a turn is swept
-    /// for durable facts at most once. Same bounded-cache discipline as
-    /// `summary_cache`/`cloud_safe_cache`.
-    flush_marks: parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    /// for durable facts at most once. `Arc` so the new-chat nudge's detached
+    /// task can share it with the on-stream flush. Same bounded-cache discipline
+    /// as `summary_cache`/`cloud_safe_cache`.
+    flush_marks:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
     stream_lock: tokio::sync::Mutex<()>,
 }
 
@@ -214,7 +216,7 @@ impl AgentLoop {
                 Arc::clone(&model_manager_for_flush),
             )),
             flush_classifier: None,
-            flush_marks: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            flush_marks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             stream_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -806,6 +808,45 @@ impl AgentLoop {
                 Ok(n) if n > 0 => emit_memory_event(&app, &conversation_id, "remembered", n),
                 Ok(_) => {}
                 Err(e) => tracing::debug!(target: "lhp::compaction", error = %e, "pre-compaction flush failed"),
+            }
+        });
+    }
+
+    /// Wave 3.5 trigger #3 — the new-chat consolidation nudge. Fire-and-forget:
+    /// when a new conversation is created, sweep the most-recent PRIOR
+    /// conversation for durable facts the on-stream flush missed (a short chat
+    /// that never compacted). Cheap sync guard here, then a detached task does
+    /// the DB reads + local-model extraction + saves. Disabled (no-op) until a
+    /// flush classifier is wired or when no local model is available.
+    pub(crate) fn consolidate_on_new_chat(&self, profile: &str, new_conversation_id: &str) {
+        let Some(classifier) = &self.flush_classifier else {
+            return;
+        };
+        if !self.fact_extractor.available() {
+            return;
+        }
+        let extractor = Arc::clone(&self.fact_extractor);
+        let classifier = Arc::clone(classifier);
+        let storage = Arc::clone(&self.storage);
+        let embedder = self.embedder.clone();
+        let flush_marks = Arc::clone(&self.flush_marks);
+        let profile = profile.to_string();
+        let new_conversation_id = new_conversation_id.to_string();
+        let now = chrono::Utc::now().timestamp();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = crate::agent::memory_flush::run_new_chat_nudge(
+                extractor,
+                classifier,
+                storage,
+                embedder,
+                flush_marks,
+                profile,
+                new_conversation_id,
+                now,
+            )
+            .await
+            {
+                tracing::debug!(target: "lhp::compaction", error = %e, "new-chat consolidation nudge failed");
             }
         });
     }

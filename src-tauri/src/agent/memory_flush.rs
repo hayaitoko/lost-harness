@@ -265,6 +265,12 @@ pub(crate) async fn run_flush(
         let Some(bucket) = classify_and_route(classifier.as_ref(), &cfg, &fact) else {
             continue; // NeverPersist — a secret is never written anywhere.
         };
+        // Skip a fact whose content is already saved — so a repeated flush or the
+        // new-chat nudge re-scanning a conversation across a restart can't
+        // duplicate a fact (the in-memory high-water only dedups within a run).
+        if fact_already_saved(&mem, &fact) {
+            continue;
+        }
         let mf = MemoryFact {
             id: uuid::Uuid::new_v4().to_string(),
             content: fact,
@@ -281,6 +287,81 @@ pub(crate) async fn run_flush(
         }
     }
     Ok(saved)
+}
+
+/// Is a fact with this exact content already in the profile's memory? A bounded
+/// keyword (FTS) probe + normalized-content compare — dedups across triggers
+/// and restarts (the in-memory high-water only dedups within one process run).
+fn fact_already_saved(mem: &crate::storage::GlobalDb, content: &str) -> bool {
+    let norm = content.trim().to_lowercase();
+    mem.search_memory(content, true, 8)
+        .map(|hits| hits.iter().any(|h| h.fact.content.trim().to_lowercase() == norm))
+        .unwrap_or(false)
+}
+
+/// Wave 3.5 trigger #3 — the new-chat consolidation nudge. On a new chat, sweep
+/// the most-recently-updated PRIOR conversation for durable facts the first two
+/// triggers missed (e.g. a short conversation that never compacted, so the
+/// pre-compaction flush never fired). Reuses [`run_flush`] + the shared
+/// `flush_marks` high-water (so a conversation already flushed on-stream isn't
+/// re-swept) + the content dedup above (so a restart can't duplicate a fact).
+/// Best-effort; runs entirely in a detached task.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_new_chat_nudge(
+    extractor: Arc<dyn DurableFactExtractor>,
+    classifier: Arc<dyn Classifier>,
+    storage: Arc<Storage>,
+    embedder: Option<Arc<EmbedderHandle>>,
+    flush_marks: Arc<
+        parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    >,
+    profile: String,
+    new_conversation_id: String,
+    now: i64,
+) -> anyhow::Result<usize> {
+    let db = storage.open_profile(&profile)?;
+    // The most-recently-updated conversation that ISN'T the one just created.
+    let prior = db
+        .list_conversations()?
+        .into_iter()
+        .filter(|c| c.id != new_conversation_id)
+        .max_by_key(|c| c.updated_at);
+    let Some(prior) = prior else {
+        return Ok(0);
+    };
+    let turns: Vec<ChatMessage> = db
+        .list_messages_by_conversation(&prior.id)?
+        .into_iter()
+        .map(|m| ChatMessage {
+            role: m.role,
+            content: m.content,
+        })
+        .collect();
+    // Select the not-yet-swept turns and mark them (shared high-water with the
+    // on-stream flush, so an already-flushed conversation is skipped).
+    let unswept = {
+        let mut marks = flush_marks.lock();
+        let swept = marks.entry(prior.id.clone()).or_default();
+        let unswept = select_unswept(&turns, swept);
+        for m in &unswept {
+            swept.insert(identity(m));
+        }
+        unswept
+    };
+    if unswept.is_empty() {
+        return Ok(0);
+    }
+    run_flush(
+        extractor,
+        classifier,
+        storage,
+        embedder,
+        profile,
+        prior.id,
+        unswept,
+        now,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -410,6 +491,121 @@ mod tests {
         assert!(priv_only.iter().any(|h| h.fact.content.contains("SSN")));
         let cloud_view = g.search_memory("SSN", false, 10).unwrap();
         assert!(cloud_view.is_empty(), "a private fact never surfaces on a cloud (shared) search");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn run_flush_does_not_duplicate_an_already_saved_fact() {
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-flush-dup-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(Storage::open(&root).unwrap());
+        // Pre-seed the exact fact.
+        storage
+            .global()
+            .insert_memory_fact_in(
+                MemoryBucket::Shared,
+                &crate::storage::MemoryFact {
+                    id: "pre".into(),
+                    content: "the team standup is at 10am".into(),
+                    origin_profile: "personal".into(),
+                    tags: None,
+                    created_at: 1,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+        let classifier: Arc<dyn Classifier> = Arc::new(RulesClassifier::new());
+        let extractor: Arc<dyn DurableFactExtractor> = Arc::new(FakeExtractor {
+            available: true,
+            facts: vec!["The team standup is at 10AM".into()], // same, different case
+        });
+        let saved = run_flush(
+            extractor,
+            classifier,
+            Arc::clone(&storage),
+            None,
+            "personal".into(),
+            "c1".into(),
+            vec![user("x")],
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved, 0, "an already-saved fact is not duplicated");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn new_chat_nudge_sweeps_the_prior_conversation_once() {
+        use crate::storage::{Conversation, Message};
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-nudge-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(Storage::open(&root).unwrap());
+        let db = storage.open_profile("personal").unwrap();
+        // A prior conversation with a fact-bearing user turn.
+        db.create_conversation(&Conversation {
+            id: "prev".into(),
+            name: "Prev".into(),
+            pinned: false,
+            binding: "auto".into(),
+            folder_id: None,
+            color: None,
+            created_at: 1,
+            updated_at: 10,
+        })
+        .unwrap();
+        db.add_message(&Message {
+            id: "m1".into(),
+            conversation_id: "prev".into(),
+            role: "user".into(),
+            content: "i work at a bakery on Main Street".into(),
+            model: None,
+            provider_id: None,
+            routing_decision: None,
+            thinking_content: None,
+            error: None,
+            aborted: false,
+            created_at: 2,
+        })
+        .unwrap();
+
+        let classifier: Arc<dyn Classifier> = Arc::new(RulesClassifier::new());
+        let extractor: Arc<dyn DurableFactExtractor> = Arc::new(FakeExtractor {
+            available: true,
+            facts: vec!["works at a bakery on Main Street".into()],
+        });
+        let marks = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        // New chat "new" created → nudge sweeps the prior "prev".
+        let saved = run_new_chat_nudge(
+            Arc::clone(&extractor),
+            Arc::clone(&classifier),
+            Arc::clone(&storage),
+            None,
+            Arc::clone(&marks),
+            "personal".into(),
+            "new".into(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved, 1, "the prior conversation's fact is consolidated");
+
+        // Re-running the nudge does NOT re-sweep "prev" (high-water marked).
+        let again = run_new_chat_nudge(
+            extractor,
+            classifier,
+            Arc::clone(&storage),
+            None,
+            marks,
+            "personal".into(),
+            "new".into(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, 0, "an already-swept conversation is not re-consolidated");
 
         let _ = std::fs::remove_dir_all(root);
     }

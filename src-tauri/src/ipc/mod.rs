@@ -305,6 +305,12 @@ pub fn create_conversation(
         updated_at: now,
     };
     db.create_conversation(&conv).map_err(|e| e.to_string())?;
+    // Wave 3.5 trigger #3: a new chat nudges a background consolidation pass over
+    // the most-recent prior conversation (catches durable facts a short,
+    // never-compacted chat missed). Fire-and-forget; never blocks this command.
+    state
+        .agent_loop
+        .consolidate_on_new_chat(&args.profile, &conv.id);
     Ok(conv.into())
 }
 
