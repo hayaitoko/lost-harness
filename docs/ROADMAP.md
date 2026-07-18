@@ -41,7 +41,11 @@ the status board sitting on top of all of them.
 > the `skills` stub grows into a real row; `search_skills` (Safe, approved-only,
 > guard-wrapped) + `save_skill` (**Dangerous** — an always-shown review immune to
 > accept_edits, per the cron precedent, caught by the review); a skill's body
-> re-gates whatever it drives. **453 → 462 tests.** **Next fronts (per the
+> re-gates whatever it drives. Plus the **Settings → Skills** management pane
+> (`4ea9dd3`): `list_skills`/`set_skill_approval`/`delete_skill` IPC + a review
+> surface (status badges, capability chips, an auto-escaped body expander,
+> approve/reject, two-click delete) — the review gate for the 4.2 draft-first
+> loop, browser-verified. **453 → 462 tests.** **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
