@@ -18,7 +18,7 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 4;
 /// `classifier_settings` in the classifier settings round,
 /// `memory_settings` in Wave 1 memory) bumps `PROFILE_SCHEMA_VERSION`
 /// without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 6;
+pub const PROFILE_SCHEMA_VERSION: i32 = 7;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -147,6 +147,9 @@ pub const PROFILE_TABLES: &[&str] = &[
     // 15. memory_settings — per-profile memory toggles (Wave 1: semantic-search
     //     on/off, walled-memory island) — PLAN §9 + §7
     "memory_settings",
+    // 16. usage_events — per-profile model-call cost ledger (Wave 3.2, PLAN §3):
+    //     one row per model call; cost NULL = unknown ("flying blind"), never a guess.
+    "usage_events",
 ];
 
 /// CREATE TABLE statements for per-profile DBs (in dependency order).
@@ -319,6 +322,16 @@ CREATE TABLE IF NOT EXISTS memory_settings (
     updated_at              INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                TEXT PRIMARY KEY,
+    conversation_id   TEXT,
+    model             TEXT NOT NULL,
+    provider_id       TEXT,
+    provider_kind     TEXT NOT NULL,          -- 'local' | 'cloud' | 'custom'
+    cost_usd          REAL,                    -- NULL = unknown ("flying blind"); local = 0.0
+    created_at        INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_folder ON conversations(folder_id);
@@ -328,4 +341,5 @@ CREATE INDEX IF NOT EXISTS idx_trm_logs_created ON trm_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_email_messages_account ON email_messages(account_id);
 CREATE INDEX IF NOT EXISTS idx_calendar_events_start ON calendar_events(start_time);
 CREATE INDEX IF NOT EXISTS idx_tasks_done ON tasks(done);
+CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);
 "#;

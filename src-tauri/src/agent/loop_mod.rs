@@ -830,6 +830,36 @@ impl AgentLoop {
             profile_db
                 .add_message(&assistant_message)
                 .context("persist assistant message")?;
+
+            // Wave 3.2: book this model call to the per-profile usage ledger
+            // (PLAN §3). A local/on-device (or private) endpoint costs $0; a
+            // cloud call we can't price is recorded as UNKNOWN (`None`) —
+            // flagged, never guessed. Cost is driven by `is_cloud` (the real
+            // routing, honoring a mid-turn reroute-to-local), while
+            // `provider_kind`/`provider_id` record the endpoint that served this
+            // round. Best-effort: a ledger write must never fail the turn.
+            // Caveat (pre-existing): `model` is the turn's originally-selected
+            // model id and is not re-stamped when a round reroutes to a local
+            // endpoint — cost stays correct, but the per-row model label is
+            // endpoint-approximate after a reroute.
+            {
+                let kind = match provider.kind {
+                    crate::models::ProviderKind::Local => "local",
+                    crate::models::ProviderKind::Cloud => "cloud",
+                    crate::models::ProviderKind::Custom => "custom",
+                };
+                if let Err(e) = profile_db.record_usage(&crate::storage::UsageEvent {
+                    id: Uuid::new_v4().to_string(),
+                    conversation_id: Some(conversation_id.clone()),
+                    model: model.clone(),
+                    provider_id: Some(provider.id.clone()),
+                    provider_kind: kind.to_string(),
+                    cost_usd: if is_cloud { None } else { Some(0.0) },
+                    created_at: chrono::Utc::now().timestamp(),
+                }) {
+                    tracing::warn!(error = %e, "failed to book usage event to the ledger");
+                }
+            }
             final_text = persisted_content;
 
             // On the last permitted round, stop without dispatching more tools.

@@ -233,6 +233,26 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
             updated_at              INTEGER NOT NULL
         );",
     },
+    Migration {
+        version: 7,
+        // Per-profile model-call cost ledger (Wave 3.2, PLAN §3 usage ledger).
+        // One row per model call; `cost_usd` NULL means UNKNOWN ("flying
+        // blind") — never a silent guess — and 0.0 for a local/on-device call.
+        // Same dual-definition convention as v2/v3/v4/v6: the CREATE is
+        // IF NOT EXISTS and also lives in PROFILE_SCHEMA_SQL, so v7 is a no-op on
+        // a fresh install (v1 already created it) and a real upgrade on a v6 DB.
+        name: "usage_events_table",
+        sql: "CREATE TABLE IF NOT EXISTS usage_events (
+            id                TEXT PRIMARY KEY,
+            conversation_id   TEXT,
+            model             TEXT NOT NULL,
+            provider_id       TEXT,
+            provider_kind     TEXT NOT NULL,
+            cost_usd          REAL,
+            created_at        INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.

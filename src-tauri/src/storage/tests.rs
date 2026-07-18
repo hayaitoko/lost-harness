@@ -74,18 +74,18 @@ fn schema_version_is_current_after_init_global() {
 }
 
 #[test]
-fn schema_version_is_six_after_init_profile() {
-    // Profile schema version is now 6 (v2 tool_audit, v3 tool_rules, v4
+fn schema_version_is_seven_after_init_profile() {
+    // Profile schema version is now 7 (v2 tool_audit, v3 tool_rules, v4
     // classifier_settings, v5 the classifier_settings.redaction_enabled column,
-    // v6 memory_settings); global stays at its own version. The two are tracked
-    // independently.
+    // v6 memory_settings, v7 usage_events); global stays at its own version. The
+    // two are tracked independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 6);
+    assert_eq!(v, 7);
 }
 
 #[test]

@@ -98,6 +98,33 @@ pub struct CronJob {
     pub target_conversation_id: Option<String>,
 }
 
+/// One booked model call in the per-profile usage ledger (Wave 3.2, PLAN §3).
+/// `cost_usd` is `None` when the cost is UNKNOWN ("flying blind" — we don't
+/// have the tokens/pricing to compute it) and `Some(0.0)` for a local /
+/// on-device call. It is NEVER a silent guess for a cloud call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageEvent {
+    pub id: String,
+    pub conversation_id: Option<String>,
+    pub model: String,
+    pub provider_id: Option<String>,
+    /// "local" | "cloud" | "custom".
+    pub provider_kind: String,
+    pub cost_usd: Option<f64>,
+    pub created_at: i64,
+}
+
+/// A roll-up of a profile's usage ledger — the shape a budget governor / a
+/// "spend so far" UI reads. `unknown_cost_calls` is the honest "flying blind"
+/// count: cloud calls we couldn't price. `known_cost_usd` sums only the calls
+/// whose cost we actually know (local $0 + any priced cloud call).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageSummary {
+    pub total_calls: usize,
+    pub known_cost_usd: f64,
+    pub unknown_cost_calls: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrmLog {
     pub id: String,
@@ -868,6 +895,49 @@ impl ProfileDb {
         Ok(n > 0)
     }
 
+    // ── usage_events (Wave 3.2 — the model-call cost ledger, PLAN §3) ─────────
+
+    /// Book one model call to the ledger. `cost_usd` is `None` for an
+    /// unknown/"flying blind" cloud cost (never a guess), `Some(0.0)` for local.
+    pub fn record_usage(&self, e: &UsageEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO usage_events
+             (id, conversation_id, model, provider_id, provider_kind, cost_usd, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                e.id,
+                e.conversation_id,
+                e.model,
+                e.provider_id,
+                e.provider_kind,
+                e.cost_usd,
+                e.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Roll up the whole profile's ledger: total calls, summed KNOWN cost, and
+    /// the count of unknown-cost ("flying blind") calls. `SUM(cost_usd)` skips
+    /// NULLs in SQLite, so the known-cost total is honest; the unknown count is
+    /// surfaced separately rather than folded into the total as a guess.
+    pub fn usage_summary(&self) -> Result<UsageSummary> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+             FROM usage_events",
+            [],
+            |r| {
+                Ok(UsageSummary {
+                    total_calls: r.get::<_, i64>(0)? as usize,
+                    known_cost_usd: r.get::<_, f64>(1)?,
+                    unknown_cost_calls: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
+                })
+            },
+        )?)
+    }
+
     // ── trm_logs ────────────────────────────────────────────────────────────
 
     pub fn insert_trm_log(&self, l: &TrmLog) -> Result<()> {
@@ -1260,4 +1330,67 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         aborted: r.get::<_, i64>(9)? != 0,
         created_at: r.get(10)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Storage;
+
+    fn temp_profile() -> (Storage, std::sync::Arc<ProfileDb>, std::path::PathBuf) {
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-usage-{}", uuid::Uuid::new_v4()));
+        let storage = Storage::open(&root).unwrap();
+        let db = storage.open_profile("personal").unwrap();
+        (storage, db, root)
+    }
+
+    fn ev(kind: &str, cost: Option<f64>) -> UsageEvent {
+        UsageEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: Some("c1".into()),
+            model: "some-model".into(),
+            provider_id: Some("p1".into()),
+            provider_kind: kind.into(),
+            cost_usd: cost,
+            created_at: 100,
+        }
+    }
+
+    #[test]
+    fn usage_ledger_sums_known_cost_and_counts_flying_blind() {
+        let (_storage, db, root) = temp_profile();
+
+        // Fresh ledger is empty.
+        let s = db.usage_summary().unwrap();
+        assert_eq!(s, UsageSummary { total_calls: 0, known_cost_usd: 0.0, unknown_cost_calls: 0 });
+
+        // Two local ($0), one priced cloud, two unknown-cost cloud calls.
+        db.record_usage(&ev("local", Some(0.0))).unwrap();
+        db.record_usage(&ev("local", Some(0.0))).unwrap();
+        db.record_usage(&ev("cloud", Some(0.42))).unwrap();
+        db.record_usage(&ev("cloud", None)).unwrap();
+        db.record_usage(&ev("cloud", None)).unwrap();
+
+        let s = db.usage_summary().unwrap();
+        assert_eq!(s.total_calls, 5);
+        // Known cost = 0 + 0 + 0.42; the two None calls are NOT guessed into it.
+        assert!((s.known_cost_usd - 0.42).abs() < 1e-9, "known cost = {}", s.known_cost_usd);
+        assert_eq!(s.unknown_cost_calls, 2, "the two None cloud calls are flagged, not summed");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_events_are_profile_isolated() {
+        let (storage, personal, root) = temp_profile();
+        personal.record_usage(&ev("cloud", None)).unwrap();
+
+        // A different profile's ledger is independent.
+        let work = storage.open_profile("work").unwrap();
+        assert_eq!(work.usage_summary().unwrap().total_calls, 0);
+        assert_eq!(personal.usage_summary().unwrap().total_calls, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
