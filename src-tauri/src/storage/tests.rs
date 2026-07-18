@@ -74,17 +74,18 @@ fn schema_version_is_current_after_init_global() {
 }
 
 #[test]
-fn schema_version_is_five_after_init_profile() {
-    // Profile schema version is now 5 (v2 tool_audit, v3 tool_rules, v4
-    // classifier_settings, v5 the classifier_settings.redaction_enabled column);
-    // global stays at 2. The two are tracked independently.
+fn schema_version_is_six_after_init_profile() {
+    // Profile schema version is now 6 (v2 tool_audit, v3 tool_rules, v4
+    // classifier_settings, v5 the classifier_settings.redaction_enabled column,
+    // v6 memory_settings); global stays at its own version. The two are tracked
+    // independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 5);
+    assert_eq!(v, 6);
 }
 
 #[test]
@@ -618,6 +619,144 @@ fn storage_open_profile_rejects_path_traversal() {
         let res = storage.open_profile(bad);
         assert!(res.is_err(), "expected error for bad profile name {bad:?}");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 1 — per-profile memory settings + walled-memory physical separation
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn walled_fact(id: &str, content: &str, profile: &str) -> MemoryFact {
+    MemoryFact {
+        id: id.into(),
+        content: content.into(),
+        origin_profile: profile.into(),
+        tags: None,
+        created_at: 1,
+        pinned: false,
+    }
+}
+
+#[test]
+fn memory_settings_round_trip_and_default() {
+    let dir = tempdir();
+    let storage = Storage::open(&dir).unwrap();
+    let db = storage.open_profile("personal").unwrap();
+
+    // Default (no row): semantic on, not walled.
+    let d = db.memory_settings().unwrap();
+    assert!(d.semantic_search_enabled && !d.walled, "defaults: semantic on, shared");
+
+    db.set_memory_settings(&MemorySettings {
+        semantic_search_enabled: false,
+        walled: true,
+    })
+    .unwrap();
+    let s = db.memory_settings().unwrap();
+    assert!(!s.semantic_search_enabled && s.walled, "round-trips both flags");
+}
+
+#[test]
+fn walled_profile_memory_is_physically_separate_and_survives_toggle_back() {
+    // The §7 / Wave 1.5 guarantee: a walled profile's facts live in its own DB,
+    // never global.db — and toggling the wall back OFF can't retroactively spill
+    // what was written while walled (it was never in the shared pool).
+    let dir = tempdir();
+    let storage = Storage::open(&dir).unwrap();
+
+    // A shared (default) profile routes to global.db.
+    let shared = storage.memory_db_for_profile("personal").unwrap();
+    shared
+        .insert_memory_fact_in(MemoryBucket::Shared, &walled_fact("s1", "alpha personal reminder", "personal"))
+        .unwrap();
+    assert_eq!(
+        storage.global().search_memory("alpha personal reminder", true, 10).unwrap().len(),
+        1,
+        "a shared profile's writes land in global.db"
+    );
+
+    // Wall the `work` profile, then write to its memory store.
+    storage
+        .open_profile("work")
+        .unwrap()
+        .set_memory_settings(&MemorySettings { semantic_search_enabled: true, walled: true })
+        .unwrap();
+    let walled = storage.memory_db_for_profile("work").unwrap();
+    walled
+        .insert_memory_fact_in(MemoryBucket::Shared, &walled_fact("w1", "bravo confidential dossier", "work"))
+        .unwrap();
+
+    // The fact is in the walled DB...
+    assert_eq!(
+        walled.search_memory("bravo confidential dossier", true, 10).unwrap().len(),
+        1,
+        "the walled write is readable from the walled DB"
+    );
+    // ...and NEVER in global.db.
+    assert!(
+        storage.global().search_memory("bravo confidential dossier", true, 10).unwrap().is_empty(),
+        "a walled profile's fact must never enter global.db"
+    );
+    // The walled memory DB is a separate physical file.
+    assert!(
+        dir.join("walled-memory").join("work.db").exists(),
+        "walled memory lives in its own file under walled-memory/"
+    );
+
+    // Toggle the wall back OFF.
+    storage
+        .open_profile("work")
+        .unwrap()
+        .set_memory_settings(&MemorySettings { semantic_search_enabled: true, walled: false })
+        .unwrap();
+
+    // The walled-era fact STILL isn't in global — the wall survived the toggle.
+    assert!(
+        storage.global().search_memory("bravo confidential dossier", true, 10).unwrap().is_empty(),
+        "toggling the wall off must not retroactively spill walled data into global"
+    );
+    // And routing now goes to the shared store: a fresh write lands in global.
+    let mem_now = storage.memory_db_for_profile("work").unwrap();
+    mem_now
+        .insert_memory_fact_in(MemoryBucket::Shared, &walled_fact("w2", "gamma unwalled entry", "work"))
+        .unwrap();
+    assert_eq!(
+        storage.global().search_memory("gamma unwalled entry", true, 10).unwrap().len(),
+        1,
+        "after un-walling, writes route to the shared global store"
+    );
+}
+
+#[test]
+fn memory_routing_fails_closed_when_wall_status_is_unreadable() {
+    // §7 fail-safe (review finding): if a profile OPENS but its wall status
+    // can't be read (transient SQLite error / corrupt settings table), routing
+    // must FAIL CLOSED — never silently fall back to the shared global.db, which
+    // would leak a possibly-walled profile's memory. Simulate the unreadable
+    // status by dropping the settings table on the (cached) connection.
+    let dir = tempdir();
+    let storage = Storage::open(&dir).unwrap();
+
+    // A profile that opens fine and IS walled routes to its own DB.
+    let db = storage.open_profile("locked").unwrap();
+    db.set_memory_settings(&MemorySettings { semantic_search_enabled: true, walled: true })
+        .unwrap();
+    assert!(storage.memory_db_for_profile("locked").is_ok(), "readable walled status resolves");
+
+    // Now make the wall status unreadable (drop the table on the same cached conn).
+    db.raw().execute_batch("DROP TABLE memory_settings").unwrap();
+    assert!(
+        storage.memory_db_for_profile("locked").is_err(),
+        "an unreadable wall status must fail closed, never route to the shared store"
+    );
+
+    // A genuinely invalid/degenerate profile name (never a real walled profile,
+    // and open_profile itself rejects it) still resolves to the shared store —
+    // that path is a different, safe case (no island exists to protect).
+    let shared = storage.memory_db_for_profile("../evil").unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&shared, &storage.memory_db_for_profile("also-fresh-shared").unwrap()),
+        "a degenerate name uses the one shared global store"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

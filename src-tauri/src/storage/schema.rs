@@ -15,9 +15,10 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 4;
 /// Bump when adding a new per-profile migration. Profile and global
 /// track versions independently: an item that only adds a per-profile
 /// table (e.g. `tool_audit` in item 5, `tool_rules` in Q8,
-/// `classifier_settings` in the classifier settings round) bumps
-/// `PROFILE_SCHEMA_VERSION` without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 5;
+/// `classifier_settings` in the classifier settings round,
+/// `memory_settings` in Wave 1 memory) bumps `PROFILE_SCHEMA_VERSION`
+/// without touching `GLOBAL_SCHEMA_VERSION`.
+pub const PROFILE_SCHEMA_VERSION: i32 = 6;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -143,6 +144,9 @@ pub const PROFILE_TABLES: &[&str] = &[
     "tool_rules",
     // 14. classifier_settings — per-profile classifier thresholds (PLAN §11)
     "classifier_settings",
+    // 15. memory_settings — per-profile memory toggles (Wave 1: semantic-search
+    //     on/off, walled-memory island) — PLAN §9 + §7
+    "memory_settings",
 ];
 
 /// CREATE TABLE statements for per-profile DBs (in dependency order).
@@ -300,6 +304,19 @@ CREATE TABLE IF NOT EXISTS classifier_settings (
     tau_block   REAL NOT NULL,
     tau_band    REAL NOT NULL,
     updated_at  INTEGER NOT NULL
+);
+
+-- Per-profile memory toggles (Wave 1). Single row (id=1); a missing row means
+-- "use defaults" (semantic search ON, not walled). `semantic_search_enabled`
+-- gates the meaning-lane embedder (PLAN §9 — the user's hard off switch for
+-- computing a meaning fingerprint of everything they save). `walled` is the §7
+-- "keep this profile's memory private" island: when set, this profile's memory
+-- lives in its own physically-separate DB, never global.db.
+CREATE TABLE IF NOT EXISTS memory_settings (
+    id                      INTEGER PRIMARY KEY CHECK (id = 1),
+    semantic_search_enabled INTEGER NOT NULL DEFAULT 1,
+    walled                  INTEGER NOT NULL DEFAULT 0,
+    updated_at              INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);

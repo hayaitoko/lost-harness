@@ -80,16 +80,23 @@
     panelTab = t;
   };
 
-  // ── Non-silent memory signal (PLAN §9): a transient "recalled N notes" line
-  // when the agent injects relevance-gated memory for the current answer.
+  // ── Non-silent memory signal (PLAN §9): a transient "recalled N notes" (or
+  // "remembered N notes") line when the agent injects or saves memory for the
+  // current turn. A manual save from Settings emits with an empty
+  // conversation_id, so it's filtered out here by design — the Settings pane
+  // reloads its own list instead.
   let memoryNote = $state<string | null>(null);
   let memoryNoteTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
     const un = onMemoryEvent((e) => {
-      if (e.kind !== "recalled" || e.count < 1) return;
+      if (e.count < 1) return;
+      if (e.kind !== "recalled" && e.kind !== "remembered") return;
       // Only surface the banner for the conversation being viewed.
       if (e.conversation_id !== $activeConversation?.id) return;
-      memoryNote = `Recalled ${e.count} saved note${e.count === 1 ? "" : "s"} for this answer`;
+      memoryNote =
+        e.kind === "recalled"
+          ? `Recalled ${e.count} saved note${e.count === 1 ? "" : "s"} for this answer`
+          : `Remembered ${e.count === 1 ? "a note" : `${e.count} notes`}`;
       if (memoryNoteTimer) clearTimeout(memoryNoteTimer);
       memoryNoteTimer = setTimeout(() => (memoryNote = null), 6000);
     });

@@ -34,6 +34,8 @@
     deleteMemory,
     setMemoryPinned,
     type MemoryInfo,
+    getMemorySettings,
+    setMemorySettings,
     getClassifierSettings,
     setClassifierSettings,
     setRedactionEnabled,
@@ -61,6 +63,8 @@
     baseUrl: string;
     apiKey: string;
     kind: ProviderKind;
+    /** Q1: whether this endpoint supports OpenAI-style native structured tool calls. */
+    supportsNativeTools: boolean;
   }
   const EMPTY_PROVIDER_FORM: ProviderFormState = {
     id: null,
@@ -68,6 +72,7 @@
     baseUrl: "",
     apiKey: "",
     kind: "cloud",
+    supportsNativeTools: false,
   };
   const QUICK_PROVIDER_PRESETS: Array<{
     id: string;
@@ -110,6 +115,9 @@
   let modelsByProvider = $state<Record<string, string[]>>({});
   // memory — real facts for the active profile (PLAN §9)
   let memoryMode = $state("walled");
+  let semanticSearchEnabled = $state(true);
+  let memSettingsSaving = $state(false);
+  let memSettingsError = $state<string | null>(null);
   let memoryItems = $state<MemoryInfo[]>([]);
   let memoryLoading = $state(false);
   let memDraft = $state("");
@@ -286,7 +294,14 @@
     showProviderKey = false;
   }
   function startAddProviderFromPreset(preset: (typeof QUICK_PROVIDER_PRESETS)[number]) {
-    providerForm = { id: null, name: preset.name, baseUrl: preset.baseUrl, apiKey: "", kind: preset.kind };
+    providerForm = {
+      id: null,
+      name: preset.name,
+      baseUrl: preset.baseUrl,
+      apiKey: "",
+      kind: preset.kind,
+      supportsNativeTools: false,
+    };
     showProviderKey = false;
   }
   function startEditProvider(p: Provider) {
@@ -294,7 +309,14 @@
       providerForm = null;
       return;
     }
-    providerForm = { id: p.id, name: p.name, baseUrl: p.baseUrl, apiKey: "", kind: p.kind };
+    providerForm = {
+      id: p.id,
+      name: p.name,
+      baseUrl: p.baseUrl,
+      apiKey: "",
+      kind: p.kind,
+      supportsNativeTools: p.supportsNativeTools,
+    };
     showProviderKey = false;
   }
   function cancelProviderForm() {
@@ -310,6 +332,7 @@
         baseUrl: providerForm.baseUrl.trim(),
         apiKey: providerForm.apiKey,
         kind: providerForm.kind,
+        supportsNativeTools: providerForm.supportsNativeTools,
       });
       providerForm = null;
     } catch (err) {
@@ -355,10 +378,56 @@
       });
   });
 
+  // Load the active profile's memory settings (walled/shared + semantic
+  // search) alongside the facts above, and re-load on profile change.
+  $effect(() => {
+    if (section !== "memory") return;
+    const profile = $activeProfileId;
+    memSettingsError = null;
+    getMemorySettings(profile)
+      .then((s) => {
+        memoryMode = s.walled ? "walled" : "shared";
+        semanticSearchEnabled = s.semantic_search_enabled;
+      })
+      .catch((err) => {
+        memSettingsError = String(err);
+      });
+  });
+
   function reloadMemory() {
     listMemory($activeProfileId)
       .then((items) => (memoryItems = items))
       .catch(() => {});
+  }
+
+  async function setMemoryModeAndSave(mode: string) {
+    memoryMode = mode;
+    memSettingsSaving = true;
+    memSettingsError = null;
+    try {
+      const s = await setMemorySettings($activeProfileId, semanticSearchEnabled, mode === "walled");
+      memoryMode = s.walled ? "walled" : "shared";
+      semanticSearchEnabled = s.semantic_search_enabled;
+    } catch (err) {
+      memSettingsError = String(err);
+    } finally {
+      memSettingsSaving = false;
+    }
+  }
+
+  async function toggleSemanticSearch(enabled: boolean) {
+    semanticSearchEnabled = enabled;
+    memSettingsSaving = true;
+    memSettingsError = null;
+    try {
+      const s = await setMemorySettings($activeProfileId, enabled, memoryMode === "walled");
+      memoryMode = s.walled ? "walled" : "shared";
+      semanticSearchEnabled = s.semantic_search_enabled;
+    } catch (err) {
+      memSettingsError = String(err);
+    } finally {
+      memSettingsSaving = false;
+    }
   }
 
   async function addMemoryFact() {
@@ -393,13 +462,13 @@
       return;
     }
     confirmForgetId = null;
-    await deleteMemory(id);
+    await deleteMemory($activeProfileId, id);
     memoryItems = memoryItems.filter((m) => m.id !== id);
   }
 
   async function toggleMemoryPin(m: MemoryInfo) {
     const next = !m.pinned;
-    await setMemoryPinned(m.id, next);
+    await setMemoryPinned($activeProfileId, m.id, next);
     reloadMemory();
   }
 
@@ -792,6 +861,22 @@
                       (providerForm = { ...providerForm!, kind: v as ProviderKind })}
                   />
                 </div>
+                <div>
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="{label}">Native tool-calling</span>
+                    <Toggle
+                      checked={providerForm.supportsNativeTools}
+                      onchange={(v) =>
+                        (providerForm = { ...providerForm!, supportsNativeTools: v })}
+                      label="This endpoint supports native tool-calling (OpenAI-style tool_calls)"
+                    />
+                  </div>
+                  <p class="mt-1 text-[11px] leading-[1.4] text-text-3">
+                    This endpoint supports native tool-calling (OpenAI-style tool_calls). When
+                    unchecked, Lost Harness falls back to the fenced tool-call format for this
+                    provider.
+                  </p>
+                </div>
                 <div class="flex items-center justify-end gap-2 pt-1">
                   <Button variant="ghost" onclick={cancelProviderForm}>Cancel</Button>
                   <Button variant="primary" type="submit" disabled={!canSaveProvider || savingProvider}>
@@ -820,6 +905,9 @@
               </button>
             {/if}
           {:else if section === "memory"}
+            {#if memSettingsError}
+              <div class="mt-1 text-[11.5px] text-blocked">{memSettingsError}</div>
+            {/if}
             <SettingRow
               title="Memory privacy"
               desc="Shared = one memory across profiles · Walled = each profile keeps its own private store"
@@ -831,7 +919,26 @@
                     { value: "walled", label: "Walled" },
                   ]}
                   value={memoryMode}
-                  onchange={(v) => (memoryMode = v)}
+                  onchange={setMemoryModeAndSave}
+                />
+              {/snippet}
+            </SettingRow>
+            {#if memoryMode === "walled"}
+              <p class="px-0.5 pb-1 text-[11px] text-text-3">
+                Walled keeps this profile's memory in its own on-device store — physically
+                separate from other profiles, not just filtered.
+              </p>
+            {/if}
+            <SettingRow
+              title="Semantic memory search"
+              desc="Off = keyword-only search; no meaning fingerprint is computed for your saved notes."
+            >
+              {#snippet control()}
+                <Toggle
+                  checked={semanticSearchEnabled}
+                  locked={memSettingsSaving}
+                  onchange={toggleSemanticSearch}
+                  label="Semantic memory search"
                 />
               {/snippet}
             </SettingRow>

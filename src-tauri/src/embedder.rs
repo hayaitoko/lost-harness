@@ -28,11 +28,90 @@
 //! the box (PLAN §9 "the meaning fingerprint … is computed by a small local
 //! model").
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 /// The embedding dimension of bge-small-en-v1.5. Stored blobs are validated
 /// against this (`4 * EMBED_DIM` bytes) before entering a distance query.
 pub const EMBED_DIM: usize = 384;
+
+/// A lazily-loaded, shared embedder (Wave 1.2 / PLAN §9). The ~34 MB ONNX
+/// model loads on the FIRST `get()` and only when a caller actually needs it —
+/// i.e. only when some profile has semantic memory search enabled. A user who
+/// keeps the meaning lane off never pays the load ("It loads only when the
+/// user's memory settings enable it"). Load happens at most once; the result
+/// (the loaded embedder, or `None` if the model is absent / failed to load) is
+/// memoized, so callers keep degrading cleanly to keyword-only search.
+pub struct EmbedderHandle {
+    source: EmbedderSource,
+}
+
+enum EmbedderSource {
+    /// Production: load `<dir>/model.int8.onnx` on first use, memoize.
+    Lazy {
+        model_dir: PathBuf,
+        cell: OnceLock<Option<Arc<dyn TextEmbedder>>>,
+    },
+    /// Tests: a pre-built embedder, always ready.
+    #[cfg(test)]
+    Ready(Arc<dyn TextEmbedder>),
+}
+
+impl std::fmt::Debug for EmbedderHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbedderHandle").finish_non_exhaustive()
+    }
+}
+
+impl EmbedderHandle {
+    /// A handle that loads the model from `model_dir` on first use.
+    pub fn lazy(model_dir: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            source: EmbedderSource::Lazy {
+                model_dir,
+                cell: OnceLock::new(),
+            },
+        })
+    }
+
+    /// A handle wrapping an already-built embedder (test/injection).
+    #[cfg(test)]
+    pub fn ready(embedder: Arc<dyn TextEmbedder>) -> Arc<Self> {
+        Arc::new(Self {
+            source: EmbedderSource::Ready(embedder),
+        })
+    }
+
+    /// The embedder, loading it on first call. Returns `None` (and the caller
+    /// runs keyword-only) if the model is absent or fails to load. Cheap after
+    /// the first call — the loaded `Arc` is memoized.
+    pub fn get(&self) -> Option<Arc<dyn TextEmbedder>> {
+        match &self.source {
+            #[cfg(test)]
+            EmbedderSource::Ready(e) => Some(e.clone()),
+            EmbedderSource::Lazy { model_dir, cell } => cell
+                .get_or_init(|| match OnnxEmbedder::load(model_dir) {
+                    Ok(e) => {
+                        tracing::info!(
+                            target: "lhp::memory",
+                            path = %model_dir.display(),
+                            "loaded memory embedder (meaning-lane search active)"
+                        );
+                        Some(Arc::new(e) as Arc<dyn TextEmbedder>)
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            target: "lhp::memory",
+                            reason = %err,
+                            "memory embedder unavailable — keyword-only memory search"
+                        );
+                        None
+                    }
+                })
+                .clone(),
+        }
+    }
+}
 
 /// Object-safe embedding interface. The real implementation is
 /// [`OnnxEmbedder`]; tests substitute deterministic fakes.

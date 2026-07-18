@@ -23,6 +23,8 @@ export interface Provider {
   kind: ProviderKind;
   /** Whether the backend classified the endpoint as private/LAN. */
   isPrivate: boolean;
+  /** Q1: whether the endpoint supports OpenAI-style native structured tool calls. */
+  supportsNativeTools: boolean;
 }
 
 const STORAGE_KEY = "lh.providers.v1";
@@ -123,6 +125,7 @@ export async function hydrateProviders(): Promise<void> {
       apiKey: "", // backend omits the key; user must re-enter to edit
       kind: (p.kind as ProviderKind) ?? "custom",
       isPrivate: p.is_private,
+      supportsNativeTools: p.supports_native_tools,
     }));
 
     // Merge: if a local provider has the same id, keep the local apiKey
@@ -195,6 +198,7 @@ export async function addProvider(
       apiKey: p.apiKey ?? "",
       kind: p.kind,
       isPrivate: providersStore.providers[existingIdx].isPrivate,
+      supportsNativeTools: p.supportsNativeTools,
     };
     providersStore.providers[existingIdx] = next;
     persistProviders();
@@ -208,6 +212,7 @@ export async function addProvider(
       p.baseUrl.trim(),
       p.apiKey || null,
       p.kind,
+      p.supportsNativeTools,
     );
     const provider: Provider = {
       id: info.id,
@@ -216,6 +221,7 @@ export async function addProvider(
       apiKey: p.apiKey ?? "",
       kind: (info.kind as ProviderKind) ?? p.kind,
       isPrivate: info.is_private,
+      supportsNativeTools: info.supports_native_tools,
     };
     providersStore.providers.push(provider);
     // First provider added → make it active by default.
@@ -236,6 +242,7 @@ export async function addProvider(
       apiKey: p.apiKey ?? "",
       kind: p.kind,
       isPrivate: p.kind === "local",
+      supportsNativeTools: p.supportsNativeTools,
     };
     providersStore.providers.push(next);
     if (providersStore.activeProviderId === null) {

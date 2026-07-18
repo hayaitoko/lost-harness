@@ -805,7 +805,7 @@ fn assemble_memory_context_is_endpoint_aware_and_profile_scoped() {
     // CLOUD turn (is_cloud=true): the always-loaded summary carries the shared
     // fact, the private-local fact is NEVER queried, and it's guard-wrapped.
     let (block, _recalled) = agent
-        .assemble_memory_context("personal", "where is the deploy key", true)
+        .assemble_memory_context("cv1", "personal", "where is the deploy key", true)
         .expect("some context to inject");
     assert!(block.contains("deploy key"), "shared fact is loaded on a cloud turn");
     assert!(!block.contains("Oak Street"), "cloud turn must NOT surface a private-local fact");
@@ -815,20 +815,20 @@ fn assemble_memory_context_is_endpoint_aware_and_profile_scoped() {
 
     // LOCAL turn (is_cloud=false): the private-local fact MAY appear.
     let (block_local, _) = agent
-        .assemble_memory_context("personal", "what is my home address", false)
+        .assemble_memory_context("cv1", "personal", "what is my home address", false)
         .expect("some context");
     assert!(block_local.contains("Oak Street"), "a local turn may surface private-local memory");
     assert!(!block_local.contains("work standup"));
 
     // A profile with no facts injects nothing.
-    assert!(agent.assemble_memory_context("school", "anything", true).is_none());
+    assert!(agent.assemble_memory_context("cv2", "school", "anything", true).is_none());
 
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
 fn assemble_memory_context_uses_the_meaning_lane_with_a_relevance_gate() {
-    use crate::embedder::{FakeEmbedder, TextEmbedder};
+    use crate::embedder::{EmbedderHandle, FakeEmbedder, TextEmbedder};
     use crate::storage::{MemoryBucket, MemoryFact};
     use std::sync::Arc;
 
@@ -858,7 +858,7 @@ fn assemble_memory_context_uses_the_meaning_lane_with_a_relevance_gate() {
     g.upsert_memory_embedding(MemoryBucket::Shared, "h", &fake.embed_passage("the heater was repaired in March").unwrap()).unwrap();
     g.upsert_memory_embedding(MemoryBucket::Shared, "g", &fake.embed_passage("groceries are delivered on Sundays").unwrap()).unwrap();
 
-    let agent = agent.with_embedder(Some(fake));
+    let agent = agent.with_embedder(Some(EmbedderHandle::ready(fake)));
 
     // "furnace" shares no keyword with either fact, but its vector sits on the
     // heater fact's axis → that one (and only that one) injects. The summary
@@ -866,13 +866,62 @@ fn assemble_memory_context_uses_the_meaning_lane_with_a_relevance_gate() {
     // the summary by checking the unrelated fact is absent from the relevance
     // wording. Simplest robust check: the block contains the heater fact.
     let (block, recalled) = agent
-        .assemble_memory_context("personal", "when did we fix the furnace?", false)
+        .assemble_memory_context("cv", "personal", "when did we fix the furnace?", false)
         .expect("context expected");
     assert!(block.contains("heater"), "meaning-lane match must inject");
     // recalled counts only relevance snippets (not the always-loaded summary):
     // exactly the heater fact — the groceries fact is past the distance gate
     // and shares no keywords.
     assert_eq!(recalled, 1, "only the semantically-near fact clears the inject gate");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn curated_summary_is_snapshotted_per_conversation() {
+    // Wave 1.3: the curated summary is frozen at a conversation's first turn.
+    // A fact saved mid-conversation shows up in the NEXT conversation's summary,
+    // not the current one (PLAN §9 "Timing and trust").
+    use crate::storage::{MemoryBucket, MemoryFact};
+    let (agent, storage, dir) = redaction_loop();
+    let g = storage.global();
+    let mk = |id: &str, content: &str| MemoryFact {
+        id: id.into(),
+        content: content.into(),
+        origin_profile: "personal".into(),
+        tags: None,
+        created_at: 1,
+        pinned: false,
+    };
+    // Fact A exists at the start. The query shares no keyword with either fact,
+    // so nothing arrives via the relevance lane — this isolates the summary.
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("a", "alpha the first note")).unwrap();
+
+    // First turn of conversation "cv" — freezes the summary (just A).
+    let (b1, _) = agent
+        .assemble_memory_context("cv", "personal", "zzz unrelated query", false)
+        .expect("summary A");
+    assert!(b1.contains("alpha"), "turn 1 sees fact A");
+    assert!(!b1.contains("bravo"), "fact B doesn't exist yet");
+
+    // Fact B is saved mid-conversation.
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("b", "bravo the second note")).unwrap();
+
+    // Same conversation, later turn — the snapshot is unchanged (no B).
+    let (b2, _) = agent
+        .assemble_memory_context("cv", "personal", "zzz unrelated query", false)
+        .expect("summary still A");
+    assert!(b2.contains("alpha"));
+    assert!(
+        !b2.contains("bravo"),
+        "a mid-conversation save must NOT rewrite the loaded summary"
+    );
+
+    // A fresh conversation re-snapshots and sees BOTH facts.
+    let (b3, _) = agent
+        .assemble_memory_context("cv2", "personal", "zzz unrelated query", false)
+        .expect("fresh summary A+B");
+    assert!(b3.contains("alpha") && b3.contains("bravo"), "next conversation sees the new fact");
 
     let _ = std::fs::remove_dir_all(dir);
 }

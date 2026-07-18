@@ -550,6 +550,46 @@ impl GlobalDb {
         Ok(facts)
     }
 
+    /// The curated-summary CANDIDATE SET for a profile, each fact tagged with
+    /// its bucket and ALWAYS including the private-local store (Wave 1.3). This
+    /// is the snapshot form: the conversation freezes this candidate set once at
+    /// turn 1, then the per-turn renderer drops the private-local facts on a
+    /// cloud turn (never queries them into a cloud prompt) and takes the top
+    /// `limit` of what survives. Freezing the SET — but filtering privacy and
+    /// truncating per turn — keeps the summary stable for prompt caching (PLAN
+    /// §9 "Timing and trust") without ever leaking a private fact onto a cloud
+    /// turn.
+    ///
+    /// Up to `limit` facts are kept **per bucket** (not `limit` across the
+    /// union), so a cloud turn — which drops the private-local ones — can still
+    /// render a full `limit` of shared facts, matching the pre-snapshot cloud
+    /// behavior. The caller applies the final per-turn `limit`.
+    pub fn curated_summary_with_buckets(
+        &self,
+        profile: &str,
+        limit: usize,
+    ) -> Result<Vec<(MemoryFact, MemoryBucket)>> {
+        let mut facts: Vec<(MemoryFact, MemoryBucket)> = self
+            .summary_from(MemoryBucket::Shared, profile, limit)?
+            .into_iter()
+            .map(|f| (f, MemoryBucket::Shared))
+            .collect();
+        facts.extend(
+            self.summary_from(MemoryBucket::PrivateLocal, profile, limit)?
+                .into_iter()
+                .map(|f| (f, MemoryBucket::PrivateLocal)),
+        );
+        facts.sort_by(|a, b| {
+            b.0.pinned
+                .cmp(&a.0.pinned)
+                .then(b.0.created_at.cmp(&a.0.created_at))
+        });
+        // NB: intentionally NOT truncated to `limit` here — the caller filters
+        // by endpoint privacy first, then takes the top `limit`, so a cloud turn
+        // isn't shorted by private facts that occupied union slots.
+        Ok(facts)
+    }
+
     /// All of a profile's memory facts, newest first, each tagged with its
     /// bucket. `include_private` gates the private-local store (pass `false`
     /// for any cloud-bound reader; `true` for the user's own local memory view).

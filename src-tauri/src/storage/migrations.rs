@@ -217,6 +217,22 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE classifier_settings
               ADD COLUMN redaction_enabled INTEGER NOT NULL DEFAULT 1;",
     },
+    Migration {
+        version: 6,
+        // Per-profile memory toggles (Wave 1). Single row (id=1): a missing row
+        // means defaults (semantic search ON, not walled). `semantic_search_enabled`
+        // is the meaning-lane off switch (PLAN §9); `walled` is the §7 memory
+        // island. Same dual-definition convention as v3/v4: the CREATE is
+        // IF NOT EXISTS and also lives in PROFILE_SCHEMA_SQL, so v6 is a no-op on
+        // a fresh install (v1 already created it) and a real upgrade on a v5 DB.
+        name: "memory_settings_table",
+        sql: "CREATE TABLE IF NOT EXISTS memory_settings (
+            id                      INTEGER PRIMARY KEY CHECK (id = 1),
+            semantic_search_enabled INTEGER NOT NULL DEFAULT 1,
+            walled                  INTEGER NOT NULL DEFAULT 0,
+            updated_at              INTEGER NOT NULL
+        );",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.

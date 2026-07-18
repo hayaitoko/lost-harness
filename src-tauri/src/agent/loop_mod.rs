@@ -43,7 +43,7 @@ use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
 use crate::hooks::{enforce_local_routing, RoutingRequirement};
 use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider};
-use crate::storage::{Message, ProfileDb, Storage, TrmLog};
+use crate::storage::{MemoryBucket, MemoryFact, Message, ProfileDb, Storage, TrmLog};
 use crate::tools::{ExecCtx, ToolDispatcher, TurnOutcome};
 
 // ── Event payloads ────────────────────────────────────────────────────────
@@ -85,9 +85,10 @@ pub struct LocalReroutePayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryEventPayload {
     pub conversation_id: String,
-    /// "recalled" (relevance-gated notes injected for this turn).
+    /// "recalled" (relevance-gated notes injected for this turn) or
+    /// "remembered" (a durable fact was just saved).
     pub kind: &'static str,
-    /// How many notes were recalled.
+    /// How many notes were recalled / remembered.
     pub count: usize,
 }
 
@@ -141,9 +142,19 @@ pub struct AgentLoop {
     /// The tool spine: registry + gating chain + body capabilities. Every
     /// tool call the agent makes goes through this (§3.3 `tools::dispatch`).
     tools: Arc<ToolDispatcher>,
-    /// Memory's meaning-lane embedder (PLAN §9), when its model is installed.
-    /// `None` ⇒ the automatic memory injection runs keyword-only.
-    embedder: Option<Arc<dyn crate::embedder::TextEmbedder>>,
+    /// Memory's meaning-lane embedder handle (PLAN §9), when its model is
+    /// installed. `None` ⇒ the automatic memory injection runs keyword-only.
+    /// Loading is lazy AND gated per-profile — the model is only pulled in when
+    /// a profile with semantic memory search enabled actually needs it (Wave 1.2).
+    embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
+    /// Per-conversation snapshot of the curated summary's candidate fact set
+    /// (Wave 1.3). Frozen at a conversation's first turn and reused for the rest
+    /// of it, so a mid-conversation `remember` doesn't churn the loaded summary
+    /// and the prompt prefix stays cache-stable (PLAN §9 "Timing and trust").
+    /// Keyed by conversation id; holds both buckets — the per-turn renderer
+    /// applies the endpoint privacy filter, so a private fact never rides a
+    /// cloud turn even though the frozen set includes it.
+    summary_cache: parking_lot::Mutex<std::collections::HashMap<String, Vec<(MemoryFact, MemoryBucket)>>>,
     stream_lock: tokio::sync::Mutex<()>,
 }
 
@@ -166,15 +177,17 @@ impl AgentLoop {
             storage,
             tools,
             embedder: None,
+            summary_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             stream_lock: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// Attach the memory embedder (meaning-lane hybrid search). Builder-style
-    /// so existing constructions stay valid; `None` keeps keyword-only.
+    /// Attach the memory embedder handle (meaning-lane hybrid search).
+    /// Builder-style so existing constructions stay valid; `None` keeps
+    /// keyword-only.
     pub fn with_embedder(
         mut self,
-        embedder: Option<Arc<dyn crate::embedder::TextEmbedder>>,
+        embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
     ) -> Self {
         self.embedder = embedder;
         self
@@ -441,6 +454,7 @@ impl AgentLoop {
     /// embedder the meaning lane is skipped (keyword-only, as before).
     pub(crate) fn assemble_memory_context(
         &self,
+        conversation_id: &str,
         profile: &str,
         content: &str,
         is_cloud: bool,
@@ -448,15 +462,60 @@ impl AgentLoop {
         const SUMMARY_LIMIT: usize = 8;
         const AUTO_RECALL_LIMIT: usize = 3;
         let allow_private = !is_cloud;
-        let global = self.storage.global();
+        // Route to the right memory store: the shared global.db, or a walled
+        // profile's own physically-separate DB (§7 / Wave 1.5). On any error we
+        // skip memory injection entirely — never block the send.
+        let mem = self.storage.memory_db_for_profile(profile).ok()?;
 
-        let summary = global
-            .curated_summary(profile, allow_private, SUMMARY_LIMIT)
-            .unwrap_or_default();
-        // Meaning-lane query vector, when the embedder is installed. Any
-        // failure degrades to keyword-only — never blocks the send.
-        let query_vec = self.embedder.as_ref().and_then(|e| e.embed_query(content).ok());
-        let hits = global
+        // Curated summary — SNAPSHOTTED per conversation (Wave 1.3). Freeze the
+        // full candidate set (both buckets) once at the conversation's first
+        // turn, then reuse it. A mid-conversation `remember` therefore doesn't
+        // rewrite the summary already loaded into this conversation; it shows up
+        // starting the NEXT conversation (PLAN §9). The private-local facts in
+        // the frozen set are filtered out per turn below on a cloud turn.
+        // Bound the snapshot cache so a very long-lived process with thousands of
+        // conversations can't grow it without limit (review finding). The
+        // snapshot is cheap to recompute, so on overflow we clear and re-freeze —
+        // only the pathological >CAP-conversations case is affected, and only by
+        // re-snapshotting (still correct, just not the original freeze).
+        const SUMMARY_CACHE_CAP: usize = 512;
+        let candidates = {
+            let mut cache = self.summary_cache.lock();
+            if let Some(c) = cache.get(conversation_id) {
+                c.clone()
+            } else {
+                if cache.len() >= SUMMARY_CACHE_CAP {
+                    cache.clear();
+                }
+                let c = mem
+                    .curated_summary_with_buckets(profile, SUMMARY_LIMIT)
+                    .unwrap_or_default();
+                cache.insert(conversation_id.to_string(), c.clone());
+                c
+            }
+        };
+        // Per-turn privacy filter over the frozen set: a cloud turn drops the
+        // private-local facts (they never enter a cloud prompt), a local turn
+        // keeps them. This only ever REMOVES facts, so the wall holds even
+        // though the snapshot froze the full set.
+        let summary: Vec<&MemoryFact> = candidates
+            .iter()
+            .filter(|(_, b)| allow_private || *b == MemoryBucket::Shared)
+            .map(|(f, _)| f)
+            .take(SUMMARY_LIMIT)
+            .collect();
+
+        // Meaning-lane query vector — only when semantic search is enabled for
+        // this profile (Wave 1.2) AND the embedder loads. Either off ⇒ the
+        // relevance search runs keyword-only. Any failure degrades to
+        // keyword-only; never blocks the send.
+        let embedder = if self.semantic_search_enabled(profile) {
+            self.embedder.as_ref().and_then(|h| h.get())
+        } else {
+            None
+        };
+        let query_vec = embedder.as_ref().and_then(|e| e.embed_query(content).ok());
+        let hits = mem
             .search_memory_scoped_hybrid(
                 content,
                 query_vec.as_deref(),
@@ -500,6 +559,17 @@ impl AgentLoop {
         }
         let wrapped = crate::tools::calling::guard_wrap("your saved memory", block.trim());
         Some((wrapped, fresh.len()))
+    }
+
+    /// Whether this profile has the meaning-lane (semantic memory search)
+    /// enabled (Wave 1.2). Defaults to `true` (on) when settings can't be read,
+    /// matching the pre-Wave-1 behavior.
+    fn semantic_search_enabled(&self, profile: &str) -> bool {
+        self.storage
+            .open_profile(profile)
+            .and_then(|db| db.memory_settings())
+            .map(|s| s.semantic_search_enabled)
+            .unwrap_or(true)
     }
 
     // ── helpers ─────────────────────────────────────────────────────────
@@ -590,7 +660,9 @@ impl AgentLoop {
         // content, endpoint-aware (private-local facts only on a non-cloud turn)
         // and profile-scoped. Injected right after the tool catalog so it's a
         // stable prefix. A recall fires a non-silent `memory:event`.
-        if let Some((block, recalled)) = self.assemble_memory_context(&profile, &content, is_cloud) {
+        if let Some((block, recalled)) =
+            self.assemble_memory_context(&conversation_id, &profile, &content, is_cloud)
+        {
             history.push(ChatMessage::system(block));
             if recalled > 0 {
                 emit_memory_event(&app, &conversation_id, "recalled", recalled);
@@ -899,8 +971,15 @@ impl AgentLoop {
 // ── free fns ─────────────────────────────────────────────────────────────
 
 /// Emit the non-silent memory signal (`memory:event`). Content-free: only a
-/// kind + count, so a recalled fact's text never rides the event.
-fn emit_memory_event(app: &AppHandle, conversation_id: &str, kind: &'static str, count: usize) {
+/// kind + count, so a recalled/remembered fact's text never rides the event.
+/// `pub(crate)` so the `remember` tool and the manual `save_memory` IPC can
+/// fire the "remembered" variant through the same channel (Wave 1.4).
+pub(crate) fn emit_memory_event(
+    app: &AppHandle,
+    conversation_id: &str,
+    kind: &'static str,
+    count: usize,
+) {
     let payload = MemoryEventPayload {
         conversation_id: conversation_id.to_string(),
         kind,

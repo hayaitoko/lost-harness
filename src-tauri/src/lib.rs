@@ -108,38 +108,26 @@ pub fn run() {
                 };
 
             // Memory's meaning-lane embedder (PLAN §9): stock bge-small-en-v1.5
-            // INT8 ONNX from <storage>/models/embedder/ — same runtime, install
-            // pattern, and graceful-absence shape as the classifier above.
-            // Missing model ⇒ memory search runs keyword-only, nothing breaks.
+            // INT8 ONNX from <storage>/models/embedder/. Wrapped in an
+            // `EmbedderHandle` so the ~34 MB model loads LAZILY and only when a
+            // profile with semantic memory search enabled actually needs it
+            // (Wave 1.2 — "loads only when the user's memory settings enable
+            // it"). The dir may not exist; the handle loads on first use and
+            // falls back to keyword-only if absent — so `Some` here means "a
+            // model dir is configured," not "already loaded."
             let embedder_models = base_path.join("models").join("embedder");
-            let embedder: Option<Arc<dyn crate::embedder::TextEmbedder>> =
-                match crate::embedder::OnnxEmbedder::load(&embedder_models) {
-                    Ok(e) => {
-                        tracing::info!(
-                            target: "lhp::memory",
-                            path = %embedder_models.display(),
-                            "loaded memory embedder (meaning-lane search active)"
-                        );
-                        Some(Arc::new(e))
-                    }
-                    Err(e) => {
-                        tracing::info!(
-                            target: "lhp::memory",
-                            reason = %e,
-                            "memory embedder unavailable — keyword-only memory search"
-                        );
-                        None
-                    }
-                };
+            let embedder: Option<Arc<crate::embedder::EmbedderHandle>> =
+                Some(crate::embedder::EmbedderHandle::lazy(embedder_models));
 
             // Boot-time backfill: embed any fact saved before the embedder was
-            // installed (or whose embed-on-save failed). Best-effort on a
-            // blocking thread — inference is sync CPU work; a failure only
-            // means those facts stay keyword-only until the next boot.
-            if let Some(emb) = embedder.clone() {
+            // installed (or whose embed-on-save failed), for profiles that have
+            // semantic search on — sweeping the shared store and every walled
+            // profile's own DB. Best-effort on a blocking thread; the handle
+            // only forces the model load if there's actually work to do.
+            if let Some(handle) = embedder.clone() {
                 let storage_bf = Arc::clone(&storage);
                 tauri::async_runtime::spawn_blocking(move || {
-                    backfill_memory_embeddings(&storage_bf, &emb);
+                    backfill_memory_embeddings(&storage_bf, &handle);
                 });
             }
 
@@ -172,6 +160,7 @@ pub fn run() {
                 Some(Arc::clone(&prompter)),
                 (*storage).clone(),
                 embedder.clone(),
+                Some(app.handle().clone()),
             ));
 
             let agent_loop = Arc::new(
@@ -221,6 +210,8 @@ pub fn run() {
             ipc::save_memory,
             ipc::delete_memory,
             ipc::set_memory_pinned,
+            ipc::get_memory_settings,
+            ipc::set_memory_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lost Harness");
@@ -292,13 +283,50 @@ fn hydrate_providers_from_storage(
 /// so a huge archive can't stall anything; the remainder catches up next boot.
 fn backfill_memory_embeddings(
     storage: &crate::storage::Storage,
-    embedder: &Arc<dyn crate::embedder::TextEmbedder>,
+    embedder: &Arc<crate::embedder::EmbedderHandle>,
+) {
+    // Per-profile "semantic search on?" cache — a fact is only embedded if its
+    // origin profile has the meaning lane enabled (Wave 1.2), so the "hard off
+    // switch for computing a meaning fingerprint" is honored on the catch-up
+    // path too.
+    let mut enabled: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+
+    // The shared store (facts from every non-walled profile live here).
+    backfill_one_memory_db(storage.global(), embedder, storage, &mut enabled);
+
+    // Each walled profile's own memory DB (§7 / Wave 1.5).
+    if let Ok(names) = storage.list_profile_names() {
+        for name in names {
+            let walled = storage
+                .open_profile(&name)
+                .and_then(|db| db.memory_settings())
+                .map(|s| s.walled)
+                .unwrap_or(false);
+            if !walled {
+                continue;
+            }
+            if let Ok(mem) = storage.memory_db_for_profile(&name) {
+                backfill_one_memory_db(&mem, embedder, storage, &mut enabled);
+            }
+        }
+    }
+}
+
+/// Backfill embeddings for one memory DB, skipping facts whose origin profile
+/// has semantic search off. The embedder loads (once, memoized) only when the
+/// first eligible fact is reached — so a fully-disabled/absent setup never
+/// forces the model load.
+fn backfill_one_memory_db(
+    mem: &crate::storage::GlobalDb,
+    embedder: &Arc<crate::embedder::EmbedderHandle>,
+    storage: &crate::storage::Storage,
+    enabled: &mut std::collections::HashMap<String, bool>,
 ) {
     use crate::storage::MemoryBucket;
     const BACKFILL_CAP_PER_BUCKET: usize = 512;
 
     for bucket in [MemoryBucket::Shared, MemoryBucket::PrivateLocal] {
-        let pending = match storage.global().facts_missing_embedding(bucket, BACKFILL_CAP_PER_BUCKET) {
+        let pending = match mem.facts_missing_embedding(bucket, BACKFILL_CAP_PER_BUCKET) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(target: "lhp::memory", error = %e, "embedding backfill: listing failed");
@@ -308,11 +336,22 @@ fn backfill_memory_embeddings(
         if pending.is_empty() {
             continue;
         }
-        let total = pending.len();
         let mut done = 0usize;
+        let total = pending.len();
         for fact in pending {
-            match embedder.embed_passage(&fact.content) {
-                Ok(v) => match storage.global().upsert_memory_embedding(bucket, &fact.id, &v) {
+            let on = *enabled
+                .entry(fact.origin_profile.clone())
+                .or_insert_with(|| {
+                    crate::tools::memory::semantic_search_enabled(storage, &fact.origin_profile)
+                });
+            if !on {
+                continue;
+            }
+            // Load the model on the first eligible fact; absent ⇒ stop (nothing
+            // to embed anywhere this pass).
+            let Some(emb) = embedder.get() else { return };
+            match emb.embed_passage(&fact.content) {
+                Ok(v) => match mem.upsert_memory_embedding(bucket, &fact.id, &v) {
                     Ok(()) => done += 1,
                     Err(e) => tracing::warn!(target: "lhp::memory", error = %e, fact = %fact.id,
                         "embedding backfill: store failed"),
@@ -325,13 +364,15 @@ fn backfill_memory_embeddings(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_tool_dispatcher(
     base_path: &std::path::Path,
     classifier: Arc<dyn crate::classifier::Classifier>,
     ledger: Arc<crate::hooks::ApprovalLedger>,
     approver: Option<Arc<dyn crate::hooks::ApprovalPrompter>>,
     storage: crate::storage::Storage,
-    embedder: Option<Arc<dyn crate::embedder::TextEmbedder>>,
+    embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
+    app_handle: Option<tauri::AppHandle>,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -376,7 +417,8 @@ fn build_tool_dispatcher(
     ));
     registry.register(Box::new(
         crate::tools::memory::RememberMemoryTool::new(storage.clone(), Arc::clone(&classifier))
-            .with_embedder(embedder),
+            .with_embedder(embedder)
+            .with_app_handle(app_handle),
     ));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`

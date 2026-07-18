@@ -74,10 +74,17 @@ unsafe impl Sync for Storage {}
 struct StorageInner {
     /// Absolute path of the storage root (e.g. `~/Documents/Lost-Harness/`).
     base_path: PathBuf,
-    global: GlobalDb,
+    global: Arc<GlobalDb>,
     /// Cached open profile DBs. Mutex is fine — connections are cheap to
     /// clone internally and the agent is single-threaded per profile.
     profiles: Mutex<std::collections::HashMap<String, Arc<ProfileDb>>>,
+    /// Cached open memory DBs for WALLED profiles (§7). A walled profile's
+    /// memory lives in its own physically-separate DB under `walled-memory/`,
+    /// never in `global.db` — so toggling the wall back off can't retroactively
+    /// spill what was written while private (the data was never in the shared
+    /// pool). Reuses the `GlobalDb` shape so all memory methods work unchanged;
+    /// the non-memory tables it also creates are simply unused.
+    walled_memory: Mutex<std::collections::HashMap<String, Arc<GlobalDb>>>,
 }
 
 impl Storage {
@@ -85,6 +92,12 @@ impl Storage {
     ///
     /// Creates `base_path/` and `base_path/profiles/` if missing, then
     /// opens `global.db` and runs migrations.
+    // The `GlobalDb` behind these `Arc`s wraps a `!Send`/`!Sync` rusqlite
+    // `Connection`; that is deliberate and made sound by the `unsafe impl Send +
+    // Sync for Storage` above (single-writer via the `Mutex<Storage>` at the
+    // AppState boundary — see the module docs). The lint doesn't see that
+    // invariant, so it's allowed here.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open(base_path: &Path) -> Result<Self> {
         std::fs::create_dir_all(base_path)
             .with_context(|| format!("creating storage root {}", base_path.display()))?;
@@ -99,15 +112,78 @@ impl Storage {
         Ok(Self {
             inner: Arc::new(StorageInner {
                 base_path: base_path.to_path_buf(),
-                global,
+                global: Arc::new(global),
                 profiles: Mutex::new(std::collections::HashMap::new()),
+                walled_memory: Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
 
-    /// Borrow the global DB.
+    /// Borrow the shared global DB.
     pub fn global(&self) -> &GlobalDb {
         &self.inner.global
+    }
+
+    /// The memory database a given profile's facts read from and write to
+    /// (Wave 1.5 / §7). A **shared** profile (the default) uses the shared
+    /// `global.db`; a **walled** profile uses its own physically-separate DB
+    /// under `walled-memory/<name>.db`, which is opened + cached on first use.
+    /// Every memory call site routes through here so the wall is enforced in
+    /// one place — a walled profile never touches `global.db`'s memory, and
+    /// vice versa.
+    ///
+    /// **Fail-safe direction for the wall (§7 invariant):** the two failure
+    /// modes are handled differently on purpose.
+    /// - `open_profile` returns `Err` — an invalid / degenerate name (path
+    ///   traversal, empty, a `Default` `ExecCtx` in a tool test). This is never
+    ///   a real walled profile — there's no island to protect, and no valid
+    ///   file path to route to — so it uses the shared store.
+    /// - the profile opens but its wall status is **unreadable** (a transient
+    ///   SQLite busy/I-O error, a corrupt settings table): we **fail closed** —
+    ///   propagate the `Err` rather than route a possibly-walled profile's
+    ///   memory to the shared `global.db`. Every caller already skips the memory
+    ///   op on `Err` (injection is dropped; a save/recall surfaces the error),
+    ///   so a wall is never breached just because its status couldn't be read.
+    ///   Defaulting the unreadable case to "shared" would be a privacy
+    ///   loosening, which the invariant forbids.
+    // See `Storage::open` re: the `arc_with_non_send_sync` allow.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn memory_db_for_profile(&self, profile: &str) -> Result<Arc<GlobalDb>> {
+        // An unopenable profile (invalid/degenerate name) has no island to
+        // protect and no valid path to route to → shared store.
+        let db = match self.open_profile(profile) {
+            Ok(db) => db,
+            Err(_) => return Ok(self.inner.global.clone()),
+        };
+        // The profile opened; its wall status must be READ successfully. A read
+        // error fails closed (propagates) — we never assume "not walled".
+        let walled = db
+            .memory_settings()
+            .context("resolving memory store: reading the profile's wall status (failing closed)")?
+            .walled;
+        if !walled {
+            return Ok(self.inner.global.clone());
+        }
+        // Fast path — already open.
+        if let Some(existing) = self.inner.walled_memory.lock().get(profile) {
+            return Ok(existing.clone());
+        }
+        // `open_profile` above already validated the name (rejects traversal),
+        // so the file name is safe to build. Walled memory DBs live in their own
+        // directory to avoid any collision with `profiles/<name>.db`.
+        let dir = self.inner.base_path.join("walled-memory");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating walled-memory dir {}", dir.display()))?;
+        let path = dir.join(format!("{profile}.db"));
+        let db = Arc::new(
+            GlobalDb::open(&path)
+                .with_context(|| format!("opening walled memory DB at {}", path.display()))?,
+        );
+        self.inner
+            .walled_memory
+            .lock()
+            .insert(profile.to_string(), db.clone());
+        Ok(db)
     }
 
     /// Open (or return the cached open handle for) a per-profile DB.

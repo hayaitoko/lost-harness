@@ -13,7 +13,7 @@
 //   - `list_providers() -> Vec<ProviderInfo>`
 //   - `remove_provider(id) -> bool`
 //   - `send_message(args: { content, conversation_id, binding, provider_id, model, profile }) -> SendMessageResponse`
-//   - `add_provider(args: { name, base_url, api_key, kind }) -> ProviderInfo`
+//   - `add_provider(args: { name, base_url, api_key, kind, supports_native_tools }) -> ProviderInfo`
 //   - `list_models(args: { provider_id }) -> Vec<String>`
 //   - `list_conversations(args: { profile }) -> Vec<ConversationInfo>`
 //   - `create_conversation(args: { name, binding, profile }) -> ConversationInfo`
@@ -64,6 +64,8 @@ export interface ProviderInfo {
   kind: string;
   /** Whether the provider's endpoint is a private/LAN address. */
   is_private: boolean;
+  /** Q1: whether the endpoint supports OpenAI-style native structured tool calls. */
+  supports_native_tools: boolean;
 }
 
 /** Mirrors `ConversationInfo` in ipc/mod.rs. */
@@ -180,8 +182,13 @@ export const MEMORY_EVENT = "memory:event";
 /** Payload of `memory:event`. Mirrors `MemoryEventPayload` in `loop_mod.rs`. */
 export interface MemoryEvent {
   conversation_id: string;
-  /** "recalled" — relevance-gated notes were injected for this answer. */
-  kind: "recalled";
+  /**
+   * "recalled" — relevance-gated notes were injected for this answer.
+   * "remembered" — a new note was saved (from a conversation turn, or a
+   * manual save from Settings — the latter emits with an empty
+   * `conversation_id`, so it won't surface a chat banner).
+   */
+  kind: "recalled" | "remembered";
   count: number;
 }
 
@@ -229,6 +236,7 @@ export async function addProvider(
   baseUrl: string,
   apiKey: string | null,
   kind: string,
+  supportsNativeTools: boolean,
 ): Promise<ProviderInfo> {
   if (isTauri()) {
     return tauriInvoke<ProviderInfo>("add_provider", {
@@ -237,10 +245,11 @@ export async function addProvider(
         base_url: baseUrl,
         api_key: apiKey || null,
         kind,
+        supports_native_tools: supportsNativeTools,
       },
     });
   }
-  return browserAddProvider(name, baseUrl, apiKey, kind);
+  return browserAddProvider(name, baseUrl, apiKey, kind, supportsNativeTools);
 }
 
 /** Removes a provider by id. */
@@ -596,6 +605,21 @@ export interface SaveMemoryResult {
   fact: MemoryInfo | null;
 }
 
+/** A profile's memory settings. Mirrors `MemorySettingsInfo` in `ipc/mod.rs`. */
+export interface MemorySettingsInfo {
+  /** Whether saved notes get a semantic (embedding) fingerprint for recall. */
+  semantic_search_enabled: boolean;
+  /** Whether this profile's memory store is physically separate ("walled") vs shared. */
+  walled: boolean;
+}
+
+const DEFAULT_MEMORY_SETTINGS: MemorySettingsInfo = {
+  semantic_search_enabled: true,
+  // Shared by default — matches the backend default (§7). A profile only
+  // becomes a walled island when the user explicitly turns it on.
+  walled: false,
+};
+
 /** List a profile's memory facts (both buckets — the user's own local view). */
 export async function listMemory(profile: string): Promise<MemoryInfo[]> {
   if (isTauri()) {
@@ -612,20 +636,53 @@ export async function saveMemory(profile: string, content: string): Promise<Save
   return { sensitivity: "shared", fact: null };
 }
 
-/** Forget a memory fact by id. */
-export async function deleteMemory(id: string): Promise<boolean> {
+/** Forget a memory fact by id, within the given profile's store. */
+export async function deleteMemory(profile: string, id: string): Promise<boolean> {
   if (isTauri()) {
-    return tauriInvoke<boolean>("delete_memory", { args: { id } });
+    return tauriInvoke<boolean>("delete_memory", { args: { profile, id } });
   }
   return false;
 }
 
-/** Pin/unpin a fact into the always-loaded curated summary. */
-export async function setMemoryPinned(id: string, pinned: boolean): Promise<boolean> {
+/** Pin/unpin a fact into the always-loaded curated summary, within the given profile's store. */
+export async function setMemoryPinned(
+  profile: string,
+  id: string,
+  pinned: boolean,
+): Promise<boolean> {
   if (isTauri()) {
-    return tauriInvoke<boolean>("set_memory_pinned", { args: { id, pinned } });
+    return tauriInvoke<boolean>("set_memory_pinned", { args: { profile, id, pinned } });
   }
   return false;
+}
+
+/** The active memory settings for a profile (defaults when unset). */
+export async function getMemorySettings(profile: string): Promise<MemorySettingsInfo> {
+  if (isTauri()) {
+    return tauriInvoke<MemorySettingsInfo>("get_memory_settings", { args: { profile } });
+  }
+  return browserGetMemorySettings(profile);
+}
+
+/** Persist a profile's memory settings. Returns the stored settings. */
+export async function setMemorySettings(
+  profile: string,
+  semanticSearchEnabled: boolean,
+  walled: boolean,
+): Promise<MemorySettingsInfo> {
+  if (isTauri()) {
+    return tauriInvoke<MemorySettingsInfo>("set_memory_settings", {
+      args: {
+        profile,
+        semantic_search_enabled: semanticSearchEnabled,
+        walled,
+      },
+    });
+  }
+  return browserSetMemorySettings(profile, {
+    semantic_search_enabled: semanticSearchEnabled,
+    walled,
+  });
 }
 
 // ── Browser fallback (used when running outside Tauri) ──────────────────────
@@ -674,6 +731,7 @@ function browserAddProvider(
   baseUrl: string,
   _apiKey: string | null,
   kind: string,
+  supportsNativeTools: boolean,
 ): ProviderInfo {
   const id = crypto.randomUUID();
   const info: ProviderInfo = {
@@ -682,6 +740,7 @@ function browserAddProvider(
     base_url: baseUrl,
     kind,
     is_private: kind === "local",
+    supports_native_tools: supportsNativeTools,
   };
   const list = browserListProviders();
   list.push(info);
@@ -792,6 +851,34 @@ function chunkReply(text: string): string[] {
   }
   if (buf) out.push(buf);
   return out;
+}
+
+// ── Memory settings browser fallback ────────────────────────────────────────
+
+const BROWSER_MEMORY_SETTINGS_PREFIX = "lh.memorySettings.v1.";
+
+function browserGetMemorySettings(profile: string): MemorySettingsInfo {
+  if (typeof localStorage === "undefined") return { ...DEFAULT_MEMORY_SETTINGS };
+  try {
+    const raw = localStorage.getItem(BROWSER_MEMORY_SETTINGS_PREFIX + profile);
+    return raw ? { ...DEFAULT_MEMORY_SETTINGS, ...(JSON.parse(raw) as MemorySettingsInfo) } : { ...DEFAULT_MEMORY_SETTINGS };
+  } catch {
+    return { ...DEFAULT_MEMORY_SETTINGS };
+  }
+}
+
+function browserSetMemorySettings(
+  profile: string,
+  settings: MemorySettingsInfo,
+): MemorySettingsInfo {
+  if (typeof localStorage !== "undefined") {
+    try {
+      localStorage.setItem(BROWSER_MEMORY_SETTINGS_PREFIX + profile, JSON.stringify(settings));
+    } catch {
+      // non-fatal
+    }
+  }
+  return { ...settings };
 }
 
 // Exported for tests / mock-driven scenarios.

@@ -1112,6 +1112,72 @@ impl ProfileDb {
             .context("upsert classifier_settings redaction toggle")?;
         Ok(())
     }
+
+    // ── memory_settings (Wave 1 — per-profile memory toggles) ─────────────────
+    //
+    // A single row (id=1). Absence = defaults: semantic search ON (hybrid
+    // memory as before), NOT walled (memory lives in the shared global.db).
+
+    /// This profile's memory settings, defaulting when no row exists.
+    pub fn memory_settings(&self) -> Result<MemorySettings> {
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT semantic_search_enabled, walled FROM memory_settings WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .context("read memory_settings row")?;
+        Ok(match row {
+            Some((semantic, walled)) => MemorySettings {
+                semantic_search_enabled: semantic != 0,
+                walled: walled != 0,
+            },
+            None => MemorySettings::default(),
+        })
+    }
+
+    /// Persist this profile's memory settings (upsert the single row).
+    pub fn set_memory_settings(&self, s: &MemorySettings) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO memory_settings
+                     (id, semantic_search_enabled, walled, updated_at)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                     semantic_search_enabled = excluded.semantic_search_enabled,
+                     walled = excluded.walled,
+                     updated_at = excluded.updated_at",
+                params![s.semantic_search_enabled as i64, s.walled as i64, now],
+            )
+            .context("upsert memory_settings")?;
+        Ok(())
+    }
+}
+
+/// Per-profile memory toggles (Wave 1). Defaults preserve the pre-Wave-1
+/// behavior exactly: semantic (meaning-lane) search on, memory shared in
+/// `global.db`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySettings {
+    /// Whether the meaning-lane embedder is loaded + used (PLAN §9). Off ⇒
+    /// memory search runs keyword-only and no embeddings are computed.
+    pub semantic_search_enabled: bool,
+    /// The §7 "keep this profile's memory private" island. When set, this
+    /// profile's memory reads/writes route to its own physically-separate
+    /// memory DB instead of the shared `global.db`.
+    pub walled: bool,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            semantic_search_enabled: true,
+            walled: false,
+        }
+    }
 }
 
 fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {

@@ -18,22 +18,38 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use tauri::AppHandle;
+
 use crate::classifier::rules::RuleCategory;
 use crate::classifier::{Classification, Classifier, Label};
-use crate::embedder::TextEmbedder;
-use crate::storage::{MemoryBucket, MemoryFact, Storage, SEMANTIC_MAX_DIST_RECALL};
+use crate::embedder::{EmbedderHandle, TextEmbedder};
+use crate::storage::{GlobalDb, MemoryBucket, MemoryFact, Storage, SEMANTIC_MAX_DIST_RECALL};
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
 /// How many matches `recall_memory` returns (PLAN §9: "only the top handful").
 const RECALL_LIMIT: usize = 5;
 
+/// Whether a profile has the meaning-lane (semantic memory search) enabled
+/// (Wave 1.2). Defaults to `true` when settings can't be read, matching the
+/// pre-Wave-1 behavior. Central so the recall/remember tools and the loop agree.
+pub fn semantic_search_enabled(storage: &Storage, profile: &str) -> bool {
+    storage
+        .open_profile(profile)
+        .and_then(|db| db.memory_settings())
+        .map(|s| s.semantic_search_enabled)
+        .unwrap_or(true)
+}
+
 /// Best-effort embed-and-index of a just-saved fact into its bucket's vector
 /// table — the meaning lane of hybrid search. Canonical here so the agent's
-/// `remember` and the manual `save_memory` IPC index identically. Failure is
-/// logged, never propagated: the fact is already saved, and the boot-time
-/// backfill (`facts_missing_embedding`) re-tries any fact left unindexed.
+/// `remember` and the manual `save_memory` IPC index identically. `mem` is the
+/// resolved memory DB the fact was written to (shared global, or a walled
+/// profile's own DB) — so the embedding lands in the SAME store as the fact
+/// (Wave 1.5). Failure is logged, never propagated: the fact is already saved,
+/// and the boot-time backfill (`facts_missing_embedding`) re-tries any fact left
+/// unindexed.
 pub fn embed_fact_best_effort(
-    storage: &Storage,
+    mem: &GlobalDb,
     embedder: Option<&Arc<dyn TextEmbedder>>,
     bucket: MemoryBucket,
     fact: &MemoryFact,
@@ -41,7 +57,7 @@ pub fn embed_fact_best_effort(
     let Some(emb) = embedder else { return };
     match emb.embed_passage(&fact.content) {
         Ok(v) => {
-            if let Err(e) = storage.global().upsert_memory_embedding(bucket, &fact.id, &v) {
+            if let Err(e) = mem.upsert_memory_embedding(bucket, &fact.id, &v) {
                 tracing::warn!(target: "lhp::memory", error = %e, fact = %fact.id,
                     "failed to store memory embedding (backfill will retry)");
             }
@@ -83,7 +99,7 @@ pub fn route_memory_sensitivity(c: &Classification) -> MemoryRoute {
 /// meaning lane of the hybrid search (keyword-only otherwise).
 pub struct RecallMemoryTool {
     storage: Storage,
-    embedder: Option<Arc<dyn TextEmbedder>>,
+    embedder: Option<Arc<EmbedderHandle>>,
 }
 
 impl RecallMemoryTool {
@@ -94,7 +110,7 @@ impl RecallMemoryTool {
         }
     }
 
-    pub fn with_embedder(mut self, embedder: Option<Arc<dyn TextEmbedder>>) -> Self {
+    pub fn with_embedder(mut self, embedder: Option<Arc<EmbedderHandle>>) -> Self {
         self.embedder = embedder;
         self
     }
@@ -132,11 +148,24 @@ impl Tool for RecallMemoryTool {
                     )
                 }
             };
+            // Route to the profile's memory store — shared global.db, or a
+            // walled profile's own physically-separate DB (Wave 1.5). An error
+            // here fails the recall (rather than silently searching the wrong
+            // store).
+            let mem = match self.storage.memory_db_for_profile(&ctx.profile) {
+                Ok(m) => m,
+                Err(e) => return ToolResult::Err(format!("recall_memory failed: {e}")),
+            };
             // Hybrid search: keyword (FTS) + meaning (sqlite-vec) fused by
-            // rank, when the embedder is installed; keyword-only otherwise. An
-            // embed failure degrades to keyword-only rather than failing the
-            // recall.
-            let query_vec = self.embedder.as_ref().and_then(|e| {
+            // rank, when semantic search is enabled for this profile (Wave 1.2)
+            // AND the embedder loads; keyword-only otherwise. An embed failure
+            // degrades to keyword-only rather than failing the recall.
+            let embedder = if semantic_search_enabled(&self.storage, &ctx.profile) {
+                self.embedder.as_ref().and_then(|h| h.get())
+            } else {
+                None
+            };
+            let query_vec = embedder.as_ref().and_then(|e| {
                 e.embed_query(&query)
                     .map_err(|err| {
                         tracing::warn!(target: "lhp::memory", error = %err,
@@ -149,7 +178,7 @@ impl Tool for RecallMemoryTool {
             // only from the ACTIVE profile — shared facts are cross-profile (one
             // coherent memory, §7), but a private-local fact never crosses the
             // profile boundary. A cloud turn stays shared-only.
-            match self.storage.global().search_memory_for_recall_hybrid(
+            match mem.search_memory_for_recall_hybrid(
                 &query,
                 query_vec.as_deref(),
                 &ctx.profile,
@@ -183,7 +212,11 @@ impl Tool for RecallMemoryTool {
 pub struct RememberMemoryTool {
     storage: Storage,
     classifier: Arc<dyn Classifier>,
-    embedder: Option<Arc<dyn TextEmbedder>>,
+    embedder: Option<Arc<EmbedderHandle>>,
+    /// The app handle, when running inside the real Tauri app, so a save can
+    /// fire the non-silent "remembered" `memory:event` (Wave 1.4). `None` in
+    /// tests — the save still happens, just without the UI signal.
+    app: Option<AppHandle>,
 }
 
 impl RememberMemoryTool {
@@ -192,11 +225,19 @@ impl RememberMemoryTool {
             storage,
             classifier,
             embedder: None,
+            app: None,
         }
     }
 
-    pub fn with_embedder(mut self, embedder: Option<Arc<dyn TextEmbedder>>) -> Self {
+    pub fn with_embedder(mut self, embedder: Option<Arc<EmbedderHandle>>) -> Self {
         self.embedder = embedder;
+        self
+    }
+
+    /// Attach the Tauri app handle so a successful save emits the non-silent
+    /// "remembered" event (Wave 1.4).
+    pub fn with_app_handle(mut self, app: Option<AppHandle>) -> Self {
+        self.app = app;
         self
     }
 }
@@ -264,9 +305,31 @@ impl Tool for RememberMemoryTool {
                 created_at: chrono::Utc::now().timestamp(),
                 pinned: false,
             };
-            match self.storage.global().insert_memory_fact_in(bucket, &fact) {
+            // Route to the profile's memory store — shared global.db, or a
+            // walled profile's own physically-separate DB (Wave 1.5).
+            let mem = match self.storage.memory_db_for_profile(&ctx.profile) {
+                Ok(m) => m,
+                Err(e) => return ToolResult::Err(format!("remember failed: {e}")),
+            };
+            match mem.insert_memory_fact_in(bucket, &fact) {
                 Ok(()) => {
-                    embed_fact_best_effort(&self.storage, self.embedder.as_ref(), bucket, &fact);
+                    // Meaning-lane index — gated by the profile's semantic
+                    // setting (Wave 1.2) and written to the SAME store as the fact.
+                    let embedder = if semantic_search_enabled(&self.storage, &ctx.profile) {
+                        self.embedder.as_ref().and_then(|h| h.get())
+                    } else {
+                        None
+                    };
+                    embed_fact_best_effort(&mem, embedder.as_ref(), bucket, &fact);
+                    // Non-silent "remembered" signal (Wave 1.4) — content-free.
+                    if let Some(app) = &self.app {
+                        crate::agent::loop_mod::emit_memory_event(
+                            app,
+                            &ctx.conversation_id,
+                            "remembered",
+                            1,
+                        );
+                    }
                     ToolResult::Ok(json!({
                     "saved": true,
                     "sensitivity": if bucket == MemoryBucket::PrivateLocal {
@@ -600,9 +663,10 @@ mod hybrid_tests {
             pinned: false,
         };
         storage.global().insert_memory_fact_in(MemoryBucket::Shared, &fact).unwrap();
-        embed_fact_best_effort(&storage, Some(&fake), MemoryBucket::Shared, &fact);
+        embed_fact_best_effort(storage.global(), Some(&fake), MemoryBucket::Shared, &fact);
 
-        let tool = RecallMemoryTool::new(storage.clone()).with_embedder(Some(fake));
+        let tool =
+            RecallMemoryTool::new(storage.clone()).with_embedder(Some(EmbedderHandle::ready(fake)));
         // Zero keyword overlap with the fact (and stopwords don't count).
         match tool
             .run(ToolInput::new(json!({ "query": "sign-in secret" })), &ExecCtx::default())
@@ -626,7 +690,7 @@ mod hybrid_tests {
             storage.clone(),
             Arc::new(crate::classifier::RulesClassifier::new()),
         )
-        .with_embedder(Some(fake));
+        .with_embedder(Some(EmbedderHandle::ready(fake)));
 
         let saved_id = match tool
             .run(
@@ -641,6 +705,65 @@ mod hybrid_tests {
         let vecs = storage.global().list_vectors_for_fact(&saved_id).unwrap();
         assert_eq!(vecs.len(), 1, "remember must index the fact for the meaning lane");
         assert_eq!(vecs[0].embedding.len(), 8 * 4, "8-dim f32 blob");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Wave 1.2: with semantic search OFF for the profile, `remember` must NOT
+    /// compute or store an embedding (the "hard off switch for computing a
+    /// meaning fingerprint of everything I save"); turning it on restores it.
+    #[tokio::test]
+    async fn remember_skips_embedding_when_semantic_search_off() {
+        use crate::storage::MemorySettings;
+        let (storage, root) = temp_storage();
+        let fake: Arc<dyn TextEmbedder> = Arc::new(FakeEmbedder(vec![("standup", 1)]));
+        let tool = RememberMemoryTool::new(
+            storage.clone(),
+            Arc::new(crate::classifier::RulesClassifier::new()),
+        )
+        .with_embedder(Some(EmbedderHandle::ready(fake)));
+        let ctx = ExecCtx {
+            conversation_id: "c".into(),
+            profile: "personal".into(),
+            reads: None,
+            allow_private_memory: false,
+        };
+
+        // Semantic OFF → no vector stored.
+        storage
+            .open_profile("personal")
+            .unwrap()
+            .set_memory_settings(&MemorySettings { semantic_search_enabled: false, walled: false })
+            .unwrap();
+        let off_id = match tool
+            .run(ToolInput::new(json!({ "content": "the standup is at 10am" })), &ctx)
+            .await
+        {
+            ToolResult::Ok(v) => v["id"].as_str().unwrap().to_string(),
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        };
+        assert!(
+            storage.global().list_vectors_for_fact(&off_id).unwrap().is_empty(),
+            "semantic off ⇒ no meaning fingerprint computed"
+        );
+
+        // Semantic ON → vector stored.
+        storage
+            .open_profile("personal")
+            .unwrap()
+            .set_memory_settings(&MemorySettings { semantic_search_enabled: true, walled: false })
+            .unwrap();
+        let on_id = match tool
+            .run(ToolInput::new(json!({ "content": "the standup moved to 9am" })), &ctx)
+            .await
+        {
+            ToolResult::Ok(v) => v["id"].as_str().unwrap().to_string(),
+            ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
+        };
+        assert_eq!(
+            storage.global().list_vectors_for_fact(&on_id).unwrap().len(),
+            1,
+            "semantic on ⇒ the meaning lane indexes the fact"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

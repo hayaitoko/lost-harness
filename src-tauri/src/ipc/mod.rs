@@ -63,9 +63,10 @@ pub struct AppState {
     /// shared with the §7 gate. Backs `explain_classification` for the
     /// annotated-redaction "why" sidebar (PLAN §11).
     pub classifier: Arc<dyn crate::classifier::Classifier>,
-    /// Memory's meaning-lane embedder (PLAN §9) when its model is installed;
-    /// `None` ⇒ saves are keyword-indexed only (backfill embeds them later).
-    pub embedder: Option<Arc<dyn crate::embedder::TextEmbedder>>,
+    /// Memory's meaning-lane embedder handle (PLAN §9). Loads lazily + only
+    /// when a profile has semantic search enabled (Wave 1.2); `None` ⇒ no model
+    /// dir configured, saves stay keyword-indexed.
+    pub embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
 }
 
 // ── Response types ───────────────────────────────────────────────────────
@@ -975,7 +976,8 @@ pub fn list_memory(
 ) -> Result<Vec<MemoryInfo>, String> {
     state
         .storage
-        .global()
+        .memory_db_for_profile(&args.profile)
+        .map_err(|e| e.to_string())?
         .list_memory_by_profile(&args.profile, true)
         .map(|rows| rows.into_iter().map(|(f, b)| to_memory_info(f, b)).collect())
         .map_err(|e| e.to_string())
@@ -997,7 +999,11 @@ pub struct SaveMemoryResult {
 
 /// Save a memory fact, routing it by sensitivity (PLAN §9). A credential is
 /// dropped (never-persist); a private fact goes to the local-only store; a
-/// benign fact to the shared store. Returns the saved fact (or null if dropped).
+/// benign fact to the shared store. Writes go to the profile's memory store —
+/// shared global.db, or a walled profile's own DB (Wave 1.5). Returns the saved
+/// fact (or null if dropped) — the Settings pane surfaces that outcome (the
+/// non-silent trace for a manual save; the agent's `remember` tool fires the
+/// in-chat "remembered" event, Wave 1.4).
 #[tauri::command]
 pub fn save_memory(
     state: State<'_, AppState>,
@@ -1030,18 +1036,20 @@ pub fn save_memory(
         created_at: chrono::Utc::now().timestamp(),
         pinned: false,
     };
-    state
+    let mem = state
         .storage
-        .global()
-        .insert_memory_fact_in(bucket, &fact)
+        .memory_db_for_profile(&args.profile)
         .map_err(|e| e.to_string())?;
-    // Meaning-lane index (best-effort; identical to the agent's `remember`).
-    crate::tools::memory::embed_fact_best_effort(
-        &state.storage,
-        state.embedder.as_ref(),
-        bucket,
-        &fact,
-    );
+    mem.insert_memory_fact_in(bucket, &fact)
+        .map_err(|e| e.to_string())?;
+    // Meaning-lane index (best-effort; identical to the agent's `remember`) —
+    // gated by the profile's semantic setting (Wave 1.2), written to the same store.
+    let embedder = if crate::tools::memory::semantic_search_enabled(&state.storage, &args.profile) {
+        state.embedder.as_ref().and_then(|h| h.get())
+    } else {
+        None
+    };
+    crate::tools::memory::embed_fact_best_effort(&mem, embedder.as_ref(), bucket, &fact);
     Ok(SaveMemoryResult {
         sensitivity: bucket_str(bucket).to_string(),
         fact: Some(to_memory_info(fact, bucket)),
@@ -1050,21 +1058,28 @@ pub fn save_memory(
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryIdArgs {
+    /// The active profile, so a walled profile's fact is deleted from its own
+    /// memory DB rather than looked for in the shared store (Wave 1.5).
+    pub profile: String,
     pub id: String,
 }
 
-/// Forget a memory fact by id (checks both buckets).
+/// Forget a memory fact by id (checks both buckets), in the profile's memory
+/// store (shared global.db or a walled profile's own DB).
 #[tauri::command]
 pub fn delete_memory(state: State<'_, AppState>, args: MemoryIdArgs) -> Result<bool, String> {
     state
         .storage
-        .global()
+        .memory_db_for_profile(&args.profile)
+        .map_err(|e| e.to_string())?
         .delete_memory_fact(&args.id)
         .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetMemoryPinnedArgs {
+    /// The active profile (walled routing — see [`MemoryIdArgs`]).
+    pub profile: String,
     pub id: String,
     pub pinned: bool,
 }
@@ -1077,9 +1092,77 @@ pub fn set_memory_pinned(
 ) -> Result<bool, String> {
     state
         .storage
-        .global()
+        .memory_db_for_profile(&args.profile)
+        .map_err(|e| e.to_string())?
         .set_memory_pinned(&args.id, args.pinned)
         .map_err(|e| e.to_string())
+}
+
+// ── memory settings (Wave 1 — per-profile memory toggles) ─────────────────
+
+/// A profile's memory toggles for the UI (Wave 1.2 + 1.5).
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySettingsInfo {
+    /// Meaning-lane (semantic) memory search on/off (PLAN §9).
+    pub semantic_search_enabled: bool,
+    /// The §7 memory island — this profile's memory lives in its own DB.
+    pub walled: bool,
+}
+
+impl From<crate::storage::MemorySettings> for MemorySettingsInfo {
+    fn from(s: crate::storage::MemorySettings) -> Self {
+        Self {
+            semantic_search_enabled: s.semantic_search_enabled,
+            walled: s.walled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetMemorySettingsArgs {
+    pub profile: String,
+}
+
+/// The active memory settings for a profile (defaults when unset).
+#[tauri::command]
+pub fn get_memory_settings(
+    state: State<'_, AppState>,
+    args: GetMemorySettingsArgs,
+) -> Result<MemorySettingsInfo, String> {
+    state
+        .storage
+        .open_profile(&args.profile)
+        .and_then(|db| db.memory_settings())
+        .map(MemorySettingsInfo::from)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetMemorySettingsArgs {
+    pub profile: String,
+    pub semantic_search_enabled: bool,
+    pub walled: bool,
+}
+
+/// Persist a profile's memory settings. Returns the stored settings. Note the
+/// wall is physical (§7): flipping `walled` on routes future reads/writes to
+/// this profile's own memory DB; flipping it back off does NOT merge that DB's
+/// facts into the shared store — the wall survives the toggle by construction.
+#[tauri::command]
+pub fn set_memory_settings(
+    state: State<'_, AppState>,
+    args: SetMemorySettingsArgs,
+) -> Result<MemorySettingsInfo, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    let settings = crate::storage::MemorySettings {
+        semantic_search_enabled: args.semantic_search_enabled,
+        walled: args.walled,
+    };
+    db.set_memory_settings(&settings).map_err(|e| e.to_string())?;
+    Ok(MemorySettingsInfo::from(settings))
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────
