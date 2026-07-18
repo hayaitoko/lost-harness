@@ -147,6 +147,17 @@ pub fn run() {
                     std::time::Duration::from_secs(300),
                 ));
 
+            // The blocking `ask_human` tool's prompter + its pending-question
+            // registry (shared with `resolve_ask_human`). Longer timeout than
+            // an approval: answering a question is deliberative.
+            let ask_human = Arc::new(crate::ipc::ask_human::AskHumanRegistry::new());
+            let human_prompter: Arc<dyn crate::tools::ask_human::HumanPrompter> =
+                Arc::new(crate::ipc::ask_human::TauriHumanPrompter::new(
+                    app.handle().clone(),
+                    Arc::clone(&ask_human),
+                    std::time::Duration::from_secs(600),
+                ));
+
             // §3 tool spine: workspace-confined read-only tools behind the
             // unified pretooluse hook chain, filtered by this body's caps.
             // State-changing tools (a later round) route through the approval
@@ -161,6 +172,7 @@ pub fn run() {
                 (*storage).clone(),
                 embedder.clone(),
                 Some(app.handle().clone()),
+                Some(Arc::clone(&human_prompter)),
             ));
 
             let agent_loop = Arc::new(
@@ -178,6 +190,7 @@ pub fn run() {
                 model_manager,
                 storage,
                 approvals,
+                ask_human,
                 classifier: Arc::clone(&classifier),
                 embedder,
             };
@@ -199,6 +212,7 @@ pub fn run() {
             ipc::list_models,
             ipc::send_message,
             ipc::resolve_tool_approval,
+            ipc::resolve_ask_human,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,
@@ -365,6 +379,7 @@ fn backfill_one_memory_db(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // wiring seam: one place threads every tool dep.
 fn build_tool_dispatcher(
     base_path: &std::path::Path,
     classifier: Arc<dyn crate::classifier::Classifier>,
@@ -373,6 +388,7 @@ fn build_tool_dispatcher(
     storage: crate::storage::Storage,
     embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
     app_handle: Option<tauri::AppHandle>,
+    human_prompter: Option<Arc<dyn crate::tools::ask_human::HumanPrompter>>,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -446,6 +462,13 @@ fn build_tool_dispatcher(
     // destination; every hop re-validated (scheme + private-host + DNS/IP
     // block-list) so it can never reach localhost/RFC-1918/metadata.
     registry.register(Box::new(crate::tools::fetch::FetchUrlTool::new()));
+    // Wave 2.1: the single blocking "ask the user" tool. Safe → pre-trusted
+    // (asking a question has no side effect); it blocks the loop until the user
+    // answers via `resolve_ask_human`. `None` prompter (no UI) ⇒ it reports
+    // "no interactive user" instead of hanging.
+    registry.register(Box::new(crate::tools::ask_human::AskHumanTool::new(
+        human_prompter,
+    )));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
     // scratch dir, network off by default, killed on timeout, OS-sandboxed via

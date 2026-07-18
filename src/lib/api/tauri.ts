@@ -450,6 +450,50 @@ export async function resolveToolApproval(
   return true;
 }
 
+// ── ask_human (the blocking "ask the user" tool) ────────────────────────────
+
+export const ASK_HUMAN_REQUEST_EVENT = "tool:ask_human_request";
+
+/**
+ * Payload of `tool:ask_human_request`. Mirrors `AskHumanRequestPayload` in
+ * `ipc/ask_human.rs`. Raised when the agent calls `ask_human`; answer with
+ * `resolveAskHuman(id, text)` or decline with `resolveAskHuman(id, null)`.
+ */
+export interface AskHumanRequest {
+  id: string;
+  conversation_id: string;
+  /** The question — model-authored, display-only (render as text, not markup). */
+  question: string;
+}
+
+/** Callback shape for `onAskHumanRequest`. */
+export type AskHumanCallback = (payload: AskHumanRequest) => void;
+
+/**
+ * Subscribes to `tool:ask_human_request` events. Returns an unlisten function.
+ * In browser mode this is a no-op (the mock backend never asks).
+ */
+export async function onAskHumanRequest(callback: AskHumanCallback): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<AskHumanRequest>(ASK_HUMAN_REQUEST_EVENT, (event) => {
+      callback(event.payload);
+    });
+  }
+  return () => {};
+}
+
+/**
+ * Delivers the user's answer to a pending `ask_human` question. Pass the typed
+ * text, or `null` to decline (the tool reports "not answered"). Returns false
+ * if the id is unknown — already answered, or it timed out.
+ */
+export async function resolveAskHuman(id: string, answer: string | null): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("resolve_ask_human", { args: { id, answer } });
+  }
+  return true;
+}
+
 /** A persisted "Always allow" rule. Mirrors `ToolRuleInfo` in `ipc/mod.rs`. */
 export interface ToolRule {
   id: string;

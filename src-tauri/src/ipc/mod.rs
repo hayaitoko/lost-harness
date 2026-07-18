@@ -32,6 +32,7 @@
 mod contract_tests;
 
 pub mod approval;
+pub mod ask_human;
 
 use std::sync::Arc;
 
@@ -43,6 +44,7 @@ use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
 use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget, PermissionMode, ToolRule};
 use crate::ipc::approval::ApprovalRegistry;
+use crate::ipc::ask_human::AskHumanRegistry;
 use crate::models::{ModelManager, Provider, ProviderKind};
 use crate::storage::{Conversation, Message, Storage};
 
@@ -59,6 +61,9 @@ pub struct AppState {
     /// In-flight tool-approval prompts (§3.5). The dispatcher parks a request
     /// here and awaits it; `resolve_tool_approval` answers by id.
     pub approvals: Arc<ApprovalRegistry>,
+    /// In-flight `ask_human` prompts. The tool parks a question here and awaits
+    /// it; `resolve_ask_human` delivers the user's answer by id.
+    pub ask_human: Arc<AskHumanRegistry>,
     /// The active privacy classifier (trained ensemble or rules-only fallback),
     /// shared with the §7 gate. Backs `explain_classification` for the
     /// annotated-redaction "why" sidebar (PLAN §11).
@@ -549,6 +554,32 @@ pub fn resolve_tool_approval(
         ApprovalDecision::Approve(scope, target)
     });
     Ok(answered)
+}
+
+/// Args for `resolve_ask_human`: the request id and the user's answer. A
+/// `None`/absent `answer` = declined (the tool reports "not answered").
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveAskHumanArgs {
+    pub id: String,
+    #[serde(default)]
+    pub answer: Option<String>,
+}
+
+/// Deliver the user's answer to a parked `ask_human` question. Touches only the
+/// ask-human registry (never the stream lock), so it can't deadlock the
+/// dispatch waiting on it. Returns whether the id was still awaiting an answer.
+#[tauri::command]
+pub fn resolve_ask_human(
+    state: State<'_, AppState>,
+    args: ResolveAskHumanArgs,
+) -> Result<bool, String> {
+    // Normalize an all-whitespace answer to a decline so an empty submit isn't
+    // fed back to the model as a meaningful reply.
+    let answer = args
+        .answer
+        .filter(|a| !a.trim().is_empty())
+        .map(|a| a.trim().to_string());
+    Ok(state.ask_human.answer(&args.id, answer))
 }
 
 // ── persisted tool rules (Q8) — list + revoke ─────────────────────────────

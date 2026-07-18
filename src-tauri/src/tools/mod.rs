@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+pub mod ask_human;
 pub mod calling;
 pub mod cron;
 pub mod dispatch;

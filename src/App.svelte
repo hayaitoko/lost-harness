@@ -22,6 +22,7 @@
   import Settings from "$lib/design/screens/Settings.svelte";
   import Onboarding from "$lib/design/screens/Onboarding.svelte";
   import ApprovalDialog from "$lib/components/ApprovalDialog.svelte";
+  import AskHumanDialog from "$lib/components/AskHumanDialog.svelte";
 
   const SCREENS = {
     main: MainScreen,
@@ -56,3 +57,6 @@
 
 <!-- Backend-driven; renders only when the core raises a tool-approval prompt. -->
 <ApprovalDialog />
+
+<!-- Backend-driven; renders only when the agent calls the `ask_human` tool. -->
+<AskHumanDialog />

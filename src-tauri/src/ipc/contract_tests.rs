@@ -78,6 +78,7 @@ fn test_app() -> App<MockRuntime> {
         model_manager,
         storage,
         approvals: Arc::new(crate::ipc::approval::ApprovalRegistry::new()),
+        ask_human: Arc::new(crate::ipc::ask_human::AskHumanRegistry::new()),
         classifier: Arc::new(HeuristicClassifier::new()),
         embedder: None,
     };
