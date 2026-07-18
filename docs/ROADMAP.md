@@ -22,23 +22,28 @@ the status board sitting on top of all of them.
 ## Stage
 
 > **As of 2026-07-17: M3 COMPLETE. M4 well underway. WAVE 1 COMPLETE; WAVE 2
-> mostly drained (2.1 tools + 2.2 modes + 2.4 headless queue landed).**
-> **Wave 2 core tools + queue (2026-07-17, `9008cfb`→`26d775e`):** three more
+> mostly drained — all its READY items are done; the rest are blocked on later waves.**
+> **Wave 2 core tools + queue (2026-07-17, `9008cfb`→`e5da77f`):** four more
 > items landed — **cron management** (2.1: `list_cron_jobs` Safe +
 > `manage_cron` Dangerous, profile-scoped, cron-string-validated), **`fetch_url`**
 > (2.1: the FIRST External/egress tool — SSRF-guarded HTTP GET + readable-text
 > extraction, every hop DNS-re-checked against a full internal-IP block-list incl.
 > the 169.254 metadata endpoint + all IPv4-in-IPv6 embeddings; surfaces its
-> destination for consent), and the **headless approval queue** (2.4 / Q5:
+> destination for consent), the **headless approval queue** (2.4 / Q5:
 > `QueueingPrompter` — park-and-queue + rule pre-authorization riding the Q8
 > PolicySource; Dangerous never pre-authorized, External needs a
 > destination-naming rule, resolved with PermissionHook's exact precedence so it
-> can't be more permissive than attended). All three adversarially reviewed
-> (findings fixed: cron Write→Dangerous, fetch IPv6-embedding SSRF gaps, queue
-> `**`/precedence bypasses). 399 → **416 tests**. **Wave 2 still open (all
-> blocked on later waves or frontend):** `ask_human` (2.1 — needs a frontend
-> prompt round-trip); `delegate` (2.1 — dep 4.3 agent registry); reroute UX (2.3
-> — dep 3.1); durability journal (2.5 — dep 4.4).
+> can't be more permissive than attended), and **`ask_human`** (2.1: the single
+> blocking "ask the user" tool — Safe/pre-trusted, `HumanPrompter` trait +
+> `TauriHumanPrompter` + `AskHumanDialog.svelte`; unblocked without touching the
+> stream lock, so no deadlock). All four adversarially reviewed (findings fixed:
+> cron Write→Dangerous, fetch IPv6-embedding SSRF gaps, queue `**`/precedence
+> bypasses; ask_human clean SHIP). 399 → **423 tests**. **Wave 2 remaining (all
+> blocked on later waves):** `delegate` (2.1 — dep 4.3 agent registry, a real
+> delegate dispatches a sub-agent); reroute UX (2.3 — dep 3.1); durability
+> journal (2.5 — dep 4.4). **⇒ Wave 2's ready work is drained; next unblocked
+> front is Wave 3 (M4 model manager — seats, usage ledger, cache-shaped prompts,
+> capability registry; all Tier-A ∥).**
 > **Wave 2.2 — permission modes** (`5bf3c37`): a session-wide `SessionMode`
 > (normal / plan / accept-edits) enforced by a `SessionModeHook` placed after the
 > danger/protected-path floors and before `PermissionHook`, so it's *structurally*
@@ -85,7 +90,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 416 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 423 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -103,9 +108,9 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 2.1 cron + fetch_url + Wave 2.4 headless queue landed:
-**416 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors, frontend
-build + svelte-check clean, tree clean; embedder live test passes on the installed model).
+Last verified: 2026-07-17 (Wave 2.1 cron + fetch_url + ask_human + Wave 2.4 headless queue
+landed: **423 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
+frontend build + svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---
 
@@ -222,9 +227,9 @@ build + svelte-check clean, tree clean; embedder live test passes on the install
    agents track (do the one-queue-model unification pass before locking its schemas).
 7. **[~] Remaining core tools** — DONE: session search, system status (2.1, `6a97695`);
    **cron management** (`9008cfb` — `list_cron_jobs`/`manage_cron`); **headless browser →
-   `fetch_url`** (`f9e49eb` — the first External/egress tool, SSRF-guarded). STILL OPEN:
-   **`ask_human`** (the single blocking "ask the user" tool — needs a frontend prompt
-   round-trip like the approval dialog); **`delegate`** (blocked on the 4.3 agent-type
+   `fetch_url`** (`f9e49eb` — the first External/egress tool, SSRF-guarded); **`ask_human`**
+   (`e5da77f` — the single blocking "ask the user" tool, Safe, `HumanPrompter` +
+   `AskHumanDialog`). STILL OPEN: only **`delegate`** (blocked on the 4.3 agent-type
    registry — a real delegate dispatches a sub-agent). Each rides the existing approval spine.
 
 **[x] Wave 1 of the build manifest — DONE 2026-07-17.** All started subsystems finished:
