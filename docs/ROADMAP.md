@@ -21,8 +21,24 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-17: M3 COMPLETE. M4 well underway. WAVE 1 COMPLETE; WAVE 2 in
-> progress (permission modes landed).**
+> **As of 2026-07-17: M3 COMPLETE. M4 well underway. WAVE 1 COMPLETE; WAVE 2
+> mostly drained (2.1 tools + 2.2 modes + 2.4 headless queue landed).**
+> **Wave 2 core tools + queue (2026-07-17, `9008cfb`→`26d775e`):** three more
+> items landed — **cron management** (2.1: `list_cron_jobs` Safe +
+> `manage_cron` Dangerous, profile-scoped, cron-string-validated), **`fetch_url`**
+> (2.1: the FIRST External/egress tool — SSRF-guarded HTTP GET + readable-text
+> extraction, every hop DNS-re-checked against a full internal-IP block-list incl.
+> the 169.254 metadata endpoint + all IPv4-in-IPv6 embeddings; surfaces its
+> destination for consent), and the **headless approval queue** (2.4 / Q5:
+> `QueueingPrompter` — park-and-queue + rule pre-authorization riding the Q8
+> PolicySource; Dangerous never pre-authorized, External needs a
+> destination-naming rule, resolved with PermissionHook's exact precedence so it
+> can't be more permissive than attended). All three adversarially reviewed
+> (findings fixed: cron Write→Dangerous, fetch IPv6-embedding SSRF gaps, queue
+> `**`/precedence bypasses). 399 → **416 tests**. **Wave 2 still open (all
+> blocked on later waves or frontend):** `ask_human` (2.1 — needs a frontend
+> prompt round-trip); `delegate` (2.1 — dep 4.3 agent registry); reroute UX (2.3
+> — dep 3.1); durability journal (2.5 — dep 4.4).
 > **Wave 2.2 — permission modes** (`5bf3c37`): a session-wide `SessionMode`
 > (normal / plan / accept-edits) enforced by a `SessionModeHook` placed after the
 > danger/protected-path floors and before `PermissionHook`, so it's *structurally*
@@ -69,7 +85,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 399 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 416 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -87,9 +103,9 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 2.1 session_search + system_status tools landed: **399 passed**,
-`--no-default-features` builds clean, `cargo clippy --lib` 0 errors, frontend build +
-svelte-check clean, tree clean; embedder live test passes on the installed model).
+Last verified: 2026-07-17 (Wave 2.1 cron + fetch_url + Wave 2.4 headless queue landed:
+**416 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors, frontend
+build + svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---
 
@@ -204,9 +220,12 @@ svelte-check clean, tree clean; embedder live test passes on the installed model
 6. **[ ] Rest of M4** — model seats, usage ledger + budget governor (per-profile),
    cache-shaped prompt assembly, capability registry that refuses; then the skills &
    agents track (do the one-queue-model unification pass before locking its schemas).
-7. **[ ] Remaining core tools** — headless browser, delegate, ask-human, system status,
-   cron management, session search (PLAN §8 M3 item 10 leftovers; each rides the
-   existing approval spine).
+7. **[~] Remaining core tools** — DONE: session search, system status (2.1, `6a97695`);
+   **cron management** (`9008cfb` — `list_cron_jobs`/`manage_cron`); **headless browser →
+   `fetch_url`** (`f9e49eb` — the first External/egress tool, SSRF-guarded). STILL OPEN:
+   **`ask_human`** (the single blocking "ask the user" tool — needs a frontend prompt
+   round-trip like the approval dialog); **`delegate`** (blocked on the 4.3 agent-type
+   registry — a real delegate dispatches a sub-agent). Each rides the existing approval spine.
 
 **[x] Wave 1 of the build manifest — DONE 2026-07-17.** All started subsystems finished:
 - **[x] Native-tool UI checkbox** (1.1) — the add-provider Settings form now has a "Native
@@ -226,8 +245,12 @@ svelte-check clean, tree clean; embedder live test passes on the installed model
   7.1); **write triggers** need context compaction first (Wave 3.3 → 3.5).
 
 **Also queued in M4/later (pointers in build plan Part 2):** `UserPromptSubmit` hook +
-permission modes (Q11), reroute auto-switch UX (Q6), persisted action journal +
-idempotency keys (Q3 deferred half), headless approval queue (Q5, server-track prep).
+permission modes (Q11 — modes landed `5bf3c37`; the `UserPromptSubmit` half is deferred),
+reroute auto-switch UX (Q6, dep 3.1), persisted action journal + idempotency keys (Q3
+deferred half, dep 4.4). **[x] Headless approval queue (Q5, server-track prep) — DONE
+2026-07-17 (`26d775e`):** `QueueingPrompter` + `ApprovalQueue`, rule pre-authorization via
+the Q8 PolicySource, Dangerous/External floors enforced in-prompter, adversarially reviewed.
+Not wired into a live body yet (no headless body exists until Wave 6).
 
 ---
 

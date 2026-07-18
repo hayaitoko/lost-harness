@@ -47,7 +47,12 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **399 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 2.1** — session_search + system_status tools.)
+**Tests:** `cargo test --lib` → **416 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 2.1 cron + fetch_url + Wave 2.4 headless queue**.)
+
+**2026-07-17 (build-manifest drain, session 2): three more Wave 2 items — cron management, fetch_url, headless approval queue.** All committed to `main`, each adversarially reviewed before commit.
+- **Wave 2.1 cron management** (`9008cfb`, `src/tools/cron.rs`) — `list_cron_jobs` (Safe, read-only) + `manage_cron` (create/enable/disable/delete). Profile-scoped over the existing `cron_jobs` table; cron strings validated (5-field or @macro, range-checked, named weekdays/months `MON-FRI`/`JAN`); 64-job/profile cap; optional target conversation must exist. **`manage_cron` is `RiskClass::Dangerous`, not Write** — the review caught that Write would let `accept_edits` silently create standing autonomous automation; Dangerous forces Once-only Ask. No scheduler runs jobs yet (that's the one-queue pass, Wave 4.4) — this is the intent-CRUD surface.
+- **Wave 2.1 `fetch_url`** (`f9e49eb`, `src/tools/fetch.rs`) — the FIRST `External`/egress tool (the "headless browser" slot at v1: SSRF-guarded HTTP GET + dependency-free readable-text extraction, NOT a JS engine). Added `Tool::destination(args)`; the dispatcher now populates `ApprovalRequest.destination` from it (was hardcoded `None`), and the dialog already renders "Sends to <host>". **SSRF is airtight:** every hop (initial + each redirect, followed MANUALLY so DNS re-checks per hop) is validated — scheme, string private-host check, IP-literal fast path, and a DNS resolution whose every IP is classified against a full block-list incl. `169.254` metadata and EVERY IPv4-in-IPv6 embedding (mapped/compat/NAT64/6to4). Body/content-type/length capped. Review caught + fixed the IPv6-embedding gap, bracketed-v6 fail-closed, trailing-dot bypass. Documented residual: DNS-rebind TOCTOU (needs a pinned-IP connector).
+- **Wave 2.4 headless approval queue** (`26d775e`, `src/hooks/headless.rs`, Q5) — `QueueingPrompter` (an `ApprovalPrompter`) for the future headless/unattended body: park-and-queue + rule pre-authorization riding the Q8 `PolicySource`; a pre-auth is a per-action `Once` grant. **Floors in the prompter:** Dangerous never pre-authorized; External needs a destination-naming rule. Review caught two real bypasses (`**` defeating the wildcard guard; "any Allow matches" ignoring deny>ask>allow precedence) — fixed by extracting `resolve_effective_mode` from `PermissionHook` and resolving through it, so headless is provably never MORE permissive than attended. Server-track prep — NOT wired into a live body (none exists until Wave 6).
 
 **2026-07-16 (latest): near-term items 1–3-core DONE — the trained privacy classifier is LIVE.** Three landings this session: (1) the Q8 **Permissions pane** (`f38fd2c`) — Settings tab lists/revokes persisted "Always allow" `tool_rules`, verified live in the browser preview; (2) **frontend housekeeping** (`6dfcf12`) — deleted the 5 superseded components, removed the dev screen-switcher + theme toggle, and fixed the `ModelPicker` name collision (options now carry a composite `providerId::name` key — verified live with two `default` models); (3) the **classifier ONNX integration** (`283789b`) — ran the bundle's `export_onnx.py` (both encoders → fp32 + INT8), then wired `classifier/engine.rs` to run the real INT8 ensemble via `ort`, mirroring `serve.py` (rules layer-0 short-circuit → sliding-128-window max-prob over both encoders → fusion at 0.5/0.05). Behind a default-on `onnx-classifier` feature (rules-only fallback with `--no-default-features`, both build clean). Models installed live at `~/Documents/Lost-Harness/models/classifier/` (98 MB, NOT in git). **Gotcha caught:** the exported `tokenizer.json` bakes in Fixed(128) padding/truncation — left on, it feeds the model garbage (distilbert scored 0.999 on "capital of France"); disabled on load. An env-gated parity test (`LHP_CLASSIFIER_MODELS_DIR`) loads the live INT8 models and matches the Python reference probs (`docs/classifier-parity.json`). **Remaining in item 3:** the annotated-redaction sidebar UX (PLAN §11 — the engine's there, no UI); the `gate.rs`/§7 cosmetic renames were judged low-value/high-churn and deferred (gate.rs cleanly delegates to the `Classifier` trait, no rewrite needed).
 
@@ -108,7 +113,7 @@ Two things landed in commit `f9223c9`:
 
 **Round 1 was adversarially reviewed** (a 4-lens multi-agent pass + verification); it surfaced 3 real issues, all fixed with regression tests before commit: (1) the privacy filter's `LocalRequired` annotation was a silent no-op in tool dispatch — now the dispatcher **fails closed** (blocks a must-stay-local tool call when the conversation is on a cloud endpoint); (2) `guard_wrap` neutralized backticks but not the trust-boundary banner it teaches the model — now both are neutralized; (3) `format_outcome` spliced model-controlled tool names/errors in raw — now all interpolated untrusted text runs through `neutralize_untrusted`.
 
-**Still NOT wired (updated 2026-07-16):** the headless browser, delegate/ask-human/system-status/cron/session-search tools, and the persisted-journal half of the durability trio (deliberately deferred to the first external-effect tool). Everything else once listed here has since shipped: write/delete tools, the approval spine, `shell_exec` (Seatbelt-sandboxed), MCP-into-registry, and reroute-to-local plumbing (`NeedsLocalReroute`).
+**Still NOT wired (updated 2026-07-17):** `ask_human` (needs a frontend prompt round-trip) and `delegate` (blocked on the Wave 4.3 agent-type registry) tools, and the persisted-journal half of the durability trio (deferred to the first non-idempotent external-effect tool, dep Wave 4.4). Everything else once listed here has since shipped: session-search + system-status + cron-management + `fetch_url` tools, write/delete tools, the approval spine, `shell_exec` (Seatbelt-sandboxed), MCP-into-registry, reroute-to-local plumbing (`NeedsLocalReroute`), and the headless approval queue (`QueueingPrompter`, server-track prep).
 
 ---
 
@@ -124,7 +129,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 369 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 416 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -240,7 +245,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 369 tests
+cd src-tauri && cargo test --lib   # 416 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
