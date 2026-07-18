@@ -518,10 +518,11 @@ impl ToolDispatcher {
                         // matrix-legal buttons; the server still enforces via
                         // `resolve_grant`, so this is UX, not the gate.
                         risk: tool.risk(),
-                        // No `External` tool ships a destination yet; a future
-                        // egress tool surfaces one here (server-derived from the
-                        // call, never client input).
-                        destination: None,
+                        // For an `External` egress tool, the destination it
+                        // reaches (server-derived from the call, never client
+                        // input) — the consent the dialog surfaces. `None` for
+                        // every non-egress tool.
+                        destination: tool.destination(&call.args),
                     };
                     // NOTE (known, deferred): `process_message` holds the agent
                     // loop's stream lock across this await, so while a prompt is

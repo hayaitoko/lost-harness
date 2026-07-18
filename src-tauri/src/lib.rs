@@ -440,6 +440,12 @@ fn build_tool_dispatcher(
     registry.register(Box::new(crate::tools::cron::ManageCronTool::new(
         storage.clone(),
     )));
+    // Wave 2.1: the web-content tool (the "headless browser" slot at v1 — an
+    // SSRF-guarded HTTP GET + readable-text extraction). The FIRST External
+    // (egress) tool: RiskClass::External → approval spine + a surfaced
+    // destination; every hop re-validated (scheme + private-host + DNS/IP
+    // block-list) so it can never reach localhost/RFC-1918/metadata.
+    registry.register(Box::new(crate::tools::fetch::FetchUrlTool::new()));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
     // scratch dir, network off by default, killed on timeout, OS-sandboxed via

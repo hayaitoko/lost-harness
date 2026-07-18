@@ -26,6 +26,7 @@ pub mod calling;
 pub mod cron;
 pub mod dispatch;
 pub mod exec;
+pub mod fetch;
 pub mod fs;
 pub mod mcp;
 pub mod memory;
@@ -287,6 +288,16 @@ pub trait Tool: Send + Sync {
     /// remains a dispatch-boundary concern — `ToolInput.args` stays bare JSON.
     fn schema(&self) -> serde_json::Value {
         serde_json::json!({ "type": "object", "additionalProperties": true })
+    }
+
+    /// For `External` (egress) tools, the human-readable destination this call
+    /// reaches — a URL host, an email recipient — surfaced in the approval
+    /// dialog as the consent to grant (`ApprovalRequest.destination`). Default
+    /// `None` (non-egress tools). Server-derived from the call, never client
+    /// input. The dispatcher calls this only to populate the prompt; it is not
+    /// itself a gate.
+    fn destination(&self, _args: &serde_json::Value) -> Option<String> {
+        None
     }
 
     /// The capabilities this tool needs from its running environment.
