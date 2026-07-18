@@ -59,17 +59,11 @@ pub struct Storage {
     inner: Arc<StorageInner>,
 }
 
-// SAFETY (M1): `Storage` is logically single-writer per profile (the
-// agent loop and IPC commands are serialized through a `Mutex<Storage>`
-// at the AppState boundary — see `ipc::AppState`). The internal
-// `rusqlite::Connection` is `!Sync` due to its use of `RefCell`, but
-// `Mutex<Storage>` guarantees no two threads touch it concurrently, so
-// the manual `Send + Sync` impls below are sound for the M1 usage.
-// If a future milestone introduces truly concurrent access paths,
-// replace this with proper `parking_lot::Mutex<Connection>` inside
-// `GlobalDb` / `ProfileDb` and remove the manual impls.
-unsafe impl Send for Storage {}
-unsafe impl Sync for Storage {}
+// `Storage` is genuinely `Send + Sync` with no manual impl needed: both
+// `GlobalDb` and `ProfileDb` hold their `rusqlite::Connection` behind a
+// `parking_lot::Mutex`, which makes each of them `Send + Sync` on its own
+// (`Mutex<T>: Sync` when `T: Send`, and `Connection: Send`). Every field of
+// `StorageInner` below is therefore `Send + Sync`, and so is `Arc<StorageInner>`.
 
 struct StorageInner {
     /// Absolute path of the storage root (e.g. `~/Documents/Lost-Harness/`).
@@ -92,12 +86,6 @@ impl Storage {
     ///
     /// Creates `base_path/` and `base_path/profiles/` if missing, then
     /// opens `global.db` and runs migrations.
-    // The `GlobalDb` behind these `Arc`s wraps a `!Send`/`!Sync` rusqlite
-    // `Connection`; that is deliberate and made sound by the `unsafe impl Send +
-    // Sync for Storage` above (single-writer via the `Mutex<Storage>` at the
-    // AppState boundary — see the module docs). The lint doesn't see that
-    // invariant, so it's allowed here.
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open(base_path: &Path) -> Result<Self> {
         std::fs::create_dir_all(base_path)
             .with_context(|| format!("creating storage root {}", base_path.display()))?;
@@ -146,8 +134,6 @@ impl Storage {
     ///   so a wall is never breached just because its status couldn't be read.
     ///   Defaulting the unreadable case to "shared" would be a privacy
     ///   loosening, which the invariant forbids.
-    // See `Storage::open` re: the `arc_with_non_send_sync` allow.
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn memory_db_for_profile(&self, profile: &str) -> Result<Arc<GlobalDb>> {
         // An unopenable profile (invalid/degenerate name) has no island to
         // protect and no valid path to route to → shared store.

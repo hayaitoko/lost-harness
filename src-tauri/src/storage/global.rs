@@ -278,7 +278,7 @@ pub struct AppSetting {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct GlobalDb {
-    conn: Connection,
+    conn: parking_lot::Mutex<Connection>,
 }
 
 impl GlobalDb {
@@ -288,7 +288,7 @@ impl GlobalDb {
         let conn = Connection::open(path)
             .with_context(|| format!("opening global.db at {}", path.display()))?;
         migrate_global(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn: parking_lot::Mutex::new(conn) })
     }
 
     /// In-memory variant for tests.
@@ -297,13 +297,16 @@ impl GlobalDb {
         crate::storage::ensure_sqlite_vec_registered();
         let conn = Connection::open_in_memory()?;
         migrate_global(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn: parking_lot::Mutex::new(conn) })
     }
 
-    /// Borrow the underlying connection. Use sparingly — most callers should
-    /// go through the typed methods.
-    pub fn raw(&self) -> &Connection {
-        &self.conn
+    /// Lock and borrow the underlying connection. Use sparingly — most
+    /// callers should go through the typed methods. The returned guard holds
+    /// the connection's mutex for as long as it lives; a caller must not
+    /// invoke another locking method on this same `GlobalDb` while holding
+    /// it — `parking_lot::Mutex` is not reentrant, so that would deadlock.
+    pub fn raw(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
     }
 
     // ── user_facts ──────────────────────────────────────────────────────────
@@ -311,6 +314,7 @@ impl GlobalDb {
     pub fn set_user_fact(&self, key: &str, value: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn
+            .lock()
             .execute(
                 "INSERT INTO user_facts (key, value, updated_at) VALUES (?1, ?2, ?3)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -323,6 +327,7 @@ impl GlobalDb {
     pub fn get_user_fact(&self, key: &str) -> Result<Option<UserFact>> {
         let row = self
             .conn
+            .lock()
             .query_row(
                 "SELECT key, value, updated_at FROM user_facts WHERE key = ?1",
                 params![key],
@@ -340,9 +345,9 @@ impl GlobalDb {
     }
 
     pub fn list_user_facts(&self) -> Result<Vec<UserFact>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value, updated_at FROM user_facts ORDER BY key")?;
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT key, value, updated_at FROM user_facts ORDER BY key")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(UserFact {
@@ -358,6 +363,7 @@ impl GlobalDb {
     pub fn delete_user_fact(&self, key: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM user_facts WHERE key = ?1", params![key])?;
         Ok(n > 0)
     }
@@ -365,7 +371,7 @@ impl GlobalDb {
     // ── endpoints ───────────────────────────────────────────────────────────
 
     pub fn insert_endpoint(&self, ep: &Endpoint) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO endpoints (id, name, base_url, api_key_encrypted, kind, created_at, supports_native_tools)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -384,6 +390,7 @@ impl GlobalDb {
     pub fn get_endpoint(&self, id: &str) -> Result<Option<Endpoint>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, name, base_url, api_key_encrypted, kind, created_at, supports_native_tools
                  FROM endpoints WHERE id = ?1",
@@ -394,7 +401,8 @@ impl GlobalDb {
     }
 
     pub fn list_endpoints(&self) -> Result<Vec<Endpoint>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, name, base_url, api_key_encrypted, kind, created_at, supports_native_tools
              FROM endpoints ORDER BY name",
         )?;
@@ -412,7 +420,7 @@ impl GlobalDb {
         api_key_encrypted: Option<&[u8]>,
         kind: &str,
     ) -> Result<bool> {
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE endpoints SET name = ?1, base_url = ?2, api_key_encrypted = ?3, kind = ?4
              WHERE id = ?5",
             params![name, base_url, api_key_encrypted, kind, id],
@@ -423,6 +431,7 @@ impl GlobalDb {
     pub fn delete_endpoint(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM endpoints WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -430,7 +439,7 @@ impl GlobalDb {
     // ── model_catalog ───────────────────────────────────────────────────────
 
     pub fn insert_model(&self, m: &ModelEntry) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO model_catalog (id, name, path, size_bytes, quantization, added_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -446,7 +455,8 @@ impl GlobalDb {
     }
 
     pub fn list_models(&self) -> Result<Vec<ModelEntry>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, name, path, size_bytes, quantization, added_at
              FROM model_catalog ORDER BY added_at DESC",
         )?;
@@ -468,6 +478,7 @@ impl GlobalDb {
     pub fn get_model(&self, id: &str) -> Result<Option<ModelEntry>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, name, path, size_bytes, quantization, added_at
                  FROM model_catalog WHERE id = ?1",
@@ -489,6 +500,7 @@ impl GlobalDb {
     pub fn delete_model(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM model_catalog WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -505,7 +517,7 @@ impl GlobalDb {
     /// to `memory_facts`; `PrivateLocal` to the physically-separate
     /// `memory_facts_private` — so a cloud turn's search never touches it.
     pub fn insert_memory_fact_in(&self, bucket: MemoryBucket, fact: &MemoryFact) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             &format!(
                 "INSERT INTO {} (id, content, origin_profile, tags, created_at, pinned)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -526,6 +538,7 @@ impl GlobalDb {
     pub fn get_memory_fact(&self, id: &str) -> Result<Option<MemoryFact>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, content, origin_profile, tags, created_at, pinned
                  FROM memory_facts WHERE id = ?1",
@@ -536,7 +549,8 @@ impl GlobalDb {
     }
 
     pub fn list_memory_facts(&self) -> Result<Vec<MemoryFact>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, content, origin_profile, tags, created_at, pinned
              FROM memory_facts ORDER BY created_at DESC",
         )?;
@@ -547,7 +561,8 @@ impl GlobalDb {
     }
 
     pub fn list_memory_facts_by_profile(&self, profile: &str) -> Result<Vec<MemoryFact>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, content, origin_profile, tags, created_at, pinned
              FROM memory_facts WHERE origin_profile = ?1 ORDER BY created_at DESC",
         )?;
@@ -560,10 +575,9 @@ impl GlobalDb {
     /// Delete a fact by id from whichever bucket holds it. Returns true if a
     /// row was removed.
     pub fn delete_memory_fact(&self, id: &str) -> Result<bool> {
-        let n = self
-            .conn
-            .execute("DELETE FROM memory_facts WHERE id = ?1", params![id])?
-            + self.conn.execute(
+        let conn = self.conn.lock();
+        let n = conn.execute("DELETE FROM memory_facts WHERE id = ?1", params![id])?
+            + conn.execute(
                 "DELETE FROM memory_facts_private WHERE id = ?1",
                 params![id],
             )?;
@@ -574,10 +588,11 @@ impl GlobalDb {
     /// buckets; returns true if a row changed.
     pub fn set_memory_pinned(&self, id: &str, pinned: bool) -> Result<bool> {
         let p = pinned as i64;
-        let n = self.conn.execute(
+        let conn = self.conn.lock();
+        let n = conn.execute(
             "UPDATE memory_facts SET pinned = ?2 WHERE id = ?1",
             params![id, p],
-        )? + self.conn.execute(
+        )? + conn.execute(
             "UPDATE memory_facts_private SET pinned = ?2 WHERE id = ?1",
             params![id, p],
         )?;
@@ -681,7 +696,8 @@ impl GlobalDb {
         bucket: MemoryBucket,
         profile: &str,
     ) -> Result<Vec<MemoryFact>> {
-        let mut stmt = self.conn.prepare(&format!(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, content, origin_profile, tags, created_at, pinned
              FROM {} WHERE origin_profile = ?1 ORDER BY created_at DESC",
             bucket.table()
@@ -698,7 +714,8 @@ impl GlobalDb {
         profile: &str,
         limit: usize,
     ) -> Result<Vec<MemoryFact>> {
-        let mut stmt = self.conn.prepare(&format!(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, content, origin_profile, tags, created_at, pinned
              FROM {} WHERE origin_profile = ?1
              ORDER BY pinned DESC, created_at DESC LIMIT ?2",
@@ -819,7 +836,8 @@ impl GlobalDb {
             fts = bucket.fts_table(),
             tbl = bucket.table(),
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
         let map_hit = |r: &rusqlite::Row<'_>| {
             Ok(MemorySearchHit {
                 fact: row_to_memory_fact(r)?,
@@ -945,7 +963,8 @@ impl GlobalDb {
             vec = bucket.vectors_table(),
             tbl = bucket.table(),
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
         let map_hit = |r: &rusqlite::Row<'_>| {
             Ok(MemorySearchHit {
                 fact: row_to_memory_fact(r)?,
@@ -976,11 +995,12 @@ impl GlobalDb {
         embedding: &[f32],
     ) -> Result<()> {
         let blob = crate::embedder::vec_to_blob(embedding);
-        self.conn.execute(
+        let conn = self.conn.lock();
+        conn.execute(
             &format!("DELETE FROM {} WHERE fact_id = ?1", bucket.vectors_table()),
             params![fact_id],
         )?;
-        self.conn.execute(
+        conn.execute(
             &format!(
                 "INSERT INTO {} (fact_id, embedding) VALUES (?1, ?2)",
                 bucket.vectors_table()
@@ -1007,7 +1027,8 @@ impl GlobalDb {
             tbl = bucket.table(),
             vec = bucket.vectors_table(),
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![limit as i64], row_to_memory_fact)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1015,17 +1036,22 @@ impl GlobalDb {
     }
 
     pub fn insert_memory_vector(&self, v: &MemoryVector) -> Result<i64> {
-        self.conn.execute(
+        // Hoisted: `execute` + `last_insert_rowid` must run on the same
+        // locked connection without another thread's statement landing in
+        // between, or the rowid we read back could belong to someone else's
+        // insert.
+        let conn = self.conn.lock();
+        conn.execute(
             "INSERT INTO memory_vectors (fact_id, embedding) VALUES (?1, ?2)",
             params![v.fact_id, v.embedding],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn list_vectors_for_fact(&self, fact_id: &str) -> Result<Vec<MemoryVector>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, fact_id, embedding FROM memory_vectors WHERE fact_id = ?1")?;
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, fact_id, embedding FROM memory_vectors WHERE fact_id = ?1")?;
         let rows = stmt
             .query_map(params![fact_id], |r| {
                 Ok(MemoryVector {
@@ -1042,7 +1068,7 @@ impl GlobalDb {
 
     pub fn insert_skill(&self, s: &Skill) -> Result<()> {
         let caps = serde_json::to_string(&s.capabilities_required).unwrap_or_else(|_| "[]".into());
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO skills
              (id, name, description, content, capabilities_required, approval_status, path, version, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1064,6 +1090,7 @@ impl GlobalDb {
     pub fn get_skill(&self, id: &str) -> Result<Option<Skill>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, name, description, content, capabilities_required, approval_status, path, version, created_at
                  FROM skills WHERE id = ?1",
@@ -1074,7 +1101,8 @@ impl GlobalDb {
     }
 
     pub fn list_skills(&self) -> Result<Vec<Skill>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, name, description, content, capabilities_required, approval_status, path, version, created_at
              FROM skills ORDER BY name",
         )?;
@@ -1086,7 +1114,8 @@ impl GlobalDb {
 
     /// APPROVED skills only — the set safe to offer/search (the trust boundary).
     pub fn list_approved_skills(&self) -> Result<Vec<Skill>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, name, description, content, capabilities_required, approval_status, path, version, created_at
              FROM skills WHERE approval_status = 'approved' ORDER BY name",
         )?;
@@ -1102,7 +1131,8 @@ impl GlobalDb {
     pub fn search_skills(&self, query: &str, limit: usize) -> Result<Vec<Skill>> {
         let esc = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pat = format!("%{esc}%");
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, name, description, content, capabilities_required, approval_status, path, version, created_at
              FROM skills
              WHERE approval_status = 'approved'
@@ -1117,7 +1147,7 @@ impl GlobalDb {
 
     /// Move a skill to a trust state (the review gate). Returns whether a row moved.
     pub fn set_skill_approval(&self, id: &str, status: SkillApproval) -> Result<bool> {
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE skills SET approval_status = ?1 WHERE id = ?2",
             params![status.as_str(), id],
         )?;
@@ -1127,6 +1157,7 @@ impl GlobalDb {
     pub fn delete_skill(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM skills WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -1135,7 +1166,7 @@ impl GlobalDb {
 
     pub fn set_app_setting(&self, key: &str, value: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, value, now],
@@ -1146,6 +1177,7 @@ impl GlobalDb {
     pub fn get_app_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT value FROM app_settings WHERE key = ?1",
                 params![key],
@@ -1175,9 +1207,9 @@ impl GlobalDb {
     }
 
     pub fn list_app_settings(&self) -> Result<Vec<AppSetting>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT key, value, updated_at FROM app_settings ORDER BY key")?;
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT key, value, updated_at FROM app_settings ORDER BY key")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(AppSetting {

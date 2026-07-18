@@ -221,20 +221,16 @@ pub struct ToolRuleRow {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct ProfileDb {
-    conn: Connection,
+    conn: parking_lot::Mutex<Connection>,
     /// The profile name this DB belongs to (e.g. "personal", "work"). Set
     /// on open and used for logging + cross-profile access checks.
     pub name: String,
 }
 
-// SAFETY (M1): see `Storage` for the full rationale. `ProfileDb` holds
-// a bare `rusqlite::Connection` (RefCell-backed, `!Sync`). The agent
-// loop's internal `stream_lock` and Tauri's command boundary together
-// guarantee no two threads touch a `ProfileDb` concurrently in the M1
-// wiring. If/when true concurrency is needed, wrap `conn` in a
-// `parking_lot::Mutex` and remove these manual impls.
-unsafe impl Send for ProfileDb {}
-unsafe impl Sync for ProfileDb {}
+// `ProfileDb` is genuinely `Send + Sync` now: `conn` is a
+// `parking_lot::Mutex<Connection>` (`Mutex<T>: Sync` when `T: Send`, and
+// `rusqlite::Connection: Send`), and `name: String` is `Send + Sync` on its
+// own. No manual/unsafe impl is needed or present.
 
 impl ProfileDb {
     /// Open an existing profile DB (or create + migrate a fresh one).
@@ -248,7 +244,7 @@ impl ProfileDb {
             .with_context(|| format!("opening profile db at {}", path.display()))?;
         migrate_profile(&conn)?;
         Ok(Self {
-            conn,
+            conn: parking_lot::Mutex::new(conn),
             name: name.to_string(),
         })
     }
@@ -261,13 +257,18 @@ impl ProfileDb {
         let conn = Connection::open_in_memory()?;
         migrate_profile(&conn)?;
         Ok(Self {
-            conn,
+            conn: parking_lot::Mutex::new(conn),
             name: name.to_string(),
         })
     }
 
-    pub fn raw(&self) -> &Connection {
-        &self.conn
+    /// Lock and borrow the underlying connection. Use sparingly — most
+    /// callers should go through the typed methods. The returned guard holds
+    /// the connection's mutex for as long as it lives; a caller must not
+    /// invoke another locking method on this same `ProfileDb` while holding
+    /// it — `parking_lot::Mutex` is not reentrant, so that would deadlock.
+    pub fn raw(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
     }
 
     pub fn name(&self) -> &str {
@@ -277,7 +278,7 @@ impl ProfileDb {
     // ── conversations ───────────────────────────────────────────────────────
 
     pub fn create_conversation(&self, c: &Conversation) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO conversations
              (id, name, pinned, binding, folder_id, color, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -298,6 +299,7 @@ impl ProfileDb {
     pub fn get_conversation(&self, id: &str) -> Result<Option<Conversation>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, name, pinned, binding, folder_id, color, created_at, updated_at
                  FROM conversations WHERE id = ?1",
@@ -308,7 +310,8 @@ impl ProfileDb {
     }
 
     pub fn list_conversations(&self) -> Result<Vec<Conversation>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, name, pinned, binding, folder_id, color, created_at, updated_at
              FROM conversations
              ORDER BY pinned DESC, updated_at DESC",
@@ -320,7 +323,8 @@ impl ProfileDb {
     }
 
     pub fn list_conversations_in_folder(&self, folder_id: &str) -> Result<Vec<Conversation>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, name, pinned, binding, folder_id, color, created_at, updated_at
              FROM conversations WHERE folder_id = ?1
              ORDER BY pinned DESC, updated_at DESC",
@@ -344,7 +348,7 @@ impl ProfileDb {
         color: Option<&str>,
     ) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE conversations
              SET name = ?1, pinned = ?2, binding = ?3, folder_id = ?4, color = ?5, updated_at = ?6
              WHERE id = ?7",
@@ -356,6 +360,7 @@ impl ProfileDb {
     pub fn delete_conversation(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -363,7 +368,7 @@ impl ProfileDb {
     // ── messages ────────────────────────────────────────────────────────────
 
     pub fn add_message(&self, m: &Message) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO messages
              (id, conversation_id, role, content, model, provider_id,
               routing_decision, thinking_content, error, aborted, created_at)
@@ -388,6 +393,7 @@ impl ProfileDb {
     pub fn get_message(&self, id: &str) -> Result<Option<Message>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, conversation_id, role, content, model, provider_id,
                         routing_decision, thinking_content, error, aborted, created_at
@@ -399,7 +405,8 @@ impl ProfileDb {
     }
 
     pub fn list_messages_by_conversation(&self, conversation_id: &str) -> Result<Vec<Message>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             // Tiebreak on rowid (insertion order), NOT id: `created_at` is
             // second-granularity and `id` is a random UUID, so two messages
             // written in the same second would otherwise sort by a random
@@ -433,7 +440,8 @@ impl ProfileDb {
             .replace('%', "\\%")
             .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT m.conversation_id, c.name, m.role, m.content, m.created_at
              FROM messages m
              LEFT JOIN conversations c ON c.id = m.conversation_id
@@ -469,7 +477,7 @@ impl ProfileDb {
     ) -> Result<bool> {
         // Build a dynamic SET clause so callers can patch any subset.
         // We coalesce NULLs in the SQL to the existing column value.
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE messages SET
                 content          = COALESCE(?1, content),
                 thinking_content = COALESCE(?2, thinking_content),
@@ -490,6 +498,7 @@ impl ProfileDb {
     pub fn delete_message(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM messages WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -497,7 +506,7 @@ impl ProfileDb {
     // ── folders ─────────────────────────────────────────────────────────────
 
     pub fn create_folder(&self, f: &Folder) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO folders (id, name, color, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![f.id, f.name, f.color, f.created_at],
         )?;
@@ -507,6 +516,7 @@ impl ProfileDb {
     pub fn get_folder(&self, id: &str) -> Result<Option<Folder>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, name, color, created_at FROM folders WHERE id = ?1",
                 params![id],
@@ -523,9 +533,9 @@ impl ProfileDb {
     }
 
     pub fn list_folders(&self) -> Result<Vec<Folder>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name, color, created_at FROM folders ORDER BY name")?;
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, name, color, created_at FROM folders ORDER BY name")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(Folder {
@@ -543,6 +553,7 @@ impl ProfileDb {
         // ON DELETE SET NULL on conversations.folder_id handles the cleanup.
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM folders WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -550,7 +561,7 @@ impl ProfileDb {
     // ── tag_definitions + session_tags ──────────────────────────────────────
 
     pub fn create_tag(&self, t: &TagDefinition) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO tag_definitions (id, label, color, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![t.id, t.label, t.color, t.created_at],
         )?;
@@ -558,9 +569,9 @@ impl ProfileDb {
     }
 
     pub fn list_tags(&self) -> Result<Vec<TagDefinition>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, label, color, created_at FROM tag_definitions ORDER BY label")?;
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, label, color, created_at FROM tag_definitions ORDER BY label")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(TagDefinition {
@@ -577,6 +588,7 @@ impl ProfileDb {
     pub fn delete_tag(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM tag_definitions WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -584,7 +596,7 @@ impl ProfileDb {
     /// Apply a tag to a conversation. Idempotent (INSERT OR IGNORE on the
     /// composite PK).
     pub fn tag_conversation(&self, conversation_id: &str, tag_id: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT OR IGNORE INTO session_tags (conversation_id, tag_id) VALUES (?1, ?2)",
             params![conversation_id, tag_id],
         )?;
@@ -592,7 +604,7 @@ impl ProfileDb {
     }
 
     pub fn untag_conversation(&self, conversation_id: &str, tag_id: &str) -> Result<bool> {
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "DELETE FROM session_tags WHERE conversation_id = ?1 AND tag_id = ?2",
             params![conversation_id, tag_id],
         )?;
@@ -601,7 +613,8 @@ impl ProfileDb {
 
     /// All conversations that carry a given tag.
     pub fn list_conversations_with_tag(&self, tag_id: &str) -> Result<Vec<Conversation>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT c.id, c.name, c.pinned, c.binding, c.folder_id, c.color, c.created_at, c.updated_at
              FROM conversations c
              JOIN session_tags st ON st.conversation_id = c.id
@@ -616,7 +629,8 @@ impl ProfileDb {
 
     /// All tags applied to a given conversation.
     pub fn list_tags_for_conversation(&self, conversation_id: &str) -> Result<Vec<TagDefinition>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT td.id, td.label, td.color, td.created_at
              FROM tag_definitions td
              JOIN session_tags st ON st.tag_id = td.id
@@ -639,7 +653,7 @@ impl ProfileDb {
     // ── email_accounts + email_messages ─────────────────────────────────────
 
     pub fn insert_email_account(&self, a: &EmailAccount) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO email_accounts
              (id, label, address, imap_host, imap_port, smtp_host, smtp_port, username, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -659,7 +673,8 @@ impl ProfileDb {
     }
 
     pub fn list_email_accounts(&self) -> Result<Vec<EmailAccount>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, label, address, imap_host, imap_port, smtp_host, smtp_port,
                     username, created_at
              FROM email_accounts ORDER BY label",
@@ -683,7 +698,7 @@ impl ProfileDb {
     }
 
     pub fn insert_email_message(&self, m: &EmailMessage) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO email_messages (id, account_id, subject, from_addr, date, body, read)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -700,7 +715,8 @@ impl ProfileDb {
     }
 
     pub fn list_email_messages(&self, account_id: &str) -> Result<Vec<EmailMessage>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, account_id, subject, from_addr, date, body, read
              FROM email_messages WHERE account_id = ?1 ORDER BY date DESC",
         )?;
@@ -723,7 +739,7 @@ impl ProfileDb {
     // ── calendar_events ─────────────────────────────────────────────────────
 
     pub fn insert_calendar_event(&self, e: &CalendarEvent) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO calendar_events
              (id, title, start_time, end_time, location, description, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -741,7 +757,8 @@ impl ProfileDb {
     }
 
     pub fn list_calendar_events(&self, from: i64, to: i64) -> Result<Vec<CalendarEvent>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, title, start_time, end_time, location, description, source
              FROM calendar_events
              WHERE start_time >= ?1 AND start_time < ?2
@@ -766,7 +783,7 @@ impl ProfileDb {
     // ── tasks ───────────────────────────────────────────────────────────────
 
     pub fn insert_task(&self, t: &Task) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO tasks (id, title, done, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![t.id, t.title, t.done as i64, t.created_at],
         )?;
@@ -774,7 +791,8 @@ impl ProfileDb {
     }
 
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, title, done, created_at FROM tasks ORDER BY done, created_at DESC",
         )?;
         let rows = stmt
@@ -791,7 +809,7 @@ impl ProfileDb {
     }
 
     pub fn set_task_done(&self, id: &str, done: bool) -> Result<bool> {
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE tasks SET done = ?1 WHERE id = ?2",
             params![done as i64, id],
         )?;
@@ -801,6 +819,7 @@ impl ProfileDb {
     pub fn delete_task(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -808,7 +827,7 @@ impl ProfileDb {
     // ── cron_jobs ───────────────────────────────────────────────────────────
 
     pub fn insert_cron_job(&self, j: &CronJob) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO cron_jobs
              (id, name, prompt, schedule, enabled, last_run_at, last_status, target_conversation_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -827,7 +846,8 @@ impl ProfileDb {
     }
 
     pub fn list_cron_jobs(&self) -> Result<Vec<CronJob>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, name, prompt, schedule, enabled, last_run_at, last_status, target_conversation_id
              FROM cron_jobs ORDER BY name",
         )?;
@@ -851,6 +871,7 @@ impl ProfileDb {
     pub fn get_cron_job(&self, id: &str) -> Result<Option<CronJob>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, name, prompt, schedule, enabled, last_run_at, last_status, target_conversation_id
                  FROM cron_jobs WHERE id = ?1",
@@ -872,7 +893,7 @@ impl ProfileDb {
     }
 
     pub fn set_cron_job_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE cron_jobs SET enabled = ?1 WHERE id = ?2",
             params![enabled as i64, id],
         )?;
@@ -881,7 +902,7 @@ impl ProfileDb {
 
     pub fn record_cron_run(&self, id: &str, status: &str) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE cron_jobs SET last_run_at = ?1, last_status = ?2 WHERE id = ?3",
             params![now, status, id],
         )?;
@@ -891,6 +912,7 @@ impl ProfileDb {
     pub fn delete_cron_job(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -900,7 +922,7 @@ impl ProfileDb {
     /// Book one model call to the ledger. `cost_usd` is `None` for an
     /// unknown/"flying blind" cloud cost (never a guess), `Some(0.0)` for local.
     pub fn record_usage(&self, e: &UsageEvent) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO usage_events
              (id, conversation_id, model, provider_id, provider_kind, cost_usd, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -922,7 +944,7 @@ impl ProfileDb {
     /// NULLs in SQLite, so the known-cost total is honest; the unknown count is
     /// surfaced separately rather than folded into the total as a guess.
     pub fn usage_summary(&self) -> Result<UsageSummary> {
-        Ok(self.conn.query_row(
+        Ok(self.conn.lock().query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(cost_usd), 0.0),
                     SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
@@ -945,7 +967,7 @@ impl ProfileDb {
     /// skipped — returns `true` if a row was inserted, `false` if it was a
     /// dedup no-op (already queued/claimed for that key).
     pub fn insert_work_item(&self, w: &crate::queue::WorkItem) -> Result<bool> {
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "INSERT OR IGNORE INTO work_items
              (id, kind, state, source_ref, input_json, result_json, error, scheduled_at,
               claim_key, idempotency_key, attempts, target_conversation_id, created_at,
@@ -979,6 +1001,7 @@ impl ProfileDb {
     pub fn claim_next_due_work(&self, now: i64) -> Result<Option<crate::queue::WorkItem>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "UPDATE work_items SET state='running', started_at=?1, attempts=attempts+1
                  WHERE id = (
@@ -1011,7 +1034,7 @@ impl ProfileDb {
         if !crate::queue::WorkState::Running.can_transition_to(to) {
             anyhow::bail!("illegal work-item transition: running -> {}", to.as_str());
         }
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE work_items SET state=?1, result_json=?2, error=?3, finished_at=?4
              WHERE id=?5 AND state='running'",
             params![to.as_str(), result_json, error, finished_at, id],
@@ -1023,7 +1046,7 @@ impl ProfileDb {
     /// a mutating action (2.5 durability). Queued items are untouched (they just
     /// run when a scheduler next claims them). Returns how many were reconciled.
     pub fn terminalize_orphaned_work(&self, now: i64) -> Result<usize> {
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "UPDATE work_items SET state='failed', error='interrupted_by_crash', finished_at=?1
              WHERE state='running'",
             params![now],
@@ -1034,6 +1057,7 @@ impl ProfileDb {
     pub fn get_work_item(&self, id: &str) -> Result<Option<crate::queue::WorkItem>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT id, kind, state, source_ref, input_json, result_json, error,
                         scheduled_at, claim_key, idempotency_key, attempts,
@@ -1048,7 +1072,7 @@ impl ProfileDb {
     // ── trm_logs ────────────────────────────────────────────────────────────
 
     pub fn insert_trm_log(&self, l: &TrmLog) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO trm_logs
              (id, conversation_id, message_hash, decision, confidence, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1065,7 +1089,8 @@ impl ProfileDb {
     }
 
     pub fn list_trm_logs(&self, conversation_id: &str) -> Result<Vec<TrmLog>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, conversation_id, message_hash, decision, confidence, created_at
              FROM trm_logs WHERE conversation_id = ?1 ORDER BY created_at DESC",
         )?;
@@ -1087,7 +1112,7 @@ impl ProfileDb {
     /// Spec §3: TRM logs are auto-deleted after 7 days. Call this from a
     /// background task to enforce retention.
     pub fn purge_trm_logs_older_than(&self, cutoff: i64) -> Result<usize> {
-        let n = self.conn.execute(
+        let n = self.conn.lock().execute(
             "DELETE FROM trm_logs WHERE created_at < ?1",
             params![cutoff],
         )?;
@@ -1107,7 +1132,7 @@ impl ProfileDb {
     /// `conn.last_insert_rowid()` but we don't return it; the caller
     /// that needs it back can re-`list_tool_audit` by `(ts, fingerprint)`.
     pub fn add_tool_audit(&self, row: &ToolAuditRow) -> Result<()> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO tool_audit
              (ts, conversation_id, tool_name, canonical_args, fingerprint, risk, outcome,
               gate_by, grant_used, decision, endpoint_kind, duration_ms)
@@ -1136,7 +1161,8 @@ impl ProfileDb {
     /// install has no rows, and a conversation that hasn't called any tools
     /// also has no rows.
     pub fn list_tool_audit(&self, conversation_id: &str) -> Result<Vec<ToolAuditRow>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, ts, conversation_id, tool_name, canonical_args, fingerprint,
                     risk, outcome, gate_by, grant_used, decision, endpoint_kind, duration_ms
              FROM tool_audit WHERE conversation_id = ?1 ORDER BY id ASC",
@@ -1176,6 +1202,7 @@ impl ProfileDb {
     /// authorization the user relies on, never best-effort telemetry).
     pub fn add_tool_rule(&self, row: &ToolRuleRow) -> Result<()> {
         self.conn
+            .lock()
             .execute(
                 "INSERT OR REPLACE INTO tool_rules
                  (id, tool_name, pattern, action, created_at)
@@ -1189,7 +1216,8 @@ impl ProfileDb {
     /// All rules for one tool, newest-first. The hot read path
     /// (`SqlitePolicySource::rules_for`) — one indexed lookup per gating pass.
     pub fn list_tool_rules_for(&self, tool_name: &str) -> Result<Vec<ToolRuleRow>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, tool_name, pattern, action, created_at
              FROM tool_rules WHERE tool_name = ?1 ORDER BY created_at DESC, id ASC",
         )?;
@@ -1202,7 +1230,8 @@ impl ProfileDb {
 
     /// Every rule in this profile, newest-first — for the Settings pane.
     pub fn list_tool_rules(&self) -> Result<Vec<ToolRuleRow>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT id, tool_name, pattern, action, created_at
              FROM tool_rules ORDER BY created_at DESC, id ASC",
         )?;
@@ -1217,6 +1246,7 @@ impl ProfileDb {
     pub fn delete_tool_rule(&self, id: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM tool_rules WHERE id = ?1", params![id])
             .context("delete tool_rules row")?;
         Ok(n > 0)
@@ -1245,6 +1275,7 @@ impl ProfileDb {
         use crate::classifier::ClassifierConfig;
         let row: Option<(f64, f64)> = self
             .conn
+            .lock()
             .query_row(
                 "SELECT tau_block, tau_band FROM classifier_settings WHERE id = 1",
                 [],
@@ -1271,6 +1302,7 @@ impl ProfileDb {
         let cfg = cfg.sanitized();
         let now = chrono::Utc::now().timestamp();
         self.conn
+            .lock()
             .execute(
                 "INSERT INTO classifier_settings (id, tau_block, tau_band, updated_at)
                  VALUES (1, ?1, ?2, ?3)
@@ -1289,6 +1321,7 @@ impl ProfileDb {
     pub fn reset_classifier_config(&self) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM classifier_settings WHERE id = 1", [])
             .context("delete classifier_settings row")?;
         Ok(n > 0)
@@ -1300,6 +1333,7 @@ impl ProfileDb {
     pub fn redaction_enabled(&self) -> Result<bool> {
         let v: Option<i64> = self
             .conn
+            .lock()
             .query_row(
                 "SELECT redaction_enabled FROM classifier_settings WHERE id = 1",
                 [],
@@ -1318,6 +1352,7 @@ impl ProfileDb {
         let d = ClassifierConfig::default();
         let now = chrono::Utc::now().timestamp();
         self.conn
+            .lock()
             .execute(
                 "INSERT INTO classifier_settings (id, tau_block, tau_band, redaction_enabled, updated_at)
                  VALUES (1, ?1, ?2, ?3, ?4)
@@ -1339,6 +1374,7 @@ impl ProfileDb {
     pub fn memory_settings(&self) -> Result<MemorySettings> {
         let row: Option<(i64, i64)> = self
             .conn
+            .lock()
             .query_row(
                 "SELECT semantic_search_enabled, walled FROM memory_settings WHERE id = 1",
                 [],
@@ -1359,6 +1395,7 @@ impl ProfileDb {
     pub fn set_memory_settings(&self, s: &MemorySettings) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn
+            .lock()
             .execute(
                 "INSERT INTO memory_settings
                      (id, semantic_search_enabled, walled, updated_at)
@@ -1380,6 +1417,7 @@ impl ProfileDb {
     pub fn set_seat_binding(&self, seat: &str, provider_id: &str, model: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn
+            .lock()
             .execute(
                 "INSERT INTO seat_bindings (seat, provider_id, model, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
@@ -1398,6 +1436,7 @@ impl ProfileDb {
     pub fn get_seat_binding(&self, seat: &str) -> Result<Option<SeatBinding>> {
         Ok(self
             .conn
+            .lock()
             .query_row(
                 "SELECT seat, provider_id, model, updated_at FROM seat_bindings WHERE seat = ?1",
                 params![seat.trim()],
@@ -1409,7 +1448,8 @@ impl ProfileDb {
 
     /// Every seat binding for this profile (for the Settings → Seats view).
     pub fn list_seat_bindings(&self) -> Result<Vec<SeatBinding>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
             "SELECT seat, provider_id, model, updated_at FROM seat_bindings ORDER BY seat",
         )?;
         let rows = stmt
@@ -1422,6 +1462,7 @@ impl ProfileDb {
     pub fn delete_seat_binding(&self, seat: &str) -> Result<bool> {
         let n = self
             .conn
+            .lock()
             .execute("DELETE FROM seat_bindings WHERE seat = ?1", params![seat.trim()])?;
         Ok(n > 0)
     }

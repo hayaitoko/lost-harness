@@ -190,7 +190,8 @@ impl PolicySource for InMemoryPolicySource {
 /// persisted rule is visible on the next same-session call and a Settings
 /// revoke takes effect immediately, no restart. One indexed lookup per pass;
 /// consistent with the item-5 audit write already on the dispatch path (rides
-/// the same `ProfileDb` `unsafe impl Sync` single-in-flight deferral).
+/// the same `ProfileDb`, which serializes concurrent access through its
+/// internal `parking_lot::Mutex<Connection>`).
 /// `mode_for` is always `None` — whole-tool defaults are risk-derived and live
 /// in-memory; a persisted whole-tool policy is a `(tool, "*", …)` pattern rule.
 pub struct SqlitePolicySource {

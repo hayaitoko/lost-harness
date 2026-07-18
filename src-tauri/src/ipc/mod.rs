@@ -15,13 +15,11 @@
 //! - The frontend bridge is `src/lib/api/tauri.ts`. Any new command or event
 //!   here must be reflected there.
 //!
-//! App state: `Storage` has a manual `unsafe impl Send + Sync` (see
-//! `storage::Storage`) — the underlying `rusqlite::Connection` is
-//! `!Sync` due to its `RefCell` internals, but every code path that
-//! touches `Storage` goes through Tauri's command boundary which is
-//! single-threaded per command, and the agent loop uses a private
-//! `tokio::sync::Mutex` to serialize streams. So the manual impl is
-//! sound for the M1 wiring.
+//! App state: `Storage` is genuinely `Send + Sync` (see `storage::Storage`)
+//! — `GlobalDb` and `ProfileDb` each hold their `rusqlite::Connection`
+//! behind a `parking_lot::Mutex`, so concurrent IPC commands and the agent
+//! loop can all safely hold a `Storage` handle at once; no manual/unsafe
+//! impl is needed or present.
 //!
 //! Each top-level handle is held in an `Arc` directly (no outer Mutex
 //! at the AppState level) so the IPC commands can access them
@@ -53,7 +51,7 @@ use crate::storage::{Conversation, Message, Storage};
 /// Shared application state. Tauri stores this via `.manage(state)` and
 /// injects it into commands with `state: State<'_, AppState>`. Each
 /// field is an `Arc<T>` where `T: Send + Sync`. See the module docs
-/// for why the `unsafe impl Send + Sync for Storage` is sound.
+/// for why `Storage` is genuinely `Send + Sync`.
 pub struct AppState {
     pub agent_loop: Arc<AgentLoop>,
     pub model_manager: Arc<ModelManager>,

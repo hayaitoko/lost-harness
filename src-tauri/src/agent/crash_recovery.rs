@@ -42,9 +42,10 @@
 //! written), so this cleanly separates the deliberate stop from the crash.
 
 use anyhow::{Context, Result};
+use rusqlite::params;
 use uuid::Uuid;
 
-use crate::storage::{Message, ProfileDb, Storage};
+use crate::storage::{Conversation, Message, ProfileDb, Storage};
 use crate::tools::calling::contains_open_tool_fence;
 
 /// String tag persisted in `messages.error` for the repair row. Stable —
@@ -81,25 +82,87 @@ pub struct CrashRecoveryReport {
 /// granularity so tests can drive it directly against
 /// `ProfileDb::open_in_memory` with no `Storage`/tempdir needed.
 ///
-/// The transaction handle is held across `add_message` /
-/// `list_conversations` / `list_messages_by_conversation` — all three
-/// execute on `self.raw()` (the same `Connection`), so calling them
-/// while the `Transaction` handle is alive keeps them inside it. Same
-/// pattern as `storage::migrations::run_migrations`.
+/// **Why this inlines SQL instead of calling `db.list_conversations()` /
+/// `db.list_messages_by_conversation()` / `db.add_message()`.**
+/// `ProfileDb`'s connection is a `parking_lot::Mutex<Connection>`, which is
+/// NOT reentrant. `db.raw()` below locks it for this whole function so the
+/// transaction is a genuine critical section; re-entering any of
+/// `ProfileDb`'s own methods while that guard is held would try to lock the
+/// same mutex again on this thread and deadlock. So this function locks
+/// once, opens the transaction on that single guard, and runs the exact
+/// same queries those methods use directly against the transaction.
 pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
-    let tx = db
-        .raw()
+    let conn = db.raw();
+    let tx = conn
         .unchecked_transaction()
         .context("crash-recovery: starting transaction")?;
     let mut terminalized = Vec::new();
 
-    for conv in db
-        .list_conversations()
-        .context("crash-recovery: listing conversations")?
-    {
-        let msgs = db
-            .list_messages_by_conversation(&conv.id)
-            .context("crash-recovery: loading messages")?;
+    // Same query as `ProfileDb::list_conversations`. Bind the mapped rows to
+    // a name (`rows`) rather than tail-returning `.collect()` directly —
+    // otherwise the borrow-checker sees `stmt` as dropped before a temporary
+    // that (structurally) still refers to it, even though the temporary is
+    // fully consumed by `.collect()` (a well-known false-positive shape for
+    // a block whose tail expression borrows an earlier local).
+    let conversations: Vec<Conversation> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, name, pinned, binding, folder_id, color, created_at, updated_at
+                 FROM conversations
+                 ORDER BY pinned DESC, updated_at DESC",
+            )
+            .context("crash-recovery: preparing conversations query")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Conversation {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    pinned: r.get::<_, i64>(2)? != 0,
+                    binding: r.get(3)?,
+                    folder_id: r.get(4)?,
+                    color: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })
+            .context("crash-recovery: listing conversations")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("crash-recovery: listing conversations")?;
+        rows
+    };
+
+    for conv in conversations {
+        // Same query as `ProfileDb::list_messages_by_conversation`.
+        let msgs: Vec<Message> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, conversation_id, role, content, model, provider_id,
+                            routing_decision, thinking_content, error, aborted, created_at
+                     FROM messages WHERE conversation_id = ?1
+                     ORDER BY created_at ASC, rowid ASC",
+                )
+                .context("crash-recovery: preparing messages query")?;
+            let rows = stmt
+                .query_map(params![conv.id], |r| {
+                    Ok(Message {
+                        id: r.get(0)?,
+                        conversation_id: r.get(1)?,
+                        role: r.get(2)?,
+                        content: r.get(3)?,
+                        model: r.get(4)?,
+                        provider_id: r.get(5)?,
+                        routing_decision: r.get(6)?,
+                        thinking_content: r.get(7)?,
+                        error: r.get(8)?,
+                        aborted: r.get::<_, i64>(9)? != 0,
+                        created_at: r.get(10)?,
+                    })
+                })
+                .context("crash-recovery: loading messages")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("crash-recovery: loading messages")?;
+            rows
+        };
         let Some(last) = msgs.last() else {
             continue;
         };
@@ -128,8 +191,27 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
             aborted: true,
             created_at: chrono::Utc::now().timestamp(),
         };
-        db.add_message(&repair)
-            .context("crash-recovery: persisting interrupted-tool event")?;
+        // Same query as `ProfileDb::add_message`.
+        tx.execute(
+            "INSERT INTO messages
+             (id, conversation_id, role, content, model, provider_id,
+              routing_decision, thinking_content, error, aborted, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                repair.id,
+                repair.conversation_id,
+                repair.role,
+                repair.content,
+                repair.model,
+                repair.provider_id,
+                repair.routing_decision,
+                repair.thinking_content,
+                repair.error,
+                repair.aborted as i64,
+                repair.created_at
+            ],
+        )
+        .context("crash-recovery: persisting interrupted-tool event")?;
         terminalized.push(conv.id.clone());
 
         // TODO(item 5, once tool_audit exists): also insert an audit row
