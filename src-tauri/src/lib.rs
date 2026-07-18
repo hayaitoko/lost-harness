@@ -20,6 +20,7 @@ mod hooks; // M3: Hook chain — privacy filter + permission + sandbox + first-u
 mod ipc; // M1: Tauri command handlers
 mod models; // M4: Model manager (local + cloud)
 mod platform; // M5: cross-platform computer use (cfg'd submodules)
+mod queue; // M4 (Wave 4.4): the one-queue-model substrate (deferred work)
 mod storage; // M1+: SQLite, sqlite-vec, sled/redb
 mod tools; // M3: Tool registry + implementations
 

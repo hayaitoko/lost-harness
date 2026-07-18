@@ -18,7 +18,7 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 4;
 /// `classifier_settings` in the classifier settings round,
 /// `memory_settings` in Wave 1 memory) bumps `PROFILE_SCHEMA_VERSION`
 /// without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 7;
+pub const PROFILE_SCHEMA_VERSION: i32 = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -150,6 +150,9 @@ pub const PROFILE_TABLES: &[&str] = &[
     // 16. usage_events — per-profile model-call cost ledger (Wave 3.2, PLAN §3):
     //     one row per model call; cost NULL = unknown ("flying blind"), never a guess.
     "usage_events",
+    // 17. work_items — the one-queue-model substrate (Wave 4.4): deferred work
+    //     (cron fires / agent dispatch / server results) as one lifecycle.
+    "work_items",
 ];
 
 /// CREATE TABLE statements for per-profile DBs (in dependency order).
@@ -332,6 +335,24 @@ CREATE TABLE IF NOT EXISTS usage_events (
     created_at        INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS work_items (
+    id                      TEXT PRIMARY KEY,
+    kind                    TEXT NOT NULL,      -- 'cron' | 'agent_dispatch' | 'server_result'
+    state                   TEXT NOT NULL,      -- 'queued'|'running'|'done'|'failed'|'parked'|'cancelled'
+    source_ref              TEXT,
+    input_json              TEXT NOT NULL,
+    result_json             TEXT,
+    error                   TEXT,
+    scheduled_at            INTEGER,            -- fire-time; NULL = run ASAP
+    claim_key               TEXT,               -- exactly-once dedup (partial-unique below)
+    idempotency_key         TEXT,               -- 2.5 durability guard
+    attempts                INTEGER NOT NULL DEFAULT 0,
+    target_conversation_id  TEXT,
+    created_at              INTEGER NOT NULL,
+    started_at              INTEGER,
+    finished_at             INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_folder ON conversations(folder_id);
@@ -342,4 +363,6 @@ CREATE INDEX IF NOT EXISTS idx_email_messages_account ON email_messages(account_
 CREATE INDEX IF NOT EXISTS idx_calendar_events_start ON calendar_events(start_time);
 CREATE INDEX IF NOT EXISTS idx_tasks_done ON tasks(done);
 CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_claim ON work_items(claim_key) WHERE claim_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_work_items_state_sched ON work_items(state, scheduled_at);
 "#;

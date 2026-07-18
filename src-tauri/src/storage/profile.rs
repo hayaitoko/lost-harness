@@ -938,6 +938,113 @@ impl ProfileDb {
         )?)
     }
 
+    // ── work_items (Wave 4.4 — the one-queue-model substrate) ─────────────────
+
+    /// Enqueue a work item. Uses `INSERT OR IGNORE`, so a duplicate `claim_key`
+    /// (the exactly-once dedup, via the partial-unique index) is silently
+    /// skipped — returns `true` if a row was inserted, `false` if it was a
+    /// dedup no-op (already queued/claimed for that key).
+    pub fn insert_work_item(&self, w: &crate::queue::WorkItem) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO work_items
+             (id, kind, state, source_ref, input_json, result_json, error, scheduled_at,
+              claim_key, idempotency_key, attempts, target_conversation_id, created_at,
+              started_at, finished_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![
+                w.id,
+                w.kind.as_str(),
+                w.state.as_str(),
+                w.source_ref,
+                w.input_json,
+                w.result_json,
+                w.error,
+                w.scheduled_at,
+                w.claim_key,
+                w.idempotency_key,
+                w.attempts,
+                w.target_conversation_id,
+                w.created_at,
+                w.started_at,
+                w.finished_at,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Atomically claim the oldest DUE queued item (`scheduled_at` null or past),
+    /// flipping it to `running` and stamping `started_at`/`attempts` in the same
+    /// statement — so two runners can never claim the same item. Returns the
+    /// claimed item, or `None` when nothing is due.
+    pub fn claim_next_due_work(&self, now: i64) -> Result<Option<crate::queue::WorkItem>> {
+        Ok(self
+            .conn
+            .query_row(
+                "UPDATE work_items SET state='running', started_at=?1, attempts=attempts+1
+                 WHERE id = (
+                    SELECT id FROM work_items
+                    WHERE state='queued' AND (scheduled_at IS NULL OR scheduled_at <= ?1)
+                    ORDER BY COALESCE(scheduled_at, created_at) ASC, created_at ASC
+                    LIMIT 1
+                 )
+                 RETURNING id, kind, state, source_ref, input_json, result_json, error,
+                           scheduled_at, claim_key, idempotency_key, attempts,
+                           target_conversation_id, created_at, started_at, finished_at",
+                params![now],
+                row_to_work_item,
+            )
+            .optional()?)
+    }
+
+    /// Finish a currently-`running` item into a terminal-or-parked `to` state
+    /// (`Done`/`Failed`/`Parked`). Guarded both by the checked lifecycle
+    /// (`Running.can_transition_to`) and the SQL `state='running'` predicate, so
+    /// a terminal item can never be re-finished. Returns whether a row moved.
+    pub fn finish_work_item(
+        &self,
+        id: &str,
+        to: crate::queue::WorkState,
+        result_json: Option<&str>,
+        error: Option<&str>,
+        finished_at: i64,
+    ) -> Result<bool> {
+        if !crate::queue::WorkState::Running.can_transition_to(to) {
+            anyhow::bail!("illegal work-item transition: running -> {}", to.as_str());
+        }
+        let n = self.conn.execute(
+            "UPDATE work_items SET state=?1, result_json=?2, error=?3, finished_at=?4
+             WHERE id=?5 AND state='running'",
+            params![to.as_str(), result_json, error, finished_at, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// On boot, fail any item left `running` by a crash — never silently re-run
+    /// a mutating action (2.5 durability). Queued items are untouched (they just
+    /// run when a scheduler next claims them). Returns how many were reconciled.
+    pub fn terminalize_orphaned_work(&self, now: i64) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE work_items SET state='failed', error='interrupted_by_crash', finished_at=?1
+             WHERE state='running'",
+            params![now],
+        )?;
+        Ok(n)
+    }
+
+    pub fn get_work_item(&self, id: &str) -> Result<Option<crate::queue::WorkItem>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, kind, state, source_ref, input_json, result_json, error,
+                        scheduled_at, claim_key, idempotency_key, attempts,
+                        target_conversation_id, created_at, started_at, finished_at
+                 FROM work_items WHERE id = ?1",
+                params![id],
+                row_to_work_item,
+            )
+            .optional()?)
+    }
+
     // ── trm_logs ────────────────────────────────────────────────────────────
 
     pub fn insert_trm_log(&self, l: &TrmLog) -> Result<()> {
@@ -1316,6 +1423,32 @@ fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> 
     })
 }
 
+fn row_to_work_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::queue::WorkItem> {
+    let kind_s: String = r.get(1)?;
+    let state_s: String = r.get(2)?;
+    let kind = crate::queue::WorkKind::from_str(&kind_s)
+        .ok_or_else(|| rusqlite::Error::InvalidColumnName(format!("bad work_items.kind: {kind_s}")))?;
+    let state = crate::queue::WorkState::from_str(&state_s)
+        .ok_or_else(|| rusqlite::Error::InvalidColumnName(format!("bad work_items.state: {state_s}")))?;
+    Ok(crate::queue::WorkItem {
+        id: r.get(0)?,
+        kind,
+        state,
+        source_ref: r.get(3)?,
+        input_json: r.get(4)?,
+        result_json: r.get(5)?,
+        error: r.get(6)?,
+        scheduled_at: r.get(7)?,
+        claim_key: r.get(8)?,
+        idempotency_key: r.get(9)?,
+        attempts: r.get(10)?,
+        target_conversation_id: r.get(11)?,
+        created_at: r.get(12)?,
+        started_at: r.get(13)?,
+        finished_at: r.get(14)?,
+    })
+}
+
 fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     Ok(Message {
         id: r.get(0)?,
@@ -1377,6 +1510,71 @@ mod tests {
         // Known cost = 0 + 0 + 0.42; the two None calls are NOT guessed into it.
         assert!((s.known_cost_usd - 0.42).abs() < 1e-9, "known cost = {}", s.known_cost_usd);
         assert_eq!(s.unknown_cost_calls, 2, "the two None cloud calls are flagged, not summed");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn work_item_enqueue_claim_finish_lifecycle() {
+        use crate::queue::{WorkItem, WorkKind, WorkState};
+        let (_storage, db, root) = temp_profile();
+
+        // Enqueue two items; a claim_key dedups the second identical enqueue.
+        let mut a = WorkItem::queued(WorkKind::Cron, r#"{"prompt":"a"}"#, 100);
+        a.claim_key = Some("cron:job1@1000".into());
+        a.scheduled_at = Some(1000);
+        assert!(db.insert_work_item(&a).unwrap(), "first enqueue inserts");
+        let mut dup = WorkItem::queued(WorkKind::Cron, r#"{"prompt":"a"}"#, 101);
+        dup.claim_key = Some("cron:job1@1000".into()); // same key → deduped
+        assert!(!db.insert_work_item(&dup).unwrap(), "same claim_key is a dedup no-op");
+
+        let b = WorkItem::queued(WorkKind::AgentDispatch, r#"{"prompt":"b"}"#, 50);
+        assert!(db.insert_work_item(&b).unwrap());
+
+        // Nothing due before scheduled_at for `a`, but `b` (no schedule) is due.
+        let claimed = db.claim_next_due_work(999).unwrap().expect("b is due");
+        assert_eq!(claimed.id, b.id, "the unscheduled item claims first");
+        assert_eq!(claimed.state, WorkState::Running);
+        assert_eq!(claimed.attempts, 1, "claim stamps an attempt");
+
+        // A second claim now gets nothing (a is not due until 1000).
+        assert!(db.claim_next_due_work(999).unwrap().is_none());
+        // At/after 1000, `a` becomes claimable.
+        let claimed_a = db.claim_next_due_work(1000).unwrap().expect("a now due");
+        assert_eq!(claimed_a.id, a.id);
+
+        // Finish `b` (running) → done; a re-finish is a no-op (already terminal).
+        assert!(db.finish_work_item(&b.id, WorkState::Done, Some(r#"{"ok":true}"#), None, 200).unwrap());
+        assert!(!db.finish_work_item(&b.id, WorkState::Failed, None, Some("x"), 300).unwrap(),
+            "a terminal item can't be re-finished");
+        let got = db.get_work_item(&b.id).unwrap().unwrap();
+        assert_eq!(got.state, WorkState::Done);
+        assert_eq!(got.result_json.as_deref(), Some(r#"{"ok":true}"#));
+
+        // An illegal transition (running -> queued) is rejected.
+        assert!(db.finish_work_item(&a.id, WorkState::Queued, None, None, 400).is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminalize_orphaned_work_fails_only_running_items() {
+        use crate::queue::{WorkItem, WorkKind, WorkState};
+        let (_storage, db, root) = temp_profile();
+
+        let q = WorkItem::queued(WorkKind::Cron, "{}", 1);
+        db.insert_work_item(&q).unwrap();
+        let r = WorkItem::queued(WorkKind::AgentDispatch, "{}", 1);
+        db.insert_work_item(&r).unwrap();
+        // Claim ONE (both are due; which one is a tie) so it's mid-run, then
+        // simulate a crash + boot reconcile.
+        let claimed_id = db.claim_next_due_work(10).unwrap().unwrap().id;
+        let other_id = if claimed_id == r.id { q.id.clone() } else { r.id.clone() };
+        let n = db.terminalize_orphaned_work(500).unwrap();
+        assert_eq!(n, 1, "only the running item is reconciled");
+        assert_eq!(db.get_work_item(&claimed_id).unwrap().unwrap().state, WorkState::Failed);
+        // The still-queued item is untouched (it will run later).
+        assert_eq!(db.get_work_item(&other_id).unwrap().unwrap().state, WorkState::Queued);
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -253,6 +253,35 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
         );
         CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);",
     },
+    Migration {
+        version: 8,
+        // The one-queue-model substrate (Wave 4.4): deferred work — cron fires,
+        // agent dispatch, server results — as one persisted lifecycle (also the
+        // 2.5 durability journal via idempotency_key). Same dual-definition
+        // convention: the CREATE is IF NOT EXISTS and also lives in
+        // PROFILE_SCHEMA_SQL, so v8 is a no-op on a fresh install and a real
+        // upgrade on a v7 DB.
+        name: "work_items_table",
+        sql: "CREATE TABLE IF NOT EXISTS work_items (
+            id                      TEXT PRIMARY KEY,
+            kind                    TEXT NOT NULL,
+            state                   TEXT NOT NULL,
+            source_ref              TEXT,
+            input_json              TEXT NOT NULL,
+            result_json             TEXT,
+            error                   TEXT,
+            scheduled_at            INTEGER,
+            claim_key               TEXT,
+            idempotency_key         TEXT,
+            attempts                INTEGER NOT NULL DEFAULT 0,
+            target_conversation_id  TEXT,
+            created_at              INTEGER NOT NULL,
+            started_at              INTEGER,
+            finished_at             INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_claim ON work_items(claim_key) WHERE claim_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_work_items_state_sched ON work_items(state, scheduled_at);",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.
