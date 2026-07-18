@@ -9,7 +9,7 @@
 
 /// Returns the current schema version for the GLOBAL database.
 /// Bump when adding a new global migration.
-pub const GLOBAL_SCHEMA_VERSION: i32 = 4;
+pub const GLOBAL_SCHEMA_VERSION: i32 = 5;
 
 /// Returns the current schema version for each PROFILE database.
 /// Bump when adding a new per-profile migration. Profile and global

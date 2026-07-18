@@ -474,6 +474,16 @@ fn build_tool_dispatcher(
     registry.register(Box::new(crate::tools::ask_human::AskHumanTool::new(
         human_prompter,
     )));
+    // Wave 4.1: skills — reusable playbooks as tools. `search_skills` (Safe →
+    // pre-trusted) loads a relevant approved skill's body; `save_skill` (Write →
+    // approval spine) stores a new one (the prompt showing the content is the
+    // review). A skill's body re-gates whatever tools it drives.
+    registry.register(Box::new(crate::tools::skills::SearchSkillsTool::new(
+        storage.clone(),
+    )));
+    registry.register(Box::new(crate::tools::skills::SaveSkillTool::new(
+        storage.clone(),
+    )));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`
     // scratch dir, network off by default, killed on timeout, OS-sandboxed via

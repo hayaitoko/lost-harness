@@ -32,6 +32,7 @@ pub mod fs;
 pub mod mcp;
 pub mod memory;
 pub mod session_search;
+pub mod skills;
 pub mod system_status;
 
 pub use calling::ToolCall;

@@ -133,6 +133,25 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
         name: "endpoints_native_tools_flag",
         sql: "ALTER TABLE endpoints ADD COLUMN supports_native_tools INTEGER NOT NULL DEFAULT 0;",
     },
+    Migration {
+        version: 5,
+        // Wave 4.1 — flesh out the `skills` stub into a real skill row: a
+        // description + capability requirements (which bodies can be offered),
+        // an approval_status trust boundary (only 'approved' is searchable/
+        // loadable), a resource path (Tier-3 progressive disclosure), a version,
+        // and an embedding slot (meaning-lane search, later). ADD COLUMN has no
+        // IF-NOT-EXISTS, so these live ONLY here (not in GLOBAL_SCHEMA_SQL's
+        // skills CREATE): a fresh DB creates the 4-column stub then v5 widens it,
+        // matching an existing v4 DB's upgrade. Default approval 'pending' fails
+        // CLOSED — a pre-existing skill is not auto-trusted until reviewed.
+        name: "skills_metadata",
+        sql: "ALTER TABLE skills ADD COLUMN description TEXT NOT NULL DEFAULT '';
+              ALTER TABLE skills ADD COLUMN capabilities_required TEXT NOT NULL DEFAULT '[]';
+              ALTER TABLE skills ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'pending';
+              ALTER TABLE skills ADD COLUMN path TEXT NOT NULL DEFAULT '';
+              ALTER TABLE skills ADD COLUMN version TEXT NOT NULL DEFAULT '0.1.0';
+              ALTER TABLE skills ADD COLUMN embedding BLOB;",
+    },
 ];
 
 /// All per-profile DB migrations, in order.

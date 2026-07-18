@@ -200,12 +200,70 @@ pub struct MemoryVector {
     pub embedding: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+/// A reusable playbook (Wave 4.1). Rides the same tool spine as everything else
+/// (a skill becomes a `Tool`); the `capabilities_required` gate which bodies can
+/// even be offered, and `approval_status` is the trust boundary — only
+/// `Approved` skills are searchable / loadable. `capabilities_required` is stored
+/// as capability NAME strings (JSON) so the storage layer stays independent of
+/// `tools::Capability`; the tools layer parses them.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Skill {
     pub id: String,
     pub name: String,
+    pub description: String,
     pub content: String,
+    pub capabilities_required: Vec<String>,
+    pub approval_status: SkillApproval,
+    pub path: String,
+    pub version: String,
     pub created_at: i64,
+}
+
+/// The trust state of a skill. `Approved` is the boundary (CC's install-time
+/// trust, re-expressed as our review gate) — only approved skills are offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillApproval {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl SkillApproval {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkillApproval::Pending => "pending",
+            SkillApproval::Approved => "approved",
+            SkillApproval::Rejected => "rejected",
+        }
+    }
+    pub fn from_str(s: &str) -> SkillApproval {
+        // Unknown/legacy values fail CLOSED to `Pending` (never auto-trusted).
+        match s {
+            "approved" => SkillApproval::Approved,
+            "rejected" => SkillApproval::Rejected,
+            _ => SkillApproval::Pending,
+        }
+    }
+}
+
+/// Parse a `skills` row (9 columns) into a [`Skill`]. `capabilities_required` is
+/// a JSON array of capability-name strings; a corrupt value degrades to empty
+/// (the skill then requires nothing — but `approval_status` still gates it).
+fn row_to_skill(r: &rusqlite::Row<'_>) -> rusqlite::Result<Skill> {
+    let caps_json: String = r.get(4)?;
+    let capabilities_required: Vec<String> = serde_json::from_str(&caps_json).unwrap_or_default();
+    let status: String = r.get(5)?;
+    Ok(Skill {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        description: r.get(2)?,
+        content: r.get(3)?,
+        capabilities_required,
+        approval_status: SkillApproval::from_str(&status),
+        path: r.get(6)?,
+        version: r.get(7)?,
+        created_at: r.get(8)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -983,9 +1041,22 @@ impl GlobalDb {
     // ── skills ─────────────────────────────────────────────────────────────
 
     pub fn insert_skill(&self, s: &Skill) -> Result<()> {
+        let caps = serde_json::to_string(&s.capabilities_required).unwrap_or_else(|_| "[]".into());
         self.conn.execute(
-            "INSERT INTO skills (id, name, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![s.id, s.name, s.content, s.created_at],
+            "INSERT INTO skills
+             (id, name, description, content, capabilities_required, approval_status, path, version, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                s.id,
+                s.name,
+                s.description,
+                s.content,
+                caps,
+                s.approval_status.as_str(),
+                s.path,
+                s.version,
+                s.created_at
+            ],
         )?;
         Ok(())
     }
@@ -994,35 +1065,63 @@ impl GlobalDb {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, name, content, created_at FROM skills WHERE id = ?1",
+                "SELECT id, name, description, content, capabilities_required, approval_status, path, version, created_at
+                 FROM skills WHERE id = ?1",
                 params![id],
-                |r| {
-                    Ok(Skill {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        content: r.get(2)?,
-                        created_at: r.get(3)?,
-                    })
-                },
+                row_to_skill,
             )
             .optional()?)
     }
 
     pub fn list_skills(&self) -> Result<Vec<Skill>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name, content, created_at FROM skills ORDER BY name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, content, capabilities_required, approval_status, path, version, created_at
+             FROM skills ORDER BY name",
+        )?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(Skill {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    content: r.get(2)?,
-                    created_at: r.get(3)?,
-                })
-            })?
+            .query_map([], row_to_skill)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// APPROVED skills only — the set safe to offer/search (the trust boundary).
+    pub fn list_approved_skills(&self) -> Result<Vec<Skill>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, content, capabilities_required, approval_status, path, version, created_at
+             FROM skills WHERE approval_status = 'approved' ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_skill)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Keyword search over APPROVED skills (name/description/content). `LIKE`
+    /// with the wildcard-escaped query — good enough for the handful of skills a
+    /// profile has; a meaning lane (sqlite-vec, like memory) is a later refinement.
+    pub fn search_skills(&self, query: &str, limit: usize) -> Result<Vec<Skill>> {
+        let esc = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pat = format!("%{esc}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, content, capabilities_required, approval_status, path, version, created_at
+             FROM skills
+             WHERE approval_status = 'approved'
+               AND (name LIKE ?1 ESCAPE '\\' OR description LIKE ?1 ESCAPE '\\' OR content LIKE ?1 ESCAPE '\\')
+             ORDER BY name LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![pat, limit as i64], row_to_skill)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Move a skill to a trust state (the review gate). Returns whether a row moved.
+    pub fn set_skill_approval(&self, id: &str, status: SkillApproval) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE skills SET approval_status = ?1 WHERE id = ?2",
+            params![status.as_str(), id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn delete_skill(&self, id: &str) -> Result<bool> {
