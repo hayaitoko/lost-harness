@@ -676,6 +676,32 @@ pub fn delete_skill(state: State<'_, AppState>, args: DeleteSkillArgs) -> Result
         .map_err(|e| e.to_string())
 }
 
+/// Whether autonomous skill drafting (Wave 4.2) is on. Global (skills are global).
+#[tauri::command]
+pub fn get_skill_reflect_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.storage.global().skill_reflect_enabled())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillReflectArgs {
+    pub enabled: bool,
+}
+
+/// Turn autonomous skill drafting on/off. When on, a LOCAL model reviews a
+/// finished conversation for a reusable procedure and drafts a **Pending** skill
+/// (inert until the user approves it in the Skills pane).
+#[tauri::command]
+pub fn set_skill_reflect_enabled(
+    state: State<'_, AppState>,
+    args: SkillReflectArgs,
+) -> Result<(), String> {
+    state
+        .storage
+        .global()
+        .set_skill_reflect_enabled(args.enabled)
+        .map_err(|e| e.to_string())
+}
+
 /// Roll up a profile's model-call cost ledger for the Settings "Usage" view.
 #[tauri::command]
 pub fn get_usage_summary(

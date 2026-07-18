@@ -45,6 +45,8 @@
     listSkills,
     setSkillApproval,
     deleteSkill,
+    getSkillReflectEnabled,
+    setSkillReflectEnabled,
     type SkillInfo,
   } from "$lib/api/tauri";
 
@@ -154,6 +156,8 @@
   let skillsError = $state<string | null>(null);
   let confirmDeleteSkillId = $state<string | null>(null);
   let expandedSkillId = $state<string | null>(null);
+  let skillReflectEnabled = $state(false);
+  let skillReflectSaving = $state(false);
 
   let activeLabel = $derived(SECTIONS.find(([id]) => id === section)![1]);
 
@@ -235,6 +239,11 @@
       .finally(() => {
         skillsLoading = false;
       });
+    getSkillReflectEnabled()
+      .then((v) => {
+        skillReflectEnabled = v;
+      })
+      .catch(() => {});
   });
 
   // Load the active profile's classifier thresholds when the Privacy guard
@@ -551,6 +560,19 @@
 
   function toggleSkillExpanded(id: string) {
     expandedSkillId = expandedSkillId === id ? null : id;
+  }
+
+  async function toggleSkillReflect(next: boolean) {
+    skillReflectSaving = true;
+    const prev = skillReflectEnabled;
+    skillReflectEnabled = next;
+    try {
+      await setSkillReflectEnabled(next);
+    } catch {
+      skillReflectEnabled = prev; // revert on failure
+    } finally {
+      skillReflectSaving = false;
+    }
   }
 
   function formatMemDate(epochSeconds: number): string {
@@ -1111,7 +1133,20 @@
             {#if skillsError}
               <div class="mb-2 text-[11.5px] text-blocked" data-testid="skills-error">{skillsError}</div>
             {/if}
-            <div class="mb-2 mt-1 flex items-center gap-2.5">
+            <SettingRow
+              title="Propose skills automatically"
+              desc="After a chat, a local model may draft a reusable skill from it. Drafts stay on this Mac and are inert until you approve them below — never used without your review."
+            >
+              {#snippet control()}
+                <Toggle
+                  checked={skillReflectEnabled}
+                  locked={skillReflectSaving}
+                  onchange={toggleSkillReflect}
+                  label="Propose skills automatically"
+                />
+              {/snippet}
+            </SettingRow>
+            <div class="mb-2 mt-4 flex items-center gap-2.5">
               <span class="text-[12px] font-[550] text-text">Saved skills</span>
               <span class="text-[11.5px] text-text-3">
                 {skillItems.length}

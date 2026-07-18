@@ -31,17 +31,19 @@ use serde_json::json;
 use crate::storage::{Skill, SkillApproval, Storage};
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
-/// Cap a saved skill body — a playbook, not a novel.
-const MAX_SKILL_CONTENT: usize = 20_000;
-const MAX_SKILL_NAME: usize = 120;
-const MAX_SKILL_DESCRIPTION: usize = 400;
+/// Cap a saved skill body — a playbook, not a novel. `pub(crate)` so the Wave
+/// 4.2 autonomous drafter enforces the SAME caps as an agent-driven `save_skill`.
+pub(crate) const MAX_SKILL_CONTENT: usize = 20_000;
+pub(crate) const MAX_SKILL_NAME: usize = 120;
+pub(crate) const MAX_SKILL_DESCRIPTION: usize = 400;
 /// How many matches `search_skills` returns.
 const SEARCH_LIMIT: usize = 5;
 
 /// The capability names a skill may declare (mirrors `tools::Capability`). A
 /// skill that names an unknown capability is rejected at save — so a future
-/// skill-as-Tool's `requires()` is always parseable.
-const KNOWN_CAPABILITIES: &[&str] = &[
+/// skill-as-Tool's `requires()` is always parseable. `pub(crate)` so the 4.2
+/// drafter filters drafted capabilities against the same allow-list.
+pub(crate) const KNOWN_CAPABILITIES: &[&str] = &[
     "Filesystem",
     "Network",
     "Shell",

@@ -178,6 +178,14 @@ pub struct AgentLoop {
     /// as `summary_cache`/`cloud_safe_cache`.
     flush_marks:
         Arc<parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
+    /// Wave 4.2: the autonomous skill drafter (a LOCAL model in production; a fake
+    /// in tests). `None` ⇒ reflection is disabled. Even when wired, it only runs
+    /// if the global `skill_reflect_enabled` toggle is on, and its drafts are
+    /// always saved `Pending` (inert until a human approves them). `lib.rs` sets it.
+    skill_drafter: Option<Arc<dyn crate::agent::skill_reflect::SkillDrafter>>,
+    /// Wave 4.2: per-conversation high-water — a prior conversation is reflected
+    /// at most once per process run. `Arc` so the detached reflect task shares it.
+    reflect_marks: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     stream_lock: tokio::sync::Mutex<()>,
 }
 
@@ -217,6 +225,8 @@ impl AgentLoop {
             )),
             flush_classifier: None,
             flush_marks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            skill_drafter: None,
+            reflect_marks: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             stream_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -228,6 +238,17 @@ impl AgentLoop {
         classifier: Arc<dyn crate::classifier::Classifier>,
     ) -> Self {
         self.flush_classifier = Some(classifier);
+        self
+    }
+
+    /// Wire the Wave 4.2 autonomous skill drafter. Without it, new-chat reflection
+    /// stays disabled. Even wired, it fires only when the global
+    /// `skill_reflect_enabled` toggle is on. `lib.rs` sets it.
+    pub fn with_skill_drafter(
+        mut self,
+        drafter: Arc<dyn crate::agent::skill_reflect::SkillDrafter>,
+    ) -> Self {
+        self.skill_drafter = Some(drafter);
         self
     }
 
@@ -819,34 +840,69 @@ impl AgentLoop {
     /// the DB reads + local-model extraction + saves. Disabled (no-op) until a
     /// flush classifier is wired or when no local model is available.
     pub(crate) fn consolidate_on_new_chat(&self, profile: &str, new_conversation_id: &str) {
-        let Some(classifier) = &self.flush_classifier else {
-            return;
+        // Two write-triggers mine the prior conversation on a new chat: the Wave
+        // 3.5 memory nudge and the Wave 4.2 skill reflection. They run in ONE
+        // detached task, SEQUENTIALLY — never as two concurrent tasks — so they
+        // can't both touch the shared, `!Sync` `global.db` Connection at once.
+        // (Each is still independently gated; either or both may be enabled.)
+        let flush = match &self.flush_classifier {
+            Some(classifier) if self.fact_extractor.available() => Some((
+                Arc::clone(&self.fact_extractor),
+                Arc::clone(classifier),
+                self.embedder.clone(),
+                Arc::clone(&self.flush_marks),
+            )),
+            _ => None,
         };
-        if !self.fact_extractor.available() {
+        // Cheap in-memory gate here (a local model exists); the DB-backed toggle
+        // is read INSIDE the task, so no global.db read happens off-task.
+        let reflect = match &self.skill_drafter {
+            Some(drafter) if drafter.available() => {
+                Some((Arc::clone(drafter), Arc::clone(&self.reflect_marks)))
+            }
+            _ => None,
+        };
+        if flush.is_none() && reflect.is_none() {
             return;
         }
-        let extractor = Arc::clone(&self.fact_extractor);
-        let classifier = Arc::clone(classifier);
         let storage = Arc::clone(&self.storage);
-        let embedder = self.embedder.clone();
-        let flush_marks = Arc::clone(&self.flush_marks);
         let profile = profile.to_string();
         let new_conversation_id = new_conversation_id.to_string();
         let now = chrono::Utc::now().timestamp();
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = crate::agent::memory_flush::run_new_chat_nudge(
-                extractor,
-                classifier,
-                storage,
-                embedder,
-                flush_marks,
-                profile,
-                new_conversation_id,
-                now,
-            )
-            .await
-            {
-                tracing::debug!(target: "lhp::compaction", error = %e, "new-chat consolidation nudge failed");
+            if let Some((extractor, classifier, embedder, flush_marks)) = flush {
+                if let Err(e) = crate::agent::memory_flush::run_new_chat_nudge(
+                    extractor,
+                    classifier,
+                    Arc::clone(&storage),
+                    embedder,
+                    flush_marks,
+                    profile.clone(),
+                    new_conversation_id.clone(),
+                    now,
+                )
+                .await
+                {
+                    tracing::debug!(target: "lhp::compaction", error = %e, "new-chat consolidation nudge failed");
+                }
+            }
+            if let Some((drafter, reflect_marks)) = reflect {
+                // Read the (global.db) toggle here, in-task and after the flush —
+                // never concurrently with the flush's own global access.
+                if storage.global().skill_reflect_enabled() {
+                    if let Err(e) = crate::agent::skill_reflect::run_new_chat_reflect(
+                        drafter,
+                        storage,
+                        reflect_marks,
+                        profile,
+                        new_conversation_id,
+                        now,
+                    )
+                    .await
+                    {
+                        tracing::debug!(target: "lhp::skills", error = %e, "new-chat skill reflection failed");
+                    }
+                }
             }
         });
     }

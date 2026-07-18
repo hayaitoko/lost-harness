@@ -11,6 +11,7 @@
 pub mod compaction;
 pub mod crash_recovery;
 pub mod memory_flush;
+pub mod skill_reflect;
 pub mod egress;
 pub mod gate;
 pub mod loop_mod;

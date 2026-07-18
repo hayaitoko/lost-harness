@@ -549,6 +549,21 @@ export async function deleteSkill(id: string): Promise<boolean> {
   return false;
 }
 
+/** Is autonomous skill drafting (Wave 4.2) on? Global; default off. */
+export async function getSkillReflectEnabled(): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("get_skill_reflect_enabled", {});
+  }
+  return false;
+}
+
+/** Turn autonomous skill drafting on/off. Drafts land Pending for your review. */
+export async function setSkillReflectEnabled(enabled: boolean): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("set_skill_reflect_enabled", { args: { enabled } });
+  }
+}
+
 /** A persisted "Always allow" rule. Mirrors `ToolRuleInfo` in `ipc/mod.rs`. */
 export interface ToolRule {
   id: string;

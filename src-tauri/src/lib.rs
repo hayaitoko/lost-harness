@@ -186,7 +186,14 @@ pub fn run() {
                 .with_embedder(embedder.clone())
                 // Wave 3.5: enable the pre-compaction flush (local-model durable
                 // -fact extraction over about-to-be-trimmed turns).
-                .with_flush_classifier(Arc::clone(&classifier)),
+                .with_flush_classifier(Arc::clone(&classifier))
+                // Wave 4.2: enable autonomous skill drafting (local-model
+                // reflection over a finished conversation → a Pending draft).
+                // Gated at runtime by the global `skill_reflect_enabled` toggle
+                // (default off); drafts are always Pending (human-reviewed).
+                .with_skill_drafter(Arc::new(
+                    crate::agent::skill_reflect::LocalModelDrafter::new(Arc::clone(&model_manager)),
+                )),
             );
 
             let state = AppState {
@@ -221,6 +228,8 @@ pub fn run() {
             ipc::list_skills,
             ipc::set_skill_approval,
             ipc::delete_skill,
+            ipc::get_skill_reflect_enabled,
+            ipc::set_skill_reflect_enabled,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,

@@ -1154,6 +1154,26 @@ impl GlobalDb {
             .optional()?)
     }
 
+    /// The app_settings key for the Wave 4.2 autonomous-drafting toggle. Global
+    /// (not per-profile) because skills themselves are global.
+    const SKILL_REFLECT_KEY: &'static str = "skill_reflect_enabled";
+
+    /// Is autonomous skill drafting (Wave 4.2) enabled? Defaults to `false`
+    /// (approve-first / no auto-drafting) — the safe, opt-in default. A stored
+    /// value only counts as `true` for exactly "1".
+    pub fn skill_reflect_enabled(&self) -> bool {
+        self.get_app_setting(Self::SKILL_REFLECT_KEY)
+            .ok()
+            .flatten()
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+
+    /// Turn autonomous skill drafting on/off.
+    pub fn set_skill_reflect_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_app_setting(Self::SKILL_REFLECT_KEY, if enabled { "1" } else { "0" })
+    }
+
     pub fn list_app_settings(&self) -> Result<Vec<AppSetting>> {
         let mut stmt = self
             .conn
