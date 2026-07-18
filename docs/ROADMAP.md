@@ -21,8 +21,19 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-17: M3 COMPLETE. M4 well underway. Near-term items 1–5 all
-> landed.**
+> **As of 2026-07-17: M3 COMPLETE. M4 well underway. WAVE 1 of the build manifest
+> COMPLETE — the started subsystems are finished.**
+> Wave 1 (BUILD-MANIFEST.md) landed all its items: the **native-tool add-provider
+> UI checkbox** (1.1 — everyday chat can now use the native transport), a
+> **per-profile semantic-memory toggle** (1.2 — hard off switch for computing a
+> meaning fingerprint; lazy embedder load), **curated-summary snapshot at turn 1**
+> (1.3 — frozen per conversation for prompt-cache stability), the **inline
+> "remembered" save event** (1.4), and **walled-profile memory DB routing** (1.5 —
+> a walled profile's facts live in their own physically-separate DB, proven to
+> survive toggling the wall back off). 385 → **389 tests**. (1.6, the cosmetic
+> `gate.rs` §7 rename, stays deferred — low-value/high-churn.)
+>
+> **Prior state (still true):**
 > Classifier round **fully closed** (INT8 ONNX ensemble + "why" sidebar +
 > per-profile thresholds + redact-and-send). **Memory is now HYBRID** — the
 > meaning lane shipped: a stock bge-small-en-v1.5 INT8 embedder (same ONNX
@@ -45,7 +56,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 385 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 389 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -63,9 +74,9 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (meaning lane + native tool-use landed: **385 passed**,
-`--no-default-features` builds clean, frontend build + svelte-check clean, tree clean;
-embedder live test passes on the installed model).
+Last verified: 2026-07-17 (Wave 1 of the build manifest landed: **389 passed**,
+`--no-default-features` builds clean, `cargo clippy --lib` 0 errors, frontend build +
+svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---
 
@@ -78,7 +89,7 @@ embedder live test passes on the installed model).
 | **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
 | **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). Not started: model seats, usage ledger, budget governor, cache-shaped prompts, skills & agents. |
-| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Remaining:** curated-summary snapshot-at-turn-1 (currently re-read live each turn); pre-compaction/new-chat write triggers (flush moot until compaction exists); walled-profile per-profile DB routing; an inline "remembered" save event. Design: PLAN §9. |
+| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Wave 1 (2026-07-17) closed four of the remaining gaps:** curated-summary **snapshot-at-turn-1** (frozen per conversation, privacy-filtered per turn), a per-profile **semantic-search toggle** (lazy embedder load; keyword-only when off), the inline **"remembered" save event**, and **walled-profile DB routing** (a walled profile's memory lives in its own physically-separate DB, proven to survive toggling back). **Still remaining:** pre-compaction/new-chat write triggers (flush moot until context compaction exists — Wave 3.3/3.5); embedder bundling into the packaged app (M9 / Wave 7.1). Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
 | **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **DONE (item 3 complete)** — trained bge-small + distilbert INT8 ONNX ensemble in-process via `ort` (fused with layer-0 rules, parity-verified), the "why this was routed" annotated sidebar, **per-profile runtime thresholds** (settings page), AND **partial-delegation redact-and-send** (rule-value spans blacked out → re-classified → safe remainder to cloud → rehydrated; per-profile toggle). Only optional cosmetic `gate.rs` §7 renames remain (deferred, low-value). |
 | **M5** — computer use | cross-platform screen control, the flagship | ⬜ **Not started** (stubs in `src-tauri/src/platform/`) |
@@ -184,15 +195,22 @@ embedder live test passes on the installed model).
    cron management, session search (PLAN §8 M3 item 10 leftovers; each rides the
    existing approval spine).
 
-**Explicitly slated for the NEXT round (small, agreed 2026-07-17):**
-- **Native-tool UI checkbox** — the `supports_native_tools` flag persists + hydrates and the
-  live test uses it, but the add-provider Settings form has no control to set it, so everyday
-  chat still uses the fenced fallback even against a native-capable endpoint (qwen3.6). Add a
-  checkbox to the add-provider UI (+ thread it into the `addProvider` store call). Then a
-  provider marked native actually uses the native path in normal use.
-- **Embedder bundling + memory settings toggle** — see item 5 / PLAN §9: ship the bge-small
-  model inside the app (M9 packaging) and gate its load on a memory setting; until then it's
-  the dev-path load from `~/Documents/...`.
+**[x] Wave 1 of the build manifest — DONE 2026-07-17.** All started subsystems finished:
+- **[x] Native-tool UI checkbox** (1.1) — the add-provider Settings form now has a "Native
+  tool-calling" toggle threaded through `addProvider` → `AddProviderArgs`, so a provider marked
+  native uses the native transport in everyday chat (not just the env-gated test).
+- **[x] Memory semantic-search toggle** (1.2) — per-profile setting gating the meaning-lane
+  embedder; the ~34 MB model now loads **lazily** (`EmbedderHandle`) and only when a profile has
+  semantic search on, so "off" computes no fingerprint and never loads the model.
+- **[x] Curated-summary snapshot at turn 1** (1.3) — frozen per conversation (cache-stable
+  prompt prefix); a mid-conversation `remember` shows up next conversation, not this one.
+- **[x] Inline "remembered" save event** (1.4) — non-silent `memory:event {kind:"remembered"}`
+  → transient banner, matching the "recalled" event.
+- **[x] Walled-profile memory DB routing** (1.5) — the §7 island: a walled profile's memory
+  routes to its own physically-separate DB under `walled-memory/<name>.db`, never `global.db`;
+  the wall survives toggling back off (tested).
+- Still pending (moved to later waves): **embedder bundling** into the packaged app (M9 / Wave
+  7.1); **write triggers** need context compaction first (Wave 3.3 → 3.5).
 
 **Also queued in M4/later (pointers in build plan Part 2):** `UserPromptSubmit` hook +
 permission modes (Q11), reroute auto-switch UX (Q6), persisted action journal +

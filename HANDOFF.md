@@ -47,7 +47,7 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **385 passing**, 0 failed. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after the meaning lane + native tool-use.)
+**Tests:** `cargo test --lib` → **390 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 1** of the build manifest.)
 
 **2026-07-16 (latest): near-term items 1–3-core DONE — the trained privacy classifier is LIVE.** Three landings this session: (1) the Q8 **Permissions pane** (`f38fd2c`) — Settings tab lists/revokes persisted "Always allow" `tool_rules`, verified live in the browser preview; (2) **frontend housekeeping** (`6dfcf12`) — deleted the 5 superseded components, removed the dev screen-switcher + theme toggle, and fixed the `ModelPicker` name collision (options now carry a composite `providerId::name` key — verified live with two `default` models); (3) the **classifier ONNX integration** (`283789b`) — ran the bundle's `export_onnx.py` (both encoders → fp32 + INT8), then wired `classifier/engine.rs` to run the real INT8 ensemble via `ort`, mirroring `serve.py` (rules layer-0 short-circuit → sliding-128-window max-prob over both encoders → fusion at 0.5/0.05). Behind a default-on `onnx-classifier` feature (rules-only fallback with `--no-default-features`, both build clean). Models installed live at `~/Documents/Lost-Harness/models/classifier/` (98 MB, NOT in git). **Gotcha caught:** the exported `tokenizer.json` bakes in Fixed(128) padding/truncation — left on, it feeds the model garbage (distilbert scored 0.999 on "capital of France"); disabled on load. An env-gated parity test (`LHP_CLASSIFIER_MODELS_DIR`) loads the live INT8 models and matches the Python reference probs (`docs/classifier-parity.json`). **Remaining in item 3:** the annotated-redaction sidebar UX (PLAN §11 — the engine's there, no UI); the `gate.rs`/§7 cosmetic renames were judged low-value/high-churn and deferred (gate.rs cleanly delegates to the `Classifier` trait, no rewrite needed).
 
@@ -357,3 +357,64 @@ Two M4 fronts landed, both green (385 tests), both with the same graceful-degrad
 ## Session log — 2026-07-17 (addendum: native tool-use PROVEN LIVE)
 
 Lukas turned off LM Studio's "require API token" toggle, clearing the one blocker. `live_native_tool_call_roundtrip` then ran **green three times** against **qwen3.6-35b-a3b** (`127.0.0.1:1234`): the model chose `get_weather`, streamed native `tool_calls` deltas, and our SSE parser + `assemble_native_calls` reconstructed a valid `get_weather(city=…)` — the full native transport round trip, end to end against a real model. **Item 4 (native tool-use, Q1) is now DONE + PROVEN LIVE, not just built.** Nothing is blocked. LM Studio also exposes `text-embedding-nomic-embed-text-v1.5` and other qwen models on the same endpoint. Remaining polish (not blocking): an add-provider UI checkbox to set `supports_native_tools` so everyday chat (not just the test) uses the native path.
+
+## Session log — 2026-07-17 (ultracode build — WAVE 1: finish the started subsystems)
+
+First wave of the `docs/BUILD-MANIFEST.md` full-build directive. Resumed a prior run
+whose Wave-1 working tree was built but uncommitted and whose automated review had
+stalled; re-reviewed from scratch, fixed findings, verified, committed. All six items are
+Tier A. **1.6 (the cosmetic `gate.rs`/§7 rename) is deliberately deferred** — low-value,
+high-churn; noted, not done.
+
+- **1.1 — Native-tool add-provider UI checkbox.** The `supports_native_tools` flag already
+  persisted/hydrated end-to-end; only the UI to *set* it was missing. Added a "Native
+  tool-calling" toggle to the add-provider form (`Settings.svelte`), threaded through
+  `providerForm` → `addProvider` store → `tauri.ts` `add_provider({ …, supports_native_tools })`
+  → the existing `AddProviderArgs`. `ProviderInfo`/`Provider` types + hydration carry it.
+  Default off (fenced fallback). A provider marked native now uses the native transport in
+  everyday chat, not just the env-gated test.
+- **1.2 — Per-profile semantic-memory toggle.** New per-profile `memory_settings` table
+  (migration **v6**, `PROFILE_SCHEMA_VERSION` 5→6) with `semantic_search_enabled` + `walled`.
+  The embedder is now an **`EmbedderHandle`** that loads the ~34 MB model **lazily + memoized**
+  (`OnceLock`) and only when a profile with semantic search on actually calls `.get()` — so
+  "off" computes no meaning fingerprint and never loads the model ("hard off switch"). Gated
+  at every meaning-lane site: `recall_memory`, `remember`, `save_memory` IPC,
+  `assemble_memory_context`, and the boot backfill. Keyword-only when off; hybrid when on.
+- **1.3 — Curated-summary snapshot at turn 1.** `AgentLoop` gained a `summary_cache`
+  (`Mutex<HashMap<conv_id, Vec<(fact,bucket)>>>`) frozen at a conversation's first
+  `assemble_memory_context`. New `curated_summary_with_buckets` returns the per-bucket
+  candidate set (both buckets, up to `limit` each); the per-turn renderer drops private-local
+  on a cloud turn then takes the top `limit`. So a mid-conversation `remember` shows up *next*
+  conversation, the prompt prefix stays cache-stable, and the privacy wall still holds per
+  turn. Cache bounded at 512 conversations (recomputable snapshot).
+- **1.4 — Inline "remembered" save event.** `emit_memory_event` is now `pub(crate)` and fires
+  a content-free `memory:event {kind:"remembered"}` from the `remember` tool (needs the
+  `AppHandle`, threaded via `with_app_handle`). `MainScreen.svelte` renders a transient
+  "Remembered …" banner, same language as "recalled". A manual save from Settings emits with
+  an empty conversation_id (no chat banner) — its non-silent trace is the Settings list.
+- **1.5 — Walled-profile memory DB routing (§7).** `Storage::memory_db_for_profile(profile)`
+  is the single routing point: a shared profile → `global.db`; a **walled** profile → its own
+  physically-separate `walled-memory/<name>.db` (a reused `GlobalDb`, opened + cached). Every
+  production memory read/write (tools, loop, IPC, backfill) routes through it. A walled
+  profile's facts **never enter `global.db`**, and **the wall survives toggling back off** —
+  proven by `walled_profile_memory_is_physically_separate_and_survives_toggle_back`.
+
+**Review (bounded 3-lens workflow — read-only, no builds, to avoid the prior run's stall;
+118s, 0 stalls) → 3 confirmed findings, all fixed before commit:**
+- **HIGH/CRITICAL (fail-open wall):** `memory_db_for_profile` collapsed *any* settings-read
+  error to `walled=false`, routing a possibly-walled profile's memory to the shared
+  `global.db` on a transient SQLite error — a privacy loosening. **Fixed:** distinguish
+  *can't open the profile* (invalid/degenerate name → shared, no island exists) from *profile
+  opens but wall status unreadable* (→ **fail closed**, propagate `Err`; every caller already
+  skips the op safely). Regression test `memory_routing_fails_closed_when_wall_status_is_unreadable`.
+- **Minor (cloud-summary dilution):** the snapshot froze a mixed top-8 then dropped private
+  per turn, shorting a cloud turn below the limit. **Fixed:** snapshot keeps up to `limit`
+  *per bucket*; the caller filters then takes top `limit` (matches pre-snapshot cloud behavior).
+- **LOW (unbounded cache):** `summary_cache` never evicted. **Fixed:** cap-and-clear at 512.
+- Also fixed a browser-fallback bug the manual review caught: `DEFAULT_MEMORY_SETTINGS.walled`
+  was `true`, contradicting the backend default (shared) — now `false`.
+
+**Tests: 385 → 390.** `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features`
+clean, `npm run build` + `svelte-check` clean, tree clean. Migration: PROFILE v6 (global stays
+v4). **Deferred to later waves:** embedder bundling into the packaged app (M9 / Wave 7.1);
+memory write-triggers need context compaction first (Wave 3.3 → 3.5); 1.6 rename cleanup.
