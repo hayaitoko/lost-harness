@@ -182,7 +182,10 @@ pub fn run() {
                     Arc::clone(&storage),
                     tools,
                 )
-                .with_embedder(embedder.clone()),
+                .with_embedder(embedder.clone())
+                // Wave 3.5: enable the pre-compaction flush (local-model durable
+                // -fact extraction over about-to-be-trimmed turns).
+                .with_flush_classifier(Arc::clone(&classifier)),
             );
 
             let state = AppState {

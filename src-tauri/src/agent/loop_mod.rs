@@ -164,6 +164,18 @@ pub struct AgentLoop {
     /// the entry (full re-scan) so tightening strictness can never ride a stale
     /// "safe". Cleared implicitly by process restart (cold scan re-populates).
     cloud_safe_cache: parking_lot::Mutex<std::collections::HashMap<String, CloudSafeEntry>>,
+    /// Wave 3.5: durable-fact extractor for the pre-compaction flush (a LOCAL
+    /// model in production; a fake in tests). Default `LocalModelExtractor`.
+    fact_extractor: Arc<dyn crate::agent::memory_flush::DurableFactExtractor>,
+    /// Wave 3.5: the classifier the flush re-classifies extracted facts with
+    /// (same one the gate uses). `None` ⇒ the flush is disabled (it can't route
+    /// safely without a classifier), so `on_pre_compaction` stays a no-op — the
+    /// pre-3.5 behavior. `lib.rs` sets it in production.
+    flush_classifier: Option<Arc<dyn crate::classifier::Classifier>>,
+    /// Wave 3.5: per-conversation content-hash high-water set — a turn is swept
+    /// for durable facts at most once. Same bounded-cache discipline as
+    /// `summary_cache`/`cloud_safe_cache`.
+    flush_marks: parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
     stream_lock: tokio::sync::Mutex<()>,
 }
 
@@ -189,6 +201,7 @@ impl AgentLoop {
         storage: Arc<Storage>,
         tools: Arc<ToolDispatcher>,
     ) -> Self {
+        let model_manager_for_flush = Arc::clone(&model_manager);
         Self {
             gate,
             model_manager,
@@ -197,8 +210,34 @@ impl AgentLoop {
             embedder: None,
             summary_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cloud_safe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            fact_extractor: Arc::new(crate::agent::memory_flush::LocalModelExtractor::new(
+                Arc::clone(&model_manager_for_flush),
+            )),
+            flush_classifier: None,
+            flush_marks: parking_lot::Mutex::new(std::collections::HashMap::new()),
             stream_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Wire the flush's fact classifier (Wave 3.5). Without it the pre-compaction
+    /// flush stays disabled (a no-op `on_pre_compaction`). `lib.rs` sets it.
+    pub fn with_flush_classifier(
+        mut self,
+        classifier: Arc<dyn crate::classifier::Classifier>,
+    ) -> Self {
+        self.flush_classifier = Some(classifier);
+        self
+    }
+
+    /// Override the durable-fact extractor (tests inject a fake). Production uses
+    /// the default `LocalModelExtractor`.
+    #[cfg(test)]
+    pub fn with_fact_extractor(
+        mut self,
+        extractor: Arc<dyn crate::agent::memory_flush::DurableFactExtractor>,
+    ) -> Self {
+        self.fact_extractor = extractor;
+        self
     }
 
     /// Attach the memory embedder handle (meaning-lane hybrid search).
@@ -718,21 +757,80 @@ impl AgentLoop {
         Some((wrapped, fresh.len()))
     }
 
-    /// Wave 3.5 seam. Called right before a compacted send drops the `trimmed`
-    /// older turns from the model-facing history. In Wave 3.3 this only logs the
-    /// event; Wave 3.5's pre-compaction flush replaces the body to sweep
-    /// `trimmed` for durable facts and save them (gated by the profile's
-    /// approval setting) BEFORE they're lost — the "context is filling up"
-    /// write-trigger (PLAN §9). Kept as a method so 3.5 is a body swap with no
-    /// change to the compaction plumbing or the call site.
-    fn on_pre_compaction(&self, conversation_id: &str, profile: &str, trimmed: &[ChatMessage]) {
-        tracing::debug!(
-            target: "lhp::compaction",
-            conversation_id = %conversation_id,
-            profile = %profile,
-            trimmed = trimmed.len(),
-            "pre-compaction: older turns about to be trimmed from the model-facing history"
-        );
+    /// Wave 3.5 — the pre-compaction flush (PLAN §9 trigger #2). Called right
+    /// before a compacted send drops the `trimmed` older turns; sweeps them for
+    /// durable facts and saves them BEFORE they leave the model-facing history.
+    ///
+    /// Runs UNDER the stream lock, so it does ONLY cheap synchronous work here —
+    /// pick the not-yet-swept turns, mark them, and `spawn` a detached task for
+    /// the (local-model) extraction + saves. A failure or slow local model can
+    /// never delay or fail the send. Disabled (no-op) until a flush classifier is
+    /// wired (pre-3.5 behavior) or when no local model is available — in the
+    /// latter case nothing is marked, so a later round/restart still catches it.
+    fn on_pre_compaction(&self, conversation_id: &str, profile: &str, trimmed: &[ChatMessage], app: &AppHandle) {
+        // The flush needs a classifier (to route safely) AND a local model.
+        let Some(classifier) = &self.flush_classifier else {
+            return;
+        };
+        if !self.fact_extractor.available() {
+            return; // no local model → skip WITHOUT marking (catch it later)
+        }
+        // Pick the turns not yet swept, and mark them swept synchronously (before
+        // the next round runs under the still-held stream lock) — at-most-once.
+        let unswept = self.take_unswept_for_flush(conversation_id, trimmed);
+        if unswept.is_empty() {
+            return;
+        }
+        // Detached, best-effort. Nothing here is awaited by the send.
+        let extractor = Arc::clone(&self.fact_extractor);
+        let classifier = Arc::clone(classifier);
+        let storage = Arc::clone(&self.storage);
+        let embedder = self.embedder.clone();
+        let profile = profile.to_string();
+        let conversation_id = conversation_id.to_string();
+        let app = app.clone();
+        let now = chrono::Utc::now().timestamp();
+        tauri::async_runtime::spawn(async move {
+            match crate::agent::memory_flush::run_flush(
+                extractor,
+                classifier,
+                storage,
+                embedder,
+                profile,
+                conversation_id.clone(),
+                unswept,
+                now,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => emit_memory_event(&app, &conversation_id, "remembered", n),
+                Ok(_) => {}
+                Err(e) => tracing::debug!(target: "lhp::compaction", error = %e, "pre-compaction flush failed"),
+            }
+        });
+    }
+
+    /// The synchronous, at-most-once core of the pre-compaction flush: the turns
+    /// in `trimmed` not yet swept for this conversation, marking them swept in
+    /// the same locked critical section (so a concurrent next round can't
+    /// re-sweep). Extracted from `on_pre_compaction` so the dedup is testable
+    /// without a Tauri `AppHandle`.
+    pub(crate) fn take_unswept_for_flush(
+        &self,
+        conversation_id: &str,
+        trimmed: &[ChatMessage],
+    ) -> Vec<ChatMessage> {
+        const FLUSH_MARKS_CAP: usize = 512;
+        let mut marks = self.flush_marks.lock();
+        if marks.len() >= FLUSH_MARKS_CAP {
+            marks.clear();
+        }
+        let swept = marks.entry(conversation_id.to_string()).or_default();
+        let unswept = crate::agent::memory_flush::select_unswept(trimmed, swept);
+        for m in &unswept {
+            swept.insert(crate::agent::memory_flush::identity(m));
+        }
+        unswept
     }
 
     /// Whether this profile has the meaning-lane (semantic memory search)
@@ -957,9 +1055,9 @@ impl AgentLoop {
                 keep_recent,
             );
             if !compaction.trimmed.is_empty() {
-                // Wave 3.5 seam: about-to-be-trimmed turns are swept for durable
-                // facts here BEFORE they leave the wire. 3.3 only logs.
-                self.on_pre_compaction(&conversation_id, &profile, &compaction.trimmed);
+                // Wave 3.5: about-to-be-trimmed turns are swept for durable facts
+                // (async, local-model, best-effort) BEFORE they leave the wire.
+                self.on_pre_compaction(&conversation_id, &profile, &compaction.trimmed, &app);
             }
             let mut sse = client
                 .stream_chat_with_tools(

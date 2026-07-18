@@ -825,6 +825,34 @@ fn conversation_is_cloud_safe_blocks_on_a_prior_private_turn() {
 }
 
 #[test]
+fn pre_compaction_flush_sweeps_each_turn_at_most_once() {
+    // Wave 3.5: on_pre_compaction fires every tool-loop round with the same /
+    // growing trimmed prefix; the dedup high-water must sweep each turn once.
+    use crate::models::ChatMessage;
+    let (agent, _storage, dir) = redaction_loop();
+
+    let t1 = vec![
+        ChatMessage::user("i live in Portland"),
+        ChatMessage::assistant("Noted."),
+    ];
+    // First round: both genuine turns are unswept.
+    let first = agent.take_unswept_for_flush("cv", &t1);
+    assert_eq!(first.len(), 2, "first sweep sees both turns");
+    // Second round with the SAME (or growing) prefix: nothing new to sweep.
+    let mut t2 = t1.clone();
+    t2.push(ChatMessage::user("i also have a dog named Rex"));
+    let second = agent.take_unswept_for_flush("cv", &t2);
+    assert_eq!(second.len(), 1, "only the newly-appended turn is swept");
+    assert_eq!(second[0].content, "i also have a dog named Rex");
+    // Third round, no growth: nothing.
+    assert!(agent.take_unswept_for_flush("cv", &t2).is_empty());
+    // A different conversation is tracked independently.
+    assert_eq!(agent.take_unswept_for_flush("other", &t1).len(), 2);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn cloud_safe_cache_flips_to_unsafe_when_a_private_turn_is_appended() {
     // The per-conversation cloud-safe cache must NEVER let a stale "safe" verdict
     // hide a newly-appended private turn (that would reintroduce the leak). Also
