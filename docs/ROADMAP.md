@@ -70,11 +70,15 @@ the status board sitting on top of all of them.
 > `agent_types` table + `AgentType`/`AgentTypeApproval` + CRUD + two seeded
 > built-ins (code-reviewer, research-explorer) whose toolbelts name only existing
 > tools, mirroring the skills model. Pure data — dispatch (4.3b/c) consumes it.
-> **453 → 479 tests.** **Next 4.3 slices:** 4.3b bounded-toolbelt intersection
-> (a `ToolRegistry` `Box→Arc` change + `restricted_to` + `resolve_seat` wiring +
-> the security tests) delivers the first half of the done-when; 4.3c `delegate` +
-> async dispatch (needs a Lukas batch: delegate RiskClass, result attribution)
-> + the AppHandle-decoupling `ResultSink`; 4.3d UI. **Next fronts (per the
+> **WAVE 4.3b — bounded toolbelt intersection** (`25e8da6`): `ToolRegistry` now
+> holds `Arc<dyn Tool>` (register sites unchanged) + `restricted_to(allowlist)` —
+> a persona's belt is the sub-registry's CONTENTS (`allowed ∩ registered ∩
+> env`), so an out-of-belt tool is physically absent (not listable OR
+> lookupable) — a structural security boundary, 4 security tests. **453 → 483
+> tests.** **4.3 remaining:** 4.3c `delegate` + async dispatch (BLOCKED on a Lukas
+> batch: delegate RiskClass, sub-agent result attribution, floor-cap) + the
+> restricted-DISPATCHER that reuses the parent hook chain + `resolve_seat` wiring
+> + AppHandle-decoupling `ResultSink`; 4.3d UI. **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
