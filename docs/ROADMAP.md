@@ -28,13 +28,20 @@ the status board sitting on top of all of them.
 > about-to-be-trimmed turns) AND the new-chat consolidation nudge (`e0929f0`,
 > trigger #3: on a new chat, sweep the prior conversation). Sensitivity-routed,
 > async/off the stream lock, at-most-once (shared high-water) + content-deduped.
-> **Wave 3.2 cost capture** (`649f3fa`) — real $ cost in the ledger (SSE usage +
-> pricing). All multi-agent designed/reviewed. **453 tests.** **Next unblocked
-> substantive front:** Wave 4.4 (one-queue-model unification — the "do first"
-> gate for the skills/agents track, which then unblocks delegate 2.1, model-seats
-> 3.1's consumer, and 2.3 reroute UX). The 3.2 budget governor is server-track
-> (needs an unattended-mode concept). 3.1 seats / 3.4 capability-registry stay
-> speculative (no present consumer — don't build ahead of one).
+> **WAVE 4 KICKED OFF (2026-07-18):** a code-grounded **Wave 4 implementation
+> plan** landed (`docs/plans/2026-07-18-wave4-skills-agents.md`, from a 4-agent
+> mapping pass — build order, invariants, concrete shapes, the consumer contract
+> that de-speculates 4.4, + 9 open questions for Lukas), and the **4.4
+> one-queue-model substrate** (`a0b00ee`): a new `queue` module (`WorkKind`, a
+> checked `WorkState` lifecycle, `WorkItem`) + a per-profile `work_items` table
+> (PROFILE v7→v8) with atomic claim (exactly-once via `claim_key`),
+> lifecycle-guarded finish, and crash `terminalize` (also settles the 2.5
+> durability journal). The scheduler + `WorkExecutor`/`ResultSink` traits arrive
+> with the first consumer. **453 → 458 tests.** **Next fronts (per the plan):**
+> the 4.4 scheduler+executor (needs the first consumer + the AppHandle-decoupling
+> `ResultSink`); 4.1 skills (a skill = a Tool riding the registry+gate chain);
+> 4.3 agent registry (needs 3.1 seats); then 4.2 (a near-copy of `memory_flush`)
+> + 4.5 packs. The 3.2 budget governor stays server-track.
 > **Wave 2 core tools + queue (2026-07-17, `9008cfb`→`e5da77f`):** four more
 > items landed — **cron management** (2.1: `list_cron_jobs` Safe +
 > `manage_cron` Dangerous, profile-scoped, cron-string-validated), **`fetch_url`**
@@ -138,7 +145,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 453 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 458 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -156,8 +163,8 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 3.5 complete (flush + new-chat nudge):
-**453 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
+Last verified: 2026-07-17 (Wave 4.4 substrate landed:
+**458 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
 frontend build + svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---

@@ -47,7 +47,7 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **453 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 3.5 complete (flush + nudge)**.)
+**Tests:** `cargo test --lib` → **458 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 4.4 one-queue-model substrate**.)
 
 **2026-07-18: Wave 3.5 pre-compaction flush (trigger #2)** (`f89536e`, `agent/memory_flush.rs` + loop wiring). When compaction drops old turns, a LOCAL model sweeps them for durable facts + saves via the exact sensitivity-routed path (secret→dropped, private→private-local, ordinary→shared); async/off the stream lock, at-most-once (content-hash high-water), untrusted content excluded, enabled only when a flush classifier is wired (`lib.rs`). Testable via the `DurableFactExtractor` trait (fake extractor) + the `take_unswept_for_flush` seam. Multi-agent designed (3-approach panel) + reviewed (fixed: guard-wrap the extractor input against injection; add the at-most-once test). **Deferred: trigger #3** (new-chat consolidation nudge) — reuse `run_flush` on `create_conversation` gated by a persisted per-conversation high-water marker.
 
@@ -142,7 +142,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 453 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 458 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -258,7 +258,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 453 tests
+cd src-tauri && cargo test --lib   # 458 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
