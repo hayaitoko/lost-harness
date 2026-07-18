@@ -47,7 +47,9 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **478 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 3.1 model seats**.)
+**Tests:** `cargo test --lib` → **479 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 4.3a agent registry + Mutex-Connection soundness fix**.)
+
+**2026-07-18: Wave 4.3a — agent-type registry storage** (`ab4b2fc`, GLOBAL v5→v6). The "pure data" first slice of the agent registry: `agent_types` table + `AgentType`/`AgentTypeApproval` (fail-closed to Pending) + CRUD, mirroring the skills model (GLOBAL, trust-gated, forward-compatible for user-authored-vs-fixed). `ensure_builtin_agent_types` (idempotent, wired at boot) seeds code-reviewer + research-explorer with allowlists of only-existing tools. Read IPC `list_agent_types`. **Next 4.3 slices:** **4.3b** bounded toolbelt = intersection (needs a `ToolRegistry` `Box<dyn Tool>`→`Arc<dyn Tool>` change at `tools/mod.rs:341` + a `ToolDispatcher::restricted_to(allowlist)` sharing the parent hook chain; wire `resolve_seat`; land the security tests — a persona can't see/call a tool absent from its allowlist, a Dangerous tool in the sub-belt still can't earn a standing grant) — delivers the done-when's first half. **4.3c** `delegate` tool + async dispatch: needs the AppHandle-decoupling `ResultSink`/`WorkExecutor` + a `WorkQueueRunner` over `work_items`(WorkKind::AgentDispatch), and **a Lukas batch decision** (delegate RiskClass [precedent: Dangerous], inline-vs-async [manifest says async], sub-agent result attribution [child conv row vs write into parent], floor-cap External/Dangerous in a delegated belt?). **4.3d** UI. Full map in the 4.3 Explore transcript / `docs/plans/2026-07-18-wave4-skills-agents.md` §4.3.
 
 **2026-07-18: Wave 3.1 model seats COMPLETE** (`ec6c852`, PROFILE v8→v9). Lukas settled the spec-absent design → **seats are user-definable strings (not a closed enum), bindings are PER-PROFILE, an unbound seat silently inherits the caller's model.** Built: per-profile `seat_bindings` table + `ProfileDb` CRUD (`{set,get,list,delete}_seat_binding`); `models::resolve_seat(storage, mm, profile, seat, caller_provider, caller_model) -> (provider, model)` — empty/`inherit`/unbound/dangling-provider all fall back to the caller's pair, so it never yields an unusable model. `resolve_seat` is a PREFERENCE resolver ONLY (it never routes); the returned pair is a candidate the per-turn gate + `enforce_local_routing` still override — **that end-to-end "a cloud seat can't defeat RouteLocal" invariant must get its test when Wave 4.3 wires resolve_seat into `process_message`.** Per-profile IPC (`list/set/delete_seat_binding`; set reserves "inherit") + a "Seats" subsection in Settings→Models (browser-verified). **This UNBLOCKS Wave 4.3** (agent registry: persona→seat is now buildable). The earlier "⛔ BLOCKED" entry below is now RESOLVED (kept for the decision record).
 
@@ -153,7 +155,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 478 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 479 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -269,7 +271,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 478 tests
+cd src-tauri && cargo test --lib   # 479 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 

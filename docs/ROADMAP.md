@@ -66,7 +66,15 @@ the status board sitting on top of all of them.
 > (empty/`inherit`/unbound/dangling-provider → the caller's own model, so a seat
 > is a PREFERENCE the privacy gate still overrides) + a "Seats" pane in
 > Settings→Models. **This UNBLOCKS Wave 4.3** (agent registry: persona→seat).
-> **453 → 478 tests.** **Next fronts (per the
+> **WAVE 4.3a — agent-type registry storage** (`ab4b2fc`, GLOBAL v5→v6): the
+> `agent_types` table + `AgentType`/`AgentTypeApproval` + CRUD + two seeded
+> built-ins (code-reviewer, research-explorer) whose toolbelts name only existing
+> tools, mirroring the skills model. Pure data — dispatch (4.3b/c) consumes it.
+> **453 → 479 tests.** **Next 4.3 slices:** 4.3b bounded-toolbelt intersection
+> (a `ToolRegistry` `Box→Arc` change + `restricted_to` + `resolve_seat` wiring +
+> the security tests) delivers the first half of the done-when; 4.3c `delegate` +
+> async dispatch (needs a Lukas batch: delegate RiskClass, result attribution)
+> + the AppHandle-decoupling `ResultSink`; 4.3d UI. **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
