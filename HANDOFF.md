@@ -47,7 +47,9 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **423 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 2.1 cron + fetch_url + ask_human + Wave 2.4 headless queue**.)
+**Tests:** `cargo test --lib` → **425 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 2 tools + Wave 2.4 queue + Wave 3.2 usage-ledger booking**.)
+
+**2026-07-17 (build-manifest drain, session 2 cont'd): Wave 3.2 usage-ledger booking side.** The per-profile `usage_events` cost ledger (`7141d34`, PROFILE schema v6→v7 — `record_usage`/`usage_summary` on ProfileDb, booked once per model call in `stream_to_provider` after the assistant persist). PLAN §3 honesty rule: local/private=$0, cloud-we-can't-price=NULL/unknown ("flying blind", never guessed — `usage_summary` sums only known cost and surfaces the unknown count separately). Cost driven by `is_cloud` (real routing). Reviewed SHIP. **Rest of 3.2 (budget governor) deferred** — a cost-cap halting unattended spend needs real per-call cost capture first: **the SSE stream does NOT parse `usage` tokens today** (no token/cost data for cloud), so a cost-cap can't meaningfully fire. Building the governor means first adding SSE `usage` parsing (`src/models/sse.rs`) + a per-model pricing table, then the cap check + an unattended-mode signal. Known LOW (documented at the booking call site): the per-row `model` label is endpoint-approximate after a mid-turn reroute (cost stays correct); and no agent-loop-level booking test yet (storage layer fully tested; loop tests use a TestLoop reimpl).
 
 **2026-07-17 (build-manifest drain, session 2): four more Wave 2 items — cron management, fetch_url, headless approval queue, ask_human.** All committed to `main`, each adversarially reviewed before commit. **Wave 2's ready work is now drained** — every remaining Wave 2 item (`delegate`, reroute UX 2.3, durability journal 2.5) is blocked on a later wave (4.3 / 3.1 / 4.4). **Next unblocked front: Wave 3 (M4 model manager) — model seats (3.1), usage ledger + budget governor (3.2), cache-shaped prompt assembly + context compaction (3.3), capability registry that refuses (3.4); all Tier-A ∥. These live in the `src/models/` subsystem (Provider already carries `supports_native_tools`; Endpoint is in `storage/global.rs`).**
 - **Wave 2.1 `ask_human`** (`e5da77f`, `src/tools/ask_human.rs` + `src/ipc/ask_human.rs` + `AskHumanDialog.svelte`) — the single blocking "ask the user" tool. `RiskClass::Safe` (pre-trusted); blocks the loop on a `HumanPrompter` round-trip; `TauriHumanPrompter` emits `tool:ask_human_request` and awaits `resolve_ask_human` (600s decline-by-default), which touches ONLY the ask-human registry (never the stream lock) so it can't deadlock. `None` prompter (no UI) reports "no interactive user" instead of hanging. Frontend renders the untrusted question as escaped text (no `@html`); empty/whitespace answer = decline both sides. Review: clean SHIP. NOTE: build_tool_dispatcher gained a `human_prompter` param (has `#[allow(clippy::too_many_arguments)]`); AppState gained an `ask_human` field (updated in `lib.rs` + `ipc/contract_tests.rs`).
@@ -130,7 +132,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 423 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 425 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -246,7 +248,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 423 tests
+cd src-tauri && cargo test --lib   # 425 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 

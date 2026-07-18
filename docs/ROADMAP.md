@@ -41,9 +41,19 @@ the status board sitting on top of all of them.
 > bypasses; ask_human clean SHIP). 399 → **423 tests**. **Wave 2 remaining (all
 > blocked on later waves):** `delegate` (2.1 — dep 4.3 agent registry, a real
 > delegate dispatches a sub-agent); reroute UX (2.3 — dep 3.1); durability
-> journal (2.5 — dep 4.4). **⇒ Wave 2's ready work is drained; next unblocked
-> front is Wave 3 (M4 model manager — seats, usage ledger, cache-shaped prompts,
-> capability registry; all Tier-A ∥).**
+> journal (2.5 — dep 4.4). **⇒ Wave 2's ready work is drained.**
+> **Wave 3.2 — usage ledger booking side (2026-07-17, `7141d34`):** the
+> per-profile `usage_events` cost ledger + booking landed (PROFILE schema v6→v7):
+> every model call books one row; local=$0, cloud=unknown-flagged (never a
+> guess — SUM skips NULLs, unknown count surfaced separately). Reviewed SHIP.
+> 423 → **425 tests**. **Rest of 3.2 (budget governor) deferred:** a cost-cap
+> that halts unattended spend needs real per-call cost capture first (SSE `usage`
+> tokens + pricing — cloud cost is "unknown" until then). **Other Wave 3 items
+> (Tier-A ∥, not started):** model seats (3.1 — no consumer until the 4.3 agent
+> registry), cache-shaped prompt assembly + compaction (3.3), capability registry
+> that refuses (3.4 — native-tools has a valid fenced fallback, so no refusal
+> trigger exists yet). Neither 3.1 nor 3.4 has a present consumer — building them
+> now would be speculative infra; 3.3 (compaction) is the next substantive item.
 > **Wave 2.2 — permission modes** (`5bf3c37`): a session-wide `SessionMode`
 > (normal / plan / accept-edits) enforced by a `SessionModeHook` placed after the
 > danger/protected-path floors and before `PermissionHook`, so it's *structurally*
@@ -90,7 +100,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 423 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 425 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -108,8 +118,8 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 2.1 cron + fetch_url + ask_human + Wave 2.4 headless queue
-landed: **423 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
+Last verified: 2026-07-17 (Wave 2.1 tools + Wave 2.4 queue + Wave 3.2 usage-ledger booking
+landed: **425 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
 frontend build + svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---
@@ -122,7 +132,7 @@ frontend build + svelte-check clean, tree clean; embedder live test passes on th
 | **M1** — vertical slice | message → classify → route → model → stream → save | ✅ **Done + verified** (contract tests at the real IPC boundary) |
 | **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
-| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). Not started: model seats, usage ledger, budget governor, cache-shaped prompts, skills & agents. |
+| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). **Usage ledger (3.2) booking side DONE 2026-07-17** (`7141d34`): per-profile `usage_events` cost ledger, every model call booked, local=$0/cloud=unknown-flagged. Not started: budget governor (needs SSE cost capture first), model seats (3.1), cache-shaped prompts + compaction (3.3), capability registry (3.4), skills & agents. |
 | **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Wave 1 (2026-07-17) closed four of the remaining gaps:** curated-summary **snapshot-at-turn-1** (frozen per conversation, privacy-filtered per turn), a per-profile **semantic-search toggle** (lazy embedder load; keyword-only when off), the inline **"remembered" save event**, and **walled-profile DB routing** (a walled profile's memory lives in its own physically-separate DB, proven to survive toggling back). **Still remaining:** pre-compaction/new-chat write triggers (flush moot until context compaction exists — Wave 3.3/3.5); embedder bundling into the packaged app (M9 / Wave 7.1). Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
 | **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **DONE (item 3 complete)** — trained bge-small + distilbert INT8 ONNX ensemble in-process via `ort` (fused with layer-0 rules, parity-verified), the "why this was routed" annotated sidebar, **per-profile runtime thresholds** (settings page), AND **partial-delegation redact-and-send** (rule-value spans blacked out → re-classified → safe remainder to cloud → rehydrated; per-profile toggle). Only optional cosmetic `gate.rs` §7 renames remain (deferred, low-value). |
@@ -222,9 +232,18 @@ frontend build + svelte-check clean, tree clean; embedder live test passes on th
    inline **"remembered" save event** (recall has its banner; saves surface only via the
    approval prompt); **walled-profile DB routing** (§7 toggle → the profile's own memory DB).
    Design: PLAN §9 (incl. the 2026-07-15 refinements).
-6. **[ ] Rest of M4** — model seats, usage ledger + budget governor (per-profile),
-   cache-shaped prompt assembly, capability registry that refuses; then the skills &
-   agents track (do the one-queue-model unification pass before locking its schemas).
+6. **[~] Rest of M4 (Wave 3)** — **[~] usage ledger (3.2)**: the per-profile
+   `usage_events` cost ledger + booking landed (`7141d34`, PROFILE v6→v7) — every
+   model call books one row, local=$0 / cloud=unknown-flagged (never guessed).
+   **Follow-up (rest of 3.2): the budget governor** — a cost-cap that halts
+   unattended spend; needs real per-call cost capture first (SSE `usage` token
+   parsing + a pricing table — cloud costs are "unknown" until then, so a
+   cost-cap can't meaningfully fire yet; count-based budgets already exist from
+   Q4). STILL OPEN (Tier-A ∥): model seats (3.1 — no consumer until 4.3 agent
+   registry), cache-shaped prompt assembly + context compaction (3.3), capability
+   registry that refuses (3.4 — no refusal-triggering consumer yet; native-tools
+   has a valid fenced fallback). Then the skills & agents track (do the
+   one-queue-model unification pass 4.4 before locking its schemas).
 7. **[~] Remaining core tools** — DONE: session search, system status (2.1, `6a97695`);
    **cron management** (`9008cfb` — `list_cron_jobs`/`manage_cron`); **headless browser →
    `fetch_url`** (`f9e49eb` — the first External/egress tool, SSRF-guarded); **`ask_human`**
