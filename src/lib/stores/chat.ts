@@ -246,6 +246,7 @@ export async function sendMessage(
   providerId: string | null,
   model: string | null,
   bindingOverride?: Binding,
+  mode: string = "normal",
 ): Promise<void> {
   if (!content.trim()) return;
 
@@ -350,6 +351,7 @@ export async function sendMessage(
       providerIdArg,
       modelArg,
       profile,
+      mode,
     );
     if (streamError) {
       // A stream:error arrived while send_message still resolved Ok — this

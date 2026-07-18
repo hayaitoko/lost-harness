@@ -213,6 +213,7 @@ impl AgentLoop {
         provider_id: String,
         model: String,
         profile: String,
+        session_mode: crate::hooks::SessionMode,
         app: AppHandle,
     ) -> Result<String> {
         // Serialize streams — one in-flight message per agent loop.
@@ -294,6 +295,7 @@ impl AgentLoop {
                                     binding,
                                     is_cloud,
                                     Some(redaction),
+                                    session_mode,
                                     app,
                                 )
                                 .await;
@@ -321,6 +323,7 @@ impl AgentLoop {
                         binding,
                         local_is_cloud,
                         None,
+                        session_mode,
                         app,
                     )
                     .await;
@@ -337,6 +340,7 @@ impl AgentLoop {
                         binding,
                         is_cloud,
                         None,
+                        session_mode,
                         app,
                     )
                     .await;
@@ -609,6 +613,9 @@ impl AgentLoop {
         // the transcript, and the model's reply is rehydrated back to the real
         // values before it's persisted/returned. `None` ⇒ ordinary send.
         redaction: Option<crate::classifier::Redaction>,
+        // Q11: the conversation's permission mode, threaded into `ExecCtx` for
+        // this turn's tool calls.
+        session_mode: crate::hooks::SessionMode,
         app: AppHandle,
     ) -> Result<String> {
         // `provider`/`client`/`is_cloud`/`routing_decision` are mutable because
@@ -703,6 +710,10 @@ impl AgentLoop {
             profile: profile.clone(),
             reads: None,
             allow_private_memory: !is_cloud,
+            // Q11: the conversation's permission mode, applied to every tool
+            // call this turn makes (SessionModeHook). The dispatcher inherits it
+            // via `..ctx.clone()`, so a mid-turn reroute preserves it.
+            session_mode,
         };
 
         // Bound the tool loop so a model that keeps calling tools can't run

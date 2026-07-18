@@ -190,6 +190,11 @@ pub struct SendMessageArgs {
     /// required (not `Option`) to make the wiring explicit and to avoid
     /// accidentally writing a personal-profile message to a work db.
     pub profile: String,
+    /// Q11 permission mode for this turn: `"normal"` (default), `"plan"`
+    /// (read-only), or `"accept_edits"` (auto-approve local edits). Optional +
+    /// lenient so an older frontend that omits it gets `Normal`.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -419,6 +424,11 @@ pub async fn send_message(
 ) -> Result<SendMessageResponse, String> {
     let binding = parse_binding(&args.binding)
         .map_err(|e| format!("invalid binding {:?}: {e}", args.binding))?;
+    let session_mode = args
+        .mode
+        .as_deref()
+        .map(crate::hooks::SessionMode::from_str_lenient)
+        .unwrap_or_default();
 
     let profile = args.profile.clone();
     let started = chrono::Utc::now().timestamp_millis();
@@ -435,6 +445,7 @@ pub async fn send_message(
             args.provider_id,
             args.model,
             args.profile,
+            session_mode,
             app.clone(),
         )
         .await

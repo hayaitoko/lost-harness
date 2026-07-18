@@ -438,7 +438,12 @@ impl ToolDispatcher {
                 .with_conversation_id(ctx.conversation_id.as_str())
                 // Per-profile persisted `tool_rules` resolve against this
                 // profile (SqlitePolicySource); empty = pre-Q8 behavior.
-                .with_profile(ctx.profile.as_str());
+                .with_profile(ctx.profile.as_str())
+                // Q11: the tool's risk + the conversation's session mode feed
+                // the SessionModeHook (plan denies mutations; accept-edits
+                // auto-approves Write only — never External/Dangerous).
+                .with_risk(tool.risk())
+                .with_session_mode(ctx.session_mode);
 
             match self.chain.run_gating(&mut ev) {
                 (HookResult::Continue | HookResult::Allow, _) => {
@@ -1022,6 +1027,7 @@ mod tests {
             profile: "personal".to_string(),
             reads: None,
             allow_private_memory: false,
+            session_mode: Default::default(),
         }
     }
 

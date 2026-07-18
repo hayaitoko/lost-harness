@@ -360,3 +360,85 @@ fn local_required_annotation_survives_the_whole_chain_and_blocks_cloud_routing()
         "a local_required request with only cloud endpoints must never succeed"
     );
 }
+
+// ── Session modes (Q11) through the REAL full chain ──────────────────────────
+
+#[test]
+fn accept_edits_auto_approves_write_but_never_widens_external_or_dangerous() {
+    use crate::tools::RiskClass;
+    let ledger = Arc::new(ApprovalLedger::new());
+    let chain = build_pretooluse_chain_full(
+        real_gate(),
+        Box::new(InMemoryPolicySource::new()),
+        &[],
+        Arc::clone(&ledger),
+        None,
+    );
+
+    // A first-use Write in accept-edits mode passes the WHOLE chain with no
+    // prompt — the SessionModeHook's `policy_allowed` satisfies first-use too.
+    let mut w = EventContext::pre_tool_use("edit_file")
+        .with_content("edit the readme")
+        .with_risk(RiskClass::Write)
+        .with_session_mode(SessionMode::AcceptEdits);
+    assert_eq!(
+        chain.run_gating(&mut w).0,
+        HookResult::Continue,
+        "accept-edits must auto-approve a first-use Write"
+    );
+
+    // A Dangerous tool in accept-edits mode is NOT widened — first-use still
+    // Asks (the matrix bound holds).
+    let mut d = EventContext::pre_tool_use("danger_tool")
+        .with_content("do a big thing")
+        .with_risk(RiskClass::Dangerous)
+        .with_session_mode(SessionMode::AcceptEdits);
+    let (rd, _by) = chain.run_gating(&mut d);
+    assert!(
+        matches!(rd, HookResult::Ask(_)),
+        "accept-edits must NOT auto-approve a Dangerous tool; got {rd:?}"
+    );
+
+    // Same for External.
+    let mut e = EventContext::pre_tool_use("reach_out")
+        .with_content("call an api")
+        .with_risk(RiskClass::External)
+        .with_session_mode(SessionMode::AcceptEdits);
+    assert!(
+        matches!(chain.run_gating(&mut e).0, HookResult::Ask(_)),
+        "accept-edits must NOT auto-approve an External tool"
+    );
+}
+
+#[test]
+fn plan_mode_allows_reads_and_denies_every_mutation_through_the_full_chain() {
+    use crate::tools::RiskClass;
+    let ledger = Arc::new(ApprovalLedger::new());
+    let chain = build_pretooluse_chain_full(
+        real_gate(),
+        Box::new(InMemoryPolicySource::new()),
+        &["read_file"], // pre-confirmed so a Safe read isn't first-use-asked
+        Arc::clone(&ledger),
+        None,
+    );
+
+    let mut safe = EventContext::pre_tool_use("read_file")
+        .with_content("read something")
+        .with_risk(RiskClass::Safe)
+        .with_session_mode(SessionMode::Plan);
+    assert_eq!(
+        chain.run_gating(&mut safe).0,
+        HookResult::Continue,
+        "plan mode allows Safe reads"
+    );
+
+    for risk in [RiskClass::Write, RiskClass::External, RiskClass::Dangerous] {
+        let mut m = EventContext::pre_tool_use("mutate")
+            .with_content("change something")
+            .with_risk(risk)
+            .with_session_mode(SessionMode::Plan);
+        let (rm, by) = chain.run_gating(&mut m);
+        assert!(matches!(rm, HookResult::Deny(_)), "plan denies {risk:?}; got {rm:?}");
+        assert_eq!(by, Some("session_mode"), "plan denial comes from the session_mode hook");
+    }
+}

@@ -12,7 +12,7 @@
 //   - `list_profiles() -> Vec<String>`
 //   - `list_providers() -> Vec<ProviderInfo>`
 //   - `remove_provider(id) -> bool`
-//   - `send_message(args: { content, conversation_id, binding, provider_id, model, profile }) -> SendMessageResponse`
+//   - `send_message(args: { content, conversation_id, binding, provider_id, model, profile, mode }) -> SendMessageResponse`
 //   - `add_provider(args: { name, base_url, api_key, kind, supports_native_tools }) -> ProviderInfo`
 //   - `list_models(args: { provider_id }) -> Vec<String>`
 //   - `list_conversations(args: { profile }) -> Vec<ConversationInfo>`
@@ -329,6 +329,7 @@ export async function sendMessage(
   providerId: string,
   model: string,
   profile: string,
+  mode: string = "normal",
 ): Promise<SendMessageResponse> {
   if (isTauri()) {
     return tauriInvoke<SendMessageResponse>("send_message", {
@@ -339,6 +340,8 @@ export async function sendMessage(
         provider_id: providerId,
         model,
         profile,
+        // Q11 permission mode: "normal" | "plan" | "accept_edits".
+        mode,
       },
     });
   }

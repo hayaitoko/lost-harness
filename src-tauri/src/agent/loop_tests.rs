@@ -556,6 +556,7 @@ fn exec_ctx() -> crate::tools::ExecCtx {
         profile: "personal".to_string(),
         reads: None,
         allow_private_memory: false,
+        session_mode: Default::default(),
     }
 }
 

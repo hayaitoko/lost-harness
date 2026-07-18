@@ -65,7 +65,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::agent::gate::Binding;
-use crate::tools::ToolInput;
+use crate::tools::{RiskClass, ToolInput};
 
 pub mod approval;
 pub mod audit;
@@ -75,6 +75,7 @@ pub mod privacy_filter;
 pub mod protected_path;
 pub mod routing;
 pub mod sandbox;
+pub mod session_mode;
 
 pub use approval::{
     persist_rule_allowed, resolve_grant, ActionFingerprint, ApprovalDecision, ApprovalLedger,
@@ -93,6 +94,7 @@ pub use privacy_filter::PrivacyFilterHook;
 pub use protected_path::ProtectedPathHook;
 pub use routing::{enforce_local_routing, LocalRoutingViolation};
 pub use sandbox::{SandboxConfig, SandboxHook, SandboxNetworkConfig};
+pub use session_mode::{SessionMode, SessionModeHook};
 
 // ── HookEvent ────────────────────────────────────────────────────────────
 
@@ -198,6 +200,15 @@ pub struct EventContext {
     /// non-overridable Sandbox/ProtectedPath floors — which run BEFORE
     /// `PermissionHook` — are unaffected.
     pub policy_allowed: bool,
+    /// The resolved tool's [`RiskClass`], stamped by the dispatcher. Drives the
+    /// session-mode gate (`plan` denies risk > `Safe`; `accept_edits`
+    /// auto-approves only `Write`). Defaults to `Safe` for contexts that don't
+    /// set it — the safe direction (a mode never mistakes an unknown call for a
+    /// mutation to auto-approve).
+    pub risk: RiskClass,
+    /// The conversation's [`SessionMode`] (Q11), stamped by the dispatcher from
+    /// `ExecCtx.session_mode`. Defaults to `Normal` (no-op).
+    pub session_mode: SessionMode,
     /// Set by `PrivacyFilterHook` (or any future hook) when this request
     /// must not leave the device. See `RoutingRequirement`.
     pub routing: RoutingRequirement,
@@ -218,6 +229,8 @@ impl EventContext {
             conversation_id: String::new(),
             profile: String::new(),
             policy_allowed: false,
+            risk: RiskClass::Safe,
+            session_mode: SessionMode::Normal,
             routing: RoutingRequirement::Unconstrained,
         }
     }
@@ -240,8 +253,22 @@ impl EventContext {
             conversation_id: String::new(),
             profile: String::new(),
             policy_allowed: false,
+            risk: RiskClass::Safe,
+            session_mode: SessionMode::Normal,
             routing: RoutingRequirement::Unconstrained,
         }
+    }
+
+    /// Stamp the resolved tool's risk (dispatcher sets this from `Tool::risk()`).
+    pub fn with_risk(mut self, risk: RiskClass) -> Self {
+        self.risk = risk;
+        self
+    }
+
+    /// Stamp the conversation's session mode (Q11).
+    pub fn with_session_mode(mut self, mode: SessionMode) -> Self {
+        self.session_mode = mode;
+        self
     }
 
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
@@ -509,6 +536,11 @@ pub fn build_pretooluse_chain_full(
         protected = protected.with_workspace_root(root);
     }
     chain.register_gating(Box::new(protected));
+    // Session-mode gate (Q11): placed AFTER the non-overridable floors
+    // (Sandbox danger denylist, ProtectedPath) and BEFORE PermissionHook, so a
+    // mode can neither bypass a floor nor widen the Q8 matrix. `Normal` (the
+    // default) is a no-op, so bodies/turns that don't set a mode are unaffected.
+    chain.register_gating(Box::new(SessionModeHook));
     chain.register_gating(Box::new(
         PermissionHook::new(policy).with_ledger(Arc::clone(&ledger)),
     ));

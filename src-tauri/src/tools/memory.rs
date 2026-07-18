@@ -497,6 +497,7 @@ mod tests {
             profile: "personal".into(),
             reads: None,
             allow_private_memory: false,
+            session_mode: Default::default(),
         };
 
         // Benign → shared, saved.
@@ -599,6 +600,7 @@ mod tests {
             profile: "personal".into(),
             reads: None,
             allow_private_memory: false,
+            session_mode: Default::default(),
         };
 
         // Default profile (no settings row) → Shared.
@@ -726,6 +728,7 @@ mod hybrid_tests {
             profile: "personal".into(),
             reads: None,
             allow_private_memory: false,
+            session_mode: Default::default(),
         };
 
         // Semantic OFF → no vector stored.

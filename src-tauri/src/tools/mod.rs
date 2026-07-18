@@ -210,6 +210,10 @@ pub struct ExecCtx {
     /// unset/`Default` context (tests, unknown endpoint) never surfaces a
     /// private-local fact into model context. `recall_memory` reads this.
     pub allow_private_memory: bool,
+    /// The conversation's permission mode (Q11). The dispatcher stamps this into
+    /// each tool call's `EventContext` so the `SessionModeHook` can apply it.
+    /// Defaults to `Normal` (no-op) for any context that doesn't set one.
+    pub session_mode: crate::hooks::SessionMode,
 }
 
 // ── RiskClass ──────────────────────────────────────────────────────────────

@@ -53,6 +53,26 @@
     private: "auto",
   };
 
+  // Q11 permission mode for this chat. Normal is the default; Plan is
+  // read-only (the agent can look but not change); Accept-edits auto-approves
+  // local edits (never off-box / dangerous actions). Feeds sendMessage().
+  type SessionMode = "normal" | "plan" | "accept_edits";
+  const MODE_LABEL: Record<SessionMode, string> = {
+    normal: "Normal",
+    plan: "Plan",
+    accept_edits: "Accept edits",
+  };
+  const MODE_DESC: Record<SessionMode, string> = {
+    normal: "Tool actions ask for approval as usual",
+    plan: "Read-only — the agent can look and plan but makes no changes",
+    accept_edits: "Auto-approve local edits (never off-box or dangerous actions)",
+  };
+  const NEXT_MODE: Record<SessionMode, SessionMode> = {
+    normal: "plan",
+    plan: "accept_edits",
+    accept_edits: "normal",
+  };
+
   const TABS: { id: PanelTab; label: string }[] = [
     { id: "routing", label: "Routing" },
     { id: "files", label: "Files in this chat" },
@@ -65,6 +85,7 @@
   // sendMessage() directly (see chat.ts's bindingOverride param) rather than
   // mutating the conversation's stored default.
   let binding = $state<Binding>("auto");
+  let mode = $state<SessionMode>("normal");
   let whyOpen = $state(false);
   let panelTab = $state<PanelTab>("routing");
 
@@ -74,6 +95,7 @@
   let textareaEl: HTMLTextAreaElement | null = $state(null);
 
   const cycleBinding = () => (binding = NEXT_BINDING[binding]);
+  const cycleMode = () => (mode = NEXT_MODE[mode]);
   const toggleWhy = () => (whyOpen = !whyOpen);
   const openTab = (t: PanelTab) => {
     whyOpen = true;
@@ -277,6 +299,7 @@
         providersStore.activeProviderId,
         providersStore.activeModel,
         binding,
+        mode,
       );
     } finally {
       isSending = false;
@@ -355,6 +378,18 @@
       >
         {@render dot(binding === "public" ? "bg-cloud" : "bg-local")}
         {BINDING_LABEL[binding]}
+      </button>
+
+      <button
+        type="button"
+        onclick={cycleMode}
+        title={MODE_DESC[mode]}
+        aria-label="Permission mode — click to switch"
+        class="inline-flex h-7 cursor-pointer items-center gap-[7px] rounded-[14px] border px-3 text-[12px] font-semibold tracking-[0.02em] {mode === 'normal'
+          ? 'border-border-strong bg-surface text-text'
+          : 'border-warn bg-warn-soft text-warn'}"
+      >
+        {MODE_LABEL[mode]}
       </button>
 
       <div class="flex-1"></div>
