@@ -23,15 +23,18 @@ the status board sitting on top of all of them.
 
 > **As of 2026-07-18: M3 COMPLETE. M4 well underway. WAVE 1 + WAVE 2 (ready work)
 > COMPLETE; WAVE 3 largely landed (3.2 ledger+cost, 3.3 compaction, 3.5 flush).**
-> **Latest (2026-07-18):** **Wave 3.5 pre-compaction flush** (`f89536e`) — a LOCAL
-> model sweeps about-to-be-trimmed turns for durable facts and saves them
-> (sensitivity-routed, async, at-most-once); trigger #3 (new-chat nudge) deferred.
+> **Latest (2026-07-18):** **Wave 3.5 COMPLETE** — both memory write-triggers:
+> the pre-compaction flush (`f89536e`, trigger #2: a LOCAL model sweeps
+> about-to-be-trimmed turns) AND the new-chat consolidation nudge (`e0929f0`,
+> trigger #3: on a new chat, sweep the prior conversation). Sensitivity-routed,
+> async/off the stream lock, at-most-once (shared high-water) + content-deduped.
 > **Wave 3.2 cost capture** (`649f3fa`) — real $ cost in the ledger (SSE usage +
-> pricing). Both multi-agent designed/reviewed. 451 tests. **Next unblocked
-> substantive fronts:** Wave 4.4 (one-queue-model unification — the "do first"
-> gate for the skills/agents track, which then unblocks delegate 2.1 + seats 3.1's
-> consumer); the 3.5 new-chat nudge; the 3.2 budget governor (server-track). 3.1
-> seats / 3.4 capability-registry stay speculative (no present consumer).
+> pricing). All multi-agent designed/reviewed. **453 tests.** **Next unblocked
+> substantive front:** Wave 4.4 (one-queue-model unification — the "do first"
+> gate for the skills/agents track, which then unblocks delegate 2.1, model-seats
+> 3.1's consumer, and 2.3 reroute UX). The 3.2 budget governor is server-track
+> (needs an unattended-mode concept). 3.1 seats / 3.4 capability-registry stay
+> speculative (no present consumer — don't build ahead of one).
 > **Wave 2 core tools + queue (2026-07-17, `9008cfb`→`e5da77f`):** four more
 > items landed — **cron management** (2.1: `list_cron_jobs` Safe +
 > `manage_cron` Dangerous, profile-scoped, cron-string-validated), **`fetch_url`**
@@ -133,7 +136,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 451 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 453 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -151,8 +154,8 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 3.5 pre-compaction flush landed:
-**451 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
+Last verified: 2026-07-17 (Wave 3.5 complete (flush + new-chat nudge):
+**453 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
 frontend build + svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---
@@ -166,7 +169,7 @@ frontend build + svelte-check clean, tree clean; embedder live test passes on th
 | **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
 | **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). **Usage ledger (3.2) booking side DONE 2026-07-17** (`7141d34`): per-profile `usage_events` cost ledger, every model call booked, local=$0/cloud=unknown-flagged. **Cache-shaped prompts + context compaction (3.3) DONE 2026-07-17** (`f543250`): byte-stable prefix + deterministic `compact_history` at the stream seam, emits the 3.5 pre-compaction signal (+ a HIGH cloud-history privacy fix `c026e33`). Not started: budget governor (needs SSE cost capture first), model seats (3.1), capability registry (3.4), skills & agents. **Wave 3.5 (pre-compaction flush) is now unblocked** — swap the `on_pre_compaction` seam body. |
-| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Wave 1 (2026-07-17) closed four of the remaining gaps:** curated-summary **snapshot-at-turn-1** (frozen per conversation, privacy-filtered per turn), a per-profile **semantic-search toggle** (lazy embedder load; keyword-only when off), the inline **"remembered" save event**, and **walled-profile DB routing** (a walled profile's memory lives in its own physically-separate DB, proven to survive toggling back). **Still remaining:** the **pre-compaction flush (Wave 3.5 trigger #2) is DONE** (`f89536e`, `agent/memory_flush.rs`): about-to-be-trimmed turns are swept for durable facts by a LOCAL model + saved via the exact sensitivity-routed path, async/off the stream lock, at-most-once, reviewed (guard-wrapped extractor input). **Deferred:** trigger #3 (new-chat consolidation nudge — reuses `run_flush` on `create_conversation`); embedder bundling into the packaged app (M9 / Wave 7.1). Design: PLAN §9. |
+| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Wave 1 (2026-07-17) closed four of the remaining gaps:** curated-summary **snapshot-at-turn-1** (frozen per conversation, privacy-filtered per turn), a per-profile **semantic-search toggle** (lazy embedder load; keyword-only when off), the inline **"remembered" save event**, and **walled-profile DB routing** (a walled profile's memory lives in its own physically-separate DB, proven to survive toggling back). **All write triggers DONE (Wave 3.5 complete):** trigger #1 save-as-you-go (`remember`, earlier), **#2 pre-compaction flush** (`f89536e`) and **#3 new-chat nudge** (`e0929f0`) — `agent/memory_flush.rs`: a LOCAL model extracts durable facts (guard-wrapped input) + saves via the exact sensitivity-routed path, async/off the stream lock, at-most-once (shared high-water) + content-deduped. **Still remaining:** embedder bundling into the packaged app (M9 / Wave 7.1). Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
 | **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **DONE (item 3 complete)** — trained bge-small + distilbert INT8 ONNX ensemble in-process via `ort` (fused with layer-0 rules, parity-verified), the "why this was routed" annotated sidebar, **per-profile runtime thresholds** (settings page), AND **partial-delegation redact-and-send** (rule-value spans blacked out → re-classified → safe remainder to cloud → rehydrated; per-profile toggle). Only optional cosmetic `gate.rs` §7 renames remain (deferred, low-value). |
 | **M5** — computer use | cross-platform screen control, the flagship | ⬜ **Not started** (stubs in `src-tauri/src/platform/`) |
