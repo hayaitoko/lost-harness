@@ -42,6 +42,24 @@ the status board sitting on top of all of them.
 > blocked on later waves):** `delegate` (2.1 — dep 4.3 agent registry, a real
 > delegate dispatches a sub-agent); reroute UX (2.3 — dep 3.1); durability
 > journal (2.5 — dep 4.4). **⇒ Wave 2's ready work is drained.**
+> **Wave 3.3 — cache-shaped prompt assembly + context compaction (2026-07-17,
+> `f543250`):** prompt assembly is now cache-shaped (curated summary → byte-stable
+> system PREFIX via a deterministic `guard_wrap_stable`; volatile snippets moved
+> into the current user turn at the tail) and the model-facing history is
+> compacted to a char budget by a pure deterministic `compact_history` (leading
+> prefix + pinned recent tail kept, oldest middle dropped WHOLE with a marker,
+> the trimmed set returned as the Wave 3.5 signal via the `on_pre_compaction`
+> seam) — the stored transcript is never touched. Ran a 3-approach design panel
+> + a 5-lens find→verify review (multi-agent); fixed the confirmed defect that a
+> deep tool loop could compact the user's question out (now pinned) + merged the
+> snippet block into the current turn. **This unblocks Wave 3.5** (pre-compaction
+> flush: swap the `on_pre_compaction` body to sweep the trimmed turns for durable
+> facts). **Plus a HIGH privacy fix (`c026e33`):** the review surfaced a
+> pre-existing leak — a plain Allow cloud turn replayed prior turns' persisted
+> plaintext (incl. an earlier private/redacted turn) to cloud without re-vetting;
+> now the Allow→cloud path is gated by the whole-history cloud-safe check (routes
+> local if unsafe), with a per-conversation incremental cache so long benign
+> cloud chats aren't forced local. 425 → **438 tests**.
 > **Wave 3.2 — usage ledger booking side (2026-07-17, `7141d34`):** the
 > per-profile `usage_events` cost ledger + booking landed (PROFILE schema v6→v7):
 > every model call books one row; local=$0, cloud=unknown-flagged (never a
@@ -100,7 +118,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 425 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 438 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -118,8 +136,8 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 2.1 tools + Wave 2.4 queue + Wave 3.2 usage-ledger booking
-landed: **425 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
+Last verified: 2026-07-17 (Wave 3.3 compaction + cloud-history privacy fix landed:
+**438 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
 frontend build + svelte-check clean, tree clean; embedder live test passes on the installed model).
 
 ---
@@ -132,8 +150,8 @@ frontend build + svelte-check clean, tree clean; embedder live test passes on th
 | **M1** — vertical slice | message → classify → route → model → stream → save | ✅ **Done + verified** (contract tests at the real IPC boundary) |
 | **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
-| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). **Usage ledger (3.2) booking side DONE 2026-07-17** (`7141d34`): per-profile `usage_events` cost ledger, every model call booked, local=$0/cloud=unknown-flagged. Not started: budget governor (needs SSE cost capture first), model seats (3.1), cache-shaped prompts + compaction (3.3), capability registry (3.4), skills & agents. |
-| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Wave 1 (2026-07-17) closed four of the remaining gaps:** curated-summary **snapshot-at-turn-1** (frozen per conversation, privacy-filtered per turn), a per-profile **semantic-search toggle** (lazy embedder load; keyword-only when off), the inline **"remembered" save event**, and **walled-profile DB routing** (a walled profile's memory lives in its own physically-separate DB, proven to survive toggling back). **Still remaining:** pre-compaction/new-chat write triggers (flush moot until context compaction exists — Wave 3.3/3.5); embedder bundling into the packaged app (M9 / Wave 7.1). Design: PLAN §9. |
+| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). **Usage ledger (3.2) booking side DONE 2026-07-17** (`7141d34`): per-profile `usage_events` cost ledger, every model call booked, local=$0/cloud=unknown-flagged. **Cache-shaped prompts + context compaction (3.3) DONE 2026-07-17** (`f543250`): byte-stable prefix + deterministic `compact_history` at the stream seam, emits the 3.5 pre-compaction signal (+ a HIGH cloud-history privacy fix `c026e33`). Not started: budget governor (needs SSE cost capture first), model seats (3.1), capability registry (3.4), skills & agents. **Wave 3.5 (pre-compaction flush) is now unblocked** — swap the `on_pre_compaction` seam body. |
+| **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Wave 1 (2026-07-17) closed four of the remaining gaps:** curated-summary **snapshot-at-turn-1** (frozen per conversation, privacy-filtered per turn), a per-profile **semantic-search toggle** (lazy embedder load; keyword-only when off), the inline **"remembered" save event**, and **walled-profile DB routing** (a walled profile's memory lives in its own physically-separate DB, proven to survive toggling back). **Still remaining:** pre-compaction/new-chat write triggers — **context compaction now EXISTS (Wave 3.3, `f543250`) and emits the pre-compaction signal via the `on_pre_compaction` seam, so Wave 3.5's flush is now unblocked** (swap that seam's body to sweep the trimmed turns for durable facts); the new-chat consolidation nudge; embedder bundling into the packaged app (M9 / Wave 7.1). Design: PLAN §9. |
 | **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
 | **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **DONE (item 3 complete)** — trained bge-small + distilbert INT8 ONNX ensemble in-process via `ort` (fused with layer-0 rules, parity-verified), the "why this was routed" annotated sidebar, **per-profile runtime thresholds** (settings page), AND **partial-delegation redact-and-send** (rule-value spans blacked out → re-classified → safe remainder to cloud → rehydrated; per-profile toggle). Only optional cosmetic `gate.rs` §7 renames remain (deferred, low-value). |
 | **M5** — computer use | cross-platform screen control, the flagship | ⬜ **Not started** (stubs in `src-tauri/src/platform/`) |

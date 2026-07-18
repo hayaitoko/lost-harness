@@ -47,7 +47,11 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **425 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 2 tools + Wave 2.4 queue + Wave 3.2 usage-ledger booking**.)
+**Tests:** `cargo test --lib` → **438 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-17, after **Wave 3.3 compaction + the cloud-history privacy fix**.)
+
+**2026-07-17 (build-manifest drain, session 2 cont'd): Wave 3.3 (cache-shaped assembly + context compaction) + a HIGH cloud-history privacy fix.** Ran under ultracode (multi-agent workflows): a 3-approach design panel, then a 5-lens find→verify adversarial review.
+- **Wave 3.3** (`f543250`, `src/agent/compaction.rs` + `loop_mod.rs` + `tools/calling.rs`). Cache-shaped assembly: the welded memory block was split — the curated summary is now a byte-stable system PREFIX (new `guard_wrap_stable(seed = conversation_id)` — deterministic nonce, so it's identical turn-over-turn for KV/prompt-cache reuse; the old random-nonce `guard_wrap` never was), and the relevance snippets moved INTO the current user turn at the tail (prepended, guard-wrapped — no two consecutive user messages). `assemble_memory_context` is now a thin compat wrapper over `assemble_curated_summary` + `assemble_relevance_snippets`. Compaction: pure deterministic `compact_history` at the stream-call seam (every round → bounds tool-loop growth), keeps the leading-system prefix + a PINNED recent tail (the current turn forward, via a dynamic `keep_recent` from `pinned_from`, so a deep tool loop can never trim the question), drops the oldest middle WHOLE (never sliced — protects redaction/guard frames) with one marker, returns `trimmed` as the **Wave 3.5 signal** (the new `on_pre_compaction` seam — swap its body for 3.5's flush). Stored transcript untouched. `ChatMessage` gained PartialEq/Eq. Review fixed: the question-trimmed-in-deep-loop defect (now pinned) + comment overstatements.
+- **HIGH privacy fix** (`c026e33`, `loop_mod.rs`) — the review surfaced a **pre-existing** leak (NOT a 3.3 regression): a plain `GateDecision::Allow` cloud turn replayed prior turns' persisted ORIGINALS (an earlier route_local / redact_send turn's plaintext, or a private message merely "allow"ed because the endpoint was local) to cloud, because `conversation_is_cloud_safe` ran only on the redact-send path. Fix: the Allow→cloud path now requires the whole prior history to be cloud-safe (re-classifies CONTENT, not the persisted decision); if not, routes THIS turn local (or fails closed if no local model). Added a per-conversation **incremental cloud-safe cache** (`cloud_safe_cache`: a private turn is permanent, only new turns re-checked, cfg-change invalidates) so long benign cloud chats aren't forced local by a scan cap. Adversarially verified FULLY-CLOSED (the only Allow→cloud path; reroute only moves toward local). **Follow-up:** no end-to-end test drives the guard through `process_message` (loop tests use a `TestLoop` reimpl); the guard + cache are unit-tested. Related still-open pre-existing item: prior-turn content isn't per-turn REDACTED for cloud (it fails the whole turn local instead) — a finer posture for a later round.
 
 **2026-07-17 (build-manifest drain, session 2 cont'd): Wave 3.2 usage-ledger booking side.** The per-profile `usage_events` cost ledger (`7141d34`, PROFILE schema v6→v7 — `record_usage`/`usage_summary` on ProfileDb, booked once per model call in `stream_to_provider` after the assistant persist). PLAN §3 honesty rule: local/private=$0, cloud-we-can't-price=NULL/unknown ("flying blind", never guessed — `usage_summary` sums only known cost and surfaces the unknown count separately). Cost driven by `is_cloud` (real routing). Reviewed SHIP. **Rest of 3.2 (budget governor) deferred** — a cost-cap halting unattended spend needs real per-call cost capture first: **the SSE stream does NOT parse `usage` tokens today** (no token/cost data for cloud), so a cost-cap can't meaningfully fire. Building the governor means first adding SSE `usage` parsing (`src/models/sse.rs`) + a per-model pricing table, then the cap check + an unattended-mode signal. Known LOW (documented at the booking call site): the per-row `model` label is endpoint-approximate after a mid-turn reroute (cost stays correct); and no agent-loop-level booking test yet (storage layer fully tested; loop tests use a TestLoop reimpl).
 
@@ -132,7 +136,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 425 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 438 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -248,7 +252,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 425 tests
+cd src-tauri && cargo test --lib   # 438 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
