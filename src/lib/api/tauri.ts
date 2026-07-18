@@ -494,6 +494,23 @@ export async function resolveAskHuman(id: string, answer: string | null): Promis
   return true;
 }
 
+/** A profile's model-usage roll-up. Mirrors `UsageSummaryInfo` in `ipc/mod.rs`. */
+export interface UsageSummary {
+  total_calls: number;
+  /** Summed KNOWN cost (local $0 + priced cloud calls). */
+  known_cost_usd: number;
+  /** Cloud calls we couldn't price — an honest "flying blind" count, not $0. */
+  unknown_cost_calls: number;
+}
+
+/** The active profile's model-call cost ledger roll-up (Wave 3.2). */
+export async function getUsageSummary(profile: string): Promise<UsageSummary> {
+  if (isTauri()) {
+    return tauriInvoke<UsageSummary>("get_usage_summary", { args: { profile } });
+  }
+  return { total_calls: 0, known_cost_usd: 0, unknown_cost_calls: 0 };
+}
+
 /** A persisted "Always allow" rule. Mirrors `ToolRuleInfo` in `ipc/mod.rs`. */
 export interface ToolRule {
   id: string;

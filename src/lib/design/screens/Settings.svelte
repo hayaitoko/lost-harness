@@ -40,15 +40,18 @@
     setClassifierSettings,
     setRedactionEnabled,
     resetClassifierSettings,
+    getUsageSummary,
+    type UsageSummary,
   } from "$lib/api/tauri";
 
-  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "appearance";
+  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "usage" | "appearance";
   const SECTIONS: [Section, string][] = [
     ["routing", "Routing"],
     ["privacy", "Privacy guard"],
     ["permissions", "Permissions"],
     ["models", "Models"],
     ["memory", "Memory"],
+    ["usage", "Usage"],
     ["appearance", "Appearance"],
   ];
 
@@ -135,6 +138,10 @@
   let toolRules = $state<ToolRule[]>([]);
   let rulesLoading = $state(false);
   let rulesError = $state<string | null>(null);
+  // usage — the profile's model-call cost ledger roll-up (Wave 3.2)
+  let usage = $state<UsageSummary | null>(null);
+  let usageLoading = $state(false);
+  let usageError = $state<string | null>(null);
   let confirmRevokeId = $state<string | null>(null);
 
   let activeLabel = $derived(SECTIONS.find(([id]) => id === section)![1]);
@@ -179,6 +186,24 @@
       })
       .finally(() => {
         rulesLoading = false;
+      });
+  });
+
+  // Load the active profile's usage ledger roll-up when the Usage pane opens.
+  $effect(() => {
+    if (section !== "usage") return;
+    const profile = $activeProfileId;
+    usageLoading = true;
+    usageError = null;
+    getUsageSummary(profile)
+      .then((s) => {
+        usage = s;
+      })
+      .catch((err) => {
+        usageError = String(err);
+      })
+      .finally(() => {
+        usageLoading = false;
       });
   });
 
@@ -1026,6 +1051,45 @@
                 details stay on this Mac, and pinned facts load into every conversation.
               </div>
             </div>
+          {:else if section === "usage"}
+            {#if usageLoading}
+              <div class="px-3 py-4 text-sm text-text-3">Loading usage…</div>
+            {:else if usageError}
+              <div class="px-3 py-4 text-sm text-red-400" data-testid="usage-error">{usageError}</div>
+            {:else if usage}
+              <div class="flex flex-col gap-2" data-testid="usage-summary">
+                <SettingRow title="Model calls" desc="Total model calls booked for this profile">
+                  {#snippet control()}
+                    <span class="text-sm tabular-nums text-text-1">{usage?.total_calls ?? 0}</span>
+                  {/snippet}
+                </SettingRow>
+                <SettingRow title="Known cost" desc="Local calls are $0; priced cloud calls are summed">
+                  {#snippet control()}
+                    <span class="text-sm tabular-nums text-text-1"
+                      >${(usage?.known_cost_usd ?? 0).toFixed(4)}</span>
+                  {/snippet}
+                </SettingRow>
+                <SettingRow
+                  title="Unpriced cloud calls"
+                  desc="Cloud calls we couldn't price — shown honestly, never guessed as $0"
+                >
+                  {#snippet control()}
+                    <span
+                      class="text-sm tabular-nums {(usage?.unknown_cost_calls ?? 0) > 0
+                        ? 'text-amber-400'
+                        : 'text-text-1'}">{usage?.unknown_cost_calls ?? 0}</span>
+                  {/snippet}
+                </SettingRow>
+                <div class="px-3 py-2 text-[11px] text-text-3">
+                  Cost is captured from the endpoint's reported token usage and a
+                  built-in price list for well-known cloud models. A call is only
+                  priced when both are available — otherwise it's counted as
+                  “unpriced,” never guessed.
+                </div>
+              </div>
+            {:else}
+              <div class="px-3 py-4 text-sm text-text-3">No usage recorded yet.</div>
+            {/if}
           {:else if section === "appearance"}
             <SettingRow title="Theme" desc="Follow the system, or pick one">
               {#snippet control()}

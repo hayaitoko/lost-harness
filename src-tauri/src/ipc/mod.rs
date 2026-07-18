@@ -571,6 +571,45 @@ pub struct ResolveAskHumanArgs {
     pub answer: Option<String>,
 }
 
+/// A profile's model-usage roll-up (Wave 3.2 ledger), for the Settings "Usage"
+/// view. Mirrors `storage::UsageSummary`. `known_cost_usd` sums only priced
+/// calls (local $0 + priced cloud); `unknown_cost_calls` is the honest count of
+/// cloud calls we couldn't price ("flying blind").
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageSummaryInfo {
+    pub total_calls: usize,
+    pub known_cost_usd: f64,
+    pub unknown_cost_calls: usize,
+}
+
+impl From<crate::storage::UsageSummary> for UsageSummaryInfo {
+    fn from(s: crate::storage::UsageSummary) -> Self {
+        Self {
+            total_calls: s.total_calls,
+            known_cost_usd: s.known_cost_usd,
+            unknown_cost_calls: s.unknown_cost_calls,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetUsageSummaryArgs {
+    pub profile: String,
+}
+
+/// Roll up a profile's model-call cost ledger for the Settings "Usage" view.
+#[tauri::command]
+pub fn get_usage_summary(
+    state: State<'_, AppState>,
+    args: GetUsageSummaryArgs,
+) -> Result<UsageSummaryInfo, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.usage_summary().map(Into::into).map_err(|e| e.to_string())
+}
+
 /// Deliver the user's answer to a parked `ask_human` question. Touches only the
 /// ask-human registry (never the stream lock), so it can't deadlock the
 /// dispatch waiting on it. Returns whether the id was still awaiting an answer.

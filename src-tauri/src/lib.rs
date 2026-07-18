@@ -216,6 +216,7 @@ pub fn run() {
             ipc::send_message,
             ipc::resolve_tool_approval,
             ipc::resolve_ask_human,
+            ipc::get_usage_summary,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,
