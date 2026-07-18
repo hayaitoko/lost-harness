@@ -783,6 +783,101 @@ fn conversation_is_cloud_safe_blocks_on_a_prior_private_turn() {
         "a prior private turn makes the conversation unsafe for cloud replay"
     );
 
+    // A turn that was ALLOWED on a LOCAL endpoint (persisted routing_decision =
+    // "allow") can still carry private content. The guard re-classifies the
+    // CONTENT, so it's correctly flagged unsafe for cloud replay — the persisted
+    // decision alone would wrongly pass it. This is exactly why the Allow-to-cloud
+    // path must gate on this content check, not on routing_decision.
+    db.create_conversation(&crate::storage::Conversation {
+        id: "c-localpriv".to_string(),
+        name: "L".to_string(),
+        pinned: false,
+        binding: "auto".to_string(),
+        folder_id: None,
+        color: None,
+        created_at: 1,
+        updated_at: 1,
+    })
+    .unwrap();
+    db.add_message(&Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        conversation_id: "c-localpriv".to_string(),
+        role: "user".to_string(),
+        content: "my SSN is 123-45-6789".to_string(),
+        model: None,
+        provider_id: None,
+        routing_decision: Some("allow".to_string()), // was fine on a LOCAL endpoint
+        thinking_content: None,
+        error: None,
+        aborted: false,
+        created_at: 1,
+    })
+    .unwrap();
+    assert!(
+        !agent.conversation_is_cloud_safe("personal", "c-localpriv", &cfg),
+        "private content persisted as 'allow' (a local turn) is still unsafe for cloud replay"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cloud_safe_cache_flips_to_unsafe_when_a_private_turn_is_appended() {
+    // The per-conversation cloud-safe cache must NEVER let a stale "safe" verdict
+    // hide a newly-appended private turn (that would reintroduce the leak). Also
+    // covers the cold-scan cap and cfg-change invalidation.
+    use crate::classifier::ClassifierConfig;
+    let (agent, storage, dir) = redaction_loop();
+    let cfg = ClassifierConfig::default();
+    let db = storage.open_profile("personal").unwrap();
+    db.create_conversation(&crate::storage::Conversation {
+        id: "c".to_string(),
+        name: "C".to_string(),
+        pinned: false,
+        binding: "auto".to_string(),
+        folder_id: None,
+        color: None,
+        created_at: 1,
+        updated_at: 1,
+    })
+    .unwrap();
+    let add = |content: &str, at: i64| {
+        db.add_message(&Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: "c".to_string(),
+            role: "user".to_string(),
+            content: content.to_string(),
+            model: None,
+            provider_id: None,
+            routing_decision: Some("allow".to_string()),
+            thinking_content: None,
+            error: None,
+            aborted: false,
+            created_at: at,
+        })
+        .unwrap();
+    };
+
+    // Two benign turns → safe (and caches the verdict).
+    add("what's the weather like", 1);
+    add("thanks, and the forecast for tomorrow", 2);
+    assert!(agent.conversation_is_cloud_safe("personal", "c", &cfg), "benign history is cloud-safe");
+    // A repeat hit uses the cache (still safe).
+    assert!(agent.conversation_is_cloud_safe("personal", "c", &cfg));
+
+    // Append a PRIVATE turn — the cache must re-check the new turn and flip.
+    add("my SSN is 123-45-6789", 3);
+    assert!(
+        !agent.conversation_is_cloud_safe("personal", "c", &cfg),
+        "a newly-appended private turn must flip the cached verdict to unsafe"
+    );
+    // Once unsafe, it stays unsafe (private content is permanent).
+    add("another innocuous line", 4);
+    assert!(
+        !agent.conversation_is_cloud_safe("personal", "c", &cfg),
+        "a later benign turn cannot make a conversation with private history safe again"
+    );
+
     let _ = std::fs::remove_dir_all(dir);
 }
 

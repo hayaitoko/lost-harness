@@ -155,7 +155,25 @@ pub struct AgentLoop {
     /// applies the endpoint privacy filter, so a private fact never rides a
     /// cloud turn even though the frozen set includes it.
     summary_cache: parking_lot::Mutex<std::collections::HashMap<String, Vec<(MemoryFact, MemoryBucket)>>>,
+    /// Per-conversation cloud-safety cache (privacy). Re-classifying every prior
+    /// turn on each cloud send is expensive AND, capped, would wrongly force a
+    /// long-but-benign cloud chat local. This caches `(is_safe, verified_count,
+    /// cfg)` per conversation: a private turn is permanent (append-only history),
+    /// so once unsafe it stays unsafe; when still safe, only turns added since
+    /// the last check are re-classified. A classifier-config change invalidates
+    /// the entry (full re-scan) so tightening strictness can never ride a stale
+    /// "safe". Cleared implicitly by process restart (cold scan re-populates).
+    cloud_safe_cache: parking_lot::Mutex<std::collections::HashMap<String, CloudSafeEntry>>,
     stream_lock: tokio::sync::Mutex<()>,
+}
+
+/// A cached cloud-safety verdict for a conversation's replayable history.
+#[derive(Debug, Clone)]
+struct CloudSafeEntry {
+    safe: bool,
+    /// How many leading messages have been verified under `cfg`.
+    verified_count: usize,
+    cfg: crate::classifier::ClassifierConfig,
 }
 
 impl std::fmt::Debug for AgentLoop {
@@ -178,6 +196,7 @@ impl AgentLoop {
             tools,
             embedder: None,
             summary_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            cloud_safe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             stream_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -329,6 +348,50 @@ impl AgentLoop {
                     .await;
             }
             GateDecision::Allow => {
+                // A cloud send replays the FULL conversation history. Even when
+                // THIS message is Public, an earlier turn may hold private
+                // content whose ORIGINAL is persisted — a turn that routed local
+                // or redact-sent, OR a private message that was merely "allow"ed
+                // because the endpoint was local at the time. Replaying any of
+                // those to cloud would leak, and the per-message gate never
+                // re-vets the history. So before a cloud send, require the whole
+                // prior history to be cloud-safe; if it isn't, keep THIS turn
+                // local (so the private history never leaves the device), or fail
+                // closed if no local model is configured. (Mirrors the guard the
+                // redact-and-send path already applies.)
+                if is_cloud
+                    && !self.conversation_is_cloud_safe(
+                        &profile,
+                        &conversation_id,
+                        &classifier_cfg,
+                    )
+                {
+                    let Some(local) = self.find_local_provider() else {
+                        let reason = "This conversation can't be safely continued on a cloud \
+                                      model (it contains earlier private content, or is too long \
+                                      to verify), and no local model is configured to continue it \
+                                      privately."
+                            .to_string();
+                        emit_error(&app, &conversation_id, reason.clone(), "gate");
+                        return Ok(reason);
+                    };
+                    let local_is_cloud = !is_private_endpoint(&local.base_url);
+                    return self
+                        .stream_to_provider(
+                            local,
+                            model,
+                            content,
+                            conversation_id,
+                            profile,
+                            "route_local",
+                            binding,
+                            local_is_cloud,
+                            None,
+                            session_mode,
+                            app,
+                        )
+                        .await;
+                }
                 return self
                     .stream_to_provider(
                         provider,
@@ -414,12 +477,14 @@ impl AgentLoop {
         conversation_id: &str,
         cfg: &crate::classifier::ClassifierConfig,
     ) -> bool {
-        // This re-classifies each prior turn (potentially a full ONNX pass) and
-        // runs under the app-wide `stream_lock`, so bound the cost: past this
-        // many prior turns we fail closed (keep the turn local) rather than
-        // stall every in-flight send. Redact-and-send is a best-effort
-        // optimization — declining it on a long conversation is always safe.
-        const MAX_HISTORY_SCAN: usize = 40;
+        // A cold full scan re-classifies every prior turn (each a potential ONNX
+        // pass) under the app-wide `stream_lock`, so bound the FIRST (uncached)
+        // scan of a very long conversation — beyond this, fail closed (stay
+        // local) rather than stall the send. This only bites a cold scan of a
+        // huge conversation (e.g. right after restart); once cached, growth is
+        // verified incrementally with no cap, so an ordinary long-but-benign
+        // cloud chat is NOT forced local.
+        const COLD_SCAN_CAP: usize = 200;
 
         let Ok(db) = self.storage.open_profile(profile) else {
             return false;
@@ -427,16 +492,52 @@ impl AgentLoop {
         let Ok(messages) = db.list_messages_by_conversation(conversation_id) else {
             return false;
         };
-        if messages.len() > MAX_HISTORY_SCAN {
-            return false; // too long to vet cheaply → stay local
-        }
-        messages.iter().all(|m| {
+        let n = messages.len();
+
+        // Classify one message for cloud replay: empty content is trivially safe;
+        // otherwise it must classify Allow under `cfg` on a cloud endpoint. Note
+        // this re-checks CONTENT, not the persisted routing_decision (a private
+        // message allowed on a LOCAL endpoint is still unsafe for cloud).
+        let msg_safe = |m: &Message| {
             m.content.trim().is_empty()
                 || matches!(
                     self.gate.check(&Binding::Auto, &m.content, true, cfg),
                     GateDecision::Allow
                 )
-        })
+        };
+
+        let mut cache = self.cloud_safe_cache.lock();
+        if let Some(entry) = cache.get(conversation_id) {
+            if entry.cfg == *cfg && entry.verified_count <= n {
+                if !entry.safe {
+                    // A prior private turn is permanent (history is append-only),
+                    // so the conversation stays unsafe without re-scanning.
+                    return false;
+                }
+                if entry.verified_count == n {
+                    return true; // nothing new to check
+                }
+                // Still safe so far; re-check ONLY the turns added since last time.
+                let safe = messages[entry.verified_count..].iter().all(msg_safe);
+                cache.insert(
+                    conversation_id.to_string(),
+                    CloudSafeEntry { safe, verified_count: n, cfg: *cfg },
+                );
+                return safe;
+            }
+            // cfg changed (or an impossible shrink) ⇒ discard and re-scan below.
+        }
+
+        // Cold scan. Bound its cost; a too-long cold scan fails closed (local).
+        if n > COLD_SCAN_CAP {
+            return false;
+        }
+        let safe = messages.iter().all(msg_safe);
+        cache.insert(
+            conversation_id.to_string(),
+            CloudSafeEntry { safe, verified_count: n, cfg: *cfg },
+        );
+        safe
     }
 
     /// Assemble this turn's memory context (PLAN §9): the always-loaded curated
