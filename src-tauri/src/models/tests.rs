@@ -133,6 +133,49 @@ async fn sse_handles_split_chunks() {
 }
 
 #[tokio::test]
+async fn sse_parses_the_final_usage_chunk() {
+    // With stream_options.include_usage, OpenAI sends a final chunk with empty
+    // choices + a usage object (Wave 3.2 cost ledger). It must decode to Usage.
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
+                 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":123,\"completion_tokens\":45,\"total_tokens\":168}}\n\
+                 data: [DONE]\n";
+    let events = collect(stream_from_chunks(vec![body.to_vec()])).await;
+    assert_eq!(
+        events,
+        vec![
+            SseEvent::Delta("hi".to_string()),
+            SseEvent::Usage { prompt_tokens: 123, completion_tokens: 45 },
+            SseEvent::Done,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sse_malformed_usage_never_drops_co_located_content() {
+    // Regression: a provider that rides a MALFORMED usage object on a content
+    // chunk (string/float token counts) must NOT fail the whole line's parse —
+    // the content delta must still be delivered, and no Usage event emitted.
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"keep me\"}}],\"usage\":{\"prompt_tokens\":\"oops\",\"completion_tokens\":1.5}}\n\
+                 data: [DONE]\n";
+    let events = collect(stream_from_chunks(vec![body.to_vec()])).await;
+    assert_eq!(
+        events,
+        vec![SseEvent::Delta("keep me".to_string()), SseEvent::Done],
+        "malformed usage is ignored; the content delta survives"
+    );
+}
+
+#[tokio::test]
+async fn sse_ignores_a_zero_usage_chunk() {
+    // A usage object with no tokens (or a provider that doesn't report usage)
+    // must NOT emit a Usage event — the ledger then records an unknown cost.
+    let body = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\
+                 data: [DONE]\n";
+    let events = collect(stream_from_chunks(vec![body.to_vec()])).await;
+    assert_eq!(events, vec![SseEvent::Done], "zero-token usage is not surfaced");
+}
+
+#[tokio::test]
 async fn sse_handles_crlf_line_endings() {
     let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\r\n\
                  data: [DONE]\r\n";

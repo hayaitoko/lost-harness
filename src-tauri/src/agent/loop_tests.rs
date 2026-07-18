@@ -208,7 +208,10 @@ impl<R: Runtime> TestLoop<R> {
                         },
                     );
                 }
-                SseEvent::Done | SseEvent::KeepAlive | SseEvent::ToolCalls(_) => {}
+                SseEvent::Done
+                | SseEvent::KeepAlive
+                | SseEvent::ToolCalls(_)
+                | SseEvent::Usage { .. } => {}
                 SseEvent::Error(msg) => {
                     let _ = self.app.emit(
                         "stream:error",

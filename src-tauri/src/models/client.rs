@@ -84,8 +84,19 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     stream: bool,
+    /// Ask the server to include a final `usage` chunk (Wave 3.2 cost ledger).
+    /// Standard OpenAI field; servers that don't recognize it ignore it (they
+    /// just don't send usage → the ledger records an unknown cost). Only set on
+    /// streaming requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 /// Response body of `GET /models` and `POST /chat/completions` (non-stream).
@@ -188,10 +199,18 @@ impl ModelClient {
             "{}/chat/completions",
             self.provider.base_url.trim_end_matches('/')
         );
+        // Only ask for `usage` on a non-private (billable cloud) endpoint — a
+        // local/private call is $0 in the ledger and never consults usage, so
+        // there's no reason to send the field there (and the more-likely-strict
+        // self-hosted servers never see it). Mirrors the `tools` field's "omit
+        // where not needed" precedent.
+        let stream_options = (!self.provider.is_private())
+            .then_some(StreamOptions { include_usage: true });
         let body = ChatRequest {
             model,
             messages: &messages,
             stream: true,
+            stream_options,
             tools,
         };
         let mut req = self.client.post(&url).json(&body);
@@ -226,6 +245,7 @@ impl ModelClient {
             model,
             messages: &messages,
             stream: false,
+            stream_options: None,
             tools: None,
         };
         let mut req = self.client.post(&url).json(&body);

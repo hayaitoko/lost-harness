@@ -14,6 +14,7 @@
 pub mod provider;
 pub mod client;
 pub mod manager;
+pub mod pricing;
 pub mod sse;
 
 #[cfg(test)]

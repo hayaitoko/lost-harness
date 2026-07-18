@@ -972,6 +972,9 @@ impl AgentLoop {
 
             let mut assembled = String::new();
             let mut native_frags: Vec<crate::models::sse::ToolCallFragment> = Vec::new();
+            // Wave 3.2: this round's reported token usage (if the endpoint sent
+            // it), used to book a real cost to the ledger below.
+            let mut round_usage: Option<(u32, u32)> = None;
             while let Some(event) = sse.next_event().await {
                 match event {
                     crate::models::sse::SseEvent::Delta(delta) => {
@@ -1003,6 +1006,12 @@ impl AgentLoop {
                     crate::models::sse::SseEvent::Error(msg) => {
                         emit_error(&app, &conversation_id, msg.clone(), "model");
                         anyhow::bail!("model stream error: {msg}");
+                    }
+                    crate::models::sse::SseEvent::Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                    } => {
+                        round_usage = Some((prompt_tokens, completion_tokens));
                     }
                     crate::models::sse::SseEvent::Done
                     | crate::models::sse::SseEvent::KeepAlive => {}
@@ -1072,13 +1081,24 @@ impl AgentLoop {
                     crate::models::ProviderKind::Cloud => "cloud",
                     crate::models::ProviderKind::Custom => "custom",
                 };
+                // Cost (PLAN §3, never a guess): a local/private endpoint is $0;
+                // a cloud call is priced ONLY when the endpoint reported token
+                // usage AND the model is in the pricing table — otherwise it's
+                // recorded as unknown (`None`, "flying blind").
+                let cost_usd = if !is_cloud {
+                    Some(0.0)
+                } else {
+                    round_usage.and_then(|(pt, ct)| {
+                        crate::models::pricing::cost_usd(&model, pt, ct)
+                    })
+                };
                 if let Err(e) = profile_db.record_usage(&crate::storage::UsageEvent {
                     id: Uuid::new_v4().to_string(),
                     conversation_id: Some(conversation_id.clone()),
                     model: model.clone(),
                     provider_id: Some(provider.id.clone()),
                     provider_kind: kind.to_string(),
-                    cost_usd: if is_cloud { None } else { Some(0.0) },
+                    cost_usd,
                     created_at: chrono::Utc::now().timestamp(),
                 }) {
                     tracing::warn!(error = %e, "failed to book usage event to the ledger");

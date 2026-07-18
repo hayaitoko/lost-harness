@@ -47,6 +47,14 @@ pub enum SseEvent {
     /// pieces this chunk streamed (the name arrives once; `arguments` arrives
     /// as string fragments to be concatenated per slot by the caller).
     ToolCalls(Vec<ToolCallFragment>),
+    /// The `usage` totals from the final chunk (OpenAI sends this when the
+    /// request set `stream_options.include_usage`). Feeds the usage ledger's
+    /// cost accounting (Wave 3.2). Absent on providers that don't report usage —
+    /// the ledger then records an unknown ("flying blind") cost.
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    },
 }
 
 /// One streamed piece of a native tool call (OpenAI `delta.tool_calls[i]`).
@@ -207,6 +215,27 @@ impl SseStream {
         if !fragments.is_empty() {
             return SseEvent::ToolCalls(fragments);
         }
+        // The final usage chunk (empty `choices`, a `usage` object) — surface
+        // the token totals for the cost ledger. Pulled leniently: a token count
+        // that isn't a non-negative integer is treated as absent (0), so a
+        // malformed usage yields no event (→ unknown cost) rather than poisoning
+        // the line. Clamped to u32 range.
+        if let Some(u) = &parsed.usage {
+            let field = |k: &str| -> u32 {
+                u.get(k)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n.min(u32::MAX as u64) as u32)
+                    .unwrap_or(0)
+            };
+            let prompt_tokens = field("prompt_tokens");
+            let completion_tokens = field("completion_tokens");
+            if prompt_tokens > 0 || completion_tokens > 0 {
+                return SseEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                };
+            }
+        }
         // No content and no error — keep-alive-like, e.g. a `role` chunk.
         SseEvent::KeepAlive
     }
@@ -227,6 +256,14 @@ struct SsePayload {
     /// Some providers use a string instead.
     #[serde(default)]
     error: Option<serde_json::Value>,
+    /// Token usage totals (final chunk, when `stream_options.include_usage` was
+    /// requested). Kept as a permissive `Value` — NOT a typed struct — so a
+    /// provider that ships a malformed `usage` (e.g. string or float token
+    /// counts, or usage riding on a content chunk) can NEVER fail the whole
+    /// line's parse and drop co-located `delta.content`. Tokens are pulled
+    /// leniently at the decode site; anything non-integer is treated as absent.
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
