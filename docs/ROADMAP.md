@@ -131,12 +131,19 @@ the status board sitting on top of all of them.
 > reply prefix (audio egress ≤ text egress; Private as-local-spoken-as-typed;
 > Public still hits the floor), reusing the §7 gate, fully unit-tested (515
 > tests). The SIBLING non-native cores exist but are multi-file SECURITY-CRITICAL
-> integrations unsafe to half-build under the usage cap: **M7 Tier-P** (per-profile
-> fs confinement — refactor all 5 fs tools' fixed root → `root_for(profile)` +
-> re-root ProtectedPathHook; `resolve_within` fs.rs:39 already does the traversal
-> guard) and **M5 approval model** (semantic-locator tools + a `ComputerBackend`
-> trait/mock + the covers_once/fingerprint dispatch wiring). Do these fresh, first
-> thing on the target session. **Next fronts (per the
+> integrations. **M5 reversibility core IMPLEMENTED** (`ae95d81`,
+> `tools/computer_use.rs`): the security core — `ActionTarget` semantic locators
+> + `reversibility()` (irreversible verb set) + `risk_class()` mapping onto the
+> real matrix (Reversible→Safe, Consequential/Irreversible→External + covers_once
+> floor). Additive, tested. **519 tests.** **Remaining flagship cores** (do fresh,
+> un-capped, on-target): **M7 Tier-P** — a COHERENT fs+ProtectedPathHook change
+> (all fs tools' fixed root → `profile_workspace(base, ctx.profile)` AND re-root
+> the hook via `EventContext.profile`; half-done is a security REGRESSION since
+> the hook guards base-relative paths the per-profile tools no longer write to —
+> confirmed `protected_path.rs:86` holds a fixed `workspace_root`; also a
+> behavior-change/product call: isolated-per-profile vs shared workspace). **M5
+> live wiring** — the `OnScreenActionHook` + tool registration + native backend.
+> **M6 native** — whisper/piper/AEC behind the `voice` feature. **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
