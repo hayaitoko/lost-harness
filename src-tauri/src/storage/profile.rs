@@ -1327,6 +1327,54 @@ impl ProfileDb {
         Ok(n > 0)
     }
 
+    // ── sandbox_config (M7 Tier-K Slice 2 — per-profile OS-sandbox config) ─────
+    //
+    // A single row (id=1) holding `SandboxConfig` as JSON. `None` = no row = the
+    // legacy unconstrained default (the caller keeps today's behavior). A row
+    // that exists but fails to parse is a hard Err — the shell path treats that
+    // as fail-safe (deny), never as "unconstrained".
+
+    /// This profile's stored sandbox config, or `None` if unset. A corrupt row
+    /// is an `Err` (the caller must fail safe, not silently drop the ceiling).
+    pub fn get_sandbox_config(&self) -> Result<Option<crate::hooks::SandboxConfig>> {
+        let json: Option<String> = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT config_json FROM sandbox_config WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("read sandbox_config row")?;
+        match json {
+            None => Ok(None),
+            Some(json) => {
+                let cfg: crate::hooks::SandboxConfig = serde_json::from_str(&json)
+                    .context("parse sandbox_config JSON (corrupt row — shell fails safe)")?;
+                Ok(Some(cfg))
+            }
+        }
+    }
+
+    /// Persist this profile's sandbox config (upsert the single JSON row).
+    pub fn set_sandbox_config(&self, cfg: &crate::hooks::SandboxConfig) -> Result<()> {
+        let json = serde_json::to_string(cfg).context("serialize sandbox_config")?;
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO sandbox_config (id, config_json, updated_at)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                     config_json = excluded.config_json,
+                     updated_at = excluded.updated_at",
+                params![json, now],
+            )
+            .context("upsert sandbox_config row")?;
+        Ok(())
+    }
+
     /// Whether partial-delegation redaction is enabled for this profile (PLAN
     /// §11). Defaults to `true` (redaction is the privacy-preserving default)
     /// when no row exists.

@@ -413,6 +413,10 @@ pub struct ShellExecTool {
     tmp_root: PathBuf,
     spawner: Arc<dyn SandboxedSpawn>,
     timeout_cap: Duration,
+    /// M7 Tier-K Slice 2: the storage handle used to load the CALLER's per-profile
+    /// `sandbox_config` at run time (a network CEILING). `None` (tests, or an
+    /// unwired build) = no per-profile ceiling, today's behavior.
+    storage: Option<crate::storage::Storage>,
 }
 
 impl ShellExecTool {
@@ -427,6 +431,40 @@ impl ShellExecTool {
             tmp_root: tmp_root.into(),
             spawner,
             timeout_cap,
+            storage: None,
+        }
+    }
+
+    /// Wire the storage handle so `run` can enforce the caller's per-profile
+    /// `sandbox_config` network ceiling (M7 Tier-K Slice 2).
+    pub fn with_storage(mut self, storage: crate::storage::Storage) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// The effective network permission for a call: the request is a MAXIMUM, the
+    /// profile's stored `sandbox_config` is a CEILING. Fail-safe by construction —
+    /// if the profile has a config that forbids network, or its row is corrupt/
+    /// unreadable, network is DENIED even when the call asks for it; a missing row
+    /// (or no storage wired) leaves today's behavior (the request stands).
+    fn effective_network(&self, requested: bool, profile: &str) -> bool {
+        if !requested {
+            return false;
+        }
+        let Some(storage) = &self.storage else {
+            return true; // unwired → legacy behavior
+        };
+        match storage.open_profile(profile).and_then(|db| db.get_sandbox_config()) {
+            Ok(None) => true,                            // unconfigured → unconstrained
+            Ok(Some(cfg)) => cfg.permits_shell_network(), // configured → the ceiling
+            Err(e) => {
+                tracing::warn!(
+                    profile = %profile,
+                    error = %e,
+                    "sandbox_config unreadable — denying shell network (fail-safe)"
+                );
+                false
+            }
         }
     }
 }
@@ -471,11 +509,15 @@ impl Tool for ShellExecTool {
                 );
             };
             let command = command.to_string();
-            let network = input
+            let requested_network = input
                 .args
                 .get("network")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // The call's request is a MAXIMUM; the caller's per-profile
+            // `sandbox_config` is a CEILING (M7 Tier-K Slice 2). A locked-down
+            // profile denies shell network even when the call asks for it.
+            let network = self.effective_network(requested_network, &ctx.profile);
             // model-supplied timeout can only SHORTEN, never exceed the cap.
             let timeout = match input.args.get("timeout_secs").and_then(|v| v.as_u64()) {
                 Some(secs) => std::cmp::min(Duration::from_secs(secs), self.timeout_cap),
@@ -610,6 +652,7 @@ mod tests {
     struct CaptureRootSpawn {
         seen_ws: Arc<std::sync::Mutex<Option<PathBuf>>>,
         seen_tmp: Arc<std::sync::Mutex<Option<PathBuf>>>,
+        seen_network: Arc<std::sync::Mutex<Option<bool>>>,
     }
     impl SandboxedSpawn for CaptureRootSpawn {
         fn spawn(
@@ -618,6 +661,7 @@ mod tests {
         ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
             *self.seen_ws.lock().unwrap() = Some(spec.workspace_root.clone());
             *self.seen_tmp.lock().unwrap() = Some(spec.tmp_root.clone());
+            *self.seen_network.lock().unwrap() = Some(spec.network);
             Err(ExecError::Io("captured; not spawning".to_string()))
         }
     }
@@ -636,10 +680,15 @@ mod tests {
         std::fs::create_dir_all(&tmp_base).unwrap();
         let seen_ws = Arc::new(std::sync::Mutex::new(None));
         let seen_tmp = Arc::new(std::sync::Mutex::new(None));
+        let seen_network = Arc::new(std::sync::Mutex::new(None));
         let tool = ShellExecTool::new(
             base.clone(),
             tmp_base.clone(),
-            Arc::new(CaptureRootSpawn { seen_ws: seen_ws.clone(), seen_tmp: seen_tmp.clone() }),
+            Arc::new(CaptureRootSpawn {
+                seen_ws: seen_ws.clone(),
+                seen_tmp: seen_tmp.clone(),
+                seen_network: seen_network.clone(),
+            }),
             Duration::from_secs(5),
         );
 
@@ -672,6 +721,82 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&tmp_base);
+    }
+
+    #[tokio::test]
+    async fn shell_exec_applies_the_per_profile_sandbox_config_network_ceiling() {
+        // M7 Tier-K Slice 2: the caller's per-profile `sandbox_config` is a CEILING
+        // on the shell's network — a locked-down profile denies network even when
+        // the call requests it; an unconfigured profile keeps today's behavior; a
+        // call that doesn't ask for network never gets it.
+        use crate::hooks::{SandboxConfig, SandboxNetworkConfig};
+        let base = std::env::temp_dir().join(format!("lhp-exec-net-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let storage = crate::storage::Storage::open(&base).unwrap();
+
+        // Lock down "work": no localhost, no allowed domains → no shell network.
+        let locked = SandboxConfig {
+            enabled: true,
+            auto_allow_if_sandboxed: false,
+            excluded_commands: vec![],
+            network: SandboxNetworkConfig {
+                allowed_domains: vec![],
+                allow_localhost: false,
+                allow_unix_sockets: vec![],
+            },
+        };
+        storage.open_profile("work").unwrap().set_sandbox_config(&locked).unwrap();
+        // A network-permitting config for "school".
+        storage.open_profile("school").unwrap().set_sandbox_config(&SandboxConfig::default()).ok();
+        // Note: SandboxConfig::default().network.allow_localhost == true → permits.
+        let permit = SandboxConfig {
+            network: SandboxNetworkConfig { allow_localhost: true, ..Default::default() },
+            ..locked.clone()
+        };
+        storage.open_profile("school").unwrap().set_sandbox_config(&permit).unwrap();
+
+        let seen_network = Arc::new(std::sync::Mutex::new(None));
+        let tool = ShellExecTool::new(
+            base.join("workspace"),
+            base.join("tmp"),
+            Arc::new(CaptureRootSpawn {
+                seen_ws: Arc::new(std::sync::Mutex::new(None)),
+                seen_tmp: Arc::new(std::sync::Mutex::new(None)),
+                seen_network: seen_network.clone(),
+            }),
+            Duration::from_secs(5),
+        )
+        .with_storage(storage.clone());
+
+        let run = |profile: &'static str, net: bool| {
+            let tool = &tool;
+            let input = ToolInput::new(serde_json::json!({"command": "echo hi", "network": net}));
+            let ctx = ExecCtx { profile: profile.to_string(), ..ExecCtx::default() };
+            async move {
+                let _ = tool.run(input, &ctx).await;
+            }
+        };
+
+        // Locked profile requests network → DENIED by the ceiling.
+        run("work", true).await;
+        assert_eq!(*seen_network.lock().unwrap(), Some(false), "locked profile denies shell network");
+
+        // Unconfigured profile (no row) → the request stands (legacy behavior).
+        *seen_network.lock().unwrap() = None;
+        run("personal", true).await;
+        assert_eq!(*seen_network.lock().unwrap(), Some(true), "unconfigured profile keeps today's behavior");
+
+        // Permitting config → ceiling lifted.
+        *seen_network.lock().unwrap() = None;
+        run("school", true).await;
+        assert_eq!(*seen_network.lock().unwrap(), Some(true), "a network-permitting config allows it");
+
+        // A call that doesn't ask for network never gets it, regardless of config.
+        *seen_network.lock().unwrap() = None;
+        run("school", false).await;
+        assert_eq!(*seen_network.lock().unwrap(), Some(false), "no request → no network");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── unix-only: a real subprocess through a plain (non-Seatbelt) spawner ──

@@ -18,7 +18,7 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 7;
 /// `classifier_settings` in the classifier settings round,
 /// `memory_settings` in Wave 1 memory) bumps `PROFILE_SCHEMA_VERSION`
 /// without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 9;
+pub const PROFILE_SCHEMA_VERSION: i32 = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -174,6 +174,11 @@ pub const PROFILE_TABLES: &[&str] = &[
     // 17. work_items — the one-queue-model substrate (Wave 4.4): deferred work
     //     (cron fires / agent dispatch / server results) as one lifecycle.
     "work_items",
+    // 18. sandbox_config — per-profile OS-sandbox config (M7 Tier-K, PLAN §8 M7):
+    //     one row (id=1) serializing `SandboxConfig`; a missing row = the legacy
+    //     unconstrained default. Consumed as a per-profile CEILING (network) on
+    //     the shell_exec path; the Seatbelt confinement itself is always-on.
+    "sandbox_config",
 ];
 
 /// CREATE TABLE statements for per-profile DBs (in dependency order).
@@ -383,6 +388,18 @@ CREATE TABLE IF NOT EXISTS seat_bindings (
     provider_id  TEXT NOT NULL,
     model        TEXT NOT NULL,
     updated_at   INTEGER NOT NULL
+);
+
+-- Per-profile OS-sandbox config (M7 Tier-K). Single row (id=1) serializing
+-- `SandboxConfig` as JSON; a missing row means the legacy unconstrained default
+-- (shell network follows the call's own request). Consumed on the shell_exec
+-- path as a per-profile CEILING (e.g. a locked-down profile denies shell
+-- network even when the call asks for it). The Seatbelt confinement itself is
+-- always-on and independent of this row — this never yields an unsandboxed run.
+CREATE TABLE IF NOT EXISTS sandbox_config (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    config_json TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);

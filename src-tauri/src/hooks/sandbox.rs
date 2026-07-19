@@ -139,7 +139,7 @@ impl GatingHook for SandboxHook {
 /// enforcement (Seatbelt/bubblewrap/AppContainer) consuming this same
 /// shape is PLAN.md M7/v2 work — this struct exists purely so that later
 /// work doesn't need a schema migration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SandboxConfig {
     pub enabled: bool,
     pub auto_allow_if_sandboxed: bool,
@@ -147,11 +147,31 @@ pub struct SandboxConfig {
     pub network: SandboxNetworkConfig,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SandboxNetworkConfig {
     pub allowed_domains: Vec<String>,
     pub allow_localhost: bool,
     pub allow_unix_sockets: Vec<String>,
+}
+
+impl SandboxConfig {
+    /// Whether this profile's config permits `shell_exec` to use the network AT
+    /// ALL — the per-profile CEILING consumed on the shell path (M7 Tier-K Slice
+    /// 2). A profile that grants some network allowance (localhost, or an egress
+    /// allowlist) lifts the ceiling; a locked-down profile (no localhost, no
+    /// allowed domains) denies shell network outright, even when the call itself
+    /// requests `network: true`. A call that does NOT ask for network never gets
+    /// it regardless.
+    ///
+    /// COARSE by design: Seatbelt is all-or-nothing for outbound, so a profile
+    /// permitting ANY network yields full outbound here — the config's
+    /// localhost-only / per-domain granularity is NOT enforced at this layer
+    /// (localhost-precise Seatbelt rules and per-domain egress on the `fetch` tool
+    /// are a later slice). The guarantee this DOES make precisely is the one that
+    /// matters most: a locked-down profile's shell cannot reach the network.
+    pub fn permits_shell_network(&self) -> bool {
+        self.network.allow_localhost || !self.network.allowed_domains.is_empty()
+    }
 }
 
 impl Default for SandboxConfig {

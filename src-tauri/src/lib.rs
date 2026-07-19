@@ -575,12 +575,17 @@ fn build_tool_dispatcher(
     #[cfg(not(target_os = "macos"))]
     let spawner: Arc<dyn crate::tools::exec::SandboxedSpawn> =
         Arc::new(crate::tools::exec::UnsupportedSandbox);
-    registry.register(Box::new(crate::tools::exec::ShellExecTool::new(
-        hook_workspace_root.clone(),
-        tmp_root,
-        spawner,
-        std::time::Duration::from_secs(120),
-    )));
+    registry.register(Box::new(
+        crate::tools::exec::ShellExecTool::new(
+            hook_workspace_root.clone(),
+            tmp_root,
+            spawner,
+            std::time::Duration::from_secs(120),
+        )
+        // M7 Tier-K Slice 2: enforce the caller's per-profile sandbox_config
+        // network ceiling at run time.
+        .with_storage(storage.clone()),
+    ));
 
     // Policy DERIVED from each tool's RiskClass, so adding a tool can't
     // accidentally skip the gate: read-only (Safe) tools are whole-tool

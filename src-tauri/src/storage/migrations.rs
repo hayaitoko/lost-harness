@@ -358,6 +358,22 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
             updated_at   INTEGER NOT NULL
         );",
     },
+    Migration {
+        version: 10,
+        // Per-profile OS-sandbox config (M7 Tier-K, Slice 2). One row (id=1)
+        // serializing `SandboxConfig` as JSON. Same dual-definition convention:
+        // the CREATE is IF NOT EXISTS and also lives in PROFILE_SCHEMA_SQL, so v10
+        // is a no-op on a fresh install and a real upgrade on a v9 DB. A missing
+        // row = the legacy unconstrained default; the row is consumed as a
+        // per-profile CEILING (network) on shell_exec — the Seatbelt confinement
+        // itself is always-on regardless, so this can never yield an unsandboxed run.
+        name: "sandbox_config_table",
+        sql: "CREATE TABLE IF NOT EXISTS sandbox_config (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            config_json TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.

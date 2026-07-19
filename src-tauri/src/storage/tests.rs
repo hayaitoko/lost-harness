@@ -117,18 +117,42 @@ fn agent_types_crud_and_builtin_seed() {
 }
 
 #[test]
-fn schema_version_is_nine_after_init_profile() {
-    // Profile schema version is now 9 (v2 tool_audit, v3 tool_rules, v4
+fn schema_version_is_ten_after_init_profile() {
+    // Profile schema version is now 10 (v2 tool_audit, v3 tool_rules, v4
     // classifier_settings, v5 the classifier_settings.redaction_enabled column,
-    // v6 memory_settings, v7 usage_events, v8 work_items, v9 seat_bindings);
-    // global stays at its own version. The two are tracked independently.
+    // v6 memory_settings, v7 usage_events, v8 work_items, v9 seat_bindings,
+    // v10 sandbox_config); global stays at its own version. Tracked independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 9);
+    assert_eq!(v, 10);
+
+    // sandbox_config round-trips (M7 Tier-K Slice 2): unset → None; set → Some.
+    use crate::hooks::{SandboxConfig, SandboxNetworkConfig};
+    assert!(db.get_sandbox_config().unwrap().is_none(), "no row → None (unconstrained default)");
+    let cfg = SandboxConfig {
+        enabled: true,
+        auto_allow_if_sandboxed: false,
+        excluded_commands: vec!["rm".into()],
+        network: SandboxNetworkConfig {
+            allowed_domains: vec!["example.com".into()],
+            allow_localhost: false,
+            allow_unix_sockets: vec![],
+        },
+    };
+    db.set_sandbox_config(&cfg).unwrap();
+    assert_eq!(db.get_sandbox_config().unwrap(), Some(cfg.clone()), "set → get round-trips exactly");
+    // permits_shell_network: a non-empty allowlist lifts the ceiling.
+    assert!(cfg.permits_shell_network());
+    // A fully locked-down config denies shell network.
+    let locked = SandboxConfig {
+        network: SandboxNetworkConfig { allowed_domains: vec![], allow_localhost: false, allow_unix_sockets: vec![] },
+        ..cfg
+    };
+    assert!(!locked.permits_shell_network(), "no localhost + no domains → shell network denied");
 }
 
 #[test]

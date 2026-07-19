@@ -41,8 +41,14 @@ the status board sitting on top of all of them.
 > ALL fixed** — 5 HIGH (trim divergence; `shell_exec` workspace bypass; `shell_exec` shared-tmp
 > exfil; migration sweeping live trees; `known_profiles` DB-desync), 3 MEDIUM (missing migration;
 > profile-named-file ENOTDIR; dangling-symlink clobber), 1 LOW (marker spoof) — several *dissolved*
-> by the files-only pivot. 532 tests. **Tier-K (live OS-kernel enforcement, Slices 2–4) is the
-> on-target remainder.**
+> by the files-only pivot. **M7 Tier-K Slice 2 (macOS) also landed:** the dead per-profile
+> `SandboxConfig` is now live as a **network CEILING on `shell_exec`** — a locked-down profile
+> (no localhost, no allowed domains) can't use shell network even when the call asks; unconfigured
+> profiles keep today's behavior; fails safe (corrupt/unreadable config → denied); the Seatbelt
+> confinement stays always-on (never an unsandboxed run). Per-profile `sandbox_config` table
+> (PROFILE v10). Adversarially reviewed (2 agents, ceiling-bypass + storage/migration): clean.
+> 533 tests. **Tier-K remainder = Linux Landlock/seccomp + Windows backends (Slices 3–4), and the
+> finer localhost-only/per-domain shell-network precision — all on-target.**
 > **Latest (2026-07-18):** **Wave 3.5 COMPLETE** — both memory write-triggers:
 > the pre-compaction flush (`f89536e`, trigger #2: a LOCAL model sweeps
 > about-to-be-trimmed turns) AND the new-chat consolidation nudge (`e0929f0`,
