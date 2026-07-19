@@ -117,8 +117,15 @@ the status board sitting on top of all of them.
 > accessibility/CGEvent/ScreenCaptureKit; Core Audio/whisper/TTS;
 > seatbelt/namespaces/AppContainer) requiring the TARGET OS + native APIs to build
 > AND verify — not meaningfully doable in a headless analysis context, and their
-> designs flagged NEEDS-REVISION. Wave 6 server needs external infra; Wave 7 is
-> release engineering. **Next fronts (per the
+> designs flagged NEEDS-REVISION — **now ALL REVISED → build-ready** (`00e2745`):
+> m5's semantic-locator-args reframe dissolves the fingerprint gap (no
+> HookResult::Modify, covers() aligns), m6's cooperative CancellationToken +
+> AudioEgressGate, m7's honest Tier-K/Tier-P + per-profile ProtectedPathHook
+> re-root. Each grounded in the real dispatcher/gate/hooks with honest per-slice
+> gates. Wave 6 server needs external infra; Wave 7 is release engineering. **⇒
+> Everything buildable+verifiable in a headless env is DONE; the native flagship
+> BUILDS follow their build-ready designs on the target machine.** (A hard session
+> usage limit was also hit 2026-07-18, resets ~9pm PT.) **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
