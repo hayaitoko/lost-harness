@@ -721,6 +721,46 @@ pub fn list_agent_types(state: State<'_, AppState>) -> Result<Vec<AgentTypeInfo>
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentTypeApprovalArgs {
+    pub id: String,
+    /// "approved" | "rejected" | "pending".
+    pub status: String,
+}
+
+/// Set an agent type's trust state — the review gate. Only `Approved` types are
+/// dispatchable by `delegate`. An unknown status fails closed to `pending`.
+#[tauri::command]
+pub fn set_agent_type_approval(
+    state: State<'_, AppState>,
+    args: AgentTypeApprovalArgs,
+) -> Result<bool, String> {
+    let status = crate::storage::AgentTypeApproval::from_str(&args.status);
+    state
+        .storage
+        .global()
+        .set_agent_type_approval(&args.id, status)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteAgentTypeArgs {
+    pub id: String,
+}
+
+/// Delete an agent-type persona (two-click confirm in the UI).
+#[tauri::command]
+pub fn delete_agent_type(
+    state: State<'_, AppState>,
+    args: DeleteAgentTypeArgs,
+) -> Result<bool, String> {
+    state
+        .storage
+        .global()
+        .delete_agent_type(&args.id)
+        .map_err(|e| e.to_string())
+}
+
 /// A per-profile model-seat binding for the Settings → Models "Seats" view.
 #[derive(Debug, Clone, Serialize)]
 pub struct SeatBindingInfo {

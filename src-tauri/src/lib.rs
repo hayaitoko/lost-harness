@@ -254,6 +254,8 @@ pub fn run() {
             ipc::set_seat_binding,
             ipc::delete_seat_binding,
             ipc::list_agent_types,
+            ipc::set_agent_type_approval,
+            ipc::delete_agent_type,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,

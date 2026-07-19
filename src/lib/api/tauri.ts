@@ -549,6 +549,44 @@ export async function deleteSkill(id: string): Promise<boolean> {
   return false;
 }
 
+/** A declarative agent-type persona. Mirrors `AgentTypeInfo` in `ipc/mod.rs`. */
+export interface AgentType {
+  id: string;
+  name: string;
+  description: string;
+  tools_allowlist: string[];
+  seat: string;
+  /** "pending" | "approved" | "rejected" — only approved types are dispatchable. */
+  approval_status: string;
+  /** "builtin" | "user" | pack id. */
+  source: string;
+  created_at: number;
+}
+
+/** Every agent-type persona (all statuses), for the Settings review view. */
+export async function listAgentTypes(): Promise<AgentType[]> {
+  if (isTauri()) {
+    return tauriInvoke<AgentType[]>("list_agent_types", {});
+  }
+  return [];
+}
+
+/** Approve / reject an agent type (the dispatch trust gate). */
+export async function setAgentTypeApproval(id: string, status: string): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("set_agent_type_approval", { args: { id, status } });
+  }
+  return false;
+}
+
+/** Delete an agent-type persona. */
+export async function deleteAgentType(id: string): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("delete_agent_type", { args: { id } });
+  }
+  return false;
+}
+
 /** A per-profile model-seat binding. Mirrors `SeatBindingInfo` in `ipc/mod.rs`. */
 export interface SeatBinding {
   seat: string;

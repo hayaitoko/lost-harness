@@ -52,9 +52,13 @@
     setSeatBinding,
     deleteSeatBinding,
     type SeatBinding,
+    listAgentTypes,
+    setAgentTypeApproval,
+    deleteAgentType,
+    type AgentType,
   } from "$lib/api/tauri";
 
-  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "usage" | "appearance";
+  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "agents" | "usage" | "appearance";
   const SECTIONS: [Section, string][] = [
     ["routing", "Routing"],
     ["privacy", "Privacy guard"],
@@ -62,6 +66,7 @@
     ["models", "Models"],
     ["memory", "Memory"],
     ["skills", "Skills"],
+    ["agents", "Agent types"],
     ["usage", "Usage"],
     ["appearance", "Appearance"],
   ];
@@ -160,6 +165,11 @@
   let skillsError = $state<string | null>(null);
   let confirmDeleteSkillId = $state<string | null>(null);
   let expandedSkillId = $state<string | null>(null);
+  // agent types — declarative personas delegate can dispatch to (Wave 4.3)
+  let agentTypes = $state<AgentType[]>([]);
+  let agentsLoading = $state(false);
+  let agentsError = $state<string | null>(null);
+  let confirmDeleteAgentId = $state<string | null>(null);
   let skillReflectEnabled = $state(false);
   let skillReflectSaving = $state(false);
   // seats — per-profile model-seat bindings (Wave 3.1)
@@ -256,6 +266,24 @@
         skillReflectEnabled = v;
       })
       .catch(() => {});
+  });
+
+  // Load every agent-type persona when the Agent types pane opens.
+  $effect(() => {
+    if (section !== "agents") return;
+    void $activeProfileId;
+    agentsLoading = true;
+    agentsError = null;
+    listAgentTypes()
+      .then((items) => {
+        agentTypes = items;
+      })
+      .catch((err) => {
+        agentsError = String(err);
+      })
+      .finally(() => {
+        agentsLoading = false;
+      });
   });
 
   // Load this profile's seat bindings when the Models pane opens (+ on profile change).
@@ -624,6 +652,24 @@
 
   function providerName(id: string): string {
     return providersStore.providers.find((p) => p.id === id)?.name ?? id;
+  }
+
+  async function setAgentStatus(id: string, status: "approved" | "rejected") {
+    await setAgentTypeApproval(id, status);
+    agentTypes = agentTypes.map((a) => (a.id === id ? { ...a, approval_status: status } : a));
+  }
+
+  async function removeAgentType(id: string) {
+    if (confirmDeleteAgentId !== id) {
+      confirmDeleteAgentId = id;
+      setTimeout(() => {
+        if (confirmDeleteAgentId === id) confirmDeleteAgentId = null;
+      }, 3000);
+      return;
+    }
+    confirmDeleteAgentId = null;
+    await deleteAgentType(id);
+    agentTypes = agentTypes.filter((a) => a.id !== id);
   }
 
   async function toggleSkillReflect(next: boolean) {
@@ -1371,6 +1417,79 @@
                 A skill is a saved routine the assistant can reuse. Only <span class="text-text-2">approved</span>
                 skills are searchable and usable; saving one always requires your explicit
                 one-time approval, and its actions are still gated like any other tool.
+              </div>
+            </div>
+          {:else if section === "agents"}
+            {#if agentsError}
+              <div class="mb-2 text-[11.5px] text-blocked" data-testid="agents-error">{agentsError}</div>
+            {/if}
+            <div class="mb-2 mt-1 flex items-center gap-2.5">
+              <span class="text-[12px] font-[550] text-text">Agent types</span>
+              <span class="text-[11.5px] text-text-3">
+                Named helper personas the assistant can delegate to — bounded toolbelt + a model seat
+              </span>
+              <div class="flex-1"></div>
+            </div>
+            <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border" data-testid="agents-list">
+              {#if agentsLoading && agentTypes.length === 0}
+                <div class="px-3 py-6 text-center text-[12px] text-text-3">Loading…</div>
+              {:else if agentTypes.length === 0}
+                <div class="px-3 py-8 text-center text-[12px] text-text-3">
+                  No agent types yet.
+                </div>
+              {:else}
+                {#each agentTypes as a (a.id)}
+                  <div class="flex flex-col gap-1.5 border-b border-border py-[9px] pl-3 pr-2.5" data-testid="agent-row">
+                    <div class="flex items-center gap-2">
+                      <div class="min-w-0 flex-1">
+                        <div class="truncate text-[12.5px] font-[550] text-text">{a.name}</div>
+                        <div class="truncate text-[11.5px] text-text-3">{a.description}</div>
+                      </div>
+                      {#if a.approval_status === "approved"}
+                        <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">approved</span>
+                      {:else if a.approval_status === "pending"}
+                        <span class="flex-shrink-0 rounded-[8px] bg-warn-soft px-[7px] py-px text-[10px] text-warn">pending review</span>
+                      {:else}
+                        <span class="flex-shrink-0 rounded-[8px] bg-surface-2 px-[7px] py-px text-[10px] text-text-3">rejected</span>
+                      {/if}
+                      {#if a.source === "builtin"}
+                        <span class="flex-shrink-0 rounded-[8px] bg-surface-2 px-[7px] py-px text-[10px] text-text-3">built-in</span>
+                      {/if}
+                      <button
+                        type="button"
+                        aria-label="Delete this agent type"
+                        title={confirmDeleteAgentId === a.id ? "Click again to delete" : "Delete"}
+                        onclick={() => removeAgentType(a.id)}
+                        class="grid h-6 w-6 flex-shrink-0 place-items-center rounded-[var(--r)] border-0 bg-transparent
+                          {confirmDeleteAgentId === a.id ? 'text-blocked' : 'text-text-3'} hover:bg-surface-hover hover:text-text"
+                      >
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <path d="M6 6l12 12M18 6 6 18" />
+                        </svg>
+                      </button>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-1 pl-0">
+                      <span class="rounded-[6px] bg-surface-2 px-[6px] py-px text-[10px] text-text-3">seat: {a.seat}</span>
+                      {#each a.tools_allowlist as tool (tool)}
+                        <span class="rounded-[6px] bg-surface-2 px-[6px] py-px text-[10px] text-text-3">{tool}</span>
+                      {/each}
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                      {#if a.approval_status !== "approved"}
+                        <Button variant="primary" onclick={() => setAgentStatus(a.id, "approved")}>Approve</Button>
+                      {/if}
+                      {#if a.approval_status !== "rejected"}
+                        <Button variant="ghost" onclick={() => setAgentStatus(a.id, "rejected")}>Reject</Button>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
+              {/if}
+              <div class="px-3 py-2 text-[11px] text-text-3">
+                Only <span class="text-text-2">approved</span> agent types can be dispatched via
+                the <span class="text-text-2">delegate</span> tool. A helper runs with only its
+                listed tools (intersected with what's available), each call still gated, and its
+                seat's model — inheriting the conversation's privacy binding.
               </div>
             </div>
           {:else if section === "usage"}
