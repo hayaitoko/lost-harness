@@ -19,6 +19,7 @@ mod audio; // M6: Audio engine, VAD, TTS pipeline
 mod hooks; // M3: Hook chain — privacy filter + permission + sandbox + first-use
 mod ipc; // M1: Tauri command handlers
 mod models; // M4: Model manager (local + cloud)
+mod packs; // M7 (Wave 4.5): Capability Packs — installable skill+agent+cron bundles
 mod platform; // M5: cross-platform computer use (cfg'd submodules)
 mod queue; // M4 (Wave 4.4): the one-queue-model substrate (deferred work)
 mod storage; // M1+: SQLite, sqlite-vec, sled/redb
@@ -256,6 +257,7 @@ pub fn run() {
             ipc::list_agent_types,
             ipc::set_agent_type_approval,
             ipc::delete_agent_type,
+            ipc::install_pack,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,

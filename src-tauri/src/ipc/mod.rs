@@ -680,6 +680,32 @@ pub fn delete_skill(state: State<'_, AppState>, args: DeleteSkillArgs) -> Result
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallPackArgs {
+    pub profile: String,
+    /// The pack, as JSON (pasted or loaded from a file by the UI).
+    pub json: String,
+}
+
+/// Install a Capability Pack (Wave 4.5): register its skills + agent types
+/// (GLOBAL) + cron jobs (this profile) at once. Everything lands INERT — skills
+/// + agent types `Pending` (review in Settings → Skills / Agent types), cron
+/// jobs disabled — so a pack adds capabilities to review, never arms one.
+#[tauri::command]
+pub fn install_pack(
+    state: State<'_, AppState>,
+    args: InstallPackArgs,
+) -> Result<crate::packs::InstallReport, String> {
+    let pack = crate::packs::parse_pack(&args.json).map_err(|e| e.to_string())?;
+    crate::packs::install_pack(
+        &state.storage,
+        &args.profile,
+        &pack,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// A declarative agent-type persona for the Settings view (Wave 4.3).
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentTypeInfo {

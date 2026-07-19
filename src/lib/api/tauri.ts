@@ -549,6 +549,23 @@ export async function deleteSkill(id: string): Promise<boolean> {
   return false;
 }
 
+/** Result of installing a Capability Pack. Mirrors `InstallReport` in `packs`. */
+export interface PackInstallReport {
+  pack_name: string;
+  skills_installed: number;
+  agent_types_installed: number;
+  cron_jobs_installed: number;
+}
+
+/** Install a Capability Pack from its JSON (skills + agent types + cron; all
+ *  land inert/pending for review). Throws on invalid JSON. */
+export async function installPack(profile: string, json: string): Promise<PackInstallReport> {
+  if (isTauri()) {
+    return tauriInvoke<PackInstallReport>("install_pack", { args: { profile, json } });
+  }
+  return { pack_name: "", skills_installed: 0, agent_types_installed: 0, cron_jobs_installed: 0 };
+}
+
 /** A declarative agent-type persona. Mirrors `AgentTypeInfo` in `ipc/mod.rs`. */
 export interface AgentType {
   id: string;

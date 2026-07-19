@@ -56,6 +56,7 @@
     setAgentTypeApproval,
     deleteAgentType,
     type AgentType,
+    installPack,
   } from "$lib/api/tauri";
 
   type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "agents" | "usage" | "appearance";
@@ -170,6 +171,11 @@
   let agentsLoading = $state(false);
   let agentsError = $state<string | null>(null);
   let confirmDeleteAgentId = $state<string | null>(null);
+  // capability packs — install a bundle of skills+agents+cron (Wave 4.5)
+  let packJson = $state("");
+  let packInstalling = $state(false);
+  let packNote = $state<string | null>(null);
+  let packOpen = $state(false);
   let skillReflectEnabled = $state(false);
   let skillReflectSaving = $state(false);
   // seats — per-profile model-seat bindings (Wave 3.1)
@@ -652,6 +658,22 @@
 
   function providerName(id: string): string {
     return providersStore.providers.find((p) => p.id === id)?.name ?? id;
+  }
+
+  async function doInstallPack() {
+    if (!packJson.trim()) return;
+    packInstalling = true;
+    packNote = null;
+    try {
+      const r = await installPack($activeProfileId, packJson);
+      packNote = `Installed “${r.pack_name}”: ${r.skills_installed} skill(s), ${r.agent_types_installed} agent type(s), ${r.cron_jobs_installed} cron job(s). Review and approve them below (and in Skills).`;
+      packJson = "";
+      agentTypes = await listAgentTypes();
+    } catch (err) {
+      packNote = `Couldn't install: ${String(err)}`;
+    } finally {
+      packInstalling = false;
+    }
   }
 
   async function setAgentStatus(id: string, status: "approved" | "rejected") {
@@ -1423,7 +1445,37 @@
             {#if agentsError}
               <div class="mb-2 text-[11.5px] text-blocked" data-testid="agents-error">{agentsError}</div>
             {/if}
-            <div class="mb-2 mt-1 flex items-center gap-2.5">
+            <!-- Capability packs (Wave 4.5): install a bundle of skills + agents + cron -->
+            <SettingRow
+              title="Install a capability pack"
+              desc="A shareable bundle of skills, agent types, and cron jobs. Everything lands for review — nothing is armed until you approve it."
+            >
+              {#snippet control()}
+                <Button variant="ghost" onclick={() => (packOpen = !packOpen)}>
+                  {packOpen ? "Close" : "Install…"}
+                </Button>
+              {/snippet}
+            </SettingRow>
+            {#if packOpen}
+              <div class="mb-3 flex flex-col gap-1.5 rounded-[var(--r-lg)] border border-border p-2.5">
+                <textarea
+                  bind:value={packJson}
+                  placeholder="Paste a capability-pack JSON here…"
+                  rows="4"
+                  class="w-full resize-y rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] font-mono text-[11.5px]
+                    text-text outline-none placeholder:text-text-3 focus:border-accent"
+                ></textarea>
+                <div class="flex items-center gap-2">
+                  <Button variant="primary" onclick={doInstallPack} disabled={!packJson.trim() || packInstalling}>
+                    {packInstalling ? "Installing…" : "Install pack"}
+                  </Button>
+                  {#if packNote}
+                    <span class="text-[11px] text-text-2">{packNote}</span>
+                  {/if}
+                </div>
+              </div>
+            {/if}
+            <div class="mb-2 mt-4 flex items-center gap-2.5">
               <span class="text-[12px] font-[550] text-text">Agent types</span>
               <span class="text-[11.5px] text-text-3">
                 Named helper personas the assistant can delegate to — bounded toolbelt + a model seat
