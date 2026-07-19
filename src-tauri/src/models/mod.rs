@@ -14,6 +14,8 @@
 pub mod provider;
 pub mod client;
 pub mod manager;
+pub mod catalog;
+pub mod hardware;
 pub mod pricing;
 pub mod seat;
 pub mod sse;

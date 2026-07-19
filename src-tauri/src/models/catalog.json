@@ -1,0 +1,50 @@
+{
+  "catalog_version": 1,
+  "note": "Curated local GGUF models. sha256 values marked TODO-CURATE must be filled with the REAL file hashes before release — the verified-before-runnable invariant (models/download.rs) refuses any download whose bytes don't match, so a placeholder correctly fails closed rather than installing an unverified model. URLs are pinned to specific Hugging Face revisions.",
+  "models": [
+    {
+      "id": "qwen2.5-0.5b-instruct-q4",
+      "name": "Qwen2.5 0.5B Instruct (Q4_K_M)",
+      "description": "Tiny, fast — good on modest hardware or as a local fallback.",
+      "family": "qwen2.5",
+      "quantization": "Q4_K_M",
+      "params_billions": 0.5,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "sha256": "TODO-CURATE",
+      "size_bytes": 491000000
+    },
+    {
+      "id": "qwen2.5-3b-instruct-q4",
+      "name": "Qwen2.5 3B Instruct (Q4_K_M)",
+      "description": "A capable everyday local model; fits comfortably on 16 GB+.",
+      "family": "qwen2.5",
+      "quantization": "Q4_K_M",
+      "params_billions": 3.0,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+      "sha256": "TODO-CURATE",
+      "size_bytes": 2100000000
+    },
+    {
+      "id": "qwen2.5-7b-instruct-q4",
+      "name": "Qwen2.5 7B Instruct (Q4_K_M)",
+      "description": "Strong general model; wants ~16 GB RAM to run comfortably.",
+      "family": "qwen2.5",
+      "quantization": "Q4_K_M",
+      "params_billions": 7.0,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf",
+      "sha256": "TODO-CURATE",
+      "size_bytes": 4700000000
+    },
+    {
+      "id": "qwen2.5-14b-instruct-q4",
+      "name": "Qwen2.5 14B Instruct (Q4_K_M)",
+      "description": "High-quality local model for 32 GB+ machines.",
+      "family": "qwen2.5",
+      "quantization": "Q4_K_M",
+      "params_billions": 14.0,
+      "url": "https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/main/qwen2.5-14b-instruct-q4_k_m.gguf",
+      "sha256": "TODO-CURATE",
+      "size_bytes": 9000000000
+    }
+  ]
+}

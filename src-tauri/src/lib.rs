@@ -258,6 +258,8 @@ pub fn run() {
             ipc::set_agent_type_approval,
             ipc::delete_agent_type,
             ipc::install_pack,
+            ipc::probe_hardware,
+            ipc::list_model_catalog,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,

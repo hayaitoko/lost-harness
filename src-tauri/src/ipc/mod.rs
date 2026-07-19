@@ -680,6 +680,20 @@ pub fn delete_skill(state: State<'_, AppState>, args: DeleteSkillArgs) -> Result
         .map_err(|e| e.to_string())
 }
 
+/// Probe this machine's hardware for the M8 onboarding (RAM, cores, OS/arch).
+#[tauri::command]
+pub fn probe_hardware() -> crate::models::hardware::HardwareProfile {
+    crate::models::hardware::probe()
+}
+
+/// The curated model catalog, each entry annotated with its fit against the
+/// probed hardware (Wave 5.3 / M8). Works offline (bundled catalog).
+#[tauri::command]
+pub fn list_model_catalog() -> Vec<crate::models::catalog::CatalogEntryView> {
+    let profile = crate::models::hardware::probe();
+    crate::models::catalog::catalog_for(&profile)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstallPackArgs {
     pub profile: String,

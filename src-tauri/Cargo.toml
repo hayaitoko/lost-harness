@@ -43,6 +43,11 @@ url = "2"
 # sha256 for the TRM message-hash audit log (spec §3: never log plaintext).
 sha2 = "0.10"
 
+# M8 (Wave 5.3): hardware detection for the model-lifecycle onboarding — total
+# RAM + CPU cores, to size the curated model catalog to the machine. Minimal
+# feature set; builds on every OS + under --no-default-features.
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+
 # Trained privacy classifier — the ONNX ensemble (bge-small + distilbert, INT8).
 # Behind the default-on `onnx-classifier` feature so the base crate still builds
 # if the ONNX Runtime native download is ever unavailable (e.g. a locked-down
