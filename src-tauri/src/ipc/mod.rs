@@ -695,6 +695,91 @@ pub fn list_model_catalog() -> Vec<crate::models::catalog::CatalogEntryView> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct DownloadModelArgs {
+    /// The catalog entry id to download.
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadedModelInfo {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DownloadProgress {
+    id: String,
+    downloaded: u64,
+    total: u64,
+}
+
+/// Download + verify a curated catalog model (Wave 5.3 / M8). Streams progress
+/// via the `model:download-progress` event; on success the VERIFIED file is
+/// registered in `model_catalog` (status `ready`). A digest mismatch or an
+/// off-allowlist / uncurated entry installs NOTHING and errors (the
+/// verified-before-runnable invariant). The model becomes a runnable provider
+/// once a runner points at it (external runner today; the bundled sidecar is S4).
+#[tauri::command]
+pub async fn download_model(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    args: DownloadModelArgs,
+) -> Result<DownloadedModelInfo, String> {
+    let entry = crate::models::catalog::bundled_catalog()
+        .into_iter()
+        .find(|e| e.id == args.id)
+        .ok_or_else(|| format!("no catalog model \"{}\"", args.id))?;
+    if !entry.is_curated() {
+        return Err(
+            "this model isn't release-curated yet (no verified hash) — can't download safely"
+                .to_string(),
+        );
+    }
+
+    let dir = state.storage.base_path().join("models").join("downloaded");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let final_path = dir.join(format!("{}.gguf", entry.id));
+    let partial = dir.join(format!("{}.gguf.partial", entry.id));
+
+    // Stream, emitting progress (throttling is the frontend's job).
+    let id_for_progress = entry.id.clone();
+    let app_for_progress = app.clone();
+    crate::models::download::download_to_partial(&entry.url, &partial, move |downloaded, total| {
+        let _ = app_for_progress.emit(
+            "model:download-progress",
+            DownloadProgress { id: id_for_progress.clone(), downloaded, total },
+        );
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Verify-or-nothing: a mismatch removes the partial + registers nothing.
+    crate::models::download::verify_and_install(&partial, &final_path, &entry.sha256)
+        .map_err(|e| e.to_string())?;
+
+    let model = crate::storage::ModelEntry {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        path: final_path.to_string_lossy().to_string(),
+        size_bytes: entry.size_bytes as i64,
+        quantization: Some(entry.quantization.clone()),
+        added_at: chrono::Utc::now().timestamp(),
+        sha256: entry.sha256.clone(),
+        status: "ready".to_string(),
+    };
+    state.storage.global().insert_model(&model).map_err(|e| e.to_string())?;
+
+    Ok(DownloadedModelInfo {
+        id: model.id,
+        name: model.name,
+        path: model.path,
+        sha256: model.sha256,
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct InstallPackArgs {
     pub profile: String,
     /// The pack, as JSON (pasted or loaded from a file by the UI).
