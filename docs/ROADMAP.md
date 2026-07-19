@@ -47,8 +47,12 @@ the status board sitting on top of all of them.
 > profiles keep today's behavior; fails safe (corrupt/unreadable config → denied); the Seatbelt
 > confinement stays always-on (never an unsandboxed run). Per-profile `sandbox_config` table
 > (PROFILE v10). Adversarially reviewed (2 agents, ceiling-bypass + storage/migration): clean.
-> 533 tests. **Tier-K remainder = Linux Landlock/seccomp + Windows backends (Slices 3–4), and the
-> finer localhost-only/per-domain shell-network precision — all on-target.**
+> Tier-K remainder = Linux Landlock/seccomp + Windows backends (Slices 3–4), finer network
+> precision — all on-target. **M5 Slice 0 (multimodal wire format) also landed:** `models/content.rs`
+> — `ImageBlock` + `assemble_content` emits an OpenAI image-array to a vision seat and a placeholder
+> to a text-only seat (image bytes never reach an endpoint that can't read them); plain text turns
+> unchanged. Reviewed clean. The screenshot SOURCE (capture tool + native backend) is on-target
+> Slice 1. **538 tests.**
 > **Latest (2026-07-18):** **Wave 3.5 COMPLETE** — both memory write-triggers:
 > the pre-compaction flush (`f89536e`, trigger #2: a LOCAL model sweeps
 > about-to-be-trimmed turns) AND the new-chat consolidation nudge (`e0929f0`,

@@ -11,6 +11,7 @@
 //! and consume the response stream. Privacy enforcement is layered on top via
 //! `crate::agent::egress::is_private_endpoint` (see `Provider::is_private`).
 
+pub mod content;
 pub mod provider;
 pub mod client;
 pub mod manager;
