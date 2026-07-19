@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
+use crate::agent::result_sink::{ResultSink, TauriResultSink};
 use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget, PermissionMode, ToolRule};
 use crate::ipc::approval::ApprovalRegistry;
 use crate::ipc::ask_human::AskHumanRegistry;
@@ -443,6 +444,11 @@ pub async fn send_message(
     let started = chrono::Utc::now().timestamp_millis();
     let conversation_id = args.conversation_id.clone();
 
+    // Wave 4.3c: the loop streams through the `ResultSink` trait rather than
+    // a bare `AppHandle` — this is the one place that builds the production
+    // (Tauri-backed) sink from the handle Tauri injected into this command.
+    let sink: Arc<dyn ResultSink> = Arc::new(TauriResultSink::new(app));
+
     // The agent loop's internal stream_lock serializes concurrent
     // process_message calls — see `AgentLoop::new` / `process_message`.
     let content = state
@@ -455,7 +461,7 @@ pub async fn send_message(
             args.model,
             args.profile,
             session_mode,
-            app.clone(),
+            &sink,
         )
         .await
         .map_err(|e| e.to_string())?;

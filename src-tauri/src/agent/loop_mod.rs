@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
+use crate::agent::result_sink::ResultSink;
 use crate::hooks::{enforce_local_routing, RoutingRequirement};
 use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider};
 use crate::storage::{MemoryBucket, MemoryFact, Message, ProfileDb, Storage, TrmLog};
@@ -295,7 +296,7 @@ impl AgentLoop {
         model: String,
         profile: String,
         session_mode: crate::hooks::SessionMode,
-        app: AppHandle,
+        sink: &Arc<dyn ResultSink>,
     ) -> Result<String> {
         // Serialize streams — one in-flight message per agent loop.
         // We hold the guard for the entire method so the storage /
@@ -332,12 +333,7 @@ impl AgentLoop {
 
         match decision {
             GateDecision::Block(reason) => {
-                emit_error(
-                    &app,
-                    &conversation_id,
-                    reason.clone(),
-                    "gate",
-                );
+                sink.error(&conversation_id, &reason, "gate");
                 return Ok(reason);
             }
             GateDecision::RouteLocal => {
@@ -377,7 +373,7 @@ impl AgentLoop {
                                     is_cloud,
                                     Some(redaction),
                                     session_mode,
-                                    app,
+                                    sink,
                                 )
                                 .await;
                         }
@@ -405,7 +401,7 @@ impl AgentLoop {
                         local_is_cloud,
                         None,
                         session_mode,
-                        app,
+                        sink,
                     )
                     .await;
             }
@@ -434,7 +430,7 @@ impl AgentLoop {
                                       to verify), and no local model is configured to continue it \
                                       privately."
                             .to_string();
-                        emit_error(&app, &conversation_id, reason.clone(), "gate");
+                        sink.error(&conversation_id, &reason, "gate");
                         return Ok(reason);
                     };
                     let local_is_cloud = !is_private_endpoint(&local.base_url);
@@ -450,7 +446,7 @@ impl AgentLoop {
                             local_is_cloud,
                             None,
                             session_mode,
-                            app,
+                            sink,
                         )
                         .await;
                 }
@@ -466,7 +462,7 @@ impl AgentLoop {
                         is_cloud,
                         None,
                         session_mode,
-                        app,
+                        sink,
                     )
                     .await;
             }
@@ -790,7 +786,13 @@ impl AgentLoop {
     /// never delay or fail the send. Disabled (no-op) until a flush classifier is
     /// wired (pre-3.5 behavior) or when no local model is available — in the
     /// latter case nothing is marked, so a later round/restart still catches it.
-    fn on_pre_compaction(&self, conversation_id: &str, profile: &str, trimmed: &[ChatMessage], app: &AppHandle) {
+    fn on_pre_compaction(
+        &self,
+        conversation_id: &str,
+        profile: &str,
+        trimmed: &[ChatMessage],
+        sink: &Arc<dyn ResultSink>,
+    ) {
         // The flush needs a classifier (to route safely) AND a local model.
         let Some(classifier) = &self.flush_classifier else {
             return;
@@ -811,7 +813,10 @@ impl AgentLoop {
         let embedder = self.embedder.clone();
         let profile = profile.to_string();
         let conversation_id = conversation_id.to_string();
-        let app = app.clone();
+        // Clone the `Arc`, not the trait object — this task runs detached
+        // (`tauri::async_runtime::spawn` needs a `'static` future), so the
+        // sink must outlive `on_pre_compaction`'s own stack frame.
+        let sink = Arc::clone(sink);
         let now = chrono::Utc::now().timestamp();
         tauri::async_runtime::spawn(async move {
             match crate::agent::memory_flush::run_flush(
@@ -826,7 +831,7 @@ impl AgentLoop {
             )
             .await
             {
-                Ok(n) if n > 0 => emit_memory_event(&app, &conversation_id, "remembered", n),
+                Ok(n) if n > 0 => sink.memory_event(&conversation_id, "remembered", n),
                 Ok(_) => {}
                 Err(e) => tracing::debug!(target: "lhp::compaction", error = %e, "pre-compaction flush failed"),
             }
@@ -981,7 +986,7 @@ impl AgentLoop {
         // Q11: the conversation's permission mode, threaded into `ExecCtx` for
         // this turn's tool calls.
         session_mode: crate::hooks::SessionMode,
-        app: AppHandle,
+        sink: &Arc<dyn ResultSink>,
     ) -> Result<String> {
         // `provider`/`client`/`is_cloud`/`routing_decision` are mutable because
         // a must-stay-local tool call mid-turn can switch the rest of THIS
@@ -1080,7 +1085,7 @@ impl AgentLoop {
         ) {
             Some((snippets, recalled)) => {
                 if recalled > 0 {
-                    emit_memory_event(&app, &conversation_id, "recalled", recalled);
+                    sink.memory_event(&conversation_id, "recalled", recalled);
                 }
                 format!("{snippets}\n\n{sent_content}")
             }
@@ -1154,7 +1159,7 @@ impl AgentLoop {
             if !compaction.trimmed.is_empty() {
                 // Wave 3.5: about-to-be-trimmed turns are swept for durable facts
                 // (async, local-model, best-effort) BEFORE they leave the wire.
-                self.on_pre_compaction(&conversation_id, &profile, &compaction.trimmed, &app);
+                self.on_pre_compaction(&conversation_id, &profile, &compaction.trimmed, sink);
             }
             let mut sse = client
                 .stream_chat_with_tools(
@@ -1174,14 +1179,7 @@ impl AgentLoop {
                 match event {
                     crate::models::sse::SseEvent::Delta(delta) => {
                         assembled.push_str(&delta);
-                        let payload = StreamTokenPayload {
-                            token: delta,
-                            conversation_id: conversation_id.clone(),
-                            message_id: assistant_id.clone(),
-                        };
-                        if let Err(e) = app.emit("stream:token", payload) {
-                            tracing::warn!(error = %e, "failed to emit stream:token");
-                        }
+                        sink.token(&conversation_id, &assistant_id, &delta);
                     }
                     crate::models::sse::SseEvent::ToolCalls(frags) => {
                         if native_mode {
@@ -1199,7 +1197,7 @@ impl AgentLoop {
                         }
                     }
                     crate::models::sse::SseEvent::Error(msg) => {
-                        emit_error(&app, &conversation_id, msg.clone(), "model");
+                        sink.error(&conversation_id, &msg, "model");
                         anyhow::bail!("model stream error: {msg}");
                     }
                     crate::models::sse::SseEvent::Usage {
@@ -1347,15 +1345,7 @@ impl AgentLoop {
                     is_cloud,
                     routing_decision,
                     &|from, to, reason| {
-                        let payload = LocalReroutePayload {
-                            conversation_id: conv_id.clone(),
-                            reason: reason.to_string(),
-                            from_provider: from.to_string(),
-                            to_provider: to.to_string(),
-                        };
-                        if let Err(e) = app.emit("stream:local_reroute", payload) {
-                            tracing::warn!(error = %e, "failed to emit stream:local_reroute");
-                        }
+                        sink.local_reroute(&conv_id, reason, from, to);
                     },
                 )
                 .await?;
@@ -1470,7 +1460,7 @@ pub(crate) fn emit_memory_event(
     }
 }
 
-fn emit_error(app: &AppHandle, conversation_id: &str, error: String, source: &'static str) {
+pub(crate) fn emit_error(app: &AppHandle, conversation_id: &str, error: String, source: &'static str) {
     let payload = StreamErrorPayload {
         error,
         conversation_id: conversation_id.to_string(),

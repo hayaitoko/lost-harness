@@ -15,6 +15,7 @@ pub mod skill_reflect;
 pub mod egress;
 pub mod gate;
 pub mod loop_mod;
+pub mod result_sink;
 
 #[cfg(test)]
 mod crash_recovery_tests;
