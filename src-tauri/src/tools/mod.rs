@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 pub mod ask_human;
 pub mod calling;
+pub mod computer_use;
 pub mod cron;
 pub mod delegate;
 pub mod dispatch;
