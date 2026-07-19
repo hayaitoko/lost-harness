@@ -57,6 +57,11 @@
     deleteAgentType,
     type AgentType,
     installPack,
+    listModelCatalog,
+    downloadModel,
+    probeHardware,
+    type CatalogModel,
+    type HardwareProfile,
   } from "$lib/api/tauri";
 
   type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "agents" | "usage" | "appearance";
@@ -178,6 +183,10 @@
   let packOpen = $state(false);
   let skillReflectEnabled = $state(false);
   let skillReflectSaving = $state(false);
+  // model catalog — downloadable local models sized to this machine (Wave 5.3 / M8)
+  let catalogModels = $state<CatalogModel[]>([]);
+  let hardware = $state<HardwareProfile | null>(null);
+  let modelDownloadStatus = $state<Record<string, string>>({});
   // seats — per-profile model-seat bindings (Wave 3.1)
   let seatBindings = $state<SeatBinding[]>([]);
   let seatName = $state("");
@@ -292,7 +301,7 @@
       });
   });
 
-  // Load this profile's seat bindings when the Models pane opens (+ on profile change).
+  // Load this profile's seat bindings + the model catalog when the Models pane opens.
   $effect(() => {
     if (section !== "models") return;
     const profile = $activeProfileId;
@@ -303,7 +312,23 @@
       .catch((err) => {
         seatError = String(err);
       });
+    probeHardware().then((h) => (hardware = h)).catch(() => {});
+    listModelCatalog().then((m) => (catalogModels = m)).catch(() => {});
   });
+
+  async function startModelDownload(m: CatalogModel) {
+    modelDownloadStatus = { ...modelDownloadStatus, [m.id]: "Downloading…" };
+    try {
+      await downloadModel(m.id);
+      modelDownloadStatus = { ...modelDownloadStatus, [m.id]: "Downloaded ✓" };
+    } catch (err) {
+      modelDownloadStatus = { ...modelDownloadStatus, [m.id]: `Failed: ${String(err)}` };
+    }
+  }
+
+  function fmtGB(bytes: number): string {
+    return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  }
 
   // Load the active profile's classifier thresholds when the Privacy guard
   // pane opens (and re-load on profile change). The backend reads live per
@@ -1139,6 +1164,55 @@
                 </span>
               </button>
             {/if}
+
+            <!-- Downloadable local models (Wave 5.3 / M8), sized to this machine -->
+            <div class="mb-2 mt-6 flex items-center gap-2.5">
+              <span class="text-[12px] font-[550] text-text">Download a local model</span>
+              {#if hardware}
+                <span class="text-[11.5px] text-text-3">
+                  {fmtGB(hardware.total_ram_bytes)} RAM · {hardware.cpu_cores} cores · sized to your machine
+                </span>
+              {/if}
+            </div>
+            <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border" data-testid="model-catalog">
+              {#if catalogModels.length === 0}
+                <div class="px-3 py-6 text-center text-[12px] text-text-3">
+                  No catalog models available.
+                </div>
+              {:else}
+                {#each catalogModels as m (m.id)}
+                  <div class="flex items-center gap-2 border-b border-border py-[9px] pl-3 pr-2.5" data-testid="catalog-row">
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-[12.5px] font-[550] text-text">{m.name}</span>
+                      <span class="block truncate text-[11.5px] text-text-3">{m.description} · {fmtGB(m.size_bytes)}</span>
+                    </span>
+                    {#if m.fit === "fits"}
+                      <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">fits</span>
+                    {:else if m.fit === "tight"}
+                      <span class="flex-shrink-0 rounded-[8px] bg-warn-soft px-[7px] py-px text-[10px] text-warn">tight</span>
+                    {:else}
+                      <span class="flex-shrink-0 rounded-[8px] bg-surface-2 px-[7px] py-px text-[10px] text-text-3">too large</span>
+                    {/if}
+                    {#if modelDownloadStatus[m.id]}
+                      <span class="flex-shrink-0 text-[11px] text-text-2">{modelDownloadStatus[m.id]}</span>
+                    {:else}
+                      <Button
+                        variant="ghost"
+                        disabled={!m.installable || m.fit === "too_large"}
+                        onclick={() => startModelDownload(m)}
+                      >
+                        {m.installable ? "Download" : "Soon"}
+                      </Button>
+                    {/if}
+                  </div>
+                {/each}
+              {/if}
+              <div class="px-3 py-2 text-[11px] text-text-3">
+                Models download from Hugging Face and are verified by checksum before use — a
+                mismatch installs nothing. (Entries marked “Soon” await release curation of their
+                verified hash.)
+              </div>
+            </div>
 
             <!-- Seats (Wave 3.1): named roles → a model, per profile -->
             <div class="mb-2 mt-6 flex items-center gap-2.5">

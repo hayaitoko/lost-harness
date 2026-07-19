@@ -549,6 +549,49 @@ export async function deleteSkill(id: string): Promise<boolean> {
   return false;
 }
 
+/** A catalog model annotated with its fit against the machine (Wave 5.3 / M8). */
+export interface CatalogModel {
+  id: string;
+  name: string;
+  description: string;
+  family: string;
+  quantization: string;
+  params_billions: number;
+  url: string;
+  sha256: string;
+  size_bytes: number;
+  /** "fits" | "tight" | "too_large" */
+  fit: string;
+  /** false when the entry's sha256 is still a release-curation placeholder. */
+  installable: boolean;
+}
+
+export interface HardwareProfile {
+  total_ram_bytes: number;
+  cpu_cores: number;
+  os: string;
+  arch: string;
+}
+
+/** Probe this machine (RAM/cores/os/arch) for model sizing. */
+export async function probeHardware(): Promise<HardwareProfile | null> {
+  if (isTauri()) return tauriInvoke<HardwareProfile>("probe_hardware", {});
+  return null;
+}
+
+/** The curated model catalog, sized to this machine. Works offline. */
+export async function listModelCatalog(): Promise<CatalogModel[]> {
+  if (isTauri()) return tauriInvoke<CatalogModel[]>("list_model_catalog", {});
+  return [];
+}
+
+/** Download + verify a curated catalog model. Progress arrives on the
+ *  `model:download-progress` event; throws on a digest mismatch / uncurated entry. */
+export async function downloadModel(id: string): Promise<{ id: string; name: string; path: string }> {
+  if (isTauri()) return tauriInvoke("download_model", { args: { id } });
+  return { id, name: "", path: "" };
+}
+
 /** Result of installing a Capability Pack. Mirrors `InstallReport` in `packs`. */
 export interface PackInstallReport {
   pack_name: string;
