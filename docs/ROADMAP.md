@@ -125,7 +125,18 @@ the status board sitting on top of all of them.
 > gates. Wave 6 server needs external infra; Wave 7 is release engineering. **⇒
 > Everything buildable+verifiable in a headless env is DONE; the native flagship
 > BUILDS follow their build-ready designs on the target machine.** (A hard session
-> usage limit was also hit 2026-07-18, resets ~9pm PT.) **Next fronts (per the
+> usage limit was also hit 2026-07-18, resets ~9pm PT.) **M6 audio-egress gate
+> IMPLEMENTED** (`b91d784`, `audio/privacy.rs`): the ONE non-native security core
+> of voice — `AudioEgressGate` re-vets cloud STT/TTS egress on the cumulative
+> reply prefix (audio egress ≤ text egress; Private as-local-spoken-as-typed;
+> Public still hits the floor), reusing the §7 gate, fully unit-tested (515
+> tests). The SIBLING non-native cores exist but are multi-file SECURITY-CRITICAL
+> integrations unsafe to half-build under the usage cap: **M7 Tier-P** (per-profile
+> fs confinement — refactor all 5 fs tools' fixed root → `root_for(profile)` +
+> re-root ProtectedPathHook; `resolve_within` fs.rs:39 already does the traversal
+> guard) and **M5 approval model** (semantic-locator tools + a `ComputerBackend`
+> trait/mock + the covers_once/fingerprint dispatch wiring). Do these fresh, first
+> thing on the target session. **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
