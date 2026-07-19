@@ -198,6 +198,28 @@ impl ToolDispatcher {
         }
     }
 
+    /// A bounded sub-dispatcher for a Wave-4.3 delegated agent. Same gate `chain`,
+    /// `env`, and shared grant-`ledger`/`approver`/`audit`/`rule`/`reads` state as
+    /// this dispatcher, but a `registry` RESTRICTED to `allowed` (∩ registered ∩
+    /// env). So a delegated helper (a) can only see/call its allowed tools and
+    /// (b) still passes the IDENTICAL full gate on every call — it can never be
+    /// more permissive than the parent (the chain is cloned, not rebuilt weaker;
+    /// the ledger is SHARED so a grant is consistent). It gets a FRESH
+    /// `run_state` (its own per-run budget), since it is a distinct run.
+    pub fn restricted(&self, allowed: &std::collections::HashSet<String>) -> ToolDispatcher {
+        ToolDispatcher {
+            registry: self.registry.restricted_to(allowed),
+            chain: self.chain.clone(),
+            env: self.env.clone(),
+            ledger: Arc::clone(&self.ledger),
+            approver: self.approver.clone(),
+            reads: Arc::clone(&self.reads),
+            run_state: Mutex::new(RunState::default()),
+            audit_writer: self.audit_writer.clone(),
+            rule_writer: self.rule_writer.clone(),
+        }
+    }
+
     /// Wire interactive approval: the shared ledger (must be the SAME `Arc`
     /// passed to `build_pretooluse_chain_full`) and the prompter that asks the
     /// human. Without this, `dispatch` keeps round-1 behavior (surface `Ask`).
@@ -1167,6 +1189,67 @@ mod tests {
             !ran.load(Ordering::SeqCst),
             "a denied call must never reach Tool::run"
         );
+    }
+
+    // ── Wave 4.3 — restricted sub-dispatcher (a delegated agent's toolbelt) ────
+
+    #[tokio::test]
+    async fn restricted_dispatcher_refuses_an_out_of_belt_tool() {
+        // A delegated helper whose belt does NOT include shell_exec cannot call
+        // it — even with an allow-policy that would permit it — because the tool
+        // is physically absent from the sub-registry (Unknown, before any gate).
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SpyTool { ran: ran.clone() }));
+        let chain = build_pretooluse_chain(gate(), Box::new(allow_policy(&["shell_exec"])));
+        let parent = ToolDispatcher::new(registry, chain, BodyEnv::empty());
+
+        let belt: std::collections::HashSet<String> = ["echo".to_string()].into_iter().collect();
+        let sub = parent.restricted(&belt);
+
+        let outcome = sub
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "ls"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::Unknown(_)),
+            "an out-of-belt tool is not dispatchable, got {outcome:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "the excluded tool never runs");
+    }
+
+    #[tokio::test]
+    async fn restricted_dispatcher_still_enforces_the_full_gate() {
+        // A tool that IS in the belt still passes the IDENTICAL gate chain — the
+        // sub-dispatcher clones the parent's chain, never a weaker one. The
+        // non-overridable sandbox floor still denies `rm -rf /`.
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SpyTool { ran: ran.clone() }));
+        let chain = build_pretooluse_chain(gate(), Box::new(allow_policy(&["shell_exec"])));
+        let parent = ToolDispatcher::new(registry, chain, BodyEnv::empty());
+
+        let belt: std::collections::HashSet<String> =
+            ["shell_exec".to_string()].into_iter().collect();
+        let sub = parent.restricted(&belt);
+
+        let outcome = sub
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "rm -rf /"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
+            .await;
+        match outcome {
+            ToolOutcome::Denied { by, .. } => assert_eq!(by, "sandbox", "the full gate still fires"),
+            other => panic!("expected sandbox Denied through the sub-dispatcher, got {other:?}"),
+        }
+        assert!(!ran.load(Ordering::SeqCst), "a denied call never runs, even in a sub-agent");
     }
 
     #[tokio::test]

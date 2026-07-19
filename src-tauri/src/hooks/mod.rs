@@ -380,10 +380,14 @@ pub trait ObserverHook: Send + Sync {
 /// Runs the registered gating hooks in order (short-circuiting on the
 /// first `Deny`/`Ask`) and fans out to observer hooks. One chain instance
 /// is meant to be built once per body (app / server) and reused.
-#[derive(Default)]
+/// Hooks are held behind `Arc` so a bounded sub-agent dispatcher (Wave 4.3) can
+/// REUSE the exact same gate chain via `Clone` — a delegated helper's tool calls
+/// pass the identical PrivacyFilter→…→Permission gate as the main agent's, never
+/// a fresh/weaker one. `register_*` still takes a `Box` (call sites unchanged).
+#[derive(Default, Clone)]
 pub struct HookChain {
-    gating: Vec<Box<dyn GatingHook>>,
-    observers: Vec<Box<dyn ObserverHook>>,
+    gating: Vec<Arc<dyn GatingHook>>,
+    observers: Vec<Arc<dyn ObserverHook>>,
 }
 
 impl HookChain {
@@ -395,11 +399,11 @@ impl HookChain {
     }
 
     pub fn register_gating(&mut self, hook: Box<dyn GatingHook>) {
-        self.gating.push(hook);
+        self.gating.push(Arc::from(hook));
     }
 
     pub fn register_observer(&mut self, hook: Box<dyn ObserverHook>) {
-        self.observers.push(hook);
+        self.observers.push(Arc::from(hook));
     }
 
     /// Names of registered gating hooks, in run order. Useful for tests
