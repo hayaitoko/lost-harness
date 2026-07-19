@@ -592,6 +592,28 @@ export async function downloadModel(id: string): Promise<{ id: string; name: str
   return { id, name: "", path: "" };
 }
 
+/** A downloaded local model. Mirrors `LocalModelInfo` in `ipc/mod.rs`. */
+export interface LocalModel {
+  id: string;
+  name: string;
+  path: string;
+  size_bytes: number;
+  /** "ready" | "quarantined" */
+  status: string;
+}
+
+/** List downloaded local models (M8 S6). */
+export async function listLocalModels(): Promise<LocalModel[]> {
+  if (isTauri()) return tauriInvoke<LocalModel[]>("list_local_models", {});
+  return [];
+}
+
+/** Delete a downloaded model (file + registry row). */
+export async function removeLocalModel(id: string): Promise<boolean> {
+  if (isTauri()) return tauriInvoke<boolean>("remove_local_model", { args: { id } });
+  return false;
+}
+
 /** Result of installing a Capability Pack. Mirrors `InstallReport` in `packs`. */
 export interface PackInstallReport {
   pack_name: string;

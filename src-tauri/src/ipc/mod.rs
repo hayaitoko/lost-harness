@@ -694,6 +694,52 @@ pub fn list_model_catalog() -> Vec<crate::models::catalog::CatalogEntryView> {
     crate::models::catalog::catalog_for(&profile)
 }
 
+/// A downloaded/registered local model for the Settings model-manager (M8 S6).
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalModelInfo {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub size_bytes: i64,
+    /// "ready" | "quarantined".
+    pub status: String,
+}
+
+impl From<crate::storage::ModelEntry> for LocalModelInfo {
+    fn from(m: crate::storage::ModelEntry) -> Self {
+        Self { id: m.id, name: m.name, path: m.path, size_bytes: m.size_bytes, status: m.status }
+    }
+}
+
+/// List downloaded local models (M8 S6). Global.
+#[tauri::command]
+pub fn list_local_models(state: State<'_, AppState>) -> Result<Vec<LocalModelInfo>, String> {
+    state
+        .storage
+        .global()
+        .list_models()
+        .map(|v| v.into_iter().map(Into::into).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoveModelArgs {
+    pub id: String,
+}
+
+/// Delete a downloaded model — its file AND its `model_catalog` row (M8 S6). A
+/// seat that pointed at it falls back to `inherit` automatically at resolve time
+/// (resolve_seat inherits when the provider is gone), so no dangling reference.
+#[tauri::command]
+pub fn remove_local_model(state: State<'_, AppState>, args: RemoveModelArgs) -> Result<bool, String> {
+    let global = state.storage.global();
+    if let Ok(Some(m)) = global.get_model(&args.id) {
+        // Best-effort file delete (the row removal is the source of truth).
+        let _ = std::fs::remove_file(&m.path);
+    }
+    global.delete_model(&args.id).map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownloadModelArgs {
     /// The catalog entry id to download.

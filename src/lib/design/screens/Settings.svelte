@@ -62,6 +62,9 @@
     probeHardware,
     type CatalogModel,
     type HardwareProfile,
+    listLocalModels,
+    removeLocalModel,
+    type LocalModel,
   } from "$lib/api/tauri";
 
   type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "agents" | "usage" | "appearance";
@@ -187,6 +190,8 @@
   let catalogModels = $state<CatalogModel[]>([]);
   let hardware = $state<HardwareProfile | null>(null);
   let modelDownloadStatus = $state<Record<string, string>>({});
+  let localModels = $state<LocalModel[]>([]);
+  let confirmRemoveModelId = $state<string | null>(null);
   // seats — per-profile model-seat bindings (Wave 3.1)
   let seatBindings = $state<SeatBinding[]>([]);
   let seatName = $state("");
@@ -314,6 +319,7 @@
       });
     probeHardware().then((h) => (hardware = h)).catch(() => {});
     listModelCatalog().then((m) => (catalogModels = m)).catch(() => {});
+    listLocalModels().then((m) => (localModels = m)).catch(() => {});
   });
 
   async function startModelDownload(m: CatalogModel) {
@@ -321,9 +327,23 @@
     try {
       await downloadModel(m.id);
       modelDownloadStatus = { ...modelDownloadStatus, [m.id]: "Downloaded ✓" };
+      localModels = await listLocalModels();
     } catch (err) {
       modelDownloadStatus = { ...modelDownloadStatus, [m.id]: `Failed: ${String(err)}` };
     }
+  }
+
+  async function removeModel(id: string) {
+    if (confirmRemoveModelId !== id) {
+      confirmRemoveModelId = id;
+      setTimeout(() => {
+        if (confirmRemoveModelId === id) confirmRemoveModelId = null;
+      }, 3000);
+      return;
+    }
+    confirmRemoveModelId = null;
+    await removeLocalModel(id);
+    localModels = localModels.filter((m) => m.id !== id);
   }
 
   function fmtGB(bytes: number): string {
@@ -1213,6 +1233,30 @@
                 verified hash.)
               </div>
             </div>
+
+            {#if localModels.length > 0}
+              <div class="mb-2 mt-4 flex items-center gap-2.5">
+                <span class="text-[12px] font-[550] text-text">Downloaded models</span>
+              </div>
+              <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border" data-testid="local-models">
+                {#each localModels as lm (lm.id)}
+                  <div class="flex items-center gap-2 border-b border-border py-[9px] pl-3 pr-2.5">
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-[12.5px] font-[550] text-text">{lm.name}</span>
+                      <span class="block truncate text-[11.5px] text-text-3">{fmtGB(lm.size_bytes)}</span>
+                    </span>
+                    {#if lm.status === "quarantined"}
+                      <span class="flex-shrink-0 rounded-[8px] bg-blocked-soft px-[7px] py-px text-[10px] text-blocked">quarantined</span>
+                    {:else}
+                      <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">ready</span>
+                    {/if}
+                    <Button variant="ghost" onclick={() => removeModel(lm.id)}>
+                      {confirmRemoveModelId === lm.id ? "Confirm?" : "Remove"}
+                    </Button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
 
             <!-- Seats (Wave 3.1): named roles → a model, per profile -->
             <div class="mb-2 mt-6 flex items-center gap-2.5">

@@ -261,6 +261,8 @@ pub fn run() {
             ipc::probe_hardware,
             ipc::list_model_catalog,
             ipc::download_model,
+            ipc::list_local_models,
+            ipc::remove_local_model,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::get_classifier_settings,
