@@ -69,6 +69,37 @@ pub fn enforce_local_routing<'a>(
     }
 }
 
+/// M5 Slice 2 — the **screenshot privacy invariant (SAFE DEFAULT)**. A turn that
+/// carries an on-screen IMAGE (a screenshot) is forced
+/// [`RoutingRequirement::LocalRequired`], UPGRADING any weaker requirement —
+/// **regardless of binding.** The §7 classifier labels *text*; it cannot vet the
+/// contents of a screenshot (which may show anything on the user's display — a
+/// password, a bank page, someone else's messages). Critically, the user cannot
+/// know what is on screen when a *later* turn captures it, so `Binding::Public`'s
+/// text-level cloud opt-in does NOT extend to images (opting into sending the
+/// text you just typed is not opting into whatever your screen shows). `Private`
+/// is already local, so forcing local there is consistent.
+///
+/// Per the M5 design (Fix 3 + open question OQ-1): "`image_in_window ⇒
+/// LocalRequired` today **regardless**" — screenshots are maximally private, and
+/// only a FUTURE, explicit cloud-vision **consent toggle** (OQ-1, not yet decided
+/// or built) may ever relax this. Until that toggle ships, this ignores the
+/// binding for images. An already-`LocalRequired` base is preserved with its
+/// original reason (e.g. PII in the text), so this only ever tightens routing.
+pub fn routing_for_turn(base: RoutingRequirement, has_image: bool) -> RoutingRequirement {
+    // Never downgrade an existing hard-local requirement (keep its reason).
+    if base.is_local_required() {
+        return base;
+    }
+    if has_image {
+        return RoutingRequirement::LocalRequired {
+            reason: "a screenshot can't be privacy-classified — kept local (maximally private)"
+                .to_string(),
+        };
+    }
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +185,52 @@ mod tests {
         let candidates: Vec<Provider> = vec![];
         let result = enforce_local_routing(&local_required("PII detected"), &candidates);
         assert!(result.is_err());
+    }
+
+    // ── M5 Slice 2: a screenshot forces local routing (safe default) ──────────
+
+    #[test]
+    fn a_screenshot_forces_local_regardless_of_binding() {
+        // The safe default (M5 Fix 3): image_in_window ⇒ LocalRequired today,
+        // regardless of binding — the text-routing `base` already baked the
+        // binding in, so an image tightens it further no matter what.
+        assert!(
+            routing_for_turn(RoutingRequirement::Unconstrained, true).is_local_required(),
+            "an image-bearing turn must be forced local"
+        );
+    }
+
+    #[test]
+    fn a_screenshot_over_a_public_cloud_opt_in_still_stays_local() {
+        // REGRESSION (review): `Public` is a text-level cloud opt-in — it must
+        // NOT extend to a screenshot the user can't see when it's captured.
+        // Under Public the text gate yields `Unconstrained` (base), yet an image
+        // must still force local until a cloud-vision consent toggle ships.
+        let routing = routing_for_turn(RoutingRequirement::Unconstrained, true);
+        assert!(routing.is_local_required(), "an image overrides a Public text opt-in");
+        let candidates = [cloud_provider()];
+        let result = enforce_local_routing(&routing, &candidates);
+        assert!(result.is_err(), "an unvetted screenshot must never fail over to cloud");
+    }
+
+    #[test]
+    fn no_image_is_left_unchanged() {
+        // A text-only turn is unaffected by this invariant — its routing is
+        // whatever the text gate already decided.
+        assert!(!routing_for_turn(RoutingRequirement::Unconstrained, false).is_local_required());
+    }
+
+    #[test]
+    fn an_existing_local_requirement_is_never_downgraded_and_keeps_its_reason() {
+        // A turn already local-required (e.g. PII in the text) stays local with
+        // its ORIGINAL reason — this only ever tightens, never relabels.
+        let base = local_required("PII detected in the text");
+        assert_eq!(
+            routing_for_turn(base.clone(), false),
+            base,
+            "must never downgrade or relabel an existing local requirement"
+        );
+        // …and with an image too, the pre-existing reason wins over the generic one.
+        assert_eq!(routing_for_turn(base.clone(), true), base);
     }
 }
