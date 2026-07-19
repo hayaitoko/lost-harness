@@ -576,6 +576,77 @@ impl AgentLoop {
         result
     }
 
+    /// Run one cron job's prompt as an unattended, HEADLESS, LOCAL-only turn
+    /// (Wave 4.4). Privacy-safe by default: an unattended scheduled job must
+    /// never egress, so it always uses a `local && private` model and a
+    /// `Private` binding, and its tools run headless (a Dangerous/External call
+    /// needing an `Ask` is denied this round, never a background prompt). The
+    /// prompt + result persist in `target_conv` (a fresh dedicated conversation
+    /// is created when the job names none), so the user can see what ran.
+    pub async fn run_cron(
+        &self,
+        prompt: &str,
+        profile: &str,
+        target_conv: Option<String>,
+    ) -> Result<String> {
+        let local = self
+            .model_manager
+            .list_providers()
+            .into_iter()
+            .find(|p| p.is_local() && p.is_private())
+            .ok_or_else(|| anyhow!("no local model available for an unattended cron job"))?;
+        let client = self
+            .model_manager
+            .get_client(&local.id)
+            .ok_or_else(|| anyhow!("cron: local provider has no client"))?;
+        let model = match client.list_models().await {
+            Ok(mut ms) if !ms.is_empty() => ms.remove(0),
+            _ => anyhow::bail!("cron: local provider lists no models"),
+        };
+
+        let headless = Arc::new(self.tools.headless());
+        let sub = AgentLoop::new(
+            self.gate.clone(),
+            Arc::clone(&self.model_manager),
+            Arc::clone(&self.storage),
+            headless,
+        );
+
+        let db = self.storage.open_profile(profile)?;
+        let now = chrono::Utc::now().timestamp();
+        // Deliver into the job's target conversation, or a fresh dedicated one.
+        let conv_id = match target_conv {
+            Some(id) if db.get_conversation(&id)?.is_some() => id,
+            _ => {
+                let id = Uuid::new_v4().to_string();
+                let title: String = prompt.chars().take(30).collect();
+                db.create_conversation(&crate::storage::Conversation {
+                    id: id.clone(),
+                    name: format!("⏰ {title}"),
+                    pinned: false,
+                    binding: "private".to_string(),
+                    folder_id: None,
+                    color: None,
+                    created_at: now,
+                    updated_at: now,
+                })?;
+                id
+            }
+        };
+        let sink: Arc<dyn ResultSink> = Arc::new(crate::agent::result_sink::HeadlessSink);
+        sub.process_message(
+            prompt.to_string(),
+            conv_id,
+            Binding::Private,
+            local.id,
+            model,
+            profile.to_string(),
+            crate::hooks::SessionMode::Normal,
+            &sink,
+        )
+        .await
+    }
+
     /// Plan a redact-and-send for the current message, or `None` if it can't be
     /// done safely. Returns `Some(redaction)` only when: (1) the profile has
     /// redaction enabled, (2) the classification carries redactable VALUE spans,

@@ -412,6 +412,12 @@ impl ToolRegistry {
             .map(|t| t.as_ref())
     }
 
+    /// Every registered tool's name (regardless of env). Used to build a
+    /// full-belt-but-headless sub-dispatcher for unattended cron runs.
+    pub fn all_names(&self) -> std::collections::HashSet<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
     /// The tools usable in `env` — every registered tool whose
     /// `requires()` is satisfied by `env`.
     pub fn available_tools(&self, env: &BodyEnv) -> Vec<&dyn Tool> {

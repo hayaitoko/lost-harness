@@ -167,6 +167,106 @@ fn parse_cron_num(
     ))
 }
 
+// ── cron matcher (Wave 4.4 — "is this schedule due at this minute?") ─────────
+
+/// The 5-field expansion of an `@macro`, or `None` for a plain expression.
+fn macro_to_fields(macro_name: &str) -> Option<[&'static str; 5]> {
+    Some(match macro_name {
+        "yearly" | "annually" => ["0", "0", "1", "1", "*"],
+        "monthly" => ["0", "0", "1", "*", "*"],
+        "weekly" => ["0", "0", "*", "*", "0"],
+        "daily" | "midnight" => ["0", "0", "*", "*", "*"],
+        "hourly" => ["0", "*", "*", "*", "*"],
+        _ => return None,
+    })
+}
+
+/// Does a single cron `field` (a comma-list of `*` / value / range / step /
+/// name) match `value`? Assumes a validated field (invalid parts are treated as
+/// "no match", never a panic).
+fn cron_field_matches(field: &str, value: u32, (lo, hi): (u32, u32), names: &[(&str, u32)]) -> bool {
+    for part in field.split(',') {
+        let (base, step) = match part.split_once('/') {
+            Some((b, s)) => match s.parse::<u32>() {
+                Ok(n) if n > 0 => (b, n),
+                _ => continue,
+            },
+            None => (part, 1),
+        };
+        let (start, end) = if base == "*" {
+            (lo, hi)
+        } else if let Some((a, b)) = base.split_once('-') {
+            match (
+                parse_cron_num(a, (lo, hi), "", names),
+                parse_cron_num(b, (lo, hi), "", names),
+            ) {
+                (Ok(a), Ok(b)) if a <= b => (a, b),
+                _ => continue,
+            }
+        } else {
+            match parse_cron_num(base, (lo, hi), "", names) {
+                // A bare value with a step (`5/15`) runs from the value to `hi`;
+                // a bare value alone matches only itself.
+                Ok(v) => {
+                    if part.contains('/') {
+                        (v, hi)
+                    } else {
+                        (v, v)
+                    }
+                }
+                Err(_) => continue,
+            }
+        };
+        if value >= start && value <= end && (value - start) % step == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is `schedule` due to fire at the given local wall-clock minute? Standard cron
+/// semantics, including the day-of-month / day-of-week OR rule: when BOTH are
+/// restricted (neither is `*`), the day matches if EITHER field matches. `dow`
+/// value 0 and 7 both mean Sunday.
+pub(crate) fn cron_due(schedule: &str, dt: chrono::DateTime<chrono::Local>) -> bool {
+    use chrono::{Datelike, Timelike};
+    let s = schedule.trim();
+    let fields: Vec<&str> = if let Some(m) = s.strip_prefix('@') {
+        match macro_to_fields(m) {
+            Some(f) => f.to_vec(),
+            None => return false,
+        }
+    } else {
+        s.split_whitespace().collect()
+    };
+    if fields.len() != 5 {
+        return false;
+    }
+    const BOUNDS: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
+    if !cron_field_matches(fields[0], dt.minute(), BOUNDS[0], &[]) {
+        return false;
+    }
+    if !cron_field_matches(fields[1], dt.hour(), BOUNDS[1], &[]) {
+        return false;
+    }
+    if !cron_field_matches(fields[3], dt.month(), BOUNDS[3], MONTH_NAMES) {
+        return false;
+    }
+    let dow = dt.weekday().num_days_from_sunday(); // 0=Sun .. 6=Sat
+    let dom_restricted = fields[2] != "*";
+    let dow_restricted = fields[4] != "*";
+    let dom_match = cron_field_matches(fields[2], dt.day(), BOUNDS[2], &[]);
+    let dow_match = cron_field_matches(fields[4], dow, BOUNDS[4], DAY_NAMES)
+        || (dow == 0 && cron_field_matches(fields[4], 7, BOUNDS[4], DAY_NAMES));
+    let day_ok = match (dom_restricted, dow_restricted) {
+        (true, true) => dom_match || dow_match,
+        (true, false) => dom_match,
+        (false, true) => dow_match,
+        (false, false) => true,
+    };
+    day_ok
+}
+
 fn job_json(j: &CronJob) -> serde_json::Value {
     json!({
         "id": j.id,
@@ -421,6 +521,50 @@ fn req_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::storage::Conversation;
+    use chrono::TimeZone;
+
+    /// A local DateTime for a specific wall-clock (year, month, day, hour, min).
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::Local> {
+        chrono::Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn cron_due_matches_minute_hour_and_wildcards() {
+        // 2026-07-15 is a Wednesday.
+        let wed_0930 = at(2026, 7, 15, 9, 30);
+        assert!(cron_due("30 9 * * *", wed_0930), "exact minute+hour, wildcards");
+        assert!(!cron_due("31 9 * * *", wed_0930), "wrong minute");
+        assert!(!cron_due("30 10 * * *", wed_0930), "wrong hour");
+        assert!(cron_due("* * * * *", wed_0930), "every minute");
+        assert!(cron_due("@hourly", at(2026, 7, 15, 9, 0)), "@hourly fires at :00");
+        assert!(!cron_due("@hourly", wed_0930), "@hourly doesn't fire at :30");
+        assert!(cron_due("@daily", at(2026, 7, 15, 0, 0)), "@daily at midnight");
+    }
+
+    #[test]
+    fn cron_due_handles_lists_ranges_steps_and_names() {
+        assert!(cron_due("0,30 * * * *", at(2026, 7, 15, 9, 30)), "list");
+        assert!(cron_due("*/15 * * * *", at(2026, 7, 15, 9, 45)), "step /15 at :45");
+        assert!(!cron_due("*/15 * * * *", at(2026, 7, 15, 9, 46)), "step /15 not at :46");
+        assert!(cron_due("0 9-17 * * *", at(2026, 7, 15, 14, 0)), "hour range");
+        assert!(!cron_due("0 9-17 * * *", at(2026, 7, 15, 18, 0)), "outside hour range");
+        assert!(cron_due("0 0 * JUL *", at(2026, 7, 1, 0, 0)), "month by name");
+        assert!(cron_due("0 0 * * WED", at(2026, 7, 15, 0, 0)), "weekday by name (Wed)");
+    }
+
+    #[test]
+    fn cron_due_dom_dow_or_semantics_and_sunday_0_or_7() {
+        // When BOTH dom and dow are restricted, EITHER matching fires it.
+        // 2026-07-15 is Wed the 15th. "1,15 of month OR Monday" → the 15th matches.
+        assert!(cron_due("0 0 15 * MON", at(2026, 7, 15, 0, 0)), "dom matches (OR)");
+        // 2026-07-13 is a Monday, not the 15th → dow matches (OR).
+        assert!(cron_due("0 0 15 * MON", at(2026, 7, 13, 0, 0)), "dow matches (OR)");
+        // 2026-07-14 (Tue, 14th) → neither → no fire.
+        assert!(!cron_due("0 0 15 * MON", at(2026, 7, 14, 0, 0)), "neither → no fire");
+        // Sunday: both 0 and 7 mean Sunday. 2026-07-19 is a Sunday.
+        assert!(cron_due("0 0 * * 0", at(2026, 7, 19, 0, 0)), "dow 0 = Sunday");
+        assert!(cron_due("0 0 * * 7", at(2026, 7, 19, 0, 0)), "dow 7 = Sunday");
+    }
 
     fn temp_storage() -> (Storage, std::path::PathBuf) {
         let mut root = std::env::temp_dir();

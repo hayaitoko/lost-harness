@@ -218,6 +218,16 @@ impl ToolDispatcher {
     /// helper never earns a standing grant. Pre-authorized `tool_rules` still
     /// apply (they resolve to `Allow` in the chain BEFORE any `Ask`), so a
     /// persona can still use a tool the user has standing-allowed.
+    /// A full-belt but HEADLESS sub-dispatcher for an unattended run (Wave 4.4
+    /// cron). Same as [`Self::restricted`] with the FULL tool set — so a cron
+    /// turn keeps every tool the body has, but (like any sub-dispatcher) runs
+    /// headless (`approver = None`): a tool call that needs an `Ask` is denied
+    /// this round rather than raising a prompt for an unattended job, and no
+    /// standing grant is recorded. Pre-authorized rules still apply.
+    pub fn headless(&self) -> ToolDispatcher {
+        self.restricted(&self.registry.all_names())
+    }
+
     pub fn restricted(&self, allowed: &std::collections::HashSet<String>) -> ToolDispatcher {
         ToolDispatcher {
             registry: self.registry.restricted_to(allowed),

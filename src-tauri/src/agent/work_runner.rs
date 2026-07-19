@@ -55,12 +55,18 @@ pub fn spawn_work_runner(agent_loop: Arc<AgentLoop>, storage: Arc<Storage>) {
                     continue;
                 };
                 let now = chrono::Utc::now().timestamp();
+                // Wave 4.4: enqueue any cron jobs that are due this minute as
+                // Cron work_items BEFORE draining, so they flow through the same
+                // one queue as agent dispatch (exactly-once per minute via a
+                // `cron:<id>@<minute>` claim_key + the last_run guard).
+                schedule_due_cron_jobs(&db, now);
                 // Drain every DUE item in this profile before moving to the
                 // next — `claim_next_due_work` is atomic (UPDATE ... RETURNING
                 // under the row lock), so this can never double-claim.
                 while let Ok(Some(item)) = db.claim_next_due_work(now) {
                     let agent_loop = Arc::clone(&agent_loop);
                     let db_for_task = Arc::clone(&db);
+                    let profile_for_task = profile.clone();
                     // Acquire the permit HERE (before spawning), so the drain
                     // loop itself backpressures once `MAX_CONCURRENT_HELPERS`
                     // helpers are already running — bounding concurrency is
@@ -81,7 +87,12 @@ pub fn spawn_work_runner(agent_loop: Arc<AgentLoop>, storage: Arc<Storage>) {
                         // and, if its JoinHandle reports a panic, fail the item.
                         let item_id = item.id.clone();
                         let db_supervise = Arc::clone(&db_for_task);
-                        let inner = tauri::async_runtime::spawn(run_one_item(agent_loop, db_for_task, item));
+                        let inner = tauri::async_runtime::spawn(run_one_item(
+                            agent_loop,
+                            db_for_task,
+                            profile_for_task,
+                            item,
+                        ));
                         if inner.await.is_err() {
                             let now = chrono::Utc::now().timestamp();
                             let _ = db_supervise.finish_work_item(
@@ -103,17 +114,24 @@ pub fn spawn_work_runner(agent_loop: Arc<AgentLoop>, storage: Arc<Storage>) {
 /// Run one claimed item to completion (or failure) and finish it. Never
 /// panics on a malformed payload or a failed helper run — every path ends in
 /// a `finish_work_item` call, so a bad item can never sit `running` forever.
-async fn run_one_item(agent_loop: Arc<AgentLoop>, db: Arc<ProfileDb>, item: WorkItem) {
-    if item.kind != WorkKind::AgentDispatch {
-        let now = chrono::Utc::now().timestamp();
-        let _ = db.finish_work_item(
-            &item.id,
-            WorkState::Failed,
-            None,
-            Some("no runner for this work kind yet"),
-            now,
-        );
-        return;
+async fn run_one_item(agent_loop: Arc<AgentLoop>, db: Arc<ProfileDb>, profile: String, item: WorkItem) {
+    match item.kind {
+        WorkKind::AgentDispatch => {}
+        WorkKind::Cron => {
+            run_cron_item(&agent_loop, &db, &profile, &item).await;
+            return;
+        }
+        WorkKind::ServerResult => {
+            let now = chrono::Utc::now().timestamp();
+            let _ = db.finish_work_item(
+                &item.id,
+                WorkState::Failed,
+                None,
+                Some("no runner for this work kind yet"),
+                now,
+            );
+            return;
+        }
     }
 
     let payload: serde_json::Value = match serde_json::from_str(&item.input_json) {
@@ -219,6 +237,78 @@ async fn run_one_item(agent_loop: Arc<AgentLoop>, db: Arc<ProfileDb>, item: Work
     let _ = db.finish_work_item(&item.id, state, result_json.as_deref(), error.as_deref(), finished_at);
 }
 
+/// Enqueue every enabled cron job that is DUE this minute as a `Cron`
+/// work_item, so scheduled work flows through the same one queue as agent
+/// dispatch. Exactly-once per minute: a `cron:<id>@<minute>` `claim_key` (the
+/// partial-unique index rejects a duplicate) PLUS the `last_run_at` guard (the
+/// poll runs every few seconds, but a job fires only once per matching minute).
+fn schedule_due_cron_jobs(db: &ProfileDb, now: i64) {
+    schedule_due_cron_jobs_at(db, now, chrono::Local::now())
+}
+
+/// Testable core of [`schedule_due_cron_jobs`] with the wall-clock injected.
+fn schedule_due_cron_jobs_at(db: &ProfileDb, now: i64, local_now: chrono::DateTime<chrono::Local>) {
+    let minute_start = now - now.rem_euclid(60);
+    let jobs = match db.list_cron_jobs() {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    for job in jobs {
+        if !job.enabled {
+            continue;
+        }
+        if job.last_run_at.is_some_and(|t| t >= minute_start) {
+            continue; // already fired this minute
+        }
+        if !crate::tools::cron::cron_due(&job.schedule, local_now) {
+            continue;
+        }
+        let payload = serde_json::json!({ "prompt": job.prompt, "job_id": job.id }).to_string();
+        let mut wi = WorkItem::queued(WorkKind::Cron, payload, now);
+        wi.target_conversation_id = job.target_conversation_id.clone();
+        wi.source_ref = Some(job.id.clone());
+        wi.claim_key = Some(format!("cron:{}@{}", job.id, minute_start));
+        if db.insert_work_item(&wi).unwrap_or(false) {
+            // Mark it run THIS minute so the next few-second poll won't re-enqueue.
+            let _ = db.record_cron_run(&job.id, "queued");
+        }
+    }
+}
+
+/// Execute one Cron work_item: run its prompt as an unattended, headless,
+/// local-only turn (`AgentLoop::run_cron`), delivering into the job's target
+/// conversation. Every path finishes the item; a bounded deadline mirrors the
+/// helper path.
+async fn run_cron_item(agent_loop: &AgentLoop, db: &ProfileDb, profile: &str, item: &WorkItem) {
+    let payload: serde_json::Value =
+        serde_json::from_str(&item.input_json).unwrap_or(serde_json::Value::Null);
+    let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let job_id = payload.get("job_id").and_then(|v| v.as_str()).map(str::to_string);
+    let target = item.target_conversation_id.clone();
+    let now = chrono::Utc::now().timestamp();
+
+    if prompt.trim().is_empty() {
+        let _ = db.finish_work_item(&item.id, WorkState::Failed, None, Some("cron: empty prompt"), now);
+        if let Some(id) = &job_id {
+            let _ = db.record_cron_run(id, "failed");
+        }
+        return;
+    }
+
+    let outcome =
+        tokio::time::timeout(HELPER_DEADLINE, agent_loop.run_cron(&prompt, profile, target)).await;
+    let finished_at = chrono::Utc::now().timestamp();
+    let (state, result, error, status) = match outcome {
+        Ok(Ok(text)) => (WorkState::Done, Some(text), None, "ok"),
+        Ok(Err(e)) => (WorkState::Failed, None, Some(e.to_string()), "failed"),
+        Err(_) => (WorkState::Failed, None, Some("cron: timed out".to_string()), "timed_out"),
+    };
+    let _ = db.finish_work_item(&item.id, state, result.as_deref(), error.as_deref(), finished_at);
+    if let Some(id) = &job_id {
+        let _ = db.record_cron_run(id, status);
+    }
+}
+
 /// Parse the payload's `binding` string, defaulting to `Auto` for anything
 /// unrecognized (including a missing/empty field) — never fails the run over
 /// this, since a helper defaulting to the classifier's own per-message call
@@ -228,5 +318,59 @@ fn parse_binding_lenient(s: &str) -> Binding {
         "public" => Binding::Public,
         "private" => Binding::Private,
         _ => Binding::Auto,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::CronJob;
+    use chrono::TimeZone;
+
+    fn temp_storage() -> (Storage, std::path::PathBuf) {
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-cronrun-{}", uuid::Uuid::new_v4()));
+        (Storage::open(&root).unwrap(), root)
+    }
+
+    fn job(id: &str, schedule: &str, enabled: bool) -> CronJob {
+        CronJob {
+            id: id.into(),
+            name: format!("job {id}"),
+            prompt: "do the thing".into(),
+            schedule: schedule.into(),
+            enabled,
+            last_run_at: None,
+            last_status: None,
+            target_conversation_id: None,
+        }
+    }
+
+    #[test]
+    fn schedule_enqueues_a_due_enabled_job_once_per_minute() {
+        let (storage, root) = temp_storage();
+        let db = storage.open_profile("personal").unwrap();
+        db.insert_cron_job(&job("due", "30 9 * * *", true)).unwrap();
+        db.insert_cron_job(&job("not-due", "0 0 * * *", true)).unwrap();
+        db.insert_cron_job(&job("disabled", "30 9 * * *", false)).unwrap();
+
+        // 2026-07-15 09:30 local → only "due" matches.
+        let local = chrono::Local.with_ymd_and_hms(2026, 7, 15, 9, 30, 0).unwrap();
+        let now = local.timestamp();
+        schedule_due_cron_jobs_at(&db, now, local);
+
+        // Exactly one Cron work_item enqueued, for the due job.
+        let claimed = db.claim_next_due_work(now + 1).unwrap().expect("a cron item");
+        assert_eq!(claimed.kind, WorkKind::Cron);
+        assert_eq!(claimed.source_ref.as_deref(), Some("due"));
+        let payload: serde_json::Value = serde_json::from_str(&claimed.input_json).unwrap();
+        assert_eq!(payload["job_id"], "due");
+        assert!(db.claim_next_due_work(now + 1).unwrap().is_none(), "only the due+enabled job enqueues");
+
+        // Re-running the SAME minute does not enqueue again (last_run guard +
+        // the cron:<id>@<minute> claim_key).
+        schedule_due_cron_jobs_at(&db, now, local);
+        assert!(db.claim_next_due_work(now + 1).unwrap().is_none(), "no double-fire within the minute");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
