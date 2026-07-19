@@ -176,6 +176,19 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
             created_at        INTEGER NOT NULL
         );",
     },
+    Migration {
+        version: 7,
+        // Wave 5.3 / M8 — the verified-before-runnable invariant needs two more
+        // model_catalog columns: `sha256` (the trust anchor — a row only exists
+        // after the bytes hashed to the catalog value) and `status` (ready vs
+        // quarantined — an integrity re-check that fails at boot never silently
+        // serves the model). ADD COLUMN has no IF-NOT-EXISTS, so these live ONLY
+        // here (not in GLOBAL_SCHEMA_SQL's model_catalog CREATE): a fresh DB
+        // creates the 6-column table then v7 widens it, matching a v6 DB's upgrade.
+        name: "model_catalog_integrity",
+        sql: "ALTER TABLE model_catalog ADD COLUMN sha256 TEXT NOT NULL DEFAULT '';
+              ALTER TABLE model_catalog ADD COLUMN status TEXT NOT NULL DEFAULT 'ready';",
+    },
 ];
 
 /// All per-profile DB migrations, in order.

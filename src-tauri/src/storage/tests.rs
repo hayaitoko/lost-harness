@@ -62,16 +62,17 @@ fn fresh_in_memory_profile_has_all_tables() {
 
 #[test]
 fn schema_version_is_current_after_init_global() {
-    // Global schema is now v6 (v2 memory buckets + FTS5; v3 private-bucket
+    // Global schema is now v7 (v2 memory buckets + FTS5; v3 private-bucket
     // vector table for the meaning lane; v4 endpoints.supports_native_tools;
-    // v5 skills metadata columns — Wave 4.1; v6 agent_types — Wave 4.3).
+    // v5 skills metadata columns — Wave 4.1; v6 agent_types — Wave 4.3;
+    // v7 model_catalog.sha256+status — Wave 5.3 / M8).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 6);
+    assert_eq!(v, 7);
 }
 
 #[test]
@@ -128,6 +129,30 @@ fn schema_version_is_nine_after_init_profile() {
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
     assert_eq!(v, 9);
+}
+
+#[test]
+fn model_catalog_carries_sha256_and_status() {
+    use crate::storage::ModelEntry;
+    let db = GlobalDb::open_in_memory().unwrap();
+    db.insert_model(&ModelEntry {
+        id: "qwen-3b".into(),
+        name: "Qwen 3B".into(),
+        path: "/models/qwen-3b.gguf".into(),
+        size_bytes: 2_100_000_000,
+        quantization: Some("Q4_K_M".into()),
+        added_at: 1,
+        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        status: "ready".into(),
+    })
+    .unwrap();
+    let got = db.get_model("qwen-3b").unwrap().unwrap();
+    assert_eq!(got.sha256.len(), 64);
+    assert_eq!(got.status, "ready");
+    // Quarantine flips the status (integrity re-check failed) without deleting.
+    assert!(db.set_model_status("qwen-3b", "quarantined").unwrap());
+    assert_eq!(db.get_model("qwen-3b").unwrap().unwrap().status, "quarantined");
+    assert_eq!(db.list_models().unwrap().len(), 1);
 }
 
 #[test]

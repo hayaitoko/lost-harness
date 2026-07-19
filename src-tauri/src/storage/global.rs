@@ -45,6 +45,26 @@ pub struct ModelEntry {
     pub size_bytes: i64,
     pub quantization: Option<String>,
     pub added_at: i64,
+    /// M8: the verified SHA-256 of the downloaded file (the trust anchor of the
+    /// verified-before-runnable invariant). A row only exists after the bytes
+    /// hashed to the catalog value.
+    pub sha256: String,
+    /// M8: "ready" (verified + usable) | "quarantined" (an integrity re-check
+    /// failed at boot — never silently served, re-downloadable).
+    pub status: String,
+}
+
+fn row_to_model_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelEntry> {
+    Ok(ModelEntry {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        path: r.get(2)?,
+        size_bytes: r.get(3)?,
+        quantization: r.get(4)?,
+        added_at: r.get(5)?,
+        sha256: r.get(6)?,
+        status: r.get(7)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -557,15 +577,18 @@ impl GlobalDb {
 
     pub fn insert_model(&self, m: &ModelEntry) -> Result<()> {
         self.conn.lock().execute(
-            "INSERT INTO model_catalog (id, name, path, size_bytes, quantization, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO model_catalog
+             (id, name, path, size_bytes, quantization, added_at, sha256, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 m.id,
                 m.name,
                 m.path,
                 m.size_bytes,
                 m.quantization,
-                m.added_at
+                m.added_at,
+                m.sha256,
+                m.status
             ],
         )?;
         Ok(())
@@ -574,20 +597,11 @@ impl GlobalDb {
     pub fn list_models(&self) -> Result<Vec<ModelEntry>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, path, size_bytes, quantization, added_at
+            "SELECT id, name, path, size_bytes, quantization, added_at, sha256, status
              FROM model_catalog ORDER BY added_at DESC",
         )?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(ModelEntry {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    size_bytes: r.get(3)?,
-                    quantization: r.get(4)?,
-                    added_at: r.get(5)?,
-                })
-            })?
+            .query_map([], row_to_model_entry)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -597,21 +611,21 @@ impl GlobalDb {
             .conn
             .lock()
             .query_row(
-                "SELECT id, name, path, size_bytes, quantization, added_at
+                "SELECT id, name, path, size_bytes, quantization, added_at, sha256, status
                  FROM model_catalog WHERE id = ?1",
                 params![id],
-                |r| {
-                    Ok(ModelEntry {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        path: r.get(2)?,
-                        size_bytes: r.get(3)?,
-                        quantization: r.get(4)?,
-                        added_at: r.get(5)?,
-                    })
-                },
+                row_to_model_entry,
             )
             .optional()?)
+    }
+
+    /// Move a model to a status (`ready`/`quarantined`). Returns whether a row moved.
+    pub fn set_model_status(&self, id: &str, status: &str) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE model_catalog SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn delete_model(&self, id: &str) -> Result<bool> {
