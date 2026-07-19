@@ -74,11 +74,19 @@ the status board sitting on top of all of them.
 > holds `Arc<dyn Tool>` (register sites unchanged) + `restricted_to(allowlist)` —
 > a persona's belt is the sub-registry's CONTENTS (`allowed ∩ registered ∩
 > env`), so an out-of-belt tool is physically absent (not listable OR
-> lookupable) — a structural security boundary, 4 security tests. **453 → 483
-> tests.** **4.3 remaining:** 4.3c `delegate` + async dispatch (BLOCKED on a Lukas
-> batch: delegate RiskClass, sub-agent result attribution, floor-cap) + the
-> restricted-DISPATCHER that reuses the parent hook chain + `resolve_seat` wiring
-> + AppHandle-decoupling `ResultSink`; 4.3d UI. **Next fronts (per the
+> lookupable) — a structural security boundary, 4 security tests. **WAVE 4.3 CORE
+> COMPLETE:** 4.3c(1) restricted sub-dispatcher (`2595967`), 4.3c(2) ResultSink
+> AppHandle-decoupling (`2c43832`), + the **delegate + dispatch runtime**
+> (`e1e1f8c`): `delegate` (Dangerous) enqueues an AgentDispatch work_item; a
+> background `WorkQueueRunner` (4-way semaphore) drains it + runs `run_subagent`
+> (fresh AgentLoop w/ restricted belt + seat model + HeadlessSink) + posts the
+> outcome into the parent conversation. **Adversarially reviewed (18-agent
+> find→verify); all 11 confirmed findings fixed** — incl. 3 HIGH: helper-result
+> injection (guard-wrapped when re-fed to the main agent), Private-parent→cloud
+> downgrade (helper inherits the turn binding), cross-agent grant leak
+> (sub-dispatcher runs headless). **Done-when met.** **453 → 491 tests.** **4.3
+> remaining:** 4.3d agent-type management UI (built-in personas already ship).
+> **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
