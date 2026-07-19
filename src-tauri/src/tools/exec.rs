@@ -462,7 +462,7 @@ impl Tool for ShellExecTool {
     fn run<'a>(
         &'a self,
         input: ToolInput,
-        _ctx: &'a ExecCtx,
+        ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(command) = input.args.get("command").and_then(|v| v.as_str()) else {
@@ -482,10 +482,27 @@ impl Tool for ShellExecTool {
                 None => self.timeout_cap,
             };
 
+            // M7 Tier-P: re-root the shell's cwd AND its sandbox subpaths to the
+            // caller's PER-PROFILE roots — the same call-time resolution the fs
+            // tools do. Without this, `shell_exec` (in `app_default`, so every
+            // conversation has it) runs with cwd at the SHARED base whose Seatbelt
+            // grant (`build_seatbelt_profile` → `(subpath "{ws}") (subpath
+            // "{tmp}")`) covers every profile's subtree as a sibling, so `cat
+            // ../personal/secret.txt` reads across profiles. BOTH roots must be
+            // re-rooted: the workspace AND the tmp scratch — else two profiles
+            // still share one granted `tmp/`, and `work` can stage a file at
+            // `../../tmp/x` that `personal` reads straight back (a review-caught
+            // exfil channel). Per-profile roots make every granted subpath
+            // profile-scoped, so a cross-profile path is denied by the sandbox.
+            let ws = crate::tools::fs::profile_workspace_path(&self.workspace_root, &ctx.profile);
+            let tmp = crate::tools::fs::profile_workspace_path(&self.tmp_root, &ctx.profile);
+            let _ = std::fs::create_dir_all(&ws);
+            let _ = std::fs::create_dir_all(&tmp);
+
             let spec = ExecSpec {
                 command,
-                workspace_root: self.workspace_root.clone(),
-                tmp_root: self.tmp_root.clone(),
+                workspace_root: ws,
+                tmp_root: tmp,
                 network,
                 timeout,
             };
@@ -585,6 +602,76 @@ mod tests {
             .run(ToolInput::new(serde_json::json!({"network": true})), &ctx)
             .await;
         assert!(matches!(res, ToolResult::Err(ref e) if e.contains("requires a string 'command'")));
+    }
+
+    /// A `SandboxedSpawn` that records BOTH roots (workspace + tmp) it was handed
+    /// and then declines to spawn — lets a test assert WHICH roots shell_exec
+    /// jails to without launching a real process.
+    struct CaptureRootSpawn {
+        seen_ws: Arc<std::sync::Mutex<Option<PathBuf>>>,
+        seen_tmp: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    }
+    impl SandboxedSpawn for CaptureRootSpawn {
+        fn spawn(
+            &self,
+            spec: &ExecSpec,
+        ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
+            *self.seen_ws.lock().unwrap() = Some(spec.workspace_root.clone());
+            *self.seen_tmp.lock().unwrap() = Some(spec.tmp_root.clone());
+            Err(ExecError::Io("captured; not spawning".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_exec_reroots_cwd_and_jail_to_the_callers_profile() {
+        // M7 Tier-P regression (adversarial review, HIGH): shell_exec must jail
+        // to the caller's PER-PROFILE roots — BOTH the workspace and the tmp
+        // scratch — the same values the fs tools resolve. Otherwise the macOS
+        // Seatbelt subpaths cover the shared base (every profile's subtree as
+        // siblings) and `cat ../personal/secret.txt` OR a staged `../../tmp/x`
+        // reads across profiles.
+        let base = std::env::temp_dir().join(format!("lhp-exec-tierp-{}", uuid::Uuid::new_v4()));
+        let tmp_base = std::env::temp_dir().join(format!("lhp-exec-tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&tmp_base).unwrap();
+        let seen_ws = Arc::new(std::sync::Mutex::new(None));
+        let seen_tmp = Arc::new(std::sync::Mutex::new(None));
+        let tool = ShellExecTool::new(
+            base.clone(),
+            tmp_base.clone(),
+            Arc::new(CaptureRootSpawn { seen_ws: seen_ws.clone(), seen_tmp: seen_tmp.clone() }),
+            Duration::from_secs(5),
+        );
+
+        // A `work`-profile call jails BOTH roots to their per-profile subdirs.
+        let ctx = ExecCtx { profile: "work".to_string(), ..ExecCtx::default() };
+        let _ = tool
+            .run(ToolInput::new(serde_json::json!({"command": "echo hi"})), &ctx)
+            .await;
+        assert_eq!(
+            seen_ws.lock().unwrap().clone().expect("spawner should have been called"),
+            base.join("work"),
+            "shell must run under the per-profile workspace root, not the shared base"
+        );
+        assert_eq!(
+            seen_tmp.lock().unwrap().clone().unwrap(),
+            tmp_base.join("work"),
+            "the tmp scratch must ALSO be per-profile — a shared tmp is a cross-profile exfil channel"
+        );
+        assert!(base.join("work").is_dir(), "the per-profile workspace root is created before spawn");
+        assert!(tmp_base.join("work").is_dir(), "the per-profile tmp root is created before spawn");
+
+        // Empty profile (default ctx) → the shared base, unchanged (tests).
+        *seen_ws.lock().unwrap() = None;
+        *seen_tmp.lock().unwrap() = None;
+        let _ = tool
+            .run(ToolInput::new(serde_json::json!({"command": "echo hi"})), &ExecCtx::default())
+            .await;
+        assert_eq!(seen_ws.lock().unwrap().clone().unwrap(), base, "empty profile → shared base ws");
+        assert_eq!(seen_tmp.lock().unwrap().clone().unwrap(), tmp_base, "empty profile → shared base tmp");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&tmp_base);
     }
 
     // ── unix-only: a real subprocess through a plain (non-Seatbelt) spawner ──

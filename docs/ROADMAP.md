@@ -21,11 +21,28 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-18: WAVES 1–4 COMPLETE.** Wave 1 + Wave 2 (ready work) + Wave 3
-> (3.1 seats, 3.2 ledger+cost, 3.3 compaction, 3.5 flush) + **all of Wave 4
+> **As of 2026-07-18: WAVES 1–4 COMPLETE; Wave 5 flagship SECURITY CORES landing.** Wave 1 + Wave 2
+> (ready work) + Wave 3 (3.1 seats, 3.2 ledger+cost, 3.3 compaction, 3.5 flush) + **all of Wave 4
 > (4.1 skills, 4.2 learning loop, 4.3 agents, 4.4 one-queue/cron, 4.5 packs)** are
-> landed, adversarially reviewed, and committed. **Remaining: Waves 5–7** (native
-> flagships + server twin + polish). Plus a Connection-Mutex soundness fix. 498 tests.
+> landed, adversarially reviewed, and committed. **Wave 5 in progress:** M8 (hardware probe +
+> curated catalog + verified download), M6 audio-egress gate, M5 reversibility classifier, and
+> now **M7 Tier-P per-profile filesystem confinement** are built (security cores; native
+> backends remain on-target). **Remaining: Wave 5 native backends (M5/M6/M7-Tier-K, target
+> machine) + Waves 6–7** (server twin + polish). Plus a Connection-Mutex soundness fix. 528 tests.
+> **Latest (2026-07-18): M7 Tier-P (5.4, Slice 1) COMPLETE.** Every profile now gets a
+> physically-separate workspace subtree `workspace/<profile>`, resolved at call time from
+> `ExecCtx.profile`: all 6 fs tools + `shell_exec` (its cwd AND tmp scratch, so both macOS
+> Seatbelt subpaths are per-profile) + `ProtectedPathHook`'s resolved-path signal re-root per
+> profile. `profile_workspace_path` mirrors `Storage::open_profile`'s denylist byte-for-byte (no
+> trim). A one-time legacy-workspace migration moves pre-Tier-P pooled data into the default
+> profile — **files-only, never a directory**, a structural invariant that makes profile
+> mis-attribution impossible (a dir is always ambiguous → left in place + logged).
+> **Adversarially reviewed across 3 workflows + a lean skeptic (~14 agents): 9 confirmed findings
+> ALL fixed** — 5 HIGH (trim divergence; `shell_exec` workspace bypass; `shell_exec` shared-tmp
+> exfil; migration sweeping live trees; `known_profiles` DB-desync), 3 MEDIUM (missing migration;
+> profile-named-file ENOTDIR; dangling-symlink clobber), 1 LOW (marker spoof) — several *dissolved*
+> by the files-only pivot. 532 tests. **Tier-K (live OS-kernel enforcement, Slices 2–4) is the
+> on-target remainder.**
 > **Latest (2026-07-18):** **Wave 3.5 COMPLETE** — both memory write-triggers:
 > the pre-compaction flush (`f89536e`, trigger #2: a LOCAL model sweeps
 > about-to-be-trimmed turns) AND the new-chat consolidation nudge (`e0929f0`,

@@ -67,6 +67,199 @@ fn arg_str<'a>(input: &'a ToolInput, key: &str) -> Option<&'a str> {
     input.args.get(key).and_then(|v| v.as_str())
 }
 
+/// Wave 5.4 / M7 (Tier-P) — the PER-PROFILE workspace root under `base`. Each
+/// profile gets its own physically-separate directory (`base/<profile>`), the
+/// same in-process isolation walled memory (§7) gives, so a `work` profile's
+/// files never sit in the `personal` profile's tree. This is the primary
+/// filesystem-confinement boundary; a kernel jail (Tier-K) is the on-target
+/// hardening layered ON TOP.
+///
+/// Pure + TRAVERSAL-SAFE by construction. The rule MIRRORS
+/// `Storage::open_profile` EXACTLY: apply the identical denylist to the RAW name
+/// (reject only the path-escaping forms — `/`, `\`, `..`, a leading `.`, empty),
+/// then use it VERBATIM as the subdir. This byte-for-byte equivalence is
+/// load-bearing and adversarially verified: `open_profile` keys a distinct
+/// `profiles/<name>.db` (and a distinct walled-memory island) off the raw name,
+/// so this MUST bucket by the raw name too, or two names `open_profile` treats
+/// as DISTINCT profiles would share one filesystem tree. Two traps that broke
+/// earlier cuts, both now avoided:
+/// - An allowlist (`[A-Za-z0-9_-]`) collapses a space/Unicode/punctuation name
+///   that `open_profile` accepts ("my work", "café") down to `base`.
+/// - A `.trim()` before the denylist collapses `" work"`/`"work "` onto `work`
+///   (and a whitespace-only name onto `base` itself), even though `open_profile`
+///   does NOT trim and treats each as its own profile. So do NOT trim.
+///
+/// Because a passing name has no separator and isn't `..`, `base.join(name)` is
+/// always a unique direct child of `base` (distinct names → distinct trees, no
+/// escape); the only name that collapses to `base` is the EMPTY string — the
+/// default/scratch `ExecCtx`, which `open_profile` also rejects, so it can never
+/// alias a real profile. Callers (the fs tools) create the dir; the
+/// `ProtectedPathHook` uses the path read-only.
+pub fn profile_workspace_path(base: &std::path::Path, profile: &str) -> PathBuf {
+    if profile.is_empty()
+        || profile.contains('/')
+        || profile.contains('\\')
+        || profile.contains("..")
+        || profile.starts_with('.')
+    {
+        return base.to_path_buf();
+    }
+    base.join(profile)
+}
+
+/// The filename that records the legacy-workspace migration already ran.
+const LEGACY_MIGRATION_MARKER: &str = ".tierp-migrated";
+/// The marker's CONTENT sentinel. Presence-only checks are unsafe (a legacy
+/// file that happens to be named `.tierp-migrated` would spoof "already done"
+/// and strand real data); we treat migration as done only when the marker holds
+/// this exact magic, and we (re)write it ourselves.
+const LEGACY_MIGRATION_MAGIC: &str = "lost-harness tier-p workspace migration v1\n";
+
+fn migration_is_done(marker: &std::path::Path) -> bool {
+    std::fs::read_to_string(marker).map(|s| s == LEGACY_MIGRATION_MAGIC).unwrap_or(false)
+}
+
+/// One-time, idempotent migration of the LEGACY shared workspace into the
+/// DEFAULT profile's per-profile root (M7 design, Slice 1: "migrate the legacy
+/// shared `workspace/` into the default profile's root, not deleted").
+///
+/// Before Tier-P every fs-tool write pooled at `<base>/workspace/*` regardless
+/// of profile. After Tier-P the default profile ("personal") resolves to
+/// `<base>/workspace/personal/`, so without this move a user's pre-upgrade files
+/// would still be OUT of reach of every fs tool (the MEDIUM regression the first
+/// review caught).
+///
+/// **Structural safety invariant (the key call — moving user data must NEVER
+/// mis-attribute one profile's tree to another): this moves REGULAR FILES ONLY,
+/// and NEVER moves a directory.** The rationale is decisive: after Tier-P the
+/// workspace root only ever contains per-profile *directories* + this marker
+/// (every tool write goes into a `workspace/<profile>/` subdir), so a loose
+/// *file* at the root can ONLY be legacy pooled data — always safe to move. A
+/// *directory* is inherently ambiguous — a live profile tree, an orphaned tree
+/// whose DB desynced, or a legacy subdir — and is impossible to classify safely
+/// by name alone (adversarial review disproved every name/known-list heuristic:
+/// a lost/desynced profile DB, or a legacy file colliding with a profile name,
+/// each defeated it). So we never move a directory; we leave it intact in place
+/// and LOG it (benign: its data is untouched, just not surfaced under the default
+/// profile — the human can move it deliberately). This makes profile
+/// mis-attribution *structurally impossible* rather than heuristically unlikely.
+///
+/// Also: the marker is CONTENT-checked ([`LEGACY_MIGRATION_MAGIC`]), not just
+/// presence-checked (a pre-existing same-named file can't spoof "done"); moves
+/// via `rename` within the same `workspace/` subtree (same filesystem → no
+/// `EXDEV`); never deletes; never clobbers an existing destination entry; moves
+/// everything movable in one pass and returns the first error WITHOUT stamping
+/// the marker (so a transient lock retries next boot). Called once at startup,
+/// before any fs tool runs.
+pub fn migrate_legacy_workspace(
+    workspace_root: &std::path::Path,
+    default_profile: &str,
+) -> std::io::Result<()> {
+    let marker = workspace_root.join(LEGACY_MIGRATION_MARKER);
+    if migration_is_done(&marker) {
+        return Ok(());
+    }
+    // Nothing on disk yet → stamp the marker so a file the user creates AFTER
+    // upgrade (but before the first tool call) is never mistaken for legacy data.
+    if !workspace_root.exists() {
+        std::fs::create_dir_all(workspace_root)?;
+        std::fs::write(&marker, LEGACY_MIGRATION_MAGIC)?;
+        return Ok(());
+    }
+    let dest = profile_workspace_path(workspace_root, default_profile);
+    // A degenerate default (empty/escaping → collapses to base) has no distinct
+    // subtree to isolate into; just stamp and return rather than self-move.
+    if dest == workspace_root {
+        std::fs::write(&marker, LEGACY_MIGRATION_MAGIC)?;
+        return Ok(());
+    }
+    let dest_name = dest.file_name();
+    std::fs::create_dir_all(&dest)?;
+    // Move everything movable in one pass; a single un-moveable entry (a lock, a
+    // permission error) must NOT block migrating the others. Track the first
+    // error and, if any, return it WITHOUT stamping the marker.
+    let mut first_err: Option<std::io::Error> = None;
+    let mut left_dirs: Vec<String> = Vec::new();
+    let mut left_collisions: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(workspace_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == std::ffi::OsStr::new(LEGACY_MIGRATION_MARKER) {
+            continue;
+        }
+        // Skip the destination profile dir itself (don't move it into itself).
+        if dest_name == Some(name.as_os_str()) {
+            continue;
+        }
+        // STRUCTURAL INVARIANT: only move REGULAR FILES. A directory (a live/
+        // orphaned profile tree, or a legacy subdir) or a symlink is ambiguous —
+        // never move it; leave it intact and record it for the log below.
+        let is_regular_file = match entry.file_type() {
+            Ok(ft) => ft.is_file(),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
+            }
+        };
+        if !is_regular_file {
+            if let Some(n) = name.to_str() {
+                left_dirs.push(n.to_string());
+            }
+            continue;
+        }
+        let to = dest.join(&name);
+        // Never clobber — if ANYTHING already sits at the destination (a partial
+        // earlier run, or a user's own file), leave both in place. Use lstat
+        // (`symlink_metadata`, no symlink follow), NOT `to.exists()`: the latter
+        // FOLLOWS the link, so a DANGLING destination symlink (e.g. a profile
+        // subfolder symlinked to a not-yet-mounted volume) would read as absent
+        // and `rename` would silently replace/orphan it — a review-caught clobber.
+        if std::fs::symlink_metadata(&to).is_ok() {
+            if let Some(n) = name.to_str() {
+                left_collisions.push(n.to_string());
+            }
+            continue;
+        }
+        if let Err(e) = std::fs::rename(entry.path(), &to) {
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
+    }
+    // Surface (never silently drop) any legacy top-level directories/symlinks
+    // left in place — their data is intact, just not under the default profile.
+    if !left_dirs.is_empty() {
+        tracing::warn!(
+            entries = ?left_dirs,
+            workspace = %workspace_root.display(),
+            default_profile = %default_profile,
+            "Tier-P migration left legacy top-level directories/symlinks IN PLACE (only loose \
+             files are auto-moved into the default profile, so a profile tree can never be \
+             mis-attributed); their data is intact — move them into the profile deliberately if needed"
+        );
+    }
+    // Surface any legacy files NOT moved because the destination name was already
+    // taken — also intact in place, but worth a trail (not a silent drop).
+    if !left_collisions.is_empty() {
+        tracing::warn!(
+            entries = ?left_collisions,
+            workspace = %workspace_root.display(),
+            default_profile = %default_profile,
+            "Tier-P migration left legacy files IN PLACE because a same-named entry already \
+             exists in the default profile; both copies are intact — reconcile deliberately if needed"
+        );
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => {
+            std::fs::write(&marker, LEGACY_MIGRATION_MAGIC)?;
+            Ok(())
+        }
+    }
+}
+
 // ── read_file ───────────────────────────────────────────────────────────────
 
 /// Read a UTF-8 text file from the workspace.
@@ -102,7 +295,9 @@ impl Tool for ReadFileTool {
             let Some(path) = arg_str(&input, "path") else {
                 return ToolResult::Err("read_file requires a string \"path\" arg".to_string());
             };
-            let resolved = match resolve_within(&self.root, path) {
+            let ws = profile_workspace_path(&self.root, &ctx.profile);
+            let _ = std::fs::create_dir_all(&ws);
+            let resolved = match resolve_within(&ws, path) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
@@ -169,11 +364,13 @@ impl Tool for ListDirTool {
     fn run<'a>(
         &'a self,
         input: ToolInput,
-        _ctx: &'a ExecCtx,
+        ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let path = arg_str(&input, "path").unwrap_or(".");
-            let resolved = match resolve_within(&self.root, path) {
+            let ws = profile_workspace_path(&self.root, &ctx.profile);
+            let _ = std::fs::create_dir_all(&ws);
+            let resolved = match resolve_within(&ws, path) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
@@ -227,7 +424,7 @@ impl Tool for SearchFilesTool {
     fn run<'a>(
         &'a self,
         input: ToolInput,
-        _ctx: &'a ExecCtx,
+        ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(query) = arg_str(&input, "query") else {
@@ -236,7 +433,9 @@ impl Tool for SearchFilesTool {
             if query.is_empty() {
                 return ToolResult::Err("search_files \"query\" must not be empty".to_string());
             }
-            let canon_root = match self.root.canonicalize() {
+            let ws = profile_workspace_path(&self.root, &ctx.profile);
+            let _ = std::fs::create_dir_all(&ws);
+            let canon_root = match ws.canonicalize() {
                 Ok(r) => r,
                 Err(e) => return ToolResult::Err(format!("workspace root unavailable: {e}")),
             };
@@ -489,7 +688,9 @@ impl Tool for WriteFileTool {
                     content.len()
                 ));
             }
-            let resolved = match resolve_within_new(&self.root, path) {
+            let ws = profile_workspace_path(&self.root, &ctx.profile);
+            let _ = std::fs::create_dir_all(&ws);
+            let resolved = match resolve_within_new(&ws, path) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
@@ -594,7 +795,9 @@ impl Tool for EditFileTool {
                 return ToolResult::Err("edit_file \"old\" must not be empty".to_string());
             }
             // Must exist — use the strict resolver.
-            let resolved = match resolve_within(&self.root, path) {
+            let ws = profile_workspace_path(&self.root, &ctx.profile);
+            let _ = std::fs::create_dir_all(&ws);
+            let resolved = match resolve_within(&ws, path) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
@@ -673,13 +876,15 @@ impl Tool for DeleteFileTool {
     fn run<'a>(
         &'a self,
         input: ToolInput,
-        _ctx: &'a ExecCtx,
+        ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(path) = arg_str(&input, "path") else {
                 return ToolResult::Err("delete_file requires a string \"path\" arg".to_string());
             };
-            let resolved = match resolve_within(&self.root, path) {
+            let ws = profile_workspace_path(&self.root, &ctx.profile);
+            let _ = std::fs::create_dir_all(&ws);
+            let resolved = match resolve_within(&ws, path) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
@@ -722,9 +927,26 @@ mod tests {
     /// `tracked_ctx()` across calls shares its read-set (they hold the same
     /// `Arc`), which is how a read on one call is seen by a write on the next.
     fn tracked_ctx() -> ExecCtx {
+        // Empty profile → the shared base workspace (Tier-P collapses an empty
+        // profile to `base`), so these read-before-write guard tests seed and
+        // assert at `root` exactly as before per-profile confinement existed.
+        // The per-profile isolation path has its own dedicated tests below.
         ExecCtx {
             conversation_id: "conv-1".to_string(),
-            profile: "personal".to_string(),
+            profile: String::new(),
+            reads: Some(Arc::new(ConversationReads::new())),
+            allow_private_memory: false,
+            session_mode: Default::default(),
+            ..ExecCtx::default()
+        }
+    }
+
+    /// A context bound to a specific named profile — exercises the Tier-P
+    /// per-profile confinement path (tools resolve under `base/<profile>`).
+    fn profile_ctx(profile: &str) -> ExecCtx {
+        ExecCtx {
+            conversation_id: "conv-1".to_string(),
+            profile: profile.to_string(),
             reads: Some(Arc::new(ConversationReads::new())),
             allow_private_memory: false,
             session_mode: Default::default(),
@@ -1123,5 +1345,328 @@ mod tests {
             matches!(write, ToolResult::Ok(_)),
             "after reading, a large writable file must be overwritable, got {write:?}"
         );
+    }
+
+    // ── Tier-P: per-profile filesystem confinement ───────────────────────────
+
+    #[test]
+    fn profile_workspace_path_is_traversal_safe() {
+        let base = std::path::Path::new("/ws");
+        // A simple identifier gets its own subdir.
+        assert_eq!(profile_workspace_path(base, "work"), base.join("work"));
+        assert_eq!(profile_workspace_path(base, "profile_2-a"), base.join("profile_2-a"));
+        // ONLY the empty string collapses to the shared base (the default/
+        // scratch ctx, which open_profile also rejects). Nothing else does.
+        assert_eq!(profile_workspace_path(base, ""), base.to_path_buf());
+        // A name `open_profile` ALSO accepts — a space, Unicode, or punctuation
+        // that isn't a path separator — must get its OWN verbatim subdir, NOT
+        // collapse to base. Otherwise two distinct real profiles would silently
+        // share one tree (the isolation hole an allowlist would open).
+        assert_eq!(profile_workspace_path(base, "my work"), base.join("my work"));
+        assert_eq!(profile_workspace_path(base, "café"), base.join("café"));
+        assert_eq!(profile_workspace_path(base, "work@home"), base.join("work@home"));
+        // Distinct valid names never map onto the same tree.
+        assert_ne!(
+            profile_workspace_path(base, "my work"),
+            profile_workspace_path(base, "personal space"),
+        );
+        // REGRESSION (adversarial review, HIGH): the helper must NOT trim. Since
+        // open_profile does not trim, `" work"`, `"work "`, and `"work"` are
+        // THREE distinct profiles (each its own profiles/<name>.db) — they must
+        // map to THREE distinct trees, never collide onto base/work. And a
+        // whitespace-only name (a distinct profile per open_profile) must get its
+        // own subdir, never collapse to base itself (which would expose every
+        // sibling profile's tree through an ordinary relative path).
+        assert_eq!(profile_workspace_path(base, " work"), base.join(" work"));
+        assert_eq!(profile_workspace_path(base, "work "), base.join("work "));
+        assert_ne!(profile_workspace_path(base, " work"), profile_workspace_path(base, "work"));
+        assert_ne!(profile_workspace_path(base, "work "), profile_workspace_path(base, "work"));
+        assert_ne!(profile_workspace_path(base, " work"), profile_workspace_path(base, "work "));
+        assert_ne!(profile_workspace_path(base, "   "), base.to_path_buf());
+        assert_eq!(profile_workspace_path(base, "   "), base.join("   "));
+        // The path-escaping forms `open_profile` rejects (`/`, `\`, `..`, a
+        // leading `.`) collapse to base fail-safe — never a climb-out.
+        for evil in ["..", "../etc", "a/b", "a\\b", ".", "  ..  ", ".hidden", "sub/../.."] {
+            assert_eq!(
+                profile_workspace_path(base, evil),
+                base.to_path_buf(),
+                "an escaping profile {evil:?} must collapse to base, never escape it"
+            );
+        }
+        // Core invariant: the result is NEVER outside base — it is either base
+        // itself or a direct (non-`..`) child of it, for every input.
+        for name in ["work", "my work", "café", "..", "a/b", "", "~", ".ssh", "work@home", " work", "   "] {
+            let got = profile_workspace_path(base, name);
+            assert!(
+                got == base || got.parent() == Some(base),
+                "profile {name:?} → {got:?} must stay within base"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_profiles_get_physically_separate_trees() {
+        // The SAME base + the SAME relative path, under two different profiles,
+        // must be two different files — a `work` profile can't read `personal`'s.
+        let root = workspace();
+        let write = WriteFileTool::new(&root);
+        let read = ReadFileTool::new(&root);
+
+        // `work` writes secret.txt.
+        let w = write
+            .run(
+                ToolInput::new(json!({"path": "secret.txt", "content": "work-only"})),
+                &profile_ctx("work"),
+            )
+            .await;
+        assert!(matches!(w, ToolResult::Ok(_)), "work write should succeed, got {w:?}");
+
+        // `personal` reading the SAME relative path must NOT see work's file.
+        let cross = read
+            .run(ToolInput::new(json!({"path": "secret.txt"})), &profile_ctx("personal"))
+            .await;
+        assert!(
+            matches!(cross, ToolResult::Err(_)),
+            "personal must not see work's secret.txt — got {cross:?}"
+        );
+
+        // `work` reading its own file back does see it.
+        let own = read
+            .run(ToolInput::new(json!({"path": "secret.txt"})), &profile_ctx("work"))
+            .await;
+        assert!(
+            matches!(own, ToolResult::Ok(ref v) if v["content"] == "work-only"),
+            "work must read back its own file, got {own:?}"
+        );
+
+        // And on disk they live in physically-separate per-profile subtrees.
+        assert!(root.join("work").join("secret.txt").is_file());
+        assert!(!root.join("personal").join("secret.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn per_profile_path_cannot_escape_its_subtree() {
+        // Even a profile-bound call can't `..` out of its own per-profile root
+        // into a sibling profile's tree (resolve_within rejects `..`).
+        let root = workspace();
+        std::fs::create_dir_all(root.join("personal")).unwrap();
+        std::fs::write(root.join("personal").join("diary.txt"), "private").unwrap();
+        let read = ReadFileTool::new(&root);
+        let escape = read
+            .run(
+                ToolInput::new(json!({"path": "../personal/diary.txt"})),
+                &profile_ctx("work"),
+            )
+            .await;
+        assert!(
+            matches!(escape, ToolResult::Err(ref e) if e.contains("'..'")),
+            "a profile must not climb into a sibling profile's tree, got {escape:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_profile_still_uses_the_shared_base() {
+        // Backward-compat: a default/empty-profile ctx resolves at base, so a
+        // file seeded at root is readable without any per-profile subdir.
+        let root = workspace();
+        let read = ReadFileTool::new(&root);
+        let out = read
+            .run(ToolInput::new(json!({"path": "hello.txt"})), &ctx())
+            .await;
+        assert!(
+            matches!(out, ToolResult::Ok(ref v) if v["content"] == "hello world\nsecond line\n"),
+            "empty profile must read the base-root file, got {out:?}"
+        );
+    }
+
+    // ── Tier-P: legacy-workspace migration ───────────────────────────────────
+
+    #[tokio::test]
+    async fn legacy_workspace_migrates_loose_files_into_the_default_profile_and_is_reachable() {
+        // A pre-Tier-P install: loose files + a subdir pooled directly at the
+        // shared workspace base. Loose FILES migrate under the default profile's
+        // subtree (reachable by its tools); a DIRECTORY is left in place (never
+        // moved — a dir can't be safely classified as legacy-vs-live).
+        let ws = workspace(); // seeds hello.txt (file) + sub/notes.md (a subdir)
+        migrate_legacy_workspace(&ws, "personal").unwrap();
+
+        // The loose file is physically moved under personal/, not deleted.
+        assert!(ws.join("personal").join("hello.txt").is_file());
+        assert!(!ws.join("hello.txt").exists(), "the legacy file must be MOVED, not copied");
+        // The directory is left intact in place — NOT moved into personal.
+        assert!(ws.join("sub").join("notes.md").is_file(), "a legacy dir stays put, data intact");
+        assert!(!ws.join("personal").join("sub").exists(), "a directory is never moved");
+        assert!(ws.join(LEGACY_MIGRATION_MARKER).is_file(), "marker recorded");
+
+        // The default ("personal") profile can now read its migrated file.
+        let read = ReadFileTool::new(&ws);
+        let out = read
+            .run(ToolInput::new(json!({"path": "hello.txt"})), &profile_ctx("personal"))
+            .await;
+        assert!(
+            matches!(out, ToolResult::Ok(ref v) if v["content"] == "hello world\nsecond line\n"),
+            "personal must read its migrated legacy file, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_is_idempotent_and_does_not_sweep_post_upgrade_files() {
+        let ws = workspace();
+        migrate_legacy_workspace(&ws, "personal").unwrap();
+        // A file the user creates AFTER the migration (directly at base — e.g. a
+        // different profile's fresh subtree, or scratch) must NOT be swept into
+        // personal on a later boot.
+        std::fs::write(ws.join("post_upgrade.txt"), "new").unwrap();
+        std::fs::create_dir_all(ws.join("work")).unwrap();
+        std::fs::write(ws.join("work").join("w.txt"), "work-file").unwrap();
+        migrate_legacy_workspace(&ws, "personal").unwrap(); // second run: no-op
+
+        assert!(ws.join("post_upgrade.txt").is_file(), "a post-migration base file stays put");
+        assert!(ws.join("work").join("w.txt").is_file(), "a fresh profile subtree is untouched");
+        assert!(!ws.join("personal").join("post_upgrade.txt").exists());
+        assert!(!ws.join("personal").join("work").exists());
+    }
+
+    #[test]
+    fn legacy_migration_never_clobbers_and_stamps_on_empty_root() {
+        // Fresh install (no workspace dir yet): stamp the marker, create the dir,
+        // move nothing.
+        let base = std::env::temp_dir().join(format!("lhp-fs-fresh-{}", uuid::Uuid::new_v4()));
+        migrate_legacy_workspace(&base, "personal").unwrap();
+        assert!(base.join(LEGACY_MIGRATION_MARKER).is_file());
+        assert!(!base.join("personal").exists(), "nothing to migrate → no default subtree forced");
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Clobber-safety: a destination entry already present is left in place.
+        let ws = std::env::temp_dir().join(format!("lhp-fs-clob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(ws.join("personal")).unwrap();
+        std::fs::write(ws.join("personal").join("dup.txt"), "DEST").unwrap();
+        std::fs::write(ws.join("dup.txt"), "LEGACY").unwrap();
+        migrate_legacy_workspace(&ws, "personal").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.join("personal").join("dup.txt")).unwrap(),
+            "DEST",
+            "an existing destination entry must never be clobbered"
+        );
+        assert!(ws.join("dup.txt").is_file(), "the un-migratable legacy entry is left in place, not lost");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn legacy_migration_never_moves_a_directory_only_loose_files() {
+        // REGRESSION (adversarial re-review, HIGH + MEDIUM): the structural
+        // invariant that makes profile mis-attribution impossible. A DIRECTORY at
+        // the workspace root — whether a live profile tree, an ORPHANED tree whose
+        // DB desynced, or a legacy subdir — is NEVER moved, with NO marker and NO
+        // known-profile list needed. Only loose regular FILES migrate. This also
+        // means a legacy file whose NAME collides with a profile is moved (as a
+        // file), never skipped-and-stranded into an ENOTDIR-breaking state.
+        let ws = std::env::temp_dir().join(format!("lhp-fs-live-{}", uuid::Uuid::new_v4()));
+        // An orphaned/live profile-shaped tree — its DB is NOT known here at all.
+        std::fs::create_dir_all(ws.join("work")).unwrap();
+        std::fs::write(ws.join("work").join("secret.txt"), "work-only").unwrap();
+        // A plain legacy subdir (arbitrary name) and a loose legacy file.
+        std::fs::create_dir_all(ws.join("project")).unwrap();
+        std::fs::write(ws.join("project").join("main.rs").as_path(), "fn main(){}").unwrap();
+        std::fs::write(ws.join("legacy_note.txt"), "legacy").unwrap();
+        // No marker; no known-profile list exists in the API anymore.
+        migrate_legacy_workspace(&ws, "personal").unwrap();
+
+        // Every directory is untouched in place — NOT folded into personal.
+        assert_eq!(
+            std::fs::read_to_string(ws.join("work").join("secret.txt")).unwrap(),
+            "work-only",
+            "an orphaned/live profile tree must never be swept, even with no known-profile signal"
+        );
+        assert!(!ws.join("personal").join("work").exists(), "work dir must not be nested under personal");
+        assert!(ws.join("project").join("main.rs").is_file(), "a legacy subdir stays put, data intact");
+        assert!(!ws.join("personal").join("project").exists(), "no directory is ever moved");
+        // The genuinely-loose legacy file DID migrate.
+        assert!(ws.join("personal").join("legacy_note.txt").is_file(), "loose legacy files still migrate");
+        assert!(!ws.join("legacy_note.txt").exists());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_moves_a_file_named_like_a_profile_without_breaking_it() {
+        // REGRESSION (adversarial re-review, MEDIUM): a legacy loose FILE whose
+        // name equals a profile ("work") must be MOVED (it's a file), never left
+        // at workspace/work where the work profile's `create_dir_all` would hit a
+        // non-directory and every fs tool would fail with ENOTDIR.
+        let ws = workspace();
+        std::fs::write(ws.join("work"), "a file, not a dir").unwrap();
+        migrate_legacy_workspace(&ws, "personal").unwrap();
+        assert!(
+            ws.join("personal").join("work").is_file(),
+            "a profile-named FILE is migrated into personal, not skipped"
+        );
+        assert!(!ws.join("work").exists(), "workspace/work is freed, so the work profile can mkdir it");
+
+        // Proof there's no ENOTDIR breakage: the `work` profile now creates and
+        // writes into its own fresh directory tree without error.
+        let out = WriteFileTool::new(&ws)
+            .run(ToolInput::new(json!({"path": "note.txt", "content": "hi"})), &profile_ctx("work"))
+            .await;
+        assert!(matches!(out, ToolResult::Ok(_)), "the work profile's tools must work, got {out:?}");
+        assert!(ws.join("work").join("note.txt").is_file(), "work now has a real directory tree");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn legacy_migration_marker_is_content_checked_not_spoofable_by_name() {
+        // REGRESSION (adversarial re-review, LOW): a pre-existing file literally
+        // named `.tierp-migrated` (wrong content) must NOT be taken as "already
+        // migrated" — otherwise legacy data would be stranded. Migration proceeds,
+        // then (re)writes the marker with the real magic.
+        let ws = workspace(); // seeds hello.txt at base
+        std::fs::write(ws.join(LEGACY_MIGRATION_MARKER), "not our magic").unwrap();
+        migrate_legacy_workspace(&ws, "personal").unwrap();
+
+        assert!(
+            ws.join("personal").join("hello.txt").is_file(),
+            "a spoofed marker must not skip migration — legacy data still moves"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join(LEGACY_MIGRATION_MARKER)).unwrap(),
+            LEGACY_MIGRATION_MAGIC,
+            "the marker is rewritten with the real magic after a real migration"
+        );
+        // And now it IS treated as done (idempotent second run).
+        std::fs::write(ws.join("late.txt"), "post").unwrap();
+        migrate_legacy_workspace(&ws, "personal").unwrap();
+        assert!(ws.join("late.txt").is_file(), "a valid marker now short-circuits");
+        assert!(!ws.join("personal").join("late.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_migration_does_not_clobber_a_dangling_destination_symlink() {
+        // REGRESSION (adversarial re-review, MEDIUM/HIGH): the never-clobber guard
+        // must use lstat, not `Path::exists()` (which FOLLOWS symlinks). A DANGLING
+        // destination symlink — e.g. a profile subfolder pointing at a not-yet-
+        // mounted volume — must NOT be silently replaced/orphaned by an incoming
+        // legacy file of the same name.
+        let ws = std::env::temp_dir().join(format!("lhp-fs-dangle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(ws.join("personal")).unwrap();
+        // A dangling symlink at the destination (target does not exist).
+        std::os::unix::fs::symlink(
+            ws.join("nonexistent-mount-point"),
+            ws.join("personal").join("photos"),
+        )
+        .unwrap();
+        // A legacy loose file with the SAME name at the workspace root.
+        std::fs::write(ws.join("photos"), "LEGACY DATA").unwrap();
+
+        migrate_legacy_workspace(&ws, "personal").unwrap();
+
+        // The dangling symlink is preserved as a symlink — NOT clobbered.
+        let meta = std::fs::symlink_metadata(ws.join("personal").join("photos")).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "a dangling destination symlink must survive the migration untouched"
+        );
+        // The legacy file is left in place (collision), not lost.
+        assert!(ws.join("photos").is_file(), "the un-migratable legacy file stays put, not lost");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

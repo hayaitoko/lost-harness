@@ -459,6 +459,21 @@ fn build_tool_dispatcher(
             "failed to create the tool workspace directory"
         );
     }
+    // M7 Tier-P: one-time, idempotent migration of any LEGACY shared workspace
+    // (loose files written before per-profile confinement, which pooled directly
+    // at `workspace/*`) into the default profile's subtree, so a pre-upgrade
+    // user's files stay reachable instead of being stranded outside every
+    // re-rooted fs tool. Default = "personal" (matches `ipc::get_active_profile`).
+    // Moves regular files ONLY — never a directory — so a profile tree can never
+    // be mis-attributed (see the fn's structural-invariant docs). Runs before any
+    // tool is registered/used; a failure here must not block boot.
+    if let Err(e) = crate::tools::fs::migrate_legacy_workspace(&workspace, "personal") {
+        tracing::warn!(
+            error = %e,
+            path = %workspace.display(),
+            "legacy-workspace migration failed; pre-upgrade files may be unreachable until resolved"
+        );
+    }
     // Captured before `workspace` is moved into `DeleteFileTool::new` below,
     // so the protected-path floor can resolve a call's `path` arg the same
     // way the fs tools do (following symlinks) and catch an in-workspace

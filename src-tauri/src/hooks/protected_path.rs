@@ -140,9 +140,17 @@ impl GatingHook for ProtectedPathHook {
         // "path" arg and only when a workspace root is wired; everything
         // else yields `None` and relies solely on the raw-text match,
         // unchanged from before.
-        let resolved_text: Option<String> = self.workspace_root.as_deref().and_then(|root| {
+        let resolved_text: Option<String> = self.workspace_root.as_deref().and_then(|base| {
             let rel = ctx.input.args.get("path")?.as_str()?;
-            let resolved = crate::tools::fs::canonicalize_best_effort(root, rel)?;
+            // Re-root to the SAME per-profile workspace the fs tools confine to
+            // (M7 Tier-P). `workspace_root` is the shared BASE; the tools resolve
+            // "path" against `base/<profile>`, so a fixed-base resolve here would
+            // canonicalize the WRONG target — missing a real protected symlink in
+            // the per-profile tree, and false-matching a base-relative path the
+            // per-profile tools never touch. Resolve against the same per-profile
+            // root the tool used (empty profile → base, unchanged for tests).
+            let root = crate::tools::fs::profile_workspace_path(base, &ctx.profile);
+            let resolved = crate::tools::fs::canonicalize_best_effort(&root, rel)?;
             let mut s = resolved.to_string_lossy().into_owned();
             // Normalize a bare-directory target (e.g. `alias` itself, which
             // resolves straight to `.../.git`) so it still matches the
@@ -297,6 +305,41 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_signal_re_roots_to_the_call_s_profile() {
+        // Tier-P: the fs tools confine to `base/<profile>`, so the hook's
+        // resolved-path signal must re-root the SAME way. A `.git` symlink living
+        // in the `work` profile's subtree is caught for a `work`-profile call,
+        // and the raw text alone (an innocuous `alias/pwned`) would not catch it —
+        // proving the per-profile resolution is doing the work.
+        let base =
+            std::env::temp_dir().join(format!("lhp-protected-profile-{}", uuid::Uuid::new_v4()));
+        let work = base.join("work");
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        std::os::unix::fs::symlink(work.join(".git"), work.join("alias")).unwrap();
+
+        // Hook wired with the shared BASE (as lib.rs does), not the per-profile dir.
+        let hook = ProtectedPathHook::new().with_workspace_root(&base);
+
+        let raw_text = "write_file {\"path\":\"alias/pwned\"}";
+        assert!(!raw_text.to_ascii_lowercase().contains(".git/"));
+
+        // A `work`-profile call: resolves under base/work → hits the symlink.
+        let mut c = EventContext::pre_tool_use("write_file")
+            .with_command_text(raw_text)
+            .with_profile("work")
+            .with_input(crate::tools::ToolInput::new(
+                serde_json::json!({"path": "alias/pwned"}),
+            ));
+        match hook.on_event(&mut c) {
+            HookResult::Ask(_) => {}
+            other => panic!("expected Ask via per-profile resolution, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

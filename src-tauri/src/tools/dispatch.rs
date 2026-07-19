@@ -1294,7 +1294,11 @@ mod tests {
         let mut root = std::env::temp_dir();
         root.push(format!("lhp-dispatch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("greeting.txt"), "hello from disk").unwrap();
+        // The dispatch `ctx()` runs under profile "personal" → the fs tools
+        // confine to `base/<profile>` (Tier-P); seed where the tool will read.
+        let ws = crate::tools::fs::profile_workspace_path(&root, &ctx().profile);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("greeting.txt"), "hello from disk").unwrap();
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ReadFileTool::new(PathBuf::from(&root))));
@@ -1792,6 +1796,9 @@ mod tests {
         use crate::tools::fs::WriteFileTool;
         let root = std::env::temp_dir().join(format!("lhp-approve-write-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        // ctx() runs under profile "personal" → the tool writes under
+        // base/<profile> (Tier-P); assert against that per-profile root.
+        let ws = crate::tools::fs::profile_workspace_path(&root, &ctx().profile);
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(WriteFileTool::new(&root)));
@@ -1819,7 +1826,7 @@ mod tests {
         assert!(matches!(outcome, ToolOutcome::Ok(_)), "approved write should run, got {outcome:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "should have prompted exactly once");
         assert_eq!(
-            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            std::fs::read_to_string(ws.join("note.txt")).unwrap(),
             "hi",
             "the file must actually exist with the written content"
         );
@@ -1833,7 +1840,11 @@ mod tests {
         use crate::tools::fs::{ReadFileTool, WriteFileTool};
         let root = std::env::temp_dir().join(format!("lhp-rbw-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("doc.txt"), "original").unwrap();
+        // ctx() runs under profile "personal" → the tools confine to
+        // base/<profile> (Tier-P); seed + assert against that per-profile root.
+        let ws = crate::tools::fs::profile_workspace_path(&root, &ctx().profile);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("doc.txt"), "original").unwrap();
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ReadFileTool::new(&root)));
@@ -1861,7 +1872,7 @@ mod tests {
             matches!(blind, ToolOutcome::Err(ref e) if e.contains("read_file it first")),
             "blind overwrite must be refused, got {blind:?}"
         );
-        assert_eq!(std::fs::read_to_string(root.join("doc.txt")).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(ws.join("doc.txt")).unwrap(), "original");
 
         // 2) Read it (records into the dispatcher's shared read-set)…
         let _ = dispatcher
@@ -1885,7 +1896,7 @@ mod tests {
             matches!(ok, ToolOutcome::Ok(_)),
             "read→write across calls must be allowed, got {ok:?}"
         );
-        assert_eq!(std::fs::read_to_string(root.join("doc.txt")).unwrap(), "rewritten");
+        assert_eq!(std::fs::read_to_string(ws.join("doc.txt")).unwrap(), "rewritten");
     }
 
     // ── Q4 do-now item 2: per-turn + per-run budgets, repeat detection,
@@ -2410,12 +2421,20 @@ mod tests {
         use crate::tools::fs::WriteFileTool;
         let root = std::env::temp_dir().join(format!("lhp-pp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        // The dispatch `ctx()` runs under a named profile, so the fs tools AND
+        // the floor's resolved-path signal both confine to `base/<profile>`
+        // (Tier-P). Seed the protected structure — and hand callers back — that
+        // SAME per-profile root, computed exactly as the tool does, so the
+        // tests' `.git`/`.ssh`/symlink setup lands where the tool will resolve.
+        // The tool + chain are still wired with the BASE root; they re-root by
+        // `ctx.profile` internally.
+        let profile_root = crate::tools::fs::profile_workspace_path(&root, &ctx().profile);
         // Pre-create the protected-path parent dirs the tests below
         // write into — `WriteFileTool` requires the parent directory to
         // exist (an orthogonal safety check that has nothing to do with
         // the floor itself).
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::create_dir_all(profile_root.join(".git")).unwrap();
+        std::fs::create_dir_all(profile_root.join(".ssh")).unwrap();
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(WriteFileTool::new(&root)));
@@ -2446,7 +2465,7 @@ mod tests {
         });
         let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::new([Capability::Filesystem]))
             .with_approval(ledger, Some(prompter));
-        (dispatcher, calls, root)
+        (dispatcher, calls, profile_root)
     }
 
     #[tokio::test]
