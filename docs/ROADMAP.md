@@ -107,7 +107,18 @@ the status board sitting on top of all of them.
 > its review first; m5 needs a multimodal model client prereq; m8 needs a
 > catalog-source decision), then **Wave 6 server** + **Wave 7 polish→beta** — the
 > big native/networking half, multi-session, some gated on native APIs / external
-> resources / Lukas decisions. **Next fronts (per the
+> resources / Lukas decisions. **M8 model-lifecycle SUBSTANTIALLY BUILT** (Lukas:
+> build all flagships, HF source): S1 hardware probe (`97c260b`), S2 curated
+> catalog, S3 download + SHA-verify + resume — the verified-before-runnable
+> invariant (`fa155b4`), the download IPC (`97ca856`), the Settings→Models catalog
+> UI (`30ed0ea`). **453 → 510 tests.** Deferred: S4 sidecar (native binary),
+> release-curation of the catalog sha256s. **The remaining flagships — M5
+> computer-use, M6 voice, M7 OS-sandbox — are HEAVY NATIVE builds** (macOS
+> accessibility/CGEvent/ScreenCaptureKit; Core Audio/whisper/TTS;
+> seatbelt/namespaces/AppContainer) requiring the TARGET OS + native APIs to build
+> AND verify — not meaningfully doable in a headless analysis context, and their
+> designs flagged NEEDS-REVISION. Wave 6 server needs external infra; Wave 7 is
+> release engineering. **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
