@@ -84,8 +84,11 @@ the status board sitting on top of all of them.
 > find→verify); all 11 confirmed findings fixed** — incl. 3 HIGH: helper-result
 > injection (guard-wrapped when re-fed to the main agent), Private-parent→cloud
 > downgrade (helper inherits the turn binding), cross-agent grant leak
-> (sub-dispatcher runs headless). **Done-when met.** **453 → 491 tests.** **4.3
-> remaining:** 4.3d agent-type management UI (built-in personas already ship).
+> (sub-dispatcher runs headless). **Done-when met.** Plus **4.3d** — the Settings
+> → Agent types management UI (`cbc774c`, approve/reject/delete personas). **WAVE
+> 4.3 FULLY COMPLETE.** **453 → 491 tests.** **Wave 4 remaining:** 4.4 (the
+> work_items queue + `WorkQueueRunner` are LIVE — a cron runner using them is the
+> rest); 4.5 capability packs (bundle skills+agent-types+cron). Then Waves 5–7.
 > **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
