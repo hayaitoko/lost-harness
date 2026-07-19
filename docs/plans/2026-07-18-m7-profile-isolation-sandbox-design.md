@@ -1,6 +1,6 @@
 # M7 / 5.4 — Per-profile isolation + OS sandbox (design)
 
-> **STATUS: design-pass draft (2026-07-18). Skeptical review verdict: NEEDS-REVISION.** Read the **Design Review** at the bottom before building — it flags concrete architecture gaps to fold in during the build phase.
+> **STATUS: design-pass, revised (2026-07-18). Skeptical review verdict was NEEDS-REVISION; addressed in `## Revision v2` at the bottom — READ THAT LAST.** The v2 section supersedes the original where they conflict: it restates INV-M7b as two honest enforcement tiers, re-roots `ProtectedPathHook` per profile, splits the kernel backends into their own spike-gated milestones, pulls MCP-child confinement out of scope, adds Email/Calendar/Tasks to `app_default`, and closes Q4. Build-ready for the macOS-first path (Slices 1/2/4a/5/6); Linux/Windows and Q1–Q3 remain open. Read the original §§1–7, then the Design Review, then Revision v2.
 
 
 Status: DESIGN (Wave-5 flagship, design-pass-first per BUILD-MANIFEST §"Scope honesty").
@@ -427,3 +427,127 @@ By contrast **Q3 (walled ⇒ network-deny) is correctly flagged as genuinely ope
 
 ## Credit where due
 The parts that matter most are right: RiskClass→policy derivation (§2.5) matches `lib.rs:573-583` exactly with no new gating code; `ExecCtx.profile` is genuinely threaded end-to-end (`args.profile` → `AgentLoop::run` → `ExecCtx` → `dispatch.rs:485`), so §2.3 option B is well-founded (the `get_active_profile` stub at `ipc/mod.rs:254` only affects the UI chip, not the data path); INV-M7a's fail-closed claims map precisely to real code (`exec.rs:229-231`, `UnsupportedSandbox :392`); and per-profile physical storage correctly mirrors the walled-memory pattern (`storage/mod.rs:117-160`).
+
+---
+
+## Revision v2 (addressing the review)
+
+*Written after re-reading the cited code end-to-end. Each subsection resolves one review finding, grounded in how the spine ACTUALLY works. No new parallel machinery — everything below reuses `RiskClass`, `Capability`, the `HookChain`, `ActionFingerprint`/`resolve_grant`, `run_guarded`'s fail-closed spawn, and `enforce_local_routing`. Where the revision changes a slice, the slice is re-stated with an honestly-achievable gate (and flagged when it needs an integration/real-subprocess harness rather than `cargo test --lib`).*
+
+### R0. The one correction that reshapes everything: two enforcement tiers, not one
+
+The review is right that the design blurred **two** enforcement tiers under one word "sandbox." Grounding them precisely, because the rest of the revision hangs off this:
+
+- **Tier K (kernel jail).** Applies to **child-process spawns only** — today `shell_exec` via `MacSeatbeltSpawn` (`exec.rs:305`), tomorrow any other spawn routed through the `SandboxedSpawn`/`ProfileConfinement` trait (`exec.rs:86`). This is the tier that "holds even if an in-process check is bypassed," because the confinement is imposed by the OS on a *separate process image*.
+- **Tier P (in-process path confinement + physical separation).** Applies to the **native fs tools** — `ReadFileTool`/`ListDirTool`/`SearchFilesTool`/`WriteFileTool`/`EditFileTool`/`DeleteFileTool`, each holding a fixed `root: PathBuf` (`fs.rs:73,146,204,445,551,646`) and gating every access through `resolve_within` (`fs.rs:39`) / `resolve_within_new` (`fs.rs:338`). These run **in the Tauri process**. Their boundary is exactly the tier walled memory already gives data: an in-process guard *plus* physically-separate files — no kernel backstop, because there is no child process to jail.
+
+M7 makes **both** tiers per-profile. It does **not** promote Tier P to Tier K (routing every `read_file` through a subprocess jail is not worth the per-call fork cost, and isn't proposed). The fix is to state the invariant truthfully per tier — done in R1.
+
+### R1. INV-M7b restated honestly (review gap #1)
+
+The old INV-M7b claimed kernel enforcement "even if `resolve_within` is bypassed" for *all* file-touching operations. That is false for Tier P. Replacement:
+
+> **INV-M7b (physical, not a filter — extends §7 walled memory to execution + PIM data).** A tool executing under profile P touches only P's `workspace/`, P's `tmp/`, P's `.db`, and P's `allowed_domains`. The boundary is enforced at **two tiers, each stated at its true strength**:
+> - **Child processes (`shell_exec`, and any future spawn through `ProfileConfinement`)** are confined by the **OS kernel** to P's `profile_root`+`tmp_root` and P's network posture. This tier holds even if the in-process path checks or the hook chain are bypassed by a bug, because the confinement is applied to a separate process image (`exec.rs:6-10`, `run_guarded` fail-closed at `exec.rs:229-231`).
+> - **Native fs tools** are confined by the **in-process** `resolve_within`/`resolve_within_new` check (`fs.rs:39,338`) re-rooted to P's `workspace/`, **plus physically-separate directories and DB files** — the *same tier walled memory already provides for data* (`storage/mod.rs:117-160`). This is defense-in-depth (path check ∧ physical separation), not kernel enforcement; a bug that defeats *both* the path check and the physical layout is required to cross the boundary, which is strictly stronger than today's single shared `workspace/`, but is honestly weaker than the kernel tier.
+
+The genuinely-new-vs-shipped bit survives: walled memory covered *data*, local-routing covered *model egress*; INV-M7b adds *execution + PIM data*, with the kernel tier as a real strengthening for the child-process surface. It is no longer overclaimed for fs tools.
+
+**Under-inventory fix — `ProtectedPathHook` must re-root per profile.** The review is correct: `ProtectedPathHook` is built once with a fixed `hook_workspace_root` (`lib.rs`, passed as `Some(hook_workspace_root)` into `build_pretooluse_chain_full`), and it resolves a call's `path` arg against that fixed root via `canonicalize_best_effort(root, rel)` (`protected_path.rs:143-154`). After the per-profile split, a `write_file` under profile B whose `path` is a symlink would be canonicalized against the *shared/default* root — the floor could miss a protected target, or resolve the wrong one. The clean fix reuses the machinery already in place: **the hook already receives the active profile** — `EventContext.profile` (`hooks/mod.rs:194`) is stamped by the dispatcher via `.with_profile(ctx.profile.as_str())` (`dispatch.rs:485`). So:
+
+- Replace `ProtectedPathHook`'s `workspace_root: Option<PathBuf>` with a `resolver: Option<Arc<WorkspaceResolver>>` (the same `WorkspaceResolver` §2.3 introduces).
+- In `on_event`, resolve against `self.resolver.root_for(&ctx.profile)` instead of a fixed root (`protected_path.rs:143`). Empty profile → the scratch/default root, exactly as the fs tools handle a `Default` `ExecCtx`.
+- No change to the hook's position, its hardcoded `PROTECTED` list, its Once-only `covers_once` contract, or the dispatcher's forced-Once piggyback (`dispatch.rs:611-616`). The floor stays non-overridable; it just canonicalizes against the correct profile's root.
+
+This keeps the protected-path floor *fed, not weakened*: it still runs before `PermissionHook` (`hooks/mod.rs:540-551`), still Ask-only-satisfiable by a fresh `Once` grant.
+
+### R2. Split the kernel backends; gate each on an enforcement-verification spike (review gap #2)
+
+The old Slice 3 folded macOS-done + Linux + Windows into one committable slice with the gate "behavior suite passes on Linux and Windows in CI." That is not honestly achievable as one slice, for the reason the review names: `platform/{linux,windows}/mod.rs` are stubs, each backend is a multi-week security effort, and — critically — the CI matrix (`build.yml:16` = `[macos-latest, ubuntu-latest, windows-latest]`, running `cargo test --verbose`) may run those OSes *under GitHub's own sandbox*, where `unshare(CLONE_NEWNET)`, Landlock, or AppContainer may not actually enforce. If they don't, `is_enforcing()==false` makes the behavior tests **skip**, and a green CI would falsely imply a working jail.
+
+Revised split:
+
+- **Slice 3-spike (blocking, precedes 3a/3b) — "does the backend enforce on the runner?"** A tiny, loud probe test per platform that asserts `is_enforcing()==true` on that CI runner AND that a known out-of-root write is actually OS-denied by a real subprocess. If a runner can't enforce, this test **fails or is explicitly reported as UNVERIFIED** (a printed skip marker + a non-passing status the merge gate reads) — never a silent green. This converts the review's "hollow CI" risk into a visible gate. *This is a real-subprocess integration test, not `cargo test --lib`* — it spawns a child and inspects kernel behavior, exactly like the existing macOS Seatbelt tests (`exec.rs:698-748`), which already run under `cargo test` but only on macOS.
+- **Slice 3a — Linux backend (own milestone).** Landlock ABI probe + seccomp-bpf + net-namespace + cgroup-kill, per §4. `is_enforcing()` probes Landlock at startup; non-enforcing → `UnsupportedSandbox`-style hard-deny (fail closed, `exec.rs:392-405`). *Gate:* on a runner the spike proved enforcing, the workspace-in/out + net-off suite passes against a **real** subprocess, and the cgroup kill reaps a `setsid` grandchild (the escape `exec.rs:106-113` documents). Integration harness required.
+- **Slice 3b — Windows backend (own milestone).** AppContainer + per-profile capability SID + restricted token + Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), per §4. Same gate shape as 3a, same integration-harness requirement.
+
+Both 3a and 3b keep the fail-closed default: until the spike proves a platform enforces, that platform stays hard-deny (`shell_exec` registered-but-unrunnable), never a bare spawn. §6's "no `#[cfg(feature)]` may strip confinement" reviewer check is unchanged.
+
+### R3. The two deliverables that rested on unbuilt machinery (review gap #3)
+
+**(a) MCP-child confinement → out of M7's execution scope; kept as the documented seam.** `mcp.rs` is an explicit inert stub (`UnwiredTransport`, `#![allow(dead_code)]`, `mcp.rs:9`) — no stdio/JSON-RPC transport exists. Confining an MCP child is meaningless until there is a child. So:
+
+- **Non-goal (moved from §1 #4):** wiring MCP stdio child processes through the jail is **not** in M7 — it lands with the MCP transport, its own larger item.
+- **Seam kept:** the `ProfileConfinement` trait + `ConfinementSpec` (§2.2) are written so that when the transport lands, its child spawn routes through the *same* `run_guarded(spawner, spec)` path `shell_exec` uses — one line, no new confinement machinery. This is the identical "shape now, mechanism later" split the codebase already used for `SandboxedSpawn` itself (`mcp.rs:9` calls this out). The invariant we preserve is architectural: *there is exactly one spawn chokepoint, and it is fail-closed* — so a future MCP child cannot be added except through the jail.
+
+Old Slice 4(b) is therefore deleted from M7. Slice 4 becomes 4a (`fetch` allowlist) only.
+
+**(b) Email/Calendar/Tasks must be added to `app_default`, with the local-first degrade — the design now confronts it.** The review is exactly right: `app_default` (`tools/mod.rs:105`) lacks `Email`/`Calendar`; only `headless_server_default` (`:120`) has them, so as-written the Email tools are filtered out of the app by `available_tools` (`tools/mod.rs:423`) and unreachable. Concrete fix, split by what actually needs the network so the degrade is honest:
+
+- **Capability additions.** Add `Capability::Tasks` to the enum (`tools/mod.rs:49`). Add `Email`, `Calendar`, `Tasks` to `app_default` (`tools/mod.rs:105`); add `Tasks` to `headless_server_default` (`:120`, which already has `Email`/`Calendar`).
+- **Split the tools by tier so `Capability` gating carries the degrade for free:**
+  - `email_search` / `email_read`, `calendar_list`, `task_list` → read the **local per-profile** `emails`/`calendar_events`/`tasks` tables. Require **`Email`/`Calendar`/`Tasks` only, NOT `Network`**. RiskClass `Safe` (list/read) → whole-tool `Allow` + pre-trusted by the risk-derivation (`lib.rs:573-583`), no approval prompt.
+  - `task_create` / `task_complete`, `calendar_add` (local) → `Write` → approval spine. Require `Tasks`/`Calendar`, no `Network`.
+  - `email_send`, and any `calendar_*`/`email_*` that hits a **remote** account → `External` + additionally require `Network`. `destination()` returns the recipient/account (`tools/mod.rs:321`), surfaced in the approval dialog exactly like `fetch` (`fetch.rs`).
+- **Degrade contract (satisfies §6 / local-first).** A build that keeps `Filesystem`/`Email`/`Calendar`/`Tasks` but drops `Network` from its `BodyEnv` keeps every local read/write tool and simply *omits* the `External` send/sync tools from `available_tools` — absent, not erroring, the exact capability-filter contract M3 established. The **Email screen** reads the local store over IPC (not through a tool), so it renders the per-profile store (empty if never synced) regardless of caps. This is why the visual-only screen can be wired now even though live sync (§7 Q2) is deferred.
+
+### R4. Q4 is resolved: reuse `QueueingPrompter`, decide only the seed ruleset (review's "already answered")
+
+The review is right that the unattended-authorization policy already ships, fully tested, in `hooks/headless.rs::QueueingPrompter`. It encodes the decided model exactly:
+
+- `Dangerous` is **never** pre-authorized (`headless.rs:131`) — matches `resolve_grant`'s invariant #8 (`approval.rs`).
+- `External` is pre-authorized only if a rule *names the destination* (a non-`*` pattern matching the call's `destination`) — `headless.rs:151-161`.
+- Everything else pre-authorizes only via an explicit `Allow` resolved with the **same** deny>ask>allow / most-specific-wins precedence the interactive `PermissionHook` uses (`resolve_effective_mode`, `headless.rs:142`); otherwise **park-and-deny** (fail closed).
+- A pre-authorized grant is always per-action `Once` (`headless.rs:163`) — the prompter never hands itself a standing grant.
+
+So Slice 5's server seed does **not** invent a policy — it *feeds this prompter*. Two consequences:
+
+1. **The old §2.6/§7-Q4 proposal ("Server seed auto-allows Safe only, Ask→deny for everything else") is redundant AND was inconsistent (more restrictive) with the shipped prompter — drop it.** With an **empty** `tool_rules` seed, `QueueingPrompter` already yields precisely "Safe runs (Safe is whole-tool `Allow` + pre-trusted by the risk derivation, so it never reaches an Ask or the prompter at all), everything else parks-and-denies." That is the safe default, for free, from existing code.
+2. **The only genuinely-open sliver** is whether `SeedProfile::Server` should write *any* standing `Allow` rows (e.g. `write_file` within the profile workspace) to reduce parking friction on a headless box. That is a small product tuning question, **not a blocker** — the empty-ruleset default ships safely. Slice 5 must reference `headless.rs` explicitly and wire the server seed to author `tool_rules` rows the `QueueingPrompter` consumes (via the same `StorageToolRuleWriter` the interactive "Always allow" path uses), respecting `persist_rule_allowed` (`approval.rs:271`: only `Write` persists; `External`/`Dangerous` never earn a standing row).
+
+**Q1 (Linux tech), Q2 (email sync backend), Q3 (walled ⇒ network-deny) remain genuinely open for Lukas** — the review confirms Q3 is a memory island in the specs, not a network one, so the egress default is unspecified.
+
+### R5. INV-M7c (the §12-item-4 reconciliation) restated per tier — and the "re-check permission output against the sandbox" discharge
+
+PLAN §12 item 4 asks that the OS sandbox **compose** with the danger-floor + permission gate *without weakening them*, and that permission output be *re-checked against the sandbox*. Grounded in the real control flow (`dispatch.rs:492-539`), the composition is:
+
+1. **Ordering guarantees the floor is never weakened.** The `HookChain` runs `PrivacyFilter → Sandbox(denylist) → ProtectedPath → SessionMode → Permission → FirstUse` and short-circuits on the first `Deny`/`Ask` (`hooks/mod.rs:424-438,537-557`). The kernel jail is consulted **only after** the chain returns `Continue`, at spawn time inside `Tool::run` → `run_guarded` (`dispatch.rs:536`, `exec.rs:224`). A jail-apply failure is a hard `Err` with no unsandboxed fall-through (`exec.rs:229-231`). On approve, the dispatcher re-runs the **full** chain (`dispatch.rs:617-619`), so the non-overridable `Sandbox`/`ProtectedPath` floors are re-checked every round. Therefore the jail can only ever *narrow* an already-permitted call; it can never turn a chain `Deny` into a run. (This is INV-M7a, unchanged and correct.)
+
+2. **The "re-check permission output against the sandbox" is a single-source-of-profile assertion.** The subtle failure §12 item 4 guards against is a *profile mismatch*: the permission gate resolving rules for profile P while the jail confines to profile Q's root. Both are derived from **one** source — `ExecCtx.profile` (`tools/mod.rs:211`): the permission context reads it via `EventContext::with_profile(ctx.profile)` (`dispatch.rs:485`), and the jail's `ConfinementSpec.profile_root` reads it via `WorkspaceResolver::root_for(ctx.profile)` (§2.3). The reconciliation invariant is that these are provably the same profile identity — no cell where permission thinks P but the jail confines to Q.
+
+Restated INV-M7c, split by tier (this is what the test suite must prove):
+
+> **INV-M7c-K (kernel tier).** For the child-process surface, the kernel jail denies a **superset** of what the permission gate denies: `permission_denies(call) ⇒ call never spawns` (chain short-circuit, provable in-process), and `permission_allows(call) ⇒ the jail may still deny` an out-of-`profile_root` write / out-of-`allowed_domains` egress (provable only against a **real subprocess on an enforcing backend**). Same profile identity feeds both sides (R5.2).
+>
+> **INV-M7c-P (in-process tier).** For the native fs tools, `permission_denies(call) ⇒ never runs` (chain short-circuit, in-process), and `permission_allows(call) ⇒ resolve_within still confines to the active profile's `workspace/`` (physical separation + path check), so a write permitted under A is physically absent from B. No cell relies on an in-process check that *only* Tier P backs while claiming Tier-K strength.
+
+**Test-harness honesty:** INV-M7c-P is `cargo test --lib`-able (pure in-process: two profile roots, assert a write via A's `WriteFileTool` is unreadable via B's `ReadFileTool`, and that a chain `Deny` never reaches `Tool::run` — the existing `sandbox_denied_call_never_runs_the_tool` pattern, `dispatch.rs:1193`). INV-M7c-K is **not** `--lib`-able — it requires spawning a real jailed subprocess and observing kernel denial, so it lives with the Slice 2/3 integration tests (macOS today, `exec.rs:698-748`) and is gated by the Slice 3-spike on Linux/Windows.
+
+### R6. Revised build slices (with honest gates)
+
+**Slice 1 — Per-profile physical roots (Tier P).** Introduce `WorkspaceResolver { root_for(&profile) -> PathBuf }`. Re-root the six fs tools (`fs.rs`) and `ShellExecTool` (`exec.rs:411`) from a fixed `PathBuf` to the resolver; **also re-root `ProtectedPathHook`** (R1) onto the same resolver, reading `EventContext.profile`. Create `profiles/<name>/workspace|tmp` on profile open (`storage/mod.rs`); migrate the legacy shared `workspace/` into the default profile's root (not deleted). Empty profile → scratch root.
+*Gate (`cargo test --lib`):* a file written by `write_file` under profile A is physically absent from B's workspace dir and unreadable via B's `read_file`; `ProtectedPathHook` fires on a per-profile symlink under the active profile's root; all existing `cargo test` green.
+
+**Slice 2 — Wire `SandboxConfig` live on macOS (Tier K).** Rename `SandboxedSpawn`→`ProfileConfinement`, `ExecSpec`→`ConfinementSpec`; move Seatbelt to `platform/sandbox/macos.rs`, parameterizing `subpath` rw + the `(allow network*)` line by `spec.profile_root`/`tmp_root`/`allowed_domains` (`exec.rs:357`); keep the `import system.sb` gotcha and SIGABRT/exit-65 apply-failure detection (`exec.rs:134`). Add the `sandbox_config` migration (`PROFILE_MIGRATIONS`, `migrations.rs:195`) + `ProfileDb::{get,set}_sandbox_config` serializing `SandboxConfig` (`hooks/sandbox.rs:142`). Feed the active profile's config + resolver root into the spawn. `run_guarded` fail-closed semantics kept byte-for-byte (`exec.rs:229-231`).
+*Gate (integration / real subprocess, macOS):* `shell_exec` under A is OS-denied reading B's workspace; `allowed_domains=[]` blocks egress; an apply failure is a hard `Err` (`hard_errs_when_sandbox_apply_fails`, `exec.rs:562`, still passes). Includes the INV-M7c-K reconciliation cell for macOS.
+
+**Slice 3-spike — enforcement verification (blocks 3a/3b).** Per-platform loud probe that `is_enforcing()==true` AND a real out-of-root write is OS-denied on the CI runner; UNVERIFIED is a visible non-pass, never a silent skip (R2).
+
+**Slice 3a — Linux backend / Slice 3b — Windows backend.** Each its own milestone, per R2; integration harness; fail-closed until the spike passes.
+
+**Slice 4a — `fetch` per-profile allowlist.** `fetch` (`tools/fetch.rs`) enforces the active profile's `allowed_domains` as an allowlist **layered on top of** the existing SSRF guard (`is_private_endpoint`, per-hop DNS re-check) — never replacing it. (MCP-child confinement removed from M7 — R3a.)
+*Gate (`cargo test --lib`):* a `fetch` outside P's `allowed_domains` is refused with a clear reason; the SSRF localhost/RFC-1918/metadata block still holds on every hop.
+
+**Slice 5 — Profile-activation seeding + server flavor (uses `QueueingPrompter`).** `seed_profile_defaults(storage, profile, SeedProfile)` fires idempotently on activation (fire the reserved `AppLaunch`/new `ProfileActivated` path, `hooks/mod.rs:123`); seeds `memory_settings`, seat (no-op default), `sandbox_config` (`enabled=true`), and — for `SeedProfile::Server` — any standing `tool_rules` rows via `StorageToolRuleWriter`, respecting `persist_rule_allowed` (R4). **Default Server ruleset is empty** (safe: Safe pre-trusted, everything else parks via `QueueingPrompter`).
+*Gate (`cargo test --lib`):* fresh activation seeds its defaults exactly once (re-activation is a no-op); with an empty Server ruleset, `QueueingPrompter` pre-authorizes Safe-only and parks the rest (assert against the shipped `headless.rs` tests' contract); switching profiles re-resolves memory/seat/sandbox/`ProtectedPathHook` root to the new profile.
+
+**Slice 6 — Email/calendar/tasks + Email screen.** Add `Capability::Tasks`; add `Email`/`Calendar`/`Tasks` to `app_default` (R3b); `emails`/`calendar_events`/`tasks` profile tables (+FTS); the tier-split `email_*`/`calendar_*`/`task_*` tools with the RiskClass + `Capability` split from R3b, routing through the existing spine; wire the visual-only Email screen to the local per-profile store over IPC.
+*Gate:* the Email screen shows A's mail and, on switch to B, shows B's (or empty) with no A rows leaking (INV-M7b-P physical-separation test, `--lib`); `email_send` triggers the approval dialog as `External` with a surfaced destination; a `Network`-less `BodyEnv` omits the send/sync tools but keeps the local read/write ones (degrade test, `--lib`).
+
+**Cross-cutting — INV-M7c reconciliation.** INV-M7c-P lands with Slices 1/6 (`--lib`). INV-M7c-K lands with Slice 2 (macOS, integration) and per-platform with 3a/3b behind the spike.
+
+### R7. Updated STATUS
+
+**Build-ready for the macOS-first path — Slices 1, 2, 4a, 5, 6 — with the invariants restated truthfully (INV-M7b two-tier; INV-M7c-K/P split; `ProtectedPathHook` re-rooted).** These reuse the existing spine end-to-end and their gates are honestly achievable (`--lib` for Tier-P/degrade/seeding; a real-subprocess integration test for the macOS Tier-K cell — the same harness `exec.rs:698-748` already uses). Slices **3a/3b (Linux/Windows kernel backends)** are each their own milestone, **blocked on the Slice 3-spike** that proves the backend actually enforces on the CI runner (else a green build lies). MCP-child confinement is **out of M7** (kept as the documented single-spawn-chokepoint seam). Q4 is **closed** (reuse `QueueingPrompter`; default Server ruleset empty).
+
+**Still open (genuine Lukas decisions, do not block the macOS path):** Q1 Linux tech (Landlock floor vs. bubblewrap upgrade), Q2 email sync backend, Q3 whether a walled profile defaults `allowed_domains=[]`. None of these gate Slices 1/2/4a/5/6.
