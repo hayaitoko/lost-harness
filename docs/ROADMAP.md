@@ -86,10 +86,15 @@ the status board sitting on top of all of them.
 > downgrade (helper inherits the turn binding), cross-agent grant leak
 > (sub-dispatcher runs headless). **Done-when met.** Plus **4.3d** — the Settings
 > → Agent types management UI (`cbc774c`, approve/reject/delete personas). **WAVE
-> 4.3 FULLY COMPLETE.** **453 → 491 tests.** **Wave 4 remaining:** 4.4 (the
-> work_items queue + `WorkQueueRunner` are LIVE — a cron runner using them is the
-> rest); 4.5 capability packs (bundle skills+agent-types+cron). Then Waves 5–7.
-> **Next fronts (per the
+> 4.3 FULLY COMPLETE.** **WAVE 4.5 COMPLETE** — Capability Packs (`fdda26c`): a
+> portable `Pack` JSON (skills + agent-types + cron templates) + `install_pack`
+> (everything lands INERT — skills/agents Pending, cron disabled, so a pack adds
+> capabilities to review, never arms one) + `export_pack` + an "Install a pack"
+> UI. **453 → 494 tests.** **Wave 4 remaining:** ONLY the 4.4 cron runner (the
+> unified work_items queue + `WorkQueueRunner` are LIVE + back AgentDispatch;
+> wiring cron_jobs → Cron work_items → execution is the last bit). Then Waves 5–7
+> (M5 computer-use, M6 audio/voice, M7 mobile, M8 model-download; server twin;
+> polish→beta). **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
