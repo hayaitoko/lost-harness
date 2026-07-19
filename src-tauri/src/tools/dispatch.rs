@@ -199,20 +199,32 @@ impl ToolDispatcher {
     }
 
     /// A bounded sub-dispatcher for a Wave-4.3 delegated agent. Same gate `chain`,
-    /// `env`, and shared grant-`ledger`/`approver`/`audit`/`rule`/`reads` state as
-    /// this dispatcher, but a `registry` RESTRICTED to `allowed` (∩ registered ∩
-    /// env). So a delegated helper (a) can only see/call its allowed tools and
-    /// (b) still passes the IDENTICAL full gate on every call — it can never be
-    /// more permissive than the parent (the chain is cloned, not rebuilt weaker;
-    /// the ledger is SHARED so a grant is consistent). It gets a FRESH
-    /// `run_state` (its own per-run budget), since it is a distinct run.
+    /// `env`, and shared `audit`/`rule`/`reads`/`ledger` state as this dispatcher,
+    /// but a `registry` RESTRICTED to `allowed` (∩ registered ∩ env). So a
+    /// delegated helper (a) can only see/call its allowed tools and (b) still
+    /// passes the IDENTICAL full gate on every call — never more permissive than
+    /// the parent (the chain is cloned, not rebuilt weaker). Fresh `run_state`
+    /// (its own per-run budget).
+    ///
+    /// **`approver: None` — the helper runs HEADLESS** (review fix). A delegated
+    /// helper runs unattended in the background, so it must NOT raise an
+    /// interactive approval prompt: (1) a surprise prompt for a hidden background
+    /// task is bad UX and would pin a concurrency permit for up to the 5-min
+    /// deny-default; (2) crucially, an interactive Session/Always grant would be
+    /// recorded into the SHARED `ledger` and thereby silently authorize the
+    /// PARENT and every sibling helper (a cross-agent privilege leak). With no
+    /// approver, an `Ask` from the chain is surfaced to the helper as "not
+    /// granted this round" (the same headless fallback round-1 uses) — so the
+    /// helper never earns a standing grant. Pre-authorized `tool_rules` still
+    /// apply (they resolve to `Allow` in the chain BEFORE any `Ask`), so a
+    /// persona can still use a tool the user has standing-allowed.
     pub fn restricted(&self, allowed: &std::collections::HashSet<String>) -> ToolDispatcher {
         ToolDispatcher {
             registry: self.registry.restricted_to(allowed),
             chain: self.chain.clone(),
             env: self.env.clone(),
             ledger: Arc::clone(&self.ledger),
-            approver: self.approver.clone(),
+            approver: None,
             reads: Arc::clone(&self.reads),
             run_state: Mutex::new(RunState::default()),
             audit_writer: self.audit_writer.clone(),
@@ -505,6 +517,10 @@ impl ToolDispatcher {
                     let run_ctx = ExecCtx {
                         reads: Some(Arc::clone(&self.reads)),
                         allow_private_memory: !is_cloud,
+                        // Wave 4.3c: stamp the turn's binding so `delegate` can
+                        // make a helper inherit it (never run weaker than a
+                        // Private parent).
+                        binding,
                         ..ctx.clone()
                     };
                     return match tool.run(ev.input.clone(), &run_ctx).await {
@@ -1051,6 +1067,7 @@ mod tests {
             reads: None,
             allow_private_memory: false,
             session_mode: Default::default(),
+            ..ExecCtx::default()
         }
     }
 

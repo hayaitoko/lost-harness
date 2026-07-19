@@ -183,6 +183,7 @@ pub fn run() {
                 embedder.clone(),
                 Some(app.handle().clone()),
                 Some(Arc::clone(&human_prompter)),
+                Arc::clone(&model_manager),
             ));
 
             let agent_loop = Arc::new(
@@ -203,6 +204,16 @@ pub fn run() {
                 .with_skill_drafter(Arc::new(
                     crate::agent::skill_reflect::LocalModelDrafter::new(Arc::clone(&model_manager)),
                 )),
+            );
+
+            // Wave 4.3c/4.4: the background runner that drains `work_items`
+            // and actually executes a `delegate` dispatch (see
+            // `tools::delegate` + `agent::work_runner` module docs for why
+            // this is a separate loop rather than `delegate` running things
+            // itself). Fire-and-forget: runs for the life of the process.
+            crate::agent::work_runner::spawn_work_runner(
+                Arc::clone(&agent_loop),
+                Arc::clone(&storage),
             );
 
             let state = AppState {
@@ -419,6 +430,7 @@ fn build_tool_dispatcher(
     embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
     app_handle: Option<tauri::AppHandle>,
     human_prompter: Option<Arc<dyn crate::tools::ask_human::HumanPrompter>>,
+    model_manager: Arc<ModelManager>,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -508,6 +520,16 @@ fn build_tool_dispatcher(
     )));
     registry.register(Box::new(crate::tools::skills::SaveSkillTool::new(
         storage.clone(),
+    )));
+    // Wave 4.3c: `delegate` — dispatch a bounded, approved-persona helper
+    // sub-agent. Only ENQUEUES a `work_items` row (RiskClass::Dangerous —
+    // always-shown Once-only Ask); the background `WorkQueueRunner`
+    // (spawned in `run()`, after the `AgentLoop` Arc exists) drains it and
+    // actually runs the helper. See `tools::delegate` module docs for why
+    // this tool can't hold an `Arc<AgentLoop>` itself.
+    registry.register(Box::new(crate::tools::delegate::DelegateTool::new(
+        storage.clone(),
+        model_manager,
     )));
 
     // Item 7: the guarded shell executor. Confined to `workspace/` + a `tmp/`

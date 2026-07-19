@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 pub mod ask_human;
 pub mod calling;
 pub mod cron;
+pub mod delegate;
 pub mod dispatch;
 pub mod exec;
 pub mod fetch;
@@ -220,6 +221,25 @@ pub struct ExecCtx {
     /// each tool call's `EventContext` so the `SessionModeHook` can apply it.
     /// Defaults to `Normal` (no-op) for any context that doesn't set one.
     pub session_mode: crate::hooks::SessionMode,
+    /// Wave 4.3c: the id of the provider serving THIS turn (the caller's own
+    /// model), stamped by `AgentLoop::stream_to_provider` from the turn's
+    /// resolved `provider`. `delegate` reads this as the `resolve_seat`
+    /// inherit-fallback target when a persona's seat is unbound. Empty string
+    /// default (via `ExecCtx::default()`) — a context that never stamps this
+    /// (every existing test site) simply makes `resolve_seat`'s inherit
+    /// fallback resolve to an empty pair, which `delegate` treats as "no
+    /// caller model to inherit" and reports as an error rather than silently
+    /// dispatching against nothing.
+    pub caller_provider_id: String,
+    /// Wave 4.3c: sibling of `caller_provider_id` — the model id serving this
+    /// turn. See that field's doc for the inherit-fallback contract.
+    pub caller_model: String,
+    /// Wave 4.3c: this turn's privacy binding (Auto/Public/Private), stamped by
+    /// the dispatcher. `delegate` reads it so a delegated helper INHERITS the
+    /// parent turn's binding and can never run weaker — a Private conversation's
+    /// helper stays local, never silently downgraded to Auto/cloud. Defaults to
+    /// `Auto` for any context that doesn't stamp it.
+    pub binding: crate::agent::gate::Binding,
 }
 
 // ── RiskClass ──────────────────────────────────────────────────────────────

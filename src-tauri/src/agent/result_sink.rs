@@ -112,3 +112,57 @@ impl ResultSink for TauriResultSink {
         emit_error(&self.app, conversation_id, error.to_string(), source);
     }
 }
+
+/// Wave 4.3c: a `ResultSink` for a headless one-shot sub-agent run
+/// (`AgentLoop::run_subagent`). There is no live window/event-loop to emit
+/// into — and no listener would be there to hear it — so every method is a
+/// no-op (a `tracing::trace!` breadcrumb only). This is safe because a
+/// helper's final answer comes back through `process_message`'s `Ok(String)`
+/// return value, not through any of these streamed events; the caller (the
+/// `WorkQueueRunner`) reads that return value directly.
+pub struct HeadlessSink;
+
+impl ResultSink for HeadlessSink {
+    fn token(&self, conversation_id: &str, message_id: &str, token: &str) {
+        tracing::trace!(
+            conversation_id = %conversation_id,
+            message_id = %message_id,
+            len = token.len(),
+            "headless sink: token dropped (no live listener)"
+        );
+    }
+
+    fn local_reroute(
+        &self,
+        conversation_id: &str,
+        reason: &str,
+        from_provider: &str,
+        to_provider: &str,
+    ) {
+        tracing::trace!(
+            conversation_id = %conversation_id,
+            reason = %reason,
+            from_provider = %from_provider,
+            to_provider = %to_provider,
+            "headless sink: local_reroute dropped (no live listener)"
+        );
+    }
+
+    fn memory_event(&self, conversation_id: &str, kind: &'static str, count: usize) {
+        tracing::trace!(
+            conversation_id = %conversation_id,
+            kind,
+            count,
+            "headless sink: memory_event dropped (no live listener)"
+        );
+    }
+
+    fn error(&self, conversation_id: &str, error: &str, source: &'static str) {
+        tracing::trace!(
+            conversation_id = %conversation_id,
+            error = %error,
+            source,
+            "headless sink: error dropped (no live listener)"
+        );
+    }
+}

@@ -560,6 +560,7 @@ fn exec_ctx() -> crate::tools::ExecCtx {
         reads: None,
         allow_private_memory: false,
         session_mode: Default::default(),
+        ..crate::tools::ExecCtx::default()
     }
 }
 

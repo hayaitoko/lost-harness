@@ -16,6 +16,7 @@ pub mod egress;
 pub mod gate;
 pub mod loop_mod;
 pub mod result_sink;
+pub mod work_runner;
 
 #[cfg(test)]
 mod crash_recovery_tests;

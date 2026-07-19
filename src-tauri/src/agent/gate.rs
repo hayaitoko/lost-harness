@@ -28,9 +28,10 @@ use std::sync::Arc;
 use crate::classifier::{Classification, Classifier, ClassifierConfig};
 
 /// Per-conversation routing binding (spec §12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Binding {
     /// The classifier (or fallback) decides per-message.
+    #[default]
     Auto,
     /// User override: every message may go to any endpoint.
     Public,
@@ -51,7 +52,10 @@ pub enum GateDecision {
 }
 
 /// The §7 privacy gate. Owns a `Box<dyn Classifier>` so the trained classifier
-/// and the heuristic fallback are interchangeable at the call site.
+/// and the heuristic fallback are interchangeable at the call site. `Clone` is
+/// cheap (an `Arc` bump) — a Wave-4.3 delegated sub-agent runs as a fresh
+/// `AgentLoop` built with a clone of the parent's gate (same classifier).
+#[derive(Clone)]
 pub struct PrivacyGate {
     classifier: Arc<dyn Classifier>,
 }

@@ -469,6 +469,113 @@ impl AgentLoop {
         }
     }
 
+    /// Wave 4.3c — run one bounded, one-shot "helper" sub-agent. This is the
+    /// `delegate` tool's actual EXECUTION, performed here by the background
+    /// `WorkQueueRunner` (`agent::work_runner`), never by `delegate` itself:
+    /// `delegate` can only hold `Storage` + `ModelManager`, not an
+    /// `Arc<AgentLoop>`, because `AgentLoop` owns the `ToolDispatcher` that
+    /// owns `delegate` — holding an `AgentLoop` back in `delegate` would be a
+    /// circular `Arc` dependency. So `delegate` only enqueues a `work_items`
+    /// row; this method is what the runner calls once it claims that row.
+    ///
+    /// Builds a FRESH `AgentLoop` sharing this loop's `gate`/`model_manager`/
+    /// `storage` (same classifier, same providers, same on-disk storage), but
+    /// with `tools` RESTRICTED to `tools_allowlist` via
+    /// `ToolDispatcher::restricted` — same full gate chain as the parent
+    /// (Lukas's decision #3: **no floor-cap**; a helper's belt may include
+    /// External/Dangerous tools, each call is still individually gated by the
+    /// identical chain). Deliberately does NOT wire `with_embedder` /
+    /// `with_flush_classifier` / `with_skill_drafter` — a helper run is
+    /// one-shot and its ephemeral sub-conversation is abandoned right after,
+    /// so background memory-flush/skill-reflection setup would be wasted work.
+    ///
+    /// v1 persona framing (noted as a deliberate simplification): the
+    /// persona's `system_prompt` LEADS the first (only) user turn rather than
+    /// overriding `process_message`'s own system prompt — `process_message`
+    /// always builds its own system messages (tool catalog + curated memory
+    /// summary). A proper system-prompt override is later refinement.
+    ///
+    /// The sub-conversation created here is just the ephemeral scratch
+    /// transcript `process_message` needs to operate against — Lukas's
+    /// decision #2 (the helper's result streams into the PARENT conversation)
+    /// is honored by the CALLER (`WorkQueueRunner`), which posts the returned
+    /// text into `target_conversation_id`, not by anything in this method.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_subagent(
+        &self,
+        system_prompt: &str,
+        tools_allowlist: &[String],
+        provider_id: &str,
+        model: &str,
+        profile: &str,
+        binding: Binding,
+        task: &str,
+    ) -> Result<String> {
+        let belt: std::collections::HashSet<String> = tools_allowlist.iter().cloned().collect();
+        let restricted = Arc::new(self.tools.restricted(&belt));
+        let sub = AgentLoop::new(
+            self.gate.clone(),
+            Arc::clone(&self.model_manager),
+            Arc::clone(&self.storage),
+            restricted,
+        );
+
+        let db = self
+            .storage
+            .open_profile(profile)
+            .context("run_subagent: opening profile for the ephemeral sub-conversation")?;
+        let now = chrono::Utc::now().timestamp();
+        let sub_conv_id = Uuid::new_v4().to_string();
+        // Keep the auto-generated name short and simple — this conversation is
+        // scratch space, never surfaced as a first-class chat in the sidebar.
+        // `.chars().take(30)` (not a byte-index slice) so a persona whose
+        // prompt starts with a multi-byte character can never panic here.
+        let title: String = system_prompt.chars().take(30).collect();
+        let binding_str = match binding {
+            Binding::Auto => "auto",
+            Binding::Public => "public",
+            Binding::Private => "private",
+        };
+        db.create_conversation(&crate::storage::Conversation {
+            id: sub_conv_id.clone(),
+            name: format!("⟳ {title}"),
+            pinned: false,
+            binding: binding_str.to_string(),
+            folder_id: None,
+            color: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .context("run_subagent: creating the ephemeral sub-conversation")?;
+
+        // Frame the persona: v1 leads the first user turn with the system
+        // prompt (see doc comment above for why this isn't a real system-role
+        // override yet).
+        let content = format!("{system_prompt}\n\n---\nTask:\n{task}");
+        let sink: Arc<dyn ResultSink> = Arc::new(crate::agent::result_sink::HeadlessSink);
+
+        let result = sub
+            .process_message(
+                content,
+                sub_conv_id.clone(),
+                binding,
+                provider_id.to_string(),
+                model.to_string(),
+                profile.to_string(),
+                crate::hooks::SessionMode::Normal,
+                &sink,
+            )
+            .await;
+
+        // Wave 4.3c review fix: the sub-conversation is scratch space, not a
+        // first-class chat — delete it (its messages cascade via the FK) so
+        // delegated helper runs don't pile up junk conversations in the sidebar
+        // or grow storage unboundedly. Best-effort (the result is already
+        // captured), and runs whether the helper succeeded or errored.
+        let _ = db.delete_conversation(&sub_conv_id);
+        result
+    }
+
     /// Plan a redact-and-send for the current message, or `None` if it can't be
     /// done safely. Returns `Some(redaction)` only when: (1) the profile has
     /// redaction enabled, (2) the classification carries redactable VALUE spans,
@@ -1059,12 +1166,24 @@ impl AgentLoop {
             if m.id == user_message.id {
                 continue;
             }
-            let role = if m.role == "tool" {
-                "user".to_string()
+            let (role, content) = if m.role == "tool" {
+                ("user".to_string(), m.content)
+            } else if m.routing_decision.as_deref() == Some("delegated") {
+                // Wave 4.3c review fix: a delegated helper's result is
+                // model-generated from possibly-untrusted sources (a helper can
+                // fetch the web), so when it re-enters the MAIN agent's context
+                // it must be neutralized like tool output — never replayed as a
+                // trusted assistant turn it could be steered by. The stored
+                // message stays clean (the user sees the plain answer); only the
+                // model-facing copy is guard-wrapped, as untrusted `user` input.
+                (
+                    "user".to_string(),
+                    crate::tools::calling::guard_wrap("delegated helper result", &m.content),
+                )
             } else {
-                m.role
+                (m.role, m.content)
             };
-            history.push(ChatMessage { role, content: m.content });
+            history.push(ChatMessage { role, content });
         }
         // Tail (volatile): the current user turn. When redacting, the model
         // sees the redacted remainder — never the original sensitive spans —
@@ -1112,6 +1231,19 @@ impl AgentLoop {
             // call this turn makes (SessionModeHook). The dispatcher inherits it
             // via `..ctx.clone()`, so a mid-turn reroute preserves it.
             session_mode,
+            // Wave 4.3c: this turn's own provider/model, so `delegate`'s
+            // `resolve_seat` inherit-fallback has something to inherit when a
+            // persona's seat is unbound. Stamped once here (not re-stamped per
+            // round like `is_cloud`/`allow_private_memory` below) — a mid-turn
+            // reroute-to-local doesn't change what "the caller's own model"
+            // meant when the turn started.
+            caller_provider_id: provider.id.clone(),
+            caller_model: model.clone(),
+            // Wave 4.3c: this turn's privacy binding, so `delegate` makes a
+            // helper inherit it (never run weaker than a Private parent). The
+            // dispatcher re-stamps it from the `binding` arg at the tool.run
+            // boundary too; both are the same value.
+            binding,
         };
 
         // Bound the tool loop so a model that keeps calling tools can't run

@@ -540,6 +540,7 @@ mod tests {
             reads: None,
             allow_private_memory: false,
             session_mode: Default::default(),
+            ..ExecCtx::default()
         };
         let out = dispatcher
             .run_turn(&OwnOutput::from_stream_assembly(output), &ctx, Binding::Public, false)

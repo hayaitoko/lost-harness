@@ -498,6 +498,7 @@ mod tests {
             reads: None,
             allow_private_memory: false,
             session_mode: Default::default(),
+            ..ExecCtx::default()
         };
 
         // Benign → shared, saved.
@@ -601,6 +602,7 @@ mod tests {
             reads: None,
             allow_private_memory: false,
             session_mode: Default::default(),
+            ..ExecCtx::default()
         };
 
         // Default profile (no settings row) → Shared.
@@ -729,6 +731,7 @@ mod hybrid_tests {
             reads: None,
             allow_private_memory: false,
             session_mode: Default::default(),
+            ..ExecCtx::default()
         };
 
         // Semantic OFF → no vector stored.

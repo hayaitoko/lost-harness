@@ -728,6 +728,7 @@ mod tests {
             reads: Some(Arc::new(ConversationReads::new())),
             allow_private_memory: false,
             session_mode: Default::default(),
+            ..ExecCtx::default()
         }
     }
 

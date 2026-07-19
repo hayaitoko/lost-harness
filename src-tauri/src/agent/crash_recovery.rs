@@ -265,8 +265,22 @@ pub fn run_boot_pass(storage: &Storage) -> Result<CrashRecoveryReport> {
                     error = %e,
                     "crash-recovery: reconciliation failed; skipping profile"
                 );
-                report.profile_errors.push((name, e.to_string()));
+                report.profile_errors.push((name.clone(), e.to_string()));
             }
+        }
+
+        // Wave 4.4: also reconcile any `work_items` (e.g. a `delegate`
+        // dispatch) a crash left `running` — never silently re-run a
+        // mutating/dispatched action (2.5 durability). Independent of the
+        // message-transcript repair above; best-effort, log-and-continue like
+        // every other step in this pass.
+        if let Err(e) = db.terminalize_orphaned_work(chrono::Utc::now().timestamp()) {
+            tracing::error!(
+                profile = %name,
+                error = %e,
+                "crash-recovery: terminalizing orphaned work_items failed"
+            );
+            report.profile_errors.push((name, e.to_string()));
         }
     }
     Ok(report)
