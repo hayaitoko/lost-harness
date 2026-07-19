@@ -21,8 +21,11 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **As of 2026-07-18: M3 COMPLETE. M4 well underway. WAVE 1 + WAVE 2 (ready work)
-> COMPLETE; WAVE 3 largely landed (3.2 ledger+cost, 3.3 compaction, 3.5 flush).**
+> **As of 2026-07-18: WAVES 1–4 COMPLETE.** Wave 1 + Wave 2 (ready work) + Wave 3
+> (3.1 seats, 3.2 ledger+cost, 3.3 compaction, 3.5 flush) + **all of Wave 4
+> (4.1 skills, 4.2 learning loop, 4.3 agents, 4.4 one-queue/cron, 4.5 packs)** are
+> landed, adversarially reviewed, and committed. **Remaining: Waves 5–7** (native
+> flagships + server twin + polish). Plus a Connection-Mutex soundness fix. 498 tests.
 > **Latest (2026-07-18):** **Wave 3.5 COMPLETE** — both memory write-triggers:
 > the pre-compaction flush (`f89536e`, trigger #2: a LOCAL model sweeps
 > about-to-be-trimmed turns) AND the new-chat consolidation nudge (`e0929f0`,
@@ -90,11 +93,15 @@ the status board sitting on top of all of them.
 > portable `Pack` JSON (skills + agent-types + cron templates) + `install_pack`
 > (everything lands INERT — skills/agents Pending, cron disabled, so a pack adds
 > capabilities to review, never arms one) + `export_pack` + an "Install a pack"
-> UI. **453 → 494 tests.** **Wave 4 remaining:** ONLY the 4.4 cron runner (the
-> unified work_items queue + `WorkQueueRunner` are LIVE + back AgentDispatch;
-> wiring cron_jobs → Cron work_items → execution is the last bit). Then Waves 5–7
-> (M5 computer-use, M6 audio/voice, M7 mobile, M8 model-download; server twin;
-> polish→beta). **Next fronts (per the
+> UI. **WAVE 4.4 COMPLETE** — the cron runner (`4cf9976`): a real `cron_due`
+> matcher (*, ranges, steps, names, @macros, dom/dow OR, Sunday 0/7), a headless
+> full-belt `ToolDispatcher::headless()`, `AgentLoop::run_cron` (unattended =
+> LOCAL-only + Private binding, never egresses), and the `WorkQueueRunner` now
+> enqueues due cron jobs as Cron work_items (exactly-once/minute via a claim_key
+> + last_run guard) + executes them. **⇒ WAVE 4 (Skills & Agents) FULLY COMPLETE
+> — 4.1–4.5.** **453 → 498 tests.** **Remaining: Waves 5–7** (M5 computer-use, M6
+> audio/voice, M7 mobile, M8 model-download; Wave 6 server twin; Wave 7
+> polish→beta — mostly large native/platform features). **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling

@@ -47,7 +47,7 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
 
-**Tests:** `cargo test --lib` → **494 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 4.5 Capability Packs**.)
+**Tests:** `cargo test --lib` → **498 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **Wave 4.4 cron runner — WAVE 4 COMPLETE**.)
 
 **2026-07-18: Wave 4.3b — bounded toolbelt intersection** (`25e8da6`). `ToolRegistry.tools` is now `Vec<Arc<dyn Tool>>` (was `Box`; `register(Box::new(..))` sites unchanged via `Arc::from`; `Tool: Send+Sync` keeps it thread-safe) + `ToolRegistry::restricted_to(&HashSet<String>) -> ToolRegistry` = the intersected sub-registry. SECURITY boundary enforced STRUCTURALLY (the sub-registry's contents): an out-of-belt tool is physically absent → not listable (available_tools/catalog) OR lookupable (get/dispatch); `allowed ∩ registered ∩ env`, never a widening. 4 security tests. **4.3c MUST reuse the parent hook chain** when it builds a restricted *dispatcher* from this sub-registry (else a sub-agent bypasses the gate) — this is the load-bearing 4.3c invariant to test. **4.3c DECISIONS (Lukas, 2026-07-18 — now unblocked):** (1) `delegate` = **RiskClass::Dangerous** (always-shown Once prompt, immune to accept_edits — matches save_skill/cron); (2) a delegated sub-agent's result streams **back INTO the parent conversation** labeled from the helper (target_conversation_id = parent; NOT a hidden child conversation) — simplest attribution; (3) **NO floor-cap** — a delegated belt may include External/Dangerous tools; each call is still governed by the full gate chain + headless-never-auto-authorizes-Dangerous; (4) **async** dispatch (manifest — concurrent, results come back async, parent turn ends once all are DISPATCHED not completed). Build 4.3c: `trait ResultSink`/`WorkExecutor` (AppHandle-decoupling of process_message's stream:*/memory:event emits; `TauriResultSink` preserves today's behavior) → a restricted `ToolDispatcher` from `restricted_to` REUSING the parent hook chain → a headless sub-agent run → `WorkQueueRunner` (tokio interval, concurrency-capped) over `work_items`(AgentDispatch) → the `delegate` Dangerous tool (enqueues one item per agent, guard-wraps results, returns on dispatch) → `resolve_seat` wiring → crash reconcile for orphaned dispatch. Adversarially review (security + concurrency).
     - **✓ 4.3c(1) DONE (`2595967`): the restricted sub-dispatcher.** `HookChain` now holds `Arc<dyn GatingHook/ObserverHook>` (Box→Arc, register sites unchanged) + derives `Clone`; `ToolDispatcher::restricted(&allowed) -> ToolDispatcher` = same cloned gate chain + env + SHARED ledger/approver/audit/rule/reads, registry `restricted_to(allowed)`, fresh run_state. 2 security tests: out-of-belt tool is Unknown/unreachable; in-belt tool still Denied by the sandbox floor (gate cloned intact, never weaker). **A delegated helper's toolbelt is now bounded AND fully-gated.**
@@ -161,7 +161,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 494 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 498 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -277,7 +277,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 494 tests
+cd src-tauri && cargo test --lib   # 498 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
