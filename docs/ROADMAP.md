@@ -99,9 +99,15 @@ the status board sitting on top of all of them.
 > LOCAL-only + Private binding, never egresses), and the `WorkQueueRunner` now
 > enqueues due cron jobs as Cron work_items (exactly-once/minute via a claim_key
 > + last_run guard) + executes them. **⇒ WAVE 4 (Skills & Agents) FULLY COMPLETE
-> — 4.1–4.5.** **453 → 498 tests.** **Remaining: Waves 5–7** (M5 computer-use, M6
-> audio/voice, M7 mobile, M8 model-download; Wave 6 server twin; Wave 7
-> polish→beta — mostly large native/platform features). **Next fronts (per the
+> — 4.1–4.5.** **453 → 498 tests.** **WAVE 5 DESIGN PASSES DONE** (`9d85299`,
+> `docs/plans/2026-07-18-m{5,6,7,8}-*.md`) — the manifest-mandated design-first
+> deliverable for all four flagships, each with a code-grounded skeptical review
+> folded in (3 NEEDS-REVISION: the review caught wrong-architecture BEFORE code;
+> m8 SOLID). **Remaining: the Wave 5 BUILDS** (large native — each revises against
+> its review first; m5 needs a multimodal model client prereq; m8 needs a
+> catalog-source decision), then **Wave 6 server** + **Wave 7 polish→beta** — the
+> big native/networking half, multi-session, some gated on native APIs / external
+> resources / Lukas decisions. **Next fronts (per the
 > plan):** 4.1's skill-as-Tool wrapper + hybrid search + UI; 4.3 agent registry
 > (needs 3.1 seats); 4.2 (a near-copy of `memory_flush`); 4.5 packs; the 4.4
 > scheduler+executor (needs the first consumer + the AppHandle-decoupling
