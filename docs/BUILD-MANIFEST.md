@@ -13,6 +13,23 @@ re-derive a design that already exists — read the pointer first.**
 
 ---
 
+> **PROGRESS AS OF 2026-07-21 (reconciled by the full project review; live status board =
+> [`ROADMAP.md`](ROADMAP.md)):**
+> - **Waves 1–4: FULLY DRAINED** (Wave 1 all items; Wave 2 all except 2.3 + 2.5 — see next
+>   line; Wave 3 all except 3.4 + the budget-governor tail of 3.2; Wave 4 all of 4.1–4.5).
+> - **2.3 (reroute UX) and the 3.2 budget governor are now UNBLOCKED** — their stated deps
+>   (3.1 seats; SSE cost capture) both shipped. **2.5 (durability journal)** dep (4.4) is
+>   also met; none of the three is built yet.
+> - **Wave 5:** all four design passes landed (`docs/plans/2026-07-18-m{5,6,7,8}-*.md`) and
+>   the headless-buildable cores are built — M8 substantially built + live; M6 audio-egress
+>   gate (dormant); M5 reversibility + multimodal wire + screenshot-routing cores (dormant);
+>   M7 Tier-P complete + live, Tier-K macOS ceiling (live code, but no writer surface yet).
+>   Remainder is target-machine-gated native work, EXCEPT: M5 Slice 3's logic half and
+>   M6 Slice 4a are headless-buildable per their own designs.
+> - **Waves 6–7: not started.**
+> - Current gates: **542 tests**, GLOBAL schema **v7**, PROFILE schema **v10** (the baseline
+>   figures further down are the historical 2026-07-17 snapshot).
+
 ## How the orchestrator should use this
 
 1. **Go wave by wave.** A wave's items may assume every earlier wave is merged. Within a
@@ -40,7 +57,7 @@ re-derive a design that already exists — read the pointer first.**
    backlog is drained. Do not divert into end-to-end dogfooding mid-build; just keep each
    item's own verification tight.
 
-**Baseline at manifest time (2026-07-17):** `cargo test --lib` → **385 passing**, frontend
+**Baseline at manifest time (2026-07-17, HISTORICAL — see the progress note at the top for current figures):** `cargo test --lib` → **385 passing**, frontend
 build + `svelte-check` clean, `--no-default-features` clean, tree clean on `main`. Schema
 versions: GLOBAL v4, PROFILE v5.
 

@@ -26,7 +26,7 @@
 
 This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The Electron app was a prototype to validate UX decisions; it's now a read-only reference. All new work goes in the Tauri project.
 
-**Current milestone:** **M3 COMPLETE; M4 well underway.** As of 2026-07-17: Q8 + Permissions pane, the full classifier round (ONNX ensemble + "why" sidebar + per-profile thresholds + redact-and-send), **memory HYBRID + live** (meaning lane: bge-small embedder + RRF keyword+semantic search), and **native tool-use DONE + PROVEN LIVE** (Q1, verified 3× vs LM Studio qwen3.6-35b-a3b) all landed. Everything committed to `main`, nothing in-progress. **The directive is now to BUILD EVERYTHING SPEC'D** (see the manifest banner above) — the ordered backlog is [`docs/BUILD-MANIFEST.md`](docs/BUILD-MANIFEST.md); live status is [`docs/ROADMAP.md`](docs/ROADMAP.md).
+**Current milestone (updated 2026-07-21):** **Waves 1–4 of the build manifest FULLY DRAINED; Wave 5 headless cores landed.** M3 complete; M4 core done (Q8, native tool-use proven live, seats, usage ledger + real cost capture, cache-shaped prompts + compaction, memory flush) — open in M4: budget governor (now unblocked), capability registry (3.4), reroute UX (2.3, now unblocked). Wave 4 (skills, learning loop, agent registry + `delegate` runtime, one-queue + cron, packs) fully complete. Wave 5: M8 substantially built + live; M6 audio-egress gate, M5 reversibility/multimodal/screenshot-routing cores, M7 Tier-P fs confinement (live) + Tier-K macOS ceiling all landed — the M5/M6 cores and Tier-K remainder are dormant/on-target. **A full 4-agent project review ran 2026-07-21** (see that session entry below for its findings — one HIGH: a promised seat-routing regression test was never written). Everything committed to `main`, nothing in-progress. The ordered backlog is [`docs/BUILD-MANIFEST.md`](docs/BUILD-MANIFEST.md) (see its progress note); live status is [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 | Subsystem | Status |
 |---|---|
@@ -44,10 +44,12 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Frontend — design-system port + backend wiring | **Done** (2026-07-15). Sidebar, MainScreen (chat loop + routing badge), and Settings wired to real backend. Routing-badge fix: `send_message` returns real `routing_decision` from the persisted row (commit `7ecf2d8`). Email/Files/Whiteboard/Scheduled-jobs/Editor/Onboarding/EmptyState still visual-only. |
 | sqlite-vec (semantic memory search engine) | Wired + proven — registered on every DB open, a smoke test does a real nearest-neighbour query |
 | Privacy classifier (rules + trained ONNX ensemble + redaction UX) | **DONE** (2026-07-16): INT8 ensemble live via `ort` (parity-verified), "why" annotated sidebar, per-profile thresholds settings, redact-and-send partial delegation. |
-| Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **LIVE in conversations** (2026-07-16, `3ee9790`→`6115eb9`): storage + Settings tab + recall/remember tools + endpoint-aware private recall + per-turn curated-summary/FTS injection + non-silent recall banner. Remaining: meaning lane (embedder), summary snapshot-at-turn-1, write-trigger backstops, walled-profile DB. |
-| Skills system (reusable playbooks, approve-first vs. autonomous) | **Designed in full, not built.** See PLAN.md §"Skills system." |
+| Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **COMPLETE except packaging** (updated 2026-07-21): storage + Settings tab + recall/remember tools + endpoint-aware private recall + injection + non-silent events, PLUS the meaning lane (bge-small embedder + RRF hybrid search), snapshot-at-turn-1, all three write triggers (save-as-you-go / pre-compaction flush / new-chat nudge), and walled-profile DB routing. Only remaining: embedder bundling into the packaged app (Wave 7.1). |
+| Skills system (reusable playbooks, approve-first vs. autonomous) | **BUILT (Wave 4.1–4.2, updated 2026-07-21):** CRUD fail-closed to Pending, `search_skills`/`save_skill` (Dangerous), draft-first learning loop (always-Pending drafts, default-off), Settings review pane. NOT built from PLAN §10: teacher-escalation, curator rot-check, skill-as-Tool wrapper, script exec, seed skills. |
 
-**Tests:** `cargo test --lib` → **519 passing**, 0 failed. `cargo clippy --lib` 0 errors, `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. (Last verified 2026-07-18, after **M5 reversibility + M6 audio-egress cores + M8**.)
+**Tests:** `cargo test --lib` → **542 passing**, 0 failed. `cargo clippy --lib` 0 errors (117 warnings), `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean (1 known tsconfig warning). (Last verified 2026-07-21, project-review session, tree clean at `ca54251`.)
+
+**2026-07-21: FULL PROJECT REVIEW — 4-agent audit (Wave 5 cores, Waves 3–4, docs accuracy, open-items harvest) + complete doc reconciliation.** No code changed; all gates re-verified green (542 tests / clippy 0 errors / `--no-default-features` clean / frontend build+check clean, tree clean at `ca54251`). **Verdict: the Wave 1–5 work substantially matches its claims** — every audited security invariant was found implemented and tested where stated; M7 Tier-P (per-profile fs confinement) is the strongest-evidenced area (real behavioral two-profile isolation tests, not just resolver units). **NEW findings the docs didn't disclose, now tracked in ROADMAP's current list:** (1) **HIGH** — the promised end-to-end "a cloud seat can't defeat RouteLocal" regression test was never written; the invariant holds only by construction (`run_subagent` reuses the unmodified, gate-tested `process_message`; `resolve_seat` is wired via `tools/delegate.rs:145`, not `process_message` directly, and nobody closed the loop). (2) **MED-HIGH** — the M7 Tier-K network ceiling is live enforcement code but **unreachable in practice**: no IPC/UI ever writes a `sandbox_config` row (`set_sandbox_config` has zero production callers), so every real profile takes the unconfigured/legacy branch. (3) **MED** — `audio/privacy.rs::stt_egress` deviates from the M6 design: it content-classifies a transcript, but the real pre-transcription STT decision must be content-free (binding-based) — no test; fix before wiring native STT. Also the Public+floor path unconditionally withholds where the design mandates a one-confirm opt-in (stricter than spec, undisclosed). (4) **MED** — two security-reviewed paths are untested: the delegated-helper guard-wrap-on-re-entry branch (`loop_mod.rs` ~1240-1256) and the work-runner 5-min deadline + panic supervisor. (5) **MED** — cron "never egresses" caveat: an interactively-granted Session-scope External approval could be replayed by a byte-identical headless cron call in the same app session (`ActionFingerprint` = tool+args only, no session discriminator). (6) Two items were stale-marked blocked but are **unblocked**: reroute UX 2.3 (dep 3.1 shipped) and the budget governor (dep cost-capture shipped); the 2.5 durability journal's dep (4.4) is also met. (7) M8's catalog ships `TODO-CURATE` sha256 placeholders (fails closed — nothing installable until curated); its boot-time integrity re-check primitive is unwired (disclosed as S4). (8) Minor cleanups flagged: `open_profile` whitespace-padding still open (from 2026-07-18), dead `SkillsSettings.svelte`/`SkillListItem.svelte` mockup pair, stale `RiskClass::External` "Reserved" doc comment, stale `crash_recovery.rs:217` TODO (tool_audit now exists). **Docs reconciled this session:** ROADMAP (new Stage entry, milestone board rewritten — M4/Skills/M5–M8 rows were flatly stale, health-check 462→542, a CURRENT ordered near-term list added), BUILD-MANIFEST (progress-as-of-2026-07-21 banner), this file's header block, and **all 8 `docs/codebase/` subsystem docs + README regenerated** (they predated Waves 1–5 and contained actively false claims — "no native tool-use", "classifier is an unwired stub", "schema v1"). **Recommended build order is ROADMAP's current list** (top: the seat-routing test, the sandbox_config writer surface, open_profile trim, per-profile thresholds in the tool gate, reroute UX, budget governor).
 
 **2026-07-18: Wave 5.1 / M5 Slice 2 (partial) — the screenshot-forces-local privacy invariant** (`7d28ea9`). `hooks/routing.rs::routing_for_turn(base, has_image)` — a turn carrying an on-screen IMAGE (a screenshot) is upgraded to `RoutingRequirement::LocalRequired` **regardless of binding**, only ever TIGHTENING (an existing local requirement keeps its reason). The §7 classifier labels TEXT; it can't vet a screenshot (which may show anything on screen), and the user can't know what's on screen when a *later* turn captures it — so `Public`'s text-level cloud opt-in does NOT extend to images. Composes with the existing `enforce_local_routing` (image + only-cloud candidates → a loud `LocalRoutingViolation`, never egress). **Lean review caught a HIGH I'd introduced** — my first cut exempted `Public`, but the M5 design (Fix 3 / OQ-1, ~lines 503/534) mandates the safe default `image_in_window ⇒ LocalRequired` **today regardless**, relaxable only by a FUTURE cloud-vision **consent toggle** (OQ-1, undecided/unbuilt) — fixed to force local for any image, dropped the binding param. 542 tests (+4). Gates green. **⚠ OQ-1 is an OPEN Lukas decision** (whether cloud vision is ever an opt-in vs. screenshots local-only forever) — until decided + a consent toggle built, screenshots stay maximally private. **Rest of Slice 2 (guard-wrap capture/AX/clipboard output; per-image token cost + oldest-frame eviction) is coupled to the Slice-1 capture tool + the content-model wiring — on-target.**
 
@@ -153,7 +155,7 @@ Two things landed in commit `f9223c9`:
 
 **Round 1 was adversarially reviewed** (a 4-lens multi-agent pass + verification); it surfaced 3 real issues, all fixed with regression tests before commit: (1) the privacy filter's `LocalRequired` annotation was a silent no-op in tool dispatch — now the dispatcher **fails closed** (blocks a must-stay-local tool call when the conversation is on a cloud endpoint); (2) `guard_wrap` neutralized backticks but not the trust-boundary banner it teaches the model — now both are neutralized; (3) `format_outcome` spliced model-controlled tool names/errors in raw — now all interpolated untrusted text runs through `neutralize_untrusted`.
 
-**Still NOT wired (updated 2026-07-17):** `delegate` (blocked on the Wave 4.3 agent-type registry — a real delegate dispatches a sub-agent), and the persisted-journal half of the durability trio (deferred to the first non-idempotent external-effect tool, dep Wave 4.4). Everything else once listed here has since shipped: session-search + system-status + cron-management + `fetch_url` + `ask_human` tools, write/delete tools, the approval spine, `shell_exec` (Seatbelt-sandboxed), MCP-into-registry, reroute-to-local plumbing (`NeedsLocalReroute`), and the headless approval queue (`QueueingPrompter`, server-track prep).
+**Still NOT wired (updated 2026-07-21):** only the persisted-journal half of the durability trio (its dep, Wave 4.4, is now met — buildable, not built) and MCP's real wire transport (`UnwiredTransport` — the trust spine exists, no stdio/SSE client yet). `delegate` HAS shipped (Wave 4.3c, `e1e1f8c`). Everything else once listed here has since shipped: session-search + system-status + cron-management + `fetch_url` + `ask_human` tools, write/delete tools, the approval spine, `shell_exec` (Seatbelt-sandboxed), MCP-into-registry, reroute-to-local plumbing (`NeedsLocalReroute`), and the headless approval queue (`QueueingPrompter`, server-track prep).
 
 ---
 
@@ -169,7 +171,7 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 519 passed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 542 passed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
 ```
@@ -178,7 +180,7 @@ cd /Users/hayai/Desktop/lost-harness-product && npm run check               # sv
 
 ## What's next (in order)
 
-> **The ordered, maintained version of this list now lives in [`docs/ROADMAP.md`](docs/ROADMAP.md)** — start there. The short version (2026-07-16): ① Settings "Permissions" pane (small, do first) → ② frontend housekeeping (delete superseded components, dev switcher, ModelPicker collision) → ③ classifier integration round (run the bundle's `export_onnx.py` — the ONNX ensemble is blocked on that one action, not on code — then wire `engine.rs`, do the deferred `gate.rs` renames, build the annotated-redaction sidebar) → ④ native tool-use (Q1) → ⑤ memory system → ⑥ rest of M4 → ⑦ remaining core tools. Detail below is kept for context.
+> **The ordered, maintained version of this list lives in [`docs/ROADMAP.md`](docs/ROADMAP.md) — read its "CURRENT LIST (2026-07-21)" block at the top of "What's left".** Short version: ① the missing seat-routing regression test → ② `sandbox_config` IPC + settings surface (makes the Tier-K ceiling real) → ③ `open_profile` whitespace fix → ④ per-profile thresholds in the tool-action gate → ⑤ reroute UX (2.3, unblocked) → ⑥ budget governor (unblocked) → ⑦ audit test debt → ⑧ M8 sha256 curation → then MCP transport / durability journal / M5-Slice-3-logic / M6-Slice-4a. Everything numbered below in this section is a HISTORICAL 2026-07-16 list (all of it since done) kept for context.
 
 1. **M3 do-now items 1–8 AND the first Part-2 item (Q8) are DONE.** Q8 (grant×risk matrix + persisted per-profile `tool_rules` + risk-badged dialog) landed 2026-07-16 in 6 commits and passed a 4-lens adversarial review (1 LOW, reconciled) + a live dialog visual QA. Full spec is the build plan's **"Part 2A"** section. Remaining **Part 2 (M4 / later)** items:
    - **Q8 follow-up — the Settings "Permissions" pane:** the backend `list_tool_rules`/`delete_tool_rule` commands + `tauri.ts` wrappers exist; a Settings tab to list persisted "Always allow" rules and revoke them is the one piece of Q8 not yet built. Small, self-contained.
@@ -235,18 +237,24 @@ lost-harness-product/
 │       │   ├── loop_mod.rs # AgentLoop — message→classify→gate→model→stream→[tool loop]→persist
 │       │   └── *_tests.rs
 │       ├── classifier/     # labels a message Private/Public/Uncertain (was "trm/")
-│       │   ├── heuristic.rs # regex-based PII detector (SSN, credit card, API keys, health, etc.) — active today
-│       │   └── engine.rs   # EnsembleClassifier — stub for the real trained model (bge+distilbert ONNX), not wired
-│       ├── models/         # model manager — OpenAI-compatible HTTP client, provider config, SSE streaming
-│       ├── storage/        # SQLite: global.db (shared) + one profiles/<name>.db per profile
-│       │   ├── schema.rs   # every table definition, incl. memory_facts / memory_vectors (still a raw-BLOB placeholder) / skills
-│       │   └── migrations.rs
-│       ├── tools/          # M3: registry + Tool trait; calling.rs (fenced dialect + guard_wrap),
-│       │   │               #     fs.rs (read_file/list_dir/search_files), dispatch.rs (ToolDispatcher)
-│       ├── hooks/          # M3: the unified gate chain [PrivacyFilter, Sandbox, Permission, FirstUseConfirm]
-│       ├── ipc/            # Tauri command handlers + AppState
-│       ├── platform/       # computer-use stubs, one submodule per OS (M5, not built)
-│       └── audio/          # voice stub (M6, not built)
+│       │   ├── heuristic.rs # regex-based PII rules layer (SSN, credit card, API keys, health, etc.)
+│       │   ├── engine.rs   # EnsembleClassifier — the real INT8 ONNX ensemble via `ort`, LIVE (rules-only fallback without the onnx-classifier feature)
+│       │   └── redact.rs   # redact-and-send partial delegation (nonce placeholders, rehydration)
+│       ├── models/         # model manager — client + SSE (native tool_calls + usage), content.rs (multimodal, dormant),
+│       │                   #   pricing.rs, seat.rs (resolve_seat), hardware/catalog/download (M8 lifecycle)
+│       ├── storage/        # SQLite: global.db (v7) + profiles/<name>.db (v10) + walled-memory/<name>.db;
+│       │                   #   Connection behind parking_lot::Mutex; hybrid FTS5 + sqlite-vec memory (private tables physically separate)
+│       ├── tools/          # full belt: fs (6 tools, per-profile workspaces), exec (Seatbelt shell), fetch, cron,
+│       │                   #   delegate, ask_human, memory, session_search, system_status, skills, mcp (transport unwired),
+│       │                   #   computer_use (dormant); dispatch.rs restricted()/headless(), calling.rs guard_wrap(_stable)
+│       ├── hooks/          # gate chain [PrivacyFilter, Sandbox, ProtectedPath(per-profile), SessionMode, Permission,
+│       │                   #   FirstUseConfirm] + audit observer; approval.rs matrix; headless.rs queue; routing.rs (dormant)
+│       ├── agent/          # loop_mod + compaction, memory_flush, skill_reflect, work_runner, result_sink, crash_recovery
+│       ├── queue/          # WorkKind/WorkState/WorkItem — the one-queue model (cron + agent dispatch)
+│       ├── packs/          # capability packs (install inert)
+│       ├── ipc/            # Tauri command handlers + AppState (+ ask_human.rs)
+│       ├── platform/       # per-OS computer-use backends (M5 native, on-target — still stubs)
+│       └── audio/          # privacy.rs AudioEgressGate (built, dormant); native voice (M6, on-target)
 ├── src/                    # Svelte 5 frontend — app entry is /app.html (NOT /)
 │   ├── App.svelte          # renders the current screen from the nav store; hydrates profiles→providers+conversations on mount; DEV floating screen-switcher + theme toggle (QA aid, remove later)
 │   ├── lib/
@@ -285,7 +293,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 519 tests
+cd src-tauri && cargo test --lib   # 542 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 

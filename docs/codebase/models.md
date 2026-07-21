@@ -1,75 +1,388 @@
 # Models subsystem (`src-tauri/src/models/`)
 
-- **Purpose** — Registry of model endpoints (`Provider`/`ProviderKind`) and a thin OpenAI-compatible HTTP client (`ModelClient`) with an incremental SSE parser (`SseStream`), all fronted by `ModelManager`. This is what the agent loop calls to list models, resolve a client for a given provider id, and open a streaming chat completion. **Text-only**: there is no native `tool_use` request/response path — every model, cloud or local, is talked to via plain chat messages and the fenced tool-call dialect lives entirely in `agent`/`tools`, not here. Native tool-use is a documented, unbuilt gap (PLAN.md §12, item 1).
+- **Purpose** — Registry of model endpoints (`Provider`/`ProviderKind`), an
+  OpenAI-compatible HTTP client (`ModelClient`) with an incremental SSE parser
+  (`SseStream`), all fronted by `ModelManager`; plus a cluster of Wave 5.3/M8
+  "model lifecycle" modules (hardware probing, a curated download catalog,
+  verified download) and Wave 3.1/3.2 helpers (per-profile model "seats",
+  cloud pricing for the usage ledger). **This module is no longer text-only.**
+  The previous version of this doc claimed "no native `tool_use` path" —
+  that's flatly false as of Q1 (2026-07-17): `SseEvent` decodes native
+  streamed `tool_calls`, `ChatRequest` carries an optional `tools` array, and
+  the agent loop picks native-vs-fenced transport per round. The fenced
+  dialect (`tools::calling`) remains the fallback for endpoints that don't
+  support native tool calls — it hasn't been removed, just demoted to "one of
+  two transports" instead of "the only one."
 
 - **Files**
-  - `mod.rs` (24 lines) — module doc + re-exports (`ChatMessage`, `ModelClient`, `ModelManager`, `Provider`, `ProviderKind`). Read this first for the module map.
-  - `provider.rs` (83 lines) — `ProviderKind` enum and `Provider` struct: static config for one endpoint (id/name/base_url/api_key/kind) plus `is_local()`/`is_private()`.
-  - `client.rs` (214 lines) — `ModelClient`: one `reqwest::Client` per provider; `list_models`, `stream_chat`, `complete` against the OpenAI chat-completions surface.
-  - `manager.rs` (110 lines) — `ModelManager`: `RwLock`-guarded registry of `Provider`s and a cache of built `ModelClient`s, keyed by provider id.
-  - `sse.rs` (264 lines) — `SseStream` / `SseEvent`: incremental line-buffered SSE parser, a Rust port of the Electron app's `shared/sse.mjs`.
-  - `tests.rs` (289 lines, `#[cfg(test)]`, wired in via `mod.rs:19-20`) — unit tests for `Provider::is_local`/`is_private`, `Provider` serde round-trip, `SseStream` parsing (split chunks, `[DONE]`, keep-alives, errors, delta/message/text shapes, UTF-8 resilience), and `ModelManager` add/remove/lookup/`list_models_for`. No real network — SSE tests feed byte chunks via the test-only `SseStream::from_byte_stream` (sse.rs:85-94).
+  - `mod.rs` (31 lines) — module doc + re-exports: `ChatMessage`,
+    `ModelClient`, `OwnOutput`, `ModelManager`, `Provider`, `ProviderKind`,
+    `resolve_seat`. Read this first for the module map.
+  - `provider.rs` (95 lines) — `ProviderKind` + `Provider`: static endpoint
+    config (id/name/base_url/api_key/kind) plus `is_local()`/`is_private()`
+    and the Q1 `supports_native_tools` flag + `with_native_tools()` builder.
+  - `client.rs` (279 lines) — `ModelClient`: one `reqwest::Client` per
+    provider; `list_models`, `stream_chat`, `stream_chat_with_tools`
+    (the Q1 native-transport entry point), `complete` against the OpenAI
+    chat-completions surface. `OwnOutput` (the type-level "parse only the
+    model's own current-turn output" enforcement) also lives here.
+  - `sse.rs` (370 lines, up from ~264) — `SseStream`/`SseEvent`: incremental
+    line-buffered SSE parser. `SseEvent` now has **five** variants, not
+    four: `Delta`, `Done`, `KeepAlive`, `Error`, plus Q1's `ToolCalls(Vec<
+    ToolCallFragment>)` and Wave 3.2's `Usage { prompt_tokens,
+    completion_tokens }`.
+  - `content.rs` (144 lines, **new file**) — `ImageBlock` + `assemble_content`:
+    the multimodal wire-format primitive. Built and unit-tested (5 tests) but
+    has **zero callers** anywhere in the tree — see Gotchas.
+  - `pricing.rs` (86 lines, **new file**) — `cost_usd(model, prompt_tokens,
+    completion_tokens) -> Option<f64>`: the Wave 3.2 usage-ledger price table.
+  - `seat.rs` (145 lines, **new file**) — `resolve_seat`: Wave 3.1 per-profile
+    model-seat preference resolver.
+  - `hardware.rs` (131 lines, **new file**) — M8 `HardwareProfile`/`probe()`/
+    `fits()`: sizes the model catalog against the machine's RAM.
+  - `catalog.rs` (166 lines, **new file**) — M8 curated model catalog
+    (`catalog.json`, bundled via `include_str!`), `CatalogEntry`,
+    `catalog_for(profile)`.
+  - `download.rs` (189 lines, **new file**) — M8 model download: HF-only host
+    allowlist, SHA-256 verify-before-install, atomic rename.
+  - `manager.rs` (110 lines) — `ModelManager`: `RwLock`-guarded registry of
+    `Provider`s + a cache of built `ModelClient`s, keyed by provider id.
+    Unchanged in shape since the last doc pass.
+  - `tests.rs` (446 lines, `#[cfg(test)]`, wired in via `mod.rs:25-26`) — unit
+    tests for everything above, plus the native-tool-call SSE decode/assemble
+    round trip and an opt-in **live** test against a real endpoint (see
+    "Native tool-use" below).
 
 - **Key types / traits / functions**
-  - `ProviderKind` — `provider.rs:20-28` — `Local | Cloud | Custom`. `#[serde(rename_all = "lowercase")]` (provider.rs:19) — **load-bearing**: the frontend does `p.kind === "local"` string comparisons (provider-catalog.ts, providers.svelte.ts, ProviderSettings.svelte, ModelPicker.svelte per the doc comment at provider.rs:13-17); removing that serde attribute silently breaks the frontend's kind checks without a compile error on either side.
-  - `Provider` — `provider.rs:36-47` — `{ id, name, base_url, api_key: Option<String>, kind }`. `base_url` is the *root* of the OpenAI-compatible surface (e.g. `https://api.openai.com/v1`); `ModelClient` appends `/models` and `/chat/completions`.
-    - `Provider::new(id, name, base_url, api_key, kind) -> Self` — provider.rs:53-67.
-    - `Provider::is_local(&self) -> bool` — provider.rs:71-73 — purely `kind == Local`.
-    - `Provider::is_private(&self) -> bool` — provider.rs:80-82 — delegates to `crate::agent::egress::is_private_endpoint(&self.base_url)`, a network-level check (loopback/RFC1918/Tailscale CGNAT/`.local`/`.lan`/`.internal`/`.ts.net`). **`is_local` and `is_private` are different axes** — a `Custom` provider pointing at `http://10.0.0.5` is private but not local; a `Local`-kind provider with a bogus/public `base_url` is local but not private. Callers that need "never egresses" must check `is_private`, not `is_local` (see gotcha below).
-  - `ModelClient` — `client.rs:90-93` — `{ client: reqwest::Client, provider: Provider }`.
-    - `ModelClient::new(provider: Provider) -> Result<Self>` — client.rs:99-106 — builds `reqwest::Client` with `pool_idle_timeout(60s)` and `connect_timeout(30s)`.
-    - `ModelClient::provider(&self) -> &Provider` — client.rs:109-111.
-    - `ModelClient::list_models(&self) -> Result<Vec<String>>` — client.rs:115-135 — `GET {base_url}/models`, bearer auth if `api_key` set, decodes `{ data: [{ id }] }`.
-    - `ModelClient::stream_chat(&self, model: &str, messages: Vec<ChatMessage>) -> Result<SseStream>` — client.rs:139-167 — `POST {base_url}/chat/completions` with `stream: true`; returns the raw `SseStream` for the caller to pump.
-    - `ModelClient::complete(&self, model: &str, messages: Vec<ChatMessage>) -> Result<String>` — client.rs:172-213 — non-streaming variant, `stream: false`; used for short prompts (titles, routing calls) per the doc comment. **Not currently called from anywhere in the tree outside tests** (grep found no call sites in `agent`/`tools`/`ipc`) — it's built and tested but unwired; check before assuming any caller depends on it.
-    - `ChatMessage { role: String, content: String }` — client.rs:23-27 — `role` is a bare `String`, not an enum, specifically so non-OpenAI proxy extensions round-trip without translation. Constructors: `ChatMessage::user/system/assistant` — client.rs:31-50.
-  - `ModelManager` — `manager.rs:21-24` — `{ providers: RwLock<Vec<Provider>>, clients: RwLock<HashMap<String, ModelClient>> }`. Uses `parking_lot::RwLock` deliberately (avoids std's write-starvation, no `await` held across the critical section — manager.rs:6-11).
-    - `ModelManager::new() -> Self` — manager.rs:35-40 — empty; the Tauri `setup` hook seeds it (see Data flow).
-    - `add_provider(&self, p: Provider)` — manager.rs:46-57 — upsert by `id`; **drops the cached client** for that id so `get_client` rebuilds from the new config on next call.
-    - `remove_provider(&self, id: &str)` — manager.rs:60-66 — no-op on unknown id.
-    - `list_providers(&self) -> Vec<Provider>` — manager.rs:70-72.
-    - `get_provider(&self, id: &str) -> Option<Provider>` — manager.rs:75-77.
-    - `get_client(&self, id: &str) -> Option<ModelClient>` — manager.rs:83-91 — cache-or-build; returns an owned clone each call (cheap — `reqwest::Client` is `Arc`-backed internally, `clone_client` at manager.rs:107-110 rebuilds a `ModelClient` from `provider().clone()` rather than deriving `Clone` on `ModelClient` directly).
-    - `list_models_for(&self, id: &str) -> Result<Vec<String>>` — manager.rs:96-101 — resolves client then calls `list_models`; `Err` if `id` unknown.
-  - `SseStream` / `SseEvent` — `sse.rs:32-45`, `50-60` — `SseEvent::{Delta(String), Done, KeepAlive, Error(String)}`.
-    - `SseStream::new(response: reqwest::Response) -> Self` — sse.rs:68-79 — wraps `response.bytes_stream()`.
-    - `SseStream::next_event(&mut self) -> Option<SseEvent>` — sse.rs:98-141 — the pump: drains complete `\n`-lines from an internal `String` buffer, classifying each via `parse_line`; pulls more bytes on buffer-exhaustion; `None` after `Done`/EOF. Uses `String::from_utf8_lossy` on each chunk (sse.rs:119) — deliberately resilient to a provider injecting invalid UTF-8 mid-stream.
-    - `parse_line` — sse.rs:160-191 — skips `:` comments, non-`data:` lines, empty payloads, and malformed JSON (all → `KeepAlive`, never panics); `[DONE]` → `Done`; parses `error` (string or `{message}` object) → `Error`; otherwise tries `choices[0].delta.content`, falling back to `.message.content`, then `.text` (`SsePayload::first_delta`, sse.rs:246-263) — this fallback chain is what makes non-streaming-shaped and legacy-completions providers work through the same parser.
+  - `ProviderKind` (`provider.rs:20-28`) — `Local | Cloud | Custom`,
+    `#[serde(rename_all = "lowercase")]` (`provider.rs:19`) — still
+    load-bearing for the frontend's `p.kind === "local"` checks; unchanged.
+  - `Provider` (`provider.rs:36-52`) — gained `supports_native_tools: bool`
+    (`provider.rs:47-51`, `#[serde(default)]` so old persisted rows without
+    the field still deserialize) and the builder `with_native_tools(self,
+    supported: bool) -> Self` (`provider.rs:76-79`). `is_local()`
+    (`provider.rs:83-85`) and `is_private()` (`provider.rs:92-94`, still
+    delegates to `crate::agent::egress::is_private_endpoint`) are unchanged.
+  - `ModelClient` (`client.rs:131-134`) — `stream_chat(model, messages)`
+    (`client.rs:180-186`) is now a **thin wrapper** around
+    `stream_chat_with_tools(model, messages, None)`.
+    `stream_chat_with_tools(model, messages, tools: Option<&Value>)`
+    (`client.rs:192-230`) is the Q1 entry point: builds a `ChatRequest` with
+    the optional `tools` array and a `stream_options.include_usage` that is
+    **only set when the endpoint is NOT private**
+    (`(!self.provider.is_private()).then_some(...)`, `client.rs:207-208`) —
+    a local/private call is always `$0` and never consults `usage`, so
+    there's no reason to ask a (more likely strict) self-hosted server for
+    it. `complete(model, messages)` (`client.rs:235-278`) is the non-stream
+    variant — **still has no caller outside `models/` production code
+    besides `agent/memory_flush.rs:138` and `agent/skill_reflect.rs:149`**
+    (see Gotchas for the usage-ledger gap this creates).
+  - `ChatRequest` (`client.rs:82-95`) — `tools: Option<&Value>` and
+    `stream_options: Option<StreamOptions>` both `#[serde(skip_serializing_if
+    = "Option::is_none")]` — a non-tool-capable / non-billed request never
+    sees either field on the wire.
+  - `OwnOutput` (`client.rs:60-77`) — unchanged: constructible only via the
+    `pub(crate)` `from_stream_assembly`, called exactly once per turn by the
+    agent loop right after assembling the model's SSE deltas. This is what
+    lets `tools::calling::parse_tool_calls` require `&OwnOutput` instead of
+    `&str` — a type-level guarantee that only the model's own current-turn
+    text can be parsed for (fenced) tool calls.
+  - **`SseEvent`** (`sse.rs:32-58`):
+    - `ToolCalls(Vec<ToolCallFragment>)` — one streamed piece of a native
+      tool call per fragment (`index`, optional `name`, an `arguments`
+      string fragment to concatenate). `ToolCallFragment` at `sse.rs:62-66`.
+    - `Usage { prompt_tokens: u32, completion_tokens: u32 }` — the final
+      chunk's token totals, when the endpoint reports them.
+  - **`parse_line`** (`sse.rs:181-241`) dispatch order: comment/non-`data:`/
+    empty/`[DONE]` → `error` field → content delta (`delta.content` →
+    `message.content` → `text` fallback chain, `first_delta`,
+    `sse.rs:323-339`) → **tool-call fragments** (`tool_call_fragments`,
+    `sse.rs:345-369`, reading `delta.tool_calls` falling back to
+    `message.tool_calls`) → **usage** (`sse.rs:223-238`) → `KeepAlive`.
+    Content and tool-calls are treated as mutually exclusive per chunk in
+    practice (content wins if a server ever mixes them).
+  - **Usage parsing is deliberately lenient.** `SsePayload.usage` is kept as
+    a permissive `serde_json::Value`, **not** a typed struct
+    (`sse.rs:259-266`, doc comment explains why): a malformed `usage` object
+    (string/float token counts, or `usage` riding on a content-bearing chunk)
+    must never fail the whole line's parse and drop a co-located `content`
+    delta. Token fields are pulled leniently at the decode site
+    (`sse.rs:224-229`, non-integer → treated as absent/0) and a zero/absent
+    usage never emits a `Usage` event (→ the ledger records an honest
+    "unknown" cost rather than `0`). Regression-tested:
+    `sse_malformed_usage_never_drops_co_located_content`
+    (`models/tests.rs:154-166`), `sse_ignores_a_zero_usage_chunk`
+    (`models/tests.rs:169-176`).
+  - **Native tool-use assembly** — `assemble_native_calls` lives in
+    `tools/calling.rs:59-95` (not in `models/`, but the direct consumer of
+    `models::sse::ToolCallFragment`): it folds fragments per call-slot
+    `index` (name arrives once, `arguments` streams as string pieces to
+    concatenate) into the **same `ParsedToolCall`** enum the fenced parser
+    produces — a missing name or unparseable/non-object arguments become
+    `ParsedToolCall::Malformed`, fed back to the model to retry exactly like
+    a bad fenced block. This is the normalization point where the two
+    transports converge on one downstream pipeline
+    (budgets/repeat-detection/hooks/audit in `tools::dispatch` are
+    transport-blind).
+  - `pricing::cost_usd(model, prompt_tokens, completion_tokens) ->
+    Option<f64>` (`pricing.rs:42-51`) — looks up `model` (lowercased) against
+    a small substring table (`pricing.rs:18-36`) ordered **most-specific
+    match first** (e.g. `"gpt-4o-mini"` before `"gpt-4o"`, so the cheaper
+    variant is never mis-billed at the pricier rate); an unrecognized model
+    returns `None` — never a nearest-guess.
+  - `seat::resolve_seat(storage, model_manager, profile, seat,
+    caller_provider_id, caller_model) -> (String, String)` (`seat.rs:26-49`)
+    — resolves a user-defined seat name to a concrete `(provider_id, model)`
+    via the profile's `seat_bindings` table, falling back to
+    `(caller_provider_id, caller_model)` when the seat is empty/`"inherit"`
+    (case-insensitive)/unbound/bound to a since-deleted provider. **This is a
+    preference resolver only — it never touches privacy.** The doc comment
+    (`seat.rs:8-13`) is explicit: the pair it returns is a candidate that the
+    per-turn privacy gate and `enforce_local_routing` still get the final
+    say over downstream, so a seat can prefer cloud but can never defeat a
+    `RouteLocal`/`LocalRequired` verdict. Called from `tools/delegate.rs:145`
+    (Wave 4.3c persona dispatch).
+  - `hardware::probe() -> HardwareProfile` (`hardware.rs:31-44`) — total RAM
+    + CPU cores (via `sysinfo`) + OS/arch. `fits(model_bytes, profile) ->
+    Fit` (`hardware.rs:68-82`) is a **pure** sizing function
+    (`Fits`/`Tight`/`TooLarge` against a `1.3×` working-set overhead and a
+    `0.7` "comfortable" fraction of total RAM) that **fails closed to
+    `TooLarge` when `total_ram_bytes == 0`** (`hardware.rs:69-72`) — an
+    unknown-RAM probe failure never claims a model fits.
+  - `catalog::CatalogEntry::is_curated()` (`catalog.rs:48-51`) — true only for
+    a real 64-hex-char SHA-256, not the bundled placeholder.
+    `catalog_for(profile) -> Vec<CatalogEntryView>` (`catalog.rs:93-95`)
+    annotates each bundled entry with its `Fit` and `installable` (=
+    `is_curated()`) for the onboarding picker.
+  - `download::host_allowed(url)` (`download.rs:25-39`) — HTTPS + Hugging
+    Face root domains only (`huggingface.co`, `hf.co`, and true subdomains —
+    a suffix-spoof like `huggingface.co.evil.com` is rejected,
+    `download.rs:140`). `verify_and_install(partial, final_path,
+    expected_sha256)` (`download.rs:58-73`) — hashes the downloaded file,
+    and on any mismatch **or** a non-curated placeholder hash, deletes the
+    partial and installs nothing (`bail!`); on match, an atomic
+    `std::fs::rename` publishes it. `download_to_partial(url, partial,
+    on_progress)` (`download.rs:78-119`) streams with `Range`-header resume.
 
 - **Data flow / how it fits**
-  1. **Startup**: `lib.rs` `setup()` creates `ModelManager::new()` (empty) then calls `hydrate_providers_from_storage(&storage, &model_manager)` (`lib.rs:159-186`), which reads `storage.global().list_endpoints()` and calls `add_provider` for each persisted row. **Note**: `ep.kind` is matched as `"local" | "cloud" | _ => Custom` (lib.rs:171-175) — any unrecognized/misspelled kind string silently becomes `Custom`, not an error.
-  2. **IPC surface** (`ipc/mod.rs`): `add_provider` command (ipc/mod.rs:315-329, uses `parse_kind` at ipc/mod.rs:475-480 which *does* reject unknown kind strings — inconsistent with the lenient hydration path above, see gotchas) and `remove_provider` mutate the shared `Arc<ModelManager>` on `AppState`; `list_models` command (ipc/mod.rs:347-355) calls `ModelManager::list_models_for`.
-  3. **Agent loop** (`agent/loop_mod.rs`): `AgentLoop::stream_to_provider` (loop_mod.rs:261-...) calls `model_manager.get_client(&provider.id)` (loop_mod.rs:273-276), builds the chat history (system message = tool catalog from the fenced dialect, then prior turns with `role: "tool"` remapped to `"user"` since the fenced dialect carries tool results as plain text — loop_mod.rs:300-329), then loops (bounded by `MAX_TOOL_ROUNDS = 6`, loop_mod.rs:338) calling `client.stream_chat(&model, history.clone())` (loop_mod.rs:343-346) and pumping `sse.next_event()` (loop_mod.rs:349-368), emitting a Tauri `stream:token` event per `Delta` and `stream:error` + early-return on `Error`.
-  4. `find_local_provider` (loop_mod.rs:244-249) — used by the §7 privacy-gate `RouteLocal` path — filters `list_providers()` for `p.is_local() && p.is_private()`, i.e. requires **both** kind and network location to agree before treating an endpoint as safe to route sensitive content to.
-  5. The `ModelStreamer` trait (loop_mod.rs:75-86, blanket-impl'd for `ModelClient` at loop_mod.rs:88-99) exists purely so `agent/loop_tests.rs` can inject a fake streamer without a real HTTP server — production always goes through the inherent `ModelClient::stream_chat`.
-  6. Privacy enforcement is *not* in this module — `models` only exposes the data (`is_private`, `is_local`) that `agent::egress` and `agent::gate` use to make blocking/routing decisions. This module has no knowledge of the privacy gate's decision logic (see provider.rs:1-6, mod.rs:11-12).
+  1. **Startup**: `lib.rs::hydrate_providers_from_storage`
+     (`src-tauri/src/lib.rs:304-332`) reads `storage.global().list_endpoints()`
+     and calls `add_provider` for each persisted row, building
+     `Provider::new(...).with_native_tools(ep.supports_native_tools)`
+     (`lib.rs:327-328`). `ep.kind` is matched leniently
+     (`"local"|"cloud"|_ => Custom`, `lib.rs:316-319`) — an unrecognized kind
+     string silently becomes `Custom`, not an error (see Gotchas for the
+     inconsistency with the IPC write path).
+  2. **IPC surface** (`ipc/mod.rs`) — `AppState` is defined **here**
+     (`ipc/mod.rs:56-74`), not in `agent/loop_mod.rs` as an earlier version of
+     this doc said; it holds `model_manager: Arc<ModelManager>`,
+     `storage: Arc<Storage>`, and `embedder: Option<Arc<EmbedderHandle>>`
+     among others. `add_provider` (`ipc/mod.rs:343`), `remove_provider`
+     (`ipc/mod.rs:376`), `list_models` (`ipc/mod.rs:390`); `parse_kind`
+     (`ipc/mod.rs:1704`) **rejects** unknown kind strings — inconsistent with
+     the lenient hydration path above (see Gotchas). The M8 lifecycle is also
+     IPC-wired: `probe_hardware` (`ipc/mod.rs:685`), `list_model_catalog`
+     (`ipc/mod.rs:692-694`), `download_model` (`ipc/mod.rs:771-810`, streams
+     `model:download-progress` events, refuses a non-curated entry outright
+     at `ipc/mod.rs:780-784` before ever touching the network).
+  3. **Agent loop** (`agent/loop_mod.rs`, 1825 lines — grown substantially
+     since the last doc pass): per round, `native_mode = provider
+     .supports_native_tools && native_spec.is_some()` (`loop_mod.rs:1340`,
+     `native_spec` is `self.tools.native_tools_spec()` — the OpenAI
+     function-call array built once per turn from `Tool::schema()` across
+     every available tool, `tools/dispatch.rs:366-385`). The round calls
+     `client.stream_chat_with_tools(&model, compaction.sent, if native_mode {
+     native_spec.as_ref() } else { None })` (`loop_mod.rs:1367-1374`) and
+     pumps events (`loop_mod.rs:1381-1415`): `Delta` → token sink;
+     `ToolCalls` → accumulated into `native_frags` **only if `native_mode`**
+     (an endpoint that streams `tool_calls` without the flag set is logged
+     and ignored, `loop_mod.rs:1391-1399` — the flag is the user-set
+     capability contract, not a sniff); `Usage` → `round_usage`; `Error` →
+     abort the turn. `native_frags` are turned into `ParsedToolCall`s via
+     `tools::calling::assemble_native_calls` (`loop_mod.rs:1526`) and driven
+     through `run_turn_native`, which **never invokes the fenced
+     `parse_tool_calls`** — the "a forged fence can't mint a call" invariant
+     becomes structural on a native turn, not just a convention.
+  4. **Usage ledger booking** (Wave 3.2, `loop_mod.rs:1474-1502`): after each
+     streamed round, `cost_usd` is `Some(0.0)` for a non-cloud (`!is_cloud`)
+     call, else `round_usage.and_then(|(pt,ct)| pricing::cost_usd(&model, pt,
+     ct))` — `None` when the endpoint didn't report usage or the model isn't
+     priced. `profile_db.record_usage(...)` books the row; a ledger-write
+     failure only logs a warning, never fails the turn.
+     **`ModelClient::complete` books no usage row.** The two production
+     callers of `complete` — `agent/memory_flush.rs:138` (Wave 3.5 durable-
+     fact extraction) and `agent/skill_reflect.rs:149` (Wave 4.2 autonomous
+     skill drafting) — call it and use the returned text directly; neither
+     calls `record_usage` afterward. Any cloud model used for these
+     background calls is invisible to the cost ledger today — a known gap,
+     not yet flagged as a TODO in code.
+  5. `find_local_provider`, the §7 `RouteLocal` gate, and
+     `crate::agent::egress` are unchanged in shape from the previous doc
+     pass — `models` still only exposes `is_private`/`is_local` as data for
+     `agent::gate` to make the actual blocking/routing decision.
+  6. **The multimodal content assembler is built but wired to nothing.**
+     `content::assemble_content(text, images, multimodal) -> serde_json::Value`
+     (`content.rs:65-91`) is fully unit-tested (`content.rs:93-144`) but
+     `grep`ping the tree for `assemble_content`/`ImageBlock` outside
+     `content.rs` itself returns nothing — no `ExecCtx`, tool, or IPC command
+     constructs an `ImageBlock` yet, and `ChatMessage.content` (`client.rs:26`)
+     is still a plain `String`, not the `Value` this function returns. The
+     `WIRING NOTE` doc comment at `content.rs:16-22` is explicit about the
+     integration hazard for whoever does this next: the returned `Value` must
+     be carried through to serialization **as-is**, not `.to_string()`'d (that
+     would stringify the JSON array into a literal `"[{...}]"` text field
+     instead of an actual multimodal wire payload).
+
+- **Native tool-use: proven live, not just built.** `Q1` shipped
+  2026-07-17 (`d203a9a`) and was verified end-to-end
+  (`models/tests.rs:382-446`, `live_native_tool_call_roundtrip`, opt-in via
+  `LHP_NATIVE_ENDPOINT`/`LHP_NATIVE_MODEL`/`LHP_NATIVE_TOKEN` env vars) against
+  a real **LM Studio `qwen3.6-35b-a3b`** endpoint — three clean runs per
+  `docs/ROADMAP.md`. The non-live regression test
+  `sse_decodes_native_tool_call_deltas` (`models/tests.rs:341-373`) exercises
+  the same decode → `assemble_native_calls` path with synthetic byte chunks
+  and needs no network. What's still open (per `docs/ROADMAP.md`, M4 row): an
+  add-provider UI checkbox to *set* `supports_native_tools` from Settings —
+  the flag, persistence, hydration, and backend are done; only the everyday
+  on/off control is missing, so ordinary chat against a native-capable
+  endpoint still defaults to the fenced dialect unless the row was flagged
+  some other way (e.g. a test, or a direct DB edit).
 
 - **Invariants (do NOT break)**
-  - `ProviderKind` must serialize lowercase (`provider.rs:19`) — the frontend's `kind === "local"` string checks depend on it; there is no compile-time link between the Rust enum and the TS comparisons, so a refactor here needs a matching frontend check.
-  - `Provider::is_private` must stay delegated to `crate::agent::egress::is_private_endpoint` (provider.rs:80-82) — do not duplicate or reimplement private-range logic in this module; the doc comment (provider.rs:1-6) explicitly calls this out as intentional non-duplication. The egress function itself (`agent/egress.rs:24-76`) treats unparseable URLs as **public** (refuse) by design (egress.rs:22-23) — do not "fix" this to fail open.
-  - `add_provider` must drop the cached client on upsert (manager.rs:56) — otherwise changing a provider's `api_key` or `base_url` in the UI would silently keep using the stale client until app restart.
-  - `SseStream::parse_line` must never panic on malformed input (sse.rs:178: `Err(_) => return SseEvent::KeepAlive`) — this is the boundary between an untrusted network stream and the agent loop; a panic here would be a remote DoS of the whole chat turn.
-  - `stream_chat`/`complete`/`list_models` all check `status.is_success()` before decoding JSON (client.rs:126, 162, 195) — non-2xx responses become `anyhow` errors with the body text included, not a JSON-decode panic.
+  - `ProviderKind` must serialize lowercase (`provider.rs:19`) — unchanged,
+    still load-bearing for the frontend.
+  - `Provider::is_private` must stay delegated to
+    `crate::agent::egress::is_private_endpoint` (`provider.rs:92-94`) — do
+    not duplicate private-range logic here.
+  - `add_provider` must drop the cached client on upsert (`manager.rs:56`) —
+    unchanged; otherwise an edited `api_key`/`base_url` would silently keep
+    using the stale client until restart.
+  - `SseStream::parse_line` must never panic on malformed input
+    (`sse.rs:199`: `Err(_) => return SseEvent::KeepAlive`) — the boundary
+    between an untrusted network stream and the agent loop.
+  - **A native turn must never fall through to `parse_tool_calls`.** The
+    transport choice (`native_mode` at `loop_mod.rs:1340`) is a hard branch,
+    not a "try native, then also try fenced" — mixing them would reopen the
+    "content the agent merely read forges a call" hole that `OwnOutput`
+    exists to close.
+  - `stream_chat_with_tools`/`complete`/`list_models` (`stream_chat` just
+    delegates to `stream_chat_with_tools`) all check `status.is_success()`
+    before decoding JSON (`client.rs:225`, `260`, `167`) — non-2xx responses
+    become `anyhow` errors with the body text included.
+  - **The download pipeline is verify-or-nothing.** `verify_and_install`
+    (`download.rs:58-73`) must never publish `final_path` on a hash mismatch
+    or a non-curated placeholder — both paths delete the partial and error.
+    Don't add a "trust it anyway" override.
+  - **`resolve_seat` must never be allowed to override the privacy gate.**
+    It's a preference lookup only; any refactor that lets a seat's resolved
+    provider skip `enforce_local_routing`/the §7 gate reintroduces exactly
+    the hole `seat.rs:8-13`'s doc comment calls out.
 
 - **Gotchas / watch-items**
-  - **`api_key_encrypted` is not actually encrypted.** `hydrate_providers_from_storage` (lib.rs:176-181) reads `ep.api_key_encrypted` as raw bytes and does `String::from_utf8` on it directly — the comment at lib.rs:176-178 admits "encryption is M4+ work." The field name promises encryption the code doesn't provide yet; don't assume API keys are protected at rest.
-  - **Kind-parsing is inconsistent between the two write paths.** `hydrate_providers_from_storage` (lib.rs:171-175) silently maps any unrecognized `kind` string to `Custom`. The IPC `add_provider` command's `parse_kind` (ipc/mod.rs:475-480) *rejects* unknown strings with `Err`. If storage ever gets a bad/legacy kind string written some other way, it'll load as `Custom` without complaint on next boot rather than erroring — inconsistent failure modes for the same conceptual data.
-  - **`is_local()` vs `is_private()` are easy to confuse.** `is_local` is just the `kind` tag (user-declared); `is_private` is a live URL parse. A misconfigured `Local` provider pointing at a public URL is `is_local() == true` but `is_private() == false`. `find_local_provider` (loop_mod.rs:244-249) correctly requires both; a future call site that only checks `is_local()` for a "never egresses" guarantee would be a privacy bug.
-  - **`ModelClient::complete` appears unused** outside `tests.rs` — grep the tree before removing it (it may be intended for a near-term caller, e.g. conversation titling or TRM routing calls per its doc comment at client.rs:169-171) or before assuming it's exercised by any current code path.
-  - **Text-only client, no native tool_use.** Every provider — including ones that support OpenAI/Anthropic native structured tool calls — is driven through plain `ChatMessage` history with the tool catalog injected as a system-message string (loop_mod.rs:300-311) and tool calls parsed out of the model's raw text by `tools/calling.rs` (not in this module). This is a known, prioritized gap: PLAN.md §12 item 1 calls for per-endpoint capability detection + a native `tool_use` path in the model client and agent loop, with the fenced dialect kept as fallback. If you add native tool-use, it likely means: a new request/response shape in `client.rs` (a `tools` field on `ChatRequest`, parsing `tool_calls` off the response instead of `content`), a way for `Provider`/`ModelManager` to know/cache "does this endpoint support tools" (not present today), and `SseEvent` growing a variant for streamed tool-call deltas (currently `sse.rs` only understands `content` deltas, `sse.rs:246-263`).
-  - **`ChatMessage.role` is a bare `String`**, not an enum — nothing stops a caller from passing `role: "system"` mid-conversation or a typo'd role; the wire-level looseness (client.rs:19-22) is intentional for proxy compatibility but means there's no compiler help catching a bad role at a call site.
-  - **`ModelClient` is not `Clone`** — `ModelManager::clone_client` (manager.rs:104-110) fakes cheap cloning by rebuilding a new `ModelClient` from the provider config rather than deriving `Clone`, relying on `ModelClient::new` being infallible in practice (the `.expect(...)` at manager.rs:109 assumes `reqwest::Client::builder().build()` can't fail on a config that already succeeded once — true today but worth knowing if `ModelClient::new` ever gains fallible config, e.g. TLS options).
-  - **SSE parser buffers the whole trailing partial line in memory** (`self.buffer: String`, sse.rs:57) with no size cap — a misbehaving provider that sends a huge line with no `\n` would grow this unboundedly. Not currently guarded against.
+  - **`api_key_encrypted` is not actually encrypted** — unchanged from the
+    previous doc pass. `hydrate_providers_from_storage` (`lib.rs:304-332`)
+    reads it as raw bytes and does `String::from_utf8` directly
+    (`lib.rs:321-326`); the field name still promises something the code
+    doesn't provide.
+  - **Kind-parsing is still inconsistent between the two write paths.**
+    `hydrate_providers_from_storage` (`lib.rs:316-319`) silently maps any
+    unrecognized `kind` to `Custom`; the IPC `add_provider` command's
+    `parse_kind` (`ipc/mod.rs:1704`) *rejects* unknown strings with `Err`. A
+    bad/legacy kind string written some other way loads as `Custom` on next
+    boot without complaint — still an inconsistent failure mode for the same
+    conceptual data.
+  - **`is_local()` vs `is_private()` are still easy to confuse** — unchanged;
+    `find_local_provider`-style call sites must check both, not just
+    `is_local()`, for a "never egresses" guarantee.
+  - **`ModelClient::complete` has real callers now** (unlike the earlier doc
+    version's "appears unused outside tests") — `agent/memory_flush.rs:138`
+    and `agent/skill_reflect.rs:149` — but **neither books a usage-ledger
+    row**. If someone later notices "local extraction/reflection calls are
+    invisible in the cost ledger," this is why; fixing it means threading a
+    `record_usage` call (or at least a `None`/`Some(0.0)` row) through both
+    call sites, mirroring what the streaming path already does at
+    `loop_mod.rs:1474-1502`.
+  - **`content::assemble_content`/`ImageBlock` are dormant** — built, tested,
+    zero callers, `ChatMessage.content` is still a bare `String`. Don't
+    assume screenshots or any image content can reach a model today; the
+    `WIRING NOTE` at `content.rs:16-22` is the map for whoever picks this up
+    (the on-target Slice 1 work — a `capture_screen` tool + platform backend
+    — is a separate, not-yet-built piece from this wire-format primitive).
+  - **The bundled model catalog ships placeholder hashes.** Every entry in
+    `models/catalog.json` currently has `sha256 = "TODO-CURATE"` (or similar
+    non-hex placeholder) — `CatalogEntry::is_curated()` correctly returns
+    `false` for all of them today (`catalog.rs`'s own test,
+    `placeholder_sha256_is_not_installable_curated_is`, asserts this), and
+    `download_model` refuses to even start a download for a non-curated
+    entry (`ipc/mod.rs:780-784`). **Nothing in the bundled catalog is
+    actually installable** until real hashes are curated and shipped — this
+    is a content/curation gap, not a code bug, and is headless-buildable
+    (doesn't need Lukas's machine).
+  - **`set_model_status`/boot-time integrity re-check has no production
+    caller.** `GlobalDb::set_model_status` (`storage/global.rs:623-629`) can
+    flip a `model_catalog` row between `"ready"`/`"quarantined"`, and the
+    doc comments describe an integrity re-check "at boot" — but grepping the
+    tree turns up no caller of `set_model_status` anywhere outside its own
+    definition. The verified-before-runnable invariant holds at *install*
+    time (verify-or-nothing in `download.rs`); the *ongoing* "did this file
+    on disk still match its hash" re-check is deferred to the S4
+    `llama-server` sidecar slice per `docs/ROADMAP.md` (M8 row) — don't
+    assume a tampered/corrupted local model file gets caught today.
+  - **SSE parser still buffers the whole trailing partial line in memory**
+    (`self.buffer: String`, `sse.rs:78`) with no size cap — unchanged, still
+    not guarded against a misbehaving provider sending one huge unterminated
+    line.
 
 - **How to extend**
-  - **Add a new provider "kind" or a capability flag** (e.g. "supports native tool_use"): extend `ProviderKind` or add a field to `Provider` in `provider.rs`; update both kind-parsing sites (`lib.rs:171-175` hydration, `ipc/mod.rs:475-480` `parse_kind`) together so they stay consistent; update the frontend's `provider-catalog.ts` etc. per the serde note above.
-  - **Add native tool-use support**: see the gotcha above — touches `client.rs` (request/response shapes), `sse.rs` (new `SseEvent` variant for tool-call deltas), `manager.rs`/`provider.rs` (capability detection/caching), and `agent/loop_mod.rs` (branch between fenced-dialect and native paths). Keep the fenced dialect working as fallback per PLAN.md §12.
-  - **Add a new HTTP method to the client** (e.g. embeddings): follow the `list_models`/`complete` pattern in `client.rs` — build URL from `provider.base_url`, attach bearer auth conditionally, check `status.is_success()` before decoding, wrap errors with `anyhow::Context`.
-  - **Change SSE wire-format handling** (e.g. a provider with a different delta shape): extend `SsePayload`/`SseChoice`/`SseMessage` in `sse.rs:201-225` and the fallback chain in `first_delta` (sse.rs:246-263) — do not add per-provider branching in `ModelClient`; the SSE parser is the single place that normalizes shapes.
-  - **Tests**: add unit tests to `models/tests.rs` for anything in `provider.rs`/`manager.rs`/`sse.rs`; for `client.rs` HTTP behavior there's no test harness in this module today (no mock HTTP server dependency) — the SSE tests bypass HTTP entirely via `SseStream::from_byte_stream` (sse.rs:85-94). If you need to test `list_models`/`stream_chat`/`complete` request-building, you'll likely need to introduce a mock server (e.g. `wiremock`) — check `Cargo.toml` dev-dependencies first, it's not there as of this writing.
+  - **Add/adjust a provider capability flag**: extend `ProviderKind` or add a
+    field to `Provider` in `provider.rs`; update both kind-parsing sites
+    (`lib.rs:316-319` hydration, `ipc/mod.rs:1704` `parse_kind`) together.
+  - **Wire the native-tools UI checkbox** (the one open M4 item): thread a
+    `supports_native_tools` control through the add-provider Settings form →
+    `AddProviderArgs` → the existing `parse_kind`/`add_provider` path; no
+    backend change needed, per `docs/BUILD-MANIFEST.md` item 1.1.
+  - **Wire multimodal content**: follow the `WIRING NOTE` at
+    `content.rs:16-22` — bridge `assemble_content`'s `Value` output into
+    `ChatMessage`/`ChatRequest` serialization (today a bare `String`) without
+    stringifying the array, then give it a real caller (a screenshot tool +
+    a way to mark a provider/model as vision-capable).
+  - **Book usage for `complete()` callers**: mirror the streaming path's
+    `record_usage` block (`loop_mod.rs:1474-1502`) in `memory_flush.rs`/
+    `skill_reflect.rs` if closing the cost-ledger gap becomes a priority.
+  - **Curate the model catalog**: replace `catalog.json`'s placeholder
+    `sha256` values with real, verified Hugging Face file hashes — this
+    alone makes the M8 download pipeline installable; no code changes
+    required.
+  - **Add a new HTTP method to the client**: follow `list_models`/`complete`
+    in `client.rs` — build the URL from `provider.base_url`, attach bearer
+    auth conditionally, check `status.is_success()`, wrap errors with
+    `anyhow::Context`.
+  - **Change SSE wire-format handling**: extend `SsePayload`/`SseChoice`/
+    `SseMessage`/`SseToolCallDelta` in `sse.rs:251-302` and the fallback
+    chains in `first_delta`/`tool_call_fragments` (`sse.rs:323-369`) — keep
+    per-provider branching out of `ModelClient`; the SSE parser is the one
+    place that normalizes shapes.
+  - **Tests**: add unit tests to `models/tests.rs` for `provider.rs`/
+    `manager.rs`/`sse.rs`/`pricing.rs`/`seat.rs`/`hardware.rs`/`catalog.rs`;
+    `download.rs`'s network path (`download_to_partial`) has no mock-server
+    harness today — only its pure helpers (`host_allowed`, `verify_and_install`,
+    `file_sha256`) are unit-tested. For `client.rs` HTTP request-building
+    there's still no mock-server dependency in `Cargo.toml` as of this
+    writing; the SSE tests bypass HTTP entirely via
+    `SseStream::from_byte_stream` (`sse.rs:105-115`).
 
 - **Tests**
-  - Location: `src-tauri/src/models/tests.rs`, `mod tests` gated `#[cfg(test)]` from `mod.rs:19-20`.
-  - Run just this module: `cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib models::`
-  - Related tests that exercise this module indirectly: `agent/loop_tests.rs` (agent loop against a fake `ModelStreamer`), `ipc/contract_tests.rs` (`list_models_for` error surfacing through IPC, ipc/contract_tests.rs:362-405), `hooks/tests.rs` and `hooks/routing.rs` (`Provider`/`ProviderKind` used to build routing-decision fixtures).
-  - Full suite: `cargo test --lib` from `src-tauri/` (171 passing as of the M3-round-1 handoff per `HANDOFF.md`).
+  - Location: `src-tauri/src/models/tests.rs`, gated `#[cfg(test)]` from
+    `mod.rs:25-26`.
+  - Run just this module: `cd src-tauri && cargo test --lib models::`
+  - Live/opt-in: `LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1"
+    LHP_NATIVE_MODEL="qwen/qwen3.6-35b-a3b" cargo test --lib
+    live_native_tool_call_roundtrip -- --nocapture` (skips itself with a
+    printed message when the env var isn't set — safe in CI).
+  - Related tests exercising this module indirectly: `agent/loop_tests.rs`
+    (fake `ModelStreamer`), `ipc/contract_tests.rs` (`list_models_for` error
+    surfacing, around `contract_tests.rs:369-412`), `hooks/tests.rs`/
+    `hooks/routing.rs` (`Provider`/`ProviderKind` fixtures for routing
+    decisions), `tools/delegate.rs`'s own tests (`resolve_seat` integration).
+  - Full suite: `cargo test --lib` from `src-tauri/` — 542 tests passing as
+    of 2026-07-21 (HEAD `ca54251`).

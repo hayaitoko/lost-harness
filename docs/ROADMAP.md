@@ -21,6 +21,8 @@ the status board sitting on top of all of them.
 
 ## Stage
 
+> **As of 2026-07-21: FULL PROJECT REVIEW (4-agent audit + doc reconciliation). No regressions; all gates green (542 tests / clippy 0 errors / `--no-default-features` clean / frontend build+check clean, tree clean at `ca54251`).** The audit confirmed the Wave 1–5 work substantially matches its claims — M7 Tier-P fs confinement is the strongest-evidenced area — and surfaced these NEW findings, now tracked on the milestone board + "What's left": **(1) HIGH:** the promised end-to-end "a cloud seat can't defeat RouteLocal" test was never written (invariant holds by construction only). **(2) MED-HIGH:** the M7 Tier-K network ceiling is live code but UNREACHABLE — no IPC/UI writes `sandbox_config`, every profile takes the unconfigured branch. **(3) MED:** M6 `stt_egress` deviates from its design (content-classifies a transcript; the real pre-transcription decision must be content-free) — fix before wiring native STT. **(4) MED:** untested security-reviewed paths — delegated-helper guard-wrap-on-re-entry, work-runner 5-min deadline + panic supervisor. **(5) MED:** cron "never egresses" has a narrow caveat — a Session-scoped External grant made interactively could be replayed by a byte-identical headless cron call (fingerprint has no session discriminator). **(6)** Two items were stale-blocked in these docs but are actually UNBLOCKED: reroute UX (2.3, dep 3.1 shipped) and the budget governor (3.2 tail, dep cost-capture shipped). Also: `open_profile` still accepts whitespace-padded confusable profile names (flagged 2026-07-18, still open); the `docs/codebase/` guide was fully regenerated this session (it predated Waves 1–5).
+>
 > **As of 2026-07-18: WAVES 1–4 COMPLETE; Wave 5 flagship SECURITY CORES landing.** Wave 1 + Wave 2
 > (ready work) + Wave 3 (3.1 seats, 3.2 ledger+cost, 3.3 compaction, 3.5 flush) + **all of Wave 4
 > (4.1 skills, 4.2 learning loop, 4.3 agents, 4.4 one-queue/cron, 4.5 packs)** are
@@ -255,7 +257,7 @@ the status board sitting on top of all of them.
 > survive toggling the wall back off). 385 → **389 tests**. (1.6, the cosmetic
 > `gate.rs` §7 rename, stays deferred — low-value/high-churn.)
 >
-> **Prior state (still true):**
+> **Prior state (HISTORICAL — 2026-07-17 snapshot, several claims below superseded by the entries above: skills ARE now built, seats/compaction/write-triggers/native-tool-UI all landed; only the budget governor from its "next fronts" list is still open):**
 > Classifier round **fully closed** (INT8 ONNX ensemble + "why" sidebar +
 > per-profile thresholds + redact-and-send). **Memory is now HYBRID** — the
 > meaning lane shipped: a stock bge-small-en-v1.5 INT8 embedder (same ONNX
@@ -278,7 +280,7 @@ the status board sitting on top of all of them.
 **Health check (run this before believing anything below; update expected numbers when they change):**
 
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 462 passed, 0 failed
+cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 542 passed, 0 failed
 cd /Users/hayai/Desktop/lost-harness-product && npm run build               # expect: clean
 cd /Users/hayai/Desktop/lost-harness-product && npm run check               # expect: 0 errors (1 pre-existing tsconfig warning is known noise)
 # The trained classifier is behind a default-on feature. To run its ONNX parity test:
@@ -287,7 +289,7 @@ cd .../src-tauri && LHP_CLASSIFIER_MODELS_DIR="$HOME/Documents/Lost-Harness/mode
 cd .../src-tauri && cargo build --lib --no-default-features
 ```
 
-Optional env-gated live/model tests (not part of the 385; run manually):
+Optional env-gated live/model tests (not part of the 542; run manually):
 ```bash
 # Memory embedder sanity + gate calibration on the live INT8 model:
 LHP_EMBEDDER_MODELS_DIR="$HOME/Documents/Lost-Harness/models/embedder" cargo test --lib embedder::
@@ -296,9 +298,9 @@ LHP_NATIVE_ENDPOINT="http://127.0.0.1:1234/v1" LHP_NATIVE_MODEL="qwen/qwen3.6-35
   cargo test --lib live_native_tool_call_roundtrip -- --nocapture
 ```
 
-Last verified: 2026-07-17 (Wave 4.1 skills core landed:
-**462 passed**, `--no-default-features` builds clean, `cargo clippy --lib` 0 errors,
-frontend build + svelte-check clean, tree clean; embedder live test passes on the installed model).
+Last verified: 2026-07-21 (project-review session: **542 passed**, `--no-default-features`
+builds clean, `cargo clippy --lib` 0 errors (117 warnings), frontend build + svelte-check
+clean (1 known tsconfig warning), tree clean on `main` at `ca54251`).
 
 ---
 
@@ -310,14 +312,14 @@ frontend build + svelte-check clean, tree clean; embedder live test passes on th
 | **M1** — vertical slice | message → classify → route → model → stream → save | ✅ **Done + verified** (contract tests at the real IPC boundary) |
 | **M2** — UI shell | design system, profiles, command palette | 🟡 **Mostly done** — design-system port landed and wired for chat/sidebar/settings; profile switching works. Superseded components deleted + dev screen-switcher removed (2026-07-16). Remaining gaps: `CommandPalette.svelte` is ported but mounted nowhere; 7 screens are visual-only (see Loose ends). |
 | **M3** — tool registry + spine | the whole security/tool foundation | ✅ **Done** (2026-07-16) — all 8 do-now items + approval spine + write/shell/MCP tools, every round adversarially reviewed. Exception: the durability trio's persisted-journal half is deliberately deferred to the first external-effect tool (see PLAN §8 / build plan Q3). |
-| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). **Usage ledger (3.2) booking side DONE 2026-07-17** (`7141d34`): per-profile `usage_events` cost ledger, every model call booked, local=$0/cloud=unknown-flagged. **Cache-shaped prompts + context compaction (3.3) DONE 2026-07-17** (`f543250`): byte-stable prefix + deterministic `compact_history` at the stream seam, emits the 3.5 pre-compaction signal (+ a HIGH cloud-history privacy fix `c026e33`). Not started: budget governor (needs SSE cost capture first), model seats (3.1), capability registry (3.4), skills & agents. **Wave 3.5 (pre-compaction flush) is now unblocked** — swap the `on_pre_compaction` seam body. |
+| **M4** — model manager + skills/agents | native tool-use, seats, usage ledger, budget governor, cache-shaped prompts; skills & agents track | 🔵 **In progress** — Q8 (grant×risk matrix + persisted `tool_rules` + risk-badged dialog) done 2026-07-16. **Native tool-use (Q1) DONE + PROVEN LIVE 2026-07-17** (`d203a9a`): per-endpoint `supports_native_tools` flag, structured `tool_calls` transport + fenced fallback, one transport-blind pipeline, fingerprint parity tested, and verified end-to-end against LM Studio qwen3.6-35b-a3b (3 clean runs). **Usage ledger (3.2) booking side DONE 2026-07-17** (`7141d34`): per-profile `usage_events` cost ledger, every model call booked, local=$0/cloud=unknown-flagged. **Cache-shaped prompts + context compaction (3.3) DONE 2026-07-17** (`f543250`): byte-stable prefix + deterministic `compact_history` at the stream seam, emits the 3.5 pre-compaction signal (+ a HIGH cloud-history privacy fix `c026e33`). **Model seats (3.1) DONE 2026-07-18** (`ec6c852`, per-profile, user-definable strings, unbound→inherit). **Real cost capture DONE 2026-07-18** (`649f3fa`). **Wave 3.5 flush DONE.** **The whole skills & agents track (Wave 4.1–4.5) DONE 2026-07-18** — skills, learning loop, agent registry + `delegate` runtime, one-queue + cron runner, capability packs. **Still open in M4:** budget governor (3.2 tail — its SSE-cost-capture prerequisite is now met, so it's genuinely buildable; needs the unattended-mode tie-in), capability registry that refuses (3.4, no consumer yet), reroute auto-switch UX (2.3 — unblocked since 3.1 landed, pure frontend). ⚠ 2026-07-21 audit: the promised end-to-end "a cloud seat can't defeat RouteLocal" regression test was never written — invariant holds by construction through the unmodified gate; write the test. |
 | **Memory system** | curated summary + searchable archive (hybrid FTS5 + sqlite-vec), profile wall, 3-bucket sensitivity routing | 🟢 **HYBRID + LIVE (meaning lane landed 2026-07-17, `bfb5721`).** Storage + IPC + Settings "Memory" tab + `recall_memory`/`remember` tools + endpoint-aware `allow_private_memory` + auto-injection + non-silent recall banner (all earlier), PLUS now: the **sqlite-vec meaning lane** — a stock **bge-small-en-v1.5 INT8 embedder** (`embedder.rs`, same ONNX runtime/install/fallback as the classifier; installed at `~/Documents/Lost-Harness/models/embedder/`) feeds hybrid keyword+semantic search fused by **Reciprocal Rank Fusion**; the **private vector index is a physically-separate table** (`memory_vectors_private`) so a cloud turn never queries it; distance gates **calibrated on the live model** (inject 0.38 / recall 0.48); **stopword-filtered** FTS so the injection relevance gate doesn't fire on "the"/"is"; **boot-time backfill** embeds facts saved pre-install. **Wave 1 (2026-07-17) closed four of the remaining gaps:** curated-summary **snapshot-at-turn-1** (frozen per conversation, privacy-filtered per turn), a per-profile **semantic-search toggle** (lazy embedder load; keyword-only when off), the inline **"remembered" save event**, and **walled-profile DB routing** (a walled profile's memory lives in its own physically-separate DB, proven to survive toggling back). **All write triggers DONE (Wave 3.5 complete):** trigger #1 save-as-you-go (`remember`, earlier), **#2 pre-compaction flush** (`f89536e`) and **#3 new-chat nudge** (`e0929f0`) — `agent/memory_flush.rs`: a LOCAL model extracts durable facts (guard-wrapped input) + saves via the exact sensitivity-routed path, async/off the stream lock, at-most-once (shared high-water) + content-deduped. **Still remaining:** embedder bundling into the packaged app (M9 / Wave 7.1). Design: PLAN §9. |
-| **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 📐 **Designed in full, not built.** Design: PLAN §10. |
+| **Skills system** | reusable playbooks, approve-first vs autonomous, teacher-escalation | 🟢 **Built (Wave 4.1–4.2, 2026-07-18):** skills CRUD (fail-closed to Pending) + `search_skills` (Safe, approved-only) + `save_skill` (Dangerous) + the draft-first learning loop (`agent/skill_reflect.rs`, drafts always Pending, default-off toggle) + the Settings→Skills review pane. **Not built from the original PLAN §10 design:** teacher-escalation (bigger model solves a twice-failed task and writes a skill), curator rot-check, the skill-as-Tool wrapper, Tier-3 script exec, seed skills. |
 | **Privacy classifier** | rules layer + trained ONNX ensemble + redaction UX | 🟢 **DONE (item 3 complete)** — trained bge-small + distilbert INT8 ONNX ensemble in-process via `ort` (fused with layer-0 rules, parity-verified), the "why this was routed" annotated sidebar, **per-profile runtime thresholds** (settings page), AND **partial-delegation redact-and-send** (rule-value spans blacked out → re-classified → safe remainder to cloud → rehydrated; per-profile toggle). Only optional cosmetic `gate.rs` §7 renames remain (deferred, low-value). |
-| **M5** — computer use | cross-platform screen control, the flagship | ⬜ **Not started** (stubs in `src-tauri/src/platform/`) |
-| **M6** — voice | on-device STT/TTS, barge-in | ⬜ **Not started** (stub in `src-tauri/src/audio/`) |
-| **M7** — per-profile isolation | email/calendar/tasks, Capability Packs, real OS sandbox enforcement | ⬜ **Not started** |
-| **M8** — settings/onboarding/hardware | hardware probing, model catalog, first-run | ⬜ **Not started** (Onboarding screen exists visually only) |
+| **M5** — computer use | cross-platform screen control, the flagship | 🟡 **Security cores landed, all DORMANT by design** (design: `docs/plans/2026-07-18-m5-computer-use-design.md`): reversibility classifier (`tools/computer_use.rs` — not registered as a tool yet), multimodal wire format (`models/content.rs` — zero callers, `ChatMessage.content` still a plain `String`), screenshot-forces-local routing (`hooks/routing.rs::routing_for_turn` — zero callers). All tested; nothing wired until the on-target Slices 1–6 (capture/AX backend, input synthesis, `OnScreenActionHook`, Win/Linux). Audit 2026-07-21: cores match their design. **Note:** the design says Slice 3's logic half (mock-backend hook wiring) is headless-buildable. |
+| **M6** — voice | on-device STT/TTS, barge-in | 🟡 **Audio-egress gate built + tested (`audio/privacy.rs`), dormant** — no caller until native voice lands. **⚠ Two design deviations found by the 2026-07-21 audit, fix BEFORE wiring native STT:** (1) `stt_egress` content-classifies a transcript, but the design mandates a content-free pre-transcription decision (you can't have a transcript before deciding whether audio goes to cloud STT) — untested; (2) Public+floor unconditionally withholds where the design mandates one confirm via the approval spine (stricter than spec, but a real deviation). Native STT/TTS/AEC on-target. |
+| **M7** — per-profile isolation | email/calendar/tasks, Capability Packs, real OS sandbox enforcement | 🟡 **Tier-P (per-profile fs confinement) COMPLETE + LIVE** (`3801a0e` — strongest-evidenced area of the 2026-07-21 audit). Capability Packs shipped with Wave 4.5. **Tier-K partial:** the macOS shell-network ceiling enforcement is live code (`tools/exec.rs::effective_network`) **but unreachable in practice — no IPC/UI ever writes a `sandbox_config` row**, so every real profile takes the unconfigured branch today; needs a small settings surface (headless-buildable). Linux/Windows sandbox backends on-target. Email/calendar/tasks not started (needs a Lukas backend decision, M7 Q2). |
+| **M8** — settings/onboarding/hardware | hardware probing, model catalog, first-run | 🟡 **Substantially built + LIVE in Settings→Models:** hardware probe (fails closed on unknown RAM), curated catalog, download + SHA-verify + resume (HF-only host allowlist), model list/remove. **Open:** catalog ships `sha256="TODO-CURATE"` placeholders — fails closed, so NOTHING is installable until real hashes are curated (headless-buildable); S4 `llama-server` sidecar (native, needs the C9/M8-Q2 Lukas decision); boot-time integrity re-check primitive exists but is unwired. Onboarding screen still visual-only. |
 | **M9** — polish | auto-update, signing, tray, Windows depth | ⬜ **Not started** |
 | **M10** — beta | | ⬜ **Not started** |
 | **Server companion** | the optional always-on twin | 📐 **Designed in full (nothing left to decide), zero code.** Gated on M4 landing. Design: PLAN §5. |
@@ -325,6 +327,37 @@ frontend build + svelte-check clean, tree clean; embedder live test passes on th
 ---
 
 ## What's left — near term, in recommended order
+
+> **CURRENT LIST (2026-07-21, from the full project review — supersedes the numbered
+> historical list below, which is kept for the record with its stale claims annotated).**
+> All of these are headless-buildable on this Mac, none needs a Lukas decision:
+>
+> 1. **Write the missing "cloud seat can't defeat RouteLocal" end-to-end test** (HIGH from
+>    the audit): bind a seat to a cloud provider, dispatch a `delegate` helper under a
+>    `Private` binding through `run_subagent`, assert no cloud client is ever invoked.
+>    ~20 lines; closes the one promised-but-missing regression test.
+> 2. **Make the M7 Tier-K network ceiling reachable**: `get/set_sandbox_config` IPC + a
+>    small Settings surface (per-profile "shell network" section). Until this exists the
+>    ceiling enforcement is dead in practice.
+> 3. **Fix `open_profile` whitespace-padding** (confusable profile names, flagged
+>    2026-07-18): reject padded names at `open_profile` + the `send_message` IPC boundary.
+> 4. **Thread per-profile `ClassifierConfig` into the tool-action gate**
+>    (`hooks/privacy_filter.rs` gates at default thresholds today — stricter-than-default
+>    profiles get weaker tool gating than chat gating).
+> 5. **Reroute auto-switch UX (2.3)** — was stale-marked "blocked on 3.1"; 3.1 shipped.
+>    Backend plumbing (`NeedsLocalReroute`, `stream:local_reroute`) exists; this is pure
+>    frontend (toast + first-class local-endpoint object).
+> 6. **Budget governor (3.2 tail)** — was stale-marked "needs cost capture"; cost capture
+>    shipped. Hang the cap check off the existing `QueueingPrompter` unattended concept.
+> 7. **Test debt from the audit:** the delegated-helper guard-wrap-on-re-entry branch,
+>    the work-runner deadline/panic paths, and (shared root cause) a fake `ModelStreamer`
+>    injectable into the REAL `process_message` so the cloud-safe guard / redact-and-send /
+>    usage booking get true end-to-end coverage.
+> 8. **M8 catalog sha256 curation** — download + hash the 4 catalog models so the
+>    Settings→Models catalog can actually install something.
+> 9. Then the bigger headless fronts: **MCP real wire transport**, **durability journal
+>    (2.5, dep 4.4 now met)**, **M5 Slice 3 logic half** (mock-backend `OnScreenActionHook`
+>    wiring), **M6 Slice 4a** (cooperative-cancel plumbing, fake-provider testable).
 
 1. **[x] Settings "Permissions" pane** *(DONE 2026-07-16, `f38fd2c`)* — a "Permissions"
    section in Settings (between Privacy guard and Models) lists the active profile's
@@ -399,7 +432,9 @@ frontend build + svelte-check clean, tree clean; embedder live test passes on th
    ≈0.54+ unrelated); **FTS stopword-filtered** so the injection relevance gate stops firing
    on "the"/"is"; **boot-time backfill** embeds facts saved before the model was installed.
    Model at `~/Documents/Lost-Harness/models/embedder/` (34 MB, not in git; keyword-only if
-   absent — the dev/fallback path). **Remaining:** **embedder bundled into the app + a memory
+   absent — the dev/fallback path). **Remaining (2026-07-21 note: everything below EXCEPT
+   embedder bundling has since landed — Wave 1 items 1.2–1.5 + Wave 3.5; kept as written
+   for the record):** **embedder bundled into the app + a memory
    settings toggle** (decided 2026-07-17, PLAN §9 — the model is the app's OWN bundled
    component, NOT a user download or a served endpoint like LM Studio's nomic model; it loads
    only when the user enables semantic memory search, else keyword-only. Bundling itself is
@@ -417,17 +452,20 @@ frontend build + svelte-check clean, tree clean; embedder live test passes on th
    unattended spend; needs real per-call cost capture first (SSE `usage` token
    parsing + a pricing table — cloud costs are "unknown" until then, so a
    cost-cap can't meaningfully fire yet; count-based budgets already exist from
-   Q4). STILL OPEN (Tier-A ∥): model seats (3.1 — no consumer until 4.3 agent
-   registry), cache-shaped prompt assembly + context compaction (3.3), capability
-   registry that refuses (3.4 — no refusal-triggering consumer yet; native-tools
-   has a valid fenced fallback). Then the skills & agents track (do the
-   one-queue-model unification pass 4.4 before locking its schemas).
+   Q4). *(2026-07-21 note: cost capture has since SHIPPED — the governor is now
+   genuinely buildable, see the current list above.)* STILL OPEN (Tier-A ∥):
+   ~~model seats (3.1)~~ *(DONE `ec6c852`)*, ~~cache-shaped prompt assembly +
+   context compaction (3.3)~~ *(DONE `f543250`)*, capability registry that
+   refuses (3.4 — no refusal-triggering consumer yet; native-tools has a valid
+   fenced fallback). ~~Then the skills & agents track~~ *(Wave 4.1–4.5 all DONE
+   2026-07-18)*.
 7. **[~] Remaining core tools** — DONE: session search, system status (2.1, `6a97695`);
    **cron management** (`9008cfb` — `list_cron_jobs`/`manage_cron`); **headless browser →
    `fetch_url`** (`f9e49eb` — the first External/egress tool, SSRF-guarded); **`ask_human`**
    (`e5da77f` — the single blocking "ask the user" tool, Safe, `HumanPrompter` +
-   `AskHumanDialog`). STILL OPEN: only **`delegate`** (blocked on the 4.3 agent-type
-   registry — a real delegate dispatches a sub-agent). Each rides the existing approval spine.
+   `AskHumanDialog`). ~~STILL OPEN: only **`delegate`**~~ *(2026-07-21: `delegate` is
+   DONE — Wave 4.3c runtime `e1e1f8c`, `tools/delegate.rs`. This item is fully closed;
+   every core tool rides the approval spine.)*
 
 **[x] Wave 1 of the build manifest — DONE 2026-07-17.** All started subsystems finished:
 - **[x] Native-tool UI checkbox** (1.1) — the add-provider Settings form now has a "Native

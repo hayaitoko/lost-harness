@@ -11,16 +11,22 @@ Where the code and PLAN.md disagree, the code wins and the subsystem doc notes i
 A local-first personal-AI desktop app: a **Rust core** compiled into a **Tauri 2**
 shell with a **Svelte 5** frontend. Its defining feature is a **privacy filter** —
 every call out to a model is classified and routed (kept local, sent to cloud, or
-blocked) *before* it can leave the machine. Milestones M0–M1 (core loop) and the
-bulk of M3 (tool spine + approval spine + first state-changing tools) are done and
-tested — including a conversation-scoped **read-before-write** guard (`write_file`
+blocked) *before* it can leave the machine. The core loop, the tool spine +
+approval spine, and a large surface of state-changing tools are done and tested —
+including a conversation-scoped **read-before-write** guard (`write_file`
 on an existing target, and `edit_file`, both refuse unless that path was read first
-in the same conversation); the classifier's deterministic rules layer is live, its
-trained ONNX layer is a stub. The frontend was reskinned onto the ported
-`src/lib/design/` design system (Svelte port of the React design source) and
-partially wired to the real backend (chat, sidebar, models/appearance settings);
-several screens (Email, Files, Whiteboard, Scheduled-jobs, Editor, Onboarding,
-EmptyState) are still visual-only with sample data. See HANDOFF for the precise line.
+in the same conversation). The privacy classifier is **live in both layers**: the
+deterministic rules layer, fused with a trained ONNX ensemble (bge-small +
+distilbert) when its models are installed under `<storage>/models/classifier/`,
+falling back to rules-only otherwise (`lib.rs:100-119`) — it is not a stub. The
+frontend was reskinned onto the ported `src/lib/design/` design system (Svelte
+port of the React design source); most of it is now wired to the real backend —
+chat, routing + the "why" explainability sidebar, and 7 of Settings' 9 tabs
+(privacy guard, permissions, models, memory, skills, agent types, usage — plus
+theme within Appearance). The Routing tab and several full screens (Email,
+Files, Whiteboard, Scheduled-jobs, Editor, Onboarding, EmptyState) are still
+visual-only with sample data. See
+`frontend-svelte.md` for the exact breakdown and HANDOFF for the precise line.
 
 ## The request flow (the spine)
 
@@ -42,14 +48,14 @@ user message
 
 | Doc | Covers |
 |---|---|
-| [agent-loop-and-privacy-filter.md](agent-loop-and-privacy-filter.md) | `PrivacyGate` (routing decision) + `egress::is_private_endpoint` + `AgentLoop` (the loop above) |
-| [classifier.md](classifier.md) | The `Classifier` trait; `RulesClassifier` (active), `HeuristicClassifier` (legacy/test), `EnsembleClassifier` (ONNX stub) |
-| [hooks-gating-and-approval.md](hooks-gating-and-approval.md) | The unified PreToolUse gating chain + the approval spine (fingerprints, ledger, prompter) |
-| [tools.md](tools.md) | `Tool` trait/registry/`RiskClass`, the fenced tool-call dialect + injection defense, dispatch, the fs tools |
-| [models.md](models.md) | `ModelManager`, providers, the OpenAI-compatible HTTP client + SSE (text-only, no native tool_use yet) |
-| [storage.md](storage.md) | Two-DB SQLite (global + per-profile), schema/migrations, sqlite-vec + FTS5, `trm_logs` audit |
-| [ipc-and-app-wiring.md](ipc-and-app-wiring.md) | Tauri command surface + `AppState`, the approval IPC round-trip, `lib.rs::run` wiring |
-| [frontend-svelte.md](frontend-svelte.md) | The Svelte 5 shell, `tauri.ts` (the only IPC bridge), stores, components — now including the ported `src/lib/design/` design system (components/screens reskinned from the React source at lost-harness-ui, partially wired to real backend stores) |
+| [agent-loop-and-privacy-filter.md](agent-loop-and-privacy-filter.md) | `PrivacyGate` (routing decision) + `egress::is_private_endpoint` + `AgentLoop` (the loop above), plus the agent module's satellite files: `agent/compaction.rs` (context compaction), `agent/memory_flush.rs` (pre-compaction memory flush), `agent/skill_reflect.rs` (autonomous skill drafting), `agent/work_runner.rs` (`WorkQueueRunner`, draining `queue/mod.rs`'s work-item substrate for `delegate` + cron), `agent/result_sink.rs` (`ResultSink`, decouples streaming from a live `AppHandle`), `agent/crash_recovery.rs` (boot-time reconciliation), and `audio/privacy.rs` (`AudioEgressGate`, the voice-specific egress re-vet — dormant, awaiting native audio) |
+| [classifier.md](classifier.md) | The `Classifier` trait; `RulesClassifier` (active), `HeuristicClassifier` (legacy/test), `EnsembleClassifier` (the trained ONNX ensemble — **live**, not a stub; see the note below) |
+| [hooks-gating-and-approval.md](hooks-gating-and-approval.md) | The unified PreToolUse gating chain + the approval spine (fingerprints, ledger, prompter), plus `hooks/audit.rs` (the `tool_audit` append-only observer), `hooks/headless.rs` (unattended-body `ApprovalPrompter`, dormant — no headless body exists yet), `hooks/routing.rs` (`enforce_local_routing`/`routing_for_turn`, the `RouteLocal`→endpoint enforcement), and `hooks/session_mode.rs` (Q11 normal/plan/accept-edits) |
+| [tools.md](tools.md) | `Tool` trait/registry/`RiskClass`, the fenced tool-call dialect + injection defense, dispatch, the fs tools, plus the rest of the registry: `tools/ask_human.rs`, `tools/computer_use.rs` (dormant M5 slice), `tools/cron.rs`, `tools/delegate.rs`, `tools/exec.rs` (the shell tool), `tools/fetch.rs`, `tools/mcp.rs`, `tools/memory.rs`, `tools/session_search.rs`, `tools/skills.rs`, `tools/system_status.rs` |
+| [models.md](models.md) | `ModelManager`, providers, the OpenAI-compatible HTTP client + SSE (text-only, no native tool_use yet), plus `models/content.rs` (multimodal wire format, dormant), `models/pricing.rs` (usage-ledger cost), `models/catalog.rs` (the curated download catalog), `models/download.rs` (verified-before-runnable installer), `models/hardware.rs` (hardware probe for onboarding), `models/seat.rs` (model seats) |
+| [storage.md](storage.md) | Two-DB SQLite (global + per-profile), schema/migrations, sqlite-vec + FTS5, `trm_logs` audit, plus `embedder.rs` (the on-device text embedder feeding memory's sqlite-vec meaning lane) |
+| [ipc-and-app-wiring.md](ipc-and-app-wiring.md) | Tauri command surface + `AppState` (44 commands, 7 `AppState` fields), the approval IPC round-trip, `lib.rs::run` wiring, plus `ipc/ask_human.rs` (the ask-human IPC round-trip) and `packs/mod.rs` (Capability Packs, installed via the `install_pack` command) |
+| [frontend-svelte.md](frontend-svelte.md) | The Svelte 5 shell, `tauri.ts` (the only IPC bridge), stores, components — the ported `src/lib/design/` design system (components/screens reskinned from the React source at lost-harness-ui), now mostly wired to real backend stores (see that doc for exactly which screens/tabs still aren't) |
 
 ## Load-bearing invariants (do NOT break these)
 
@@ -78,7 +84,7 @@ its own are enforced; the cross-cutting ones:
 
 ```bash
 # from the repo root
-cd src-tauri && cargo test --lib      # Rust unit/contract tests (226 as of 2026-07-15)
+cd src-tauri && cargo test --lib      # Rust unit/contract tests (542 as of 2026-07-21)
 cd src-tauri && cargo build           # Rust core
 npm run tauri dev                     # full app (native window) — see gotcha below
 npm run build && npm run check        # frontend build + svelte-check
@@ -101,23 +107,87 @@ npm run build && npm run check        # frontend build + svelte-check
 
 ## Watch-items the review surfaced (not yet fixed)
 
-Flagged here so they're not rediscovered the hard way — details in the subsystem docs:
+Flagged here so they're not rediscovered the hard way — each verified directly
+against the code as of this pass:
 
-- **Stale module doc-comments.** `gate.rs`/`loop_mod.rs`/`classifier/mod.rs` still
-  say the classifier is "the trained model or heuristic fallback"; production actually
-  wires `RulesClassifier`.
-- **`ipc::send_message` returns `routing_decision: "allow"` hardcoded** regardless of
-  the real decision — the true decision is in the persisted `Message`/`trm_logs`, not
-  the response. This now has a visible frontend cost: `MainScreen.svelte`'s per-message
-  `RoutingBadge` reads `routing_decision` off the send response, so a live send can never
-  surface an honest `route_local` badge (it shows correctly only after a reload re-fetches
-  the persisted decision). Fixing the backend to return the true decision fixes both.
-- **`EnsembleClassifier` is a stub** (`load()` always errs); the ONNX layer isn't
-  wired (no `ort` dep; blocked on exported `.onnx` artifacts).
-- **`loop_tests.rs` tests a reimplementation** (`TestLoop`), not the real `AgentLoop` —
-  `MAX_TOOL_ROUNDS`, real re-routing, and `stream_lock` concurrency are unit-untested.
-- **`trm_logs` / `TrmLog` kept their old names** after the `trm`→`classifier` rename
-  (migration cost) — grep both `classifier` and `trm`.
+- **`sandbox_config`'s network ceiling is live code but unreachable.** Nothing
+  ever writes a `sandbox_config` row: `set_sandbox_config` (`storage/profile.rs:1361`)
+  is called only from `tools/exec.rs`'s own tests — no IPC command and no UI
+  surfaces it. `ShellExecTool::effective_network` (`tools/exec.rs:450-469`)
+  therefore takes the `Ok(None) => true` ("unconfigured → unconstrained")
+  branch at line 458 for every real profile today; the ceiling only bites
+  once something writes the row.
+- **`audio/privacy.rs`'s `stt_egress` deviates from the M6 design.** It
+  content-classifies the transcript by delegating straight to `tts_egress`
+  (`audio/privacy.rs:87-95`), but the real pre-transcription STT decision has
+  to be content-free (binding-based) — you can't classify audio before it's
+  transcribed. There is also no direct test for `stt_egress` (only
+  `tts_egress` is exercised, `audio/privacy.rs:98-172`). Fix the design
+  mismatch before wiring native STT.
+- **No end-to-end test proves a cloud-bound seat can't defeat `RouteLocal`
+  through `run_subagent`.** `models/seat.rs:9-13` states the invariant
+  ("a seat may PREFER a cloud model but can never defeat a `RouteLocal`/
+  `LocalRequired` verdict"), and `AgentLoop::run_subagent` (`agent/loop_mod.rs:504`)
+  goes through the same gate as `process_message` — but no test calls
+  `run_subagent` at all (`grep -rn "run_subagent" agent/ tools/` outside its
+  own definition and doc comments turns up nothing). The invariant holds by
+  construction only.
+- **Two Wave-4.3c paths are implemented but untested:** the delegated-helper
+  guard-wrap-on-re-entry branch (`agent/loop_mod.rs:1240-1256` — a delegated
+  helper's result re-entering the main agent's context is neutralized like
+  tool output, never replayed as a trusted assistant turn) and
+  `work_runner`'s `HELPER_DEADLINE` (declared `agent/work_runner.rs:43`, 300s;
+  applied via `tokio::time::timeout` at `agent/work_runner.rs:178`) plus its
+  panic-supervisor path (`agent/work_runner.rs:81-106`). `work_runner.rs`'s
+  only test covers cron scheduling (`agent/work_runner.rs:349-350`); the deadline
+  and panic paths have zero coverage.
+- **Cron's "never egresses" claim has a session-replay nuance.**
+  `ActionFingerprint::of` (`hooks/approval.rs:61-78`) hashes only
+  `(tool_name, canonicalized args)` — no session or conversation
+  discriminator — and `ApprovalLedger`'s `session_fps`/`session_tools`
+  (`hooks/approval.rs:144-151`) are flat, app-lifetime sets shared across
+  every conversation in the process. A Session-scoped `External`-tool grant
+  made interactively could in principle be "already granted" for a
+  byte-identical headless cron call later in the same app session.
+- **`open_profile` accepts whitespace-padded profile names.**
+  `storage/mod.rs:178-204` rejects an empty name, one containing `/`, `\`, or
+  `..`, or one starting with `.` — but never trims. `" work"`, `"work "`, and
+  `"work"` are three distinct,
+  confusable profiles (three different `.db` files, three different cache
+  entries). `ipc::SendMessageArgs.profile` and the other `*ProfileArgs`
+  structs (`ipc/mod.rs`) pass whatever the frontend sends straight through
+  with no trim either. Tighten `open_profile` and the `send_message` IPC
+  boundary together.
+- **Tool-action `PrivacyFilterHook` gates at default classifier thresholds,
+  not the profile's** (`hooks/privacy_filter.rs:41-57`, acknowledged in the
+  hook's own doc comment). The per-profile strictness knob (PLAN §11) is
+  threaded into the message-egress gate but not yet into the tool-gating
+  chain — a profile configured stricter than default is, for tool-call
+  content specifically, gated *less* strictly than that same profile's chat
+  messages. Bounded by the un-tunable rules floor (structured PII is always
+  caught regardless), but real for free-text semantic PII in the narrow
+  band.
+- **Non-streaming `complete()` calls book no usage row.** `ModelClient::complete`
+  (`models/client.rs:235-278`) is called by `agent/memory_flush.rs:138` and
+  `agent/skill_reflect.rs:149` today, and its own doc comment earmarks it for
+  "titles, routing TRM calls" too (`models/client.rs:232-234`) — but
+  `record_usage` has exactly one call site in the whole codebase
+  (`agent/loop_mod.rs:1491`, inside the streaming path). Every `complete()`-based
+  call, current or future, is invisible to the Settings "Usage" view.
+- **Dormant-by-design, awaiting a native/on-target slice:** `tools/computer_use.rs`
+  (declared as a module but never registered as a tool in
+  `build_tool_dispatcher`), `models/content.rs`'s `assemble_content` (called
+  only by its own tests — the multimodal wire format has no producer yet),
+  `hooks/routing.rs`'s `routing_for_turn` (called only by its own tests — no
+  caller passes it a real `has_image` signal yet), and `audio/privacy.rs`'s
+  `AudioEgressGate` (zero callers outside its own module — no native audio
+  I/O exists to consume its verdict). None of these are bugs; don't be
+  surprised when grepping for callers turns up nothing.
+- **The model catalog ships placeholder hashes.** All four entries in
+  `models/catalog.json` have `"sha256": "TODO-CURATE"`. `CatalogEntry::is_curated()`
+  (`models/catalog.rs:48`) gates `download_model`, so this fails closed —
+  nothing in the catalog is installable until the real hashes are filled in
+  before release.
 
-*Generated 2026-07-10 by a subsystem-by-subsystem review fleet. If you change a
+*Regenerated 2026-07-21 against 542 tests / HEAD `ca54251`. If you change a
 subsystem materially, update its doc — a wrong doc is worse than none.*
