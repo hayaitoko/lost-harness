@@ -117,6 +117,7 @@ mod tests {
             cpu_cores: 8,
             os: "macos".into(),
             arch: "aarch64".into(),
+            ..Default::default()
         }
     }
 
