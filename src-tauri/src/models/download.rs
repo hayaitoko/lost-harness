@@ -38,6 +38,27 @@ pub fn host_allowed(url: &str) -> bool {
         .any(|root| host == *root || host.ends_with(&format!(".{root}")))
 }
 
+/// A redirect policy that re-checks [`host_allowed`] on EVERY hop. Checking
+/// only the caller-constructed URL is not enough: reqwest's default policy
+/// silently follows up to 10 redirects with no host re-check, so a redirect
+/// chain could carry an "allowlisted" request off the allowlist. An off-list
+/// hop errors loudly (never silently dropped); depth is bounded. Shared by the
+/// downloader, the HF search layer, and the GGUF metadata reader — every HF
+/// touchpoint rides the same gate.
+pub(crate) fn allowlisted_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
+        }
+        let next = attempt.url().as_str().to_string();
+        if host_allowed(&next) {
+            attempt.follow()
+        } else {
+            attempt.error(format!("redirect to a non-allowlisted host refused: {next}"))
+        }
+    })
+}
+
 /// The SHA-256 of a file as lowercase hex. Streams the file (never loads it whole).
 pub fn file_sha256(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path)?;
@@ -46,8 +67,12 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Is this a real, curated SHA-256 (64 lowercase-hex chars) — not a placeholder?
-fn is_real_sha256(s: &str) -> bool {
+/// Is this a real SHA-256 (64 hex chars, case-insensitive) — not a placeholder?
+/// `verify_and_install` lowercases the expected value before comparing, so an
+/// upper- or mixed-case digest is accepted here and normalised there.
+/// `pub(crate)` so the HF search layer reuses the exact same gate instead of
+/// maintaining a parallel copy (they must never drift).
+pub(crate) fn is_real_sha256(s: &str) -> bool {
     let s = s.trim();
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -87,8 +112,13 @@ pub async fn download_to_partial<F: Fn(u64, u64)>(
     }
     let already = std::fs::metadata(partial).map(|m| m.len()).unwrap_or(0);
 
+    // No TOTAL request timeout here — a multi-GB weights download legitimately
+    // runs for a long time (resume covers interruptions). Connect timeout +
+    // per-hop redirect re-check only.
     let client = reqwest::Client::builder()
         .user_agent("lost-harness/0.1 (model-downloader)")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .redirect(allowlisted_redirect_policy())
         .build()?;
     let mut req = client.get(url);
     if already > 0 {

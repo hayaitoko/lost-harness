@@ -55,6 +55,10 @@ impl KvCacheQuant {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub architecture: String,
+    /// Total parameters in billions. `0.0` is the documented "unknown"
+    /// sentinel (a GGUF's `general.parameter_count` is optional): `calculate`
+    /// then treats ALL weights as active — the conservative choice — and the
+    /// metadata reader flags the absence in its notes (honest-Unknown).
     pub total_params_b: f64,
     /// For a dense model == `total_params_b`; for a MoE, the (smaller) params
     /// actually computed per token — drives the speed estimate.
