@@ -797,3 +797,171 @@ repo/quant picks as-is? (2) ship `Qwen3.6-35B-A3B` as the large-tier primary (ma
 daily driver) given its context claim is unverified + HF tags it multimodal, or lead with the
 better-established `Qwen3-30B-A3B`? (3) green-light S2 curation on the approved list. Everything else
 (probe v2, recommender, catalog v2 schema, sidecar) proceeds without a decision.
+
+
+---
+
+# REVISION 2026-07-22b — PRODUCT REDIRECT (Lukas): HuggingFace model search + an interactive hardware calculator (supersedes the curated bundled catalog)
+
+> **Lukas, 2026-07-22 (with an LM Studio screenshot):** *"I want it to work like the one in LM
+> Studio where you can search for a model — I think they just use Hugging Face for it. … It should
+> do the calculations on its own regardless of what we say here; I'm not looking for a suggestions
+> page that will get outdated, I'm looking for a **calculator** to help a user configure the best
+> output for **tps** for the hardware they have. It should be **interactive**, take into account
+> **quants for KV and model weights**, it should think of **context size**, the whole thing."*
+
+**What this changes.** The "curated bundled catalog + pinned per-model hashes" framing of REVISION
+2026-07-22 §C is **superseded**. A hardcoded model list goes stale and is not what Lukas wants. The
+discovery half of M8 becomes, mirroring the LM Studio screenshot:
+
+1. **A HuggingFace model SEARCH** (search box by name/author + a format filter + a sort + a
+   **Staff picks** default list + capability badges + a per-model detail pane with selectable
+   quants) — LM Studio does exactly this against HF, and so do we.
+2. **An interactive hardware CALCULATOR** — for the model + quant the user is looking at, compute,
+   live, whether it fits *their* machine and roughly how fast it will run (tokens/sec), as a
+   function of **weight quant**, **KV-cache quant**, and **context size**. LM Studio's green "Full
+   GPU Offload Possible" badge is the minimal version of this; Lukas wants the richer TPS/KV/context
+   calculator.
+
+**What SURVIVES unchanged from the prior revision** (this is a re-scope of the *discovery/catalog*
+slices, not a teardown): **Probe v2 (§A / S1) — DONE and directly needed** (the calculator's whole
+input is the hardware profile it produces). The **verified downloader + HF host allowlist** (§C's
+`download.rs`, already shipped). The **sidecar (§D / S4)** — still runs the chosen GGUF (now at the
+user-chosen context size). And the **recommendation MATH** (§B) is not thrown away — it is
+*repurposed* as the calculator's pure core (the MoE-vs-dense / bandwidth / quant / fit logic is
+exactly the calculator; it just gains KV-quant + context as first-class interactive inputs).
+
+**What is DEPRECATED:** the bundled `catalog.json` as *the* model list, and **pre-curating a fixed
+set of sha256 hashes** (S2 as written). The verified-before-runnable invariant is UNCHANGED — the
+sha256 now comes from **HF's tree API `lfs.oid` at selection/download time** (the mechanism verified
+in §C, still 64-hex, still what `download.rs::file_sha256` checks the downloaded bytes against), so
+nothing is trusted-before-verified; there is just no stale hardcoded list. **The curated list I
+proposed in §C is repurposed as the "Staff picks" seed** (the default rows shown before the user
+searches — the screenshot has exactly this), not the whole story.
+
+## New components
+
+### 1. HF model search service (`models/hf_search.rs`, new; outside `local-runner`)
+Query the public, anonymous HF API (same host allowlist as downloads — `huggingface.co`):
+- **Search:** `GET https://huggingface.co/api/models?search=<q>&filter=gguf&sort=<downloads|trendingScore|lastModified>&limit=N` — verified live this session: returns per model `id`, `downloads`, `likes`, `tags`, `library_name`. Tags carry the capability/label signal the screenshot's badges need (`image-text-to-text`/vision, `moe`, `conversational`, `license:*`) and the publisher (`lmstudio-community`, `unsloth`, `bartowski`, official `Qwen`/`google`). Map to a `HfModelSummary { id, downloads, likes, tags, publisher }`.
+- **Staff picks default** (no query yet): a small curated seed (the repurposed §C list) filtered/sorted for quality — OR simply `sort=downloads&filter=gguf` top-N from trusted publishers (`lmstudio-community`, `ggml-org`, `unsloth`, official orgs). The seed is a *starting view*, refreshed by search, so it never "goes outdated" the way a hardcoded install list would.
+- **Per-model files + quants:** `GET .../api/models/{id}/tree/main` (verified in §C) → the list of `*.gguf` files, each with `lfs.oid` (sha256, 64-hex) + `lfs.size` (bytes). Group by quant (parse `Q4_K_M`/`Q8_0`/… from the filename) → the selectable "Download Options" dropdown in the detail pane, each row showing size — exactly the screenshot's `Q4_0 · 7.15 GB` control. **This is also where the sha256 for verified download comes from — no pre-curation.**
+- Host-allowlist reuse: every HF URL runs through `download::host_allowed` before a request (SSRF/allowlist discipline unchanged).
+
+### 2. GGUF metadata reader (`models/gguf_meta.rs`, new) — the calculator's model inputs
+The calculator's KV-cache term needs architecture params the file itself carries. Two tiers,
+honest-fallback:
+- **Cheap repo summary** (verified live): `GET .../api/models/{id}?blobs=false` returns a `gguf`
+  object = `{ architecture, context_length (native max), total (parameter count), totalFileSize }`.
+  Enough for weights sizing, the native context ceiling, and dense-vs-MoE hinting — but it LACKS
+  `block_count`/`head_count_kv`/`embedding_length`, so KV-cache sizing from this alone is not exact.
+- **Exact header read** (for the real KV number): GGUF stores its metadata KV block at the FRONT of
+  the file (before tensor data), so a **ranged `GET` of the first ~1–4 MB** of the chosen `.gguf`
+  URL yields the full header without downloading the weights. Parse the GGUF metadata KVs we need:
+  `general.architecture`, `{arch}.block_count` (n_layers), `{arch}.attention.head_count` (n_heads),
+  `{arch}.attention.head_count_kv` (n_kv_heads — GQA), `{arch}.embedding_length` (d_model),
+  `{arch}.attention.key_length`/`value_length` (head_dim, when present), `{arch}.context_length`,
+  `general.parameter_count`. This is precisely how LM Studio and the online GGUF VRAM calculators
+  work. **Honest fallback:** if the ranged read fails or a key is absent, fall back to the repo
+  summary + a documented KV estimate and **mark the KV figure "approximate"** in the UI (never a
+  silent guess — the house rule).
+
+### 3. The interactive calculator (`models/calculator.rs`, pure — the heart of the redirect)
+A pure, unit-testable engine — no I/O; the search/metadata layers feed it data, it computes.
+
+```rust
+pub enum KvCacheQuant { F16, Q8_0, Q4_0 }   // llama.cpp --cache-type-k/v
+impl KvCacheQuant { pub fn bytes_per_elem(self) -> f64 { match self { F16 => 2.0, Q8_0 => 1.0, Q4_0 => 0.5 } } }
+
+pub struct ModelSpec {          // from the GGUF reader
+    pub architecture: String,
+    pub total_params_b: f64,
+    pub active_params_b: f64,   // == total for dense; < total for MoE
+    pub n_layers: u32,
+    pub n_kv_heads: u32,
+    pub head_dim: u32,
+    pub native_context_len: u32,
+}
+pub struct CalcInput {
+    pub weight_quant_file_bytes: u64,   // EXACT selected-quant size from HF lfs.size (not estimated)
+    pub kv_quant: KvCacheQuant,
+    pub context_len: u32,               // user-chosen, ≤ native (or YaRN-extended, flagged)
+    pub active_fraction: f64,           // active_params_b / total_params_b
+}
+pub struct CalcOutput {
+    pub weights_bytes: u64,
+    pub kv_cache_bytes: u64,
+    pub overhead_bytes: u64,
+    pub total_required_bytes: u64,
+    pub fit: Fit,                       // reuse §A: Fits/Tight/TooLarge vs the hardware pool
+    pub full_gpu_offload: bool,         // total ≤ pool (LM Studio's badge)
+    pub predicted_tokens_per_sec: Option<f64>,   // None when bandwidth Unknown
+    pub notes: Vec<String>,             // honest caveats (approx KV, roofline, YaRN context, etc.)
+}
+```
+
+**Formulas (each an explicit, caveated model):**
+- **KV cache** (the term Lukas called out): `kv_bytes = 2 · n_layers · n_kv_heads · head_dim ·
+  context_len · kv_quant.bytes_per_elem()`. The `2` = K and V; GQA (`n_kv_heads` ≪ `n_heads`) is
+  captured exactly, which is why it matters — a 128K-context model's KV can dwarf a small model's
+  weights, and halving it via `Q8_0`/`Q4_0` cache is a real lever the user should see move.
+- **Weights** = the EXACT selected quant file's `lfs.size` (from HF) — better than any per-param
+  estimate, since it's the real artifact byte count.
+- **Overhead** = OS headroom (reuse §B's `OS_HEADROOM_*` estimates) + a modest compute/activation
+  buffer (estimate, scales mildly with context) — clearly an estimate.
+- **Pool / fit** = §A's unified-RAM-fraction (Apple) or VRAM-else-RAM, compared via §B's
+  `fit_in_pool` → `Fits/Tight/TooLarge`. `full_gpu_offload = total_required ≤ pool`.
+- **TPS (roofline, bandwidth-bound decode):** `tps ≈ (mem_bandwidth_gbps · 1e9) / (active_weight_bytes
+  + kv_cache_bytes)`, where `active_weight_bytes = weights_bytes · active_fraction` (MoE reads only
+  active experts per token; dense = full weights). Bucket **Fast/Usable/Slow**; label it an upper
+  bound (real ≈ 60–85%); suppress the number entirely when `mem_bandwidth_gbps` is `None` (Unknown
+  → "based on fit only," never a fabricated speed). This is the interactive payoff: as the user drags
+  context up, `kv_cache_bytes` rises, `tps` falls, and `fit` can flip — visibly.
+- **Refuse-loudly** still holds: if nothing fits at the smallest quant / shortest context, the
+  calculator says so and points at the external-endpoint path (never a silent empty state).
+
+### 4. Interactive UI (S5, replaces the static onboarding catalog step)
+Mirror the screenshot: a search field + format/sort controls + Staff-picks list (rows: icon, name,
+one-line desc, updated-ago, capability badges) + a detail pane (params/arch/format/capabilities,
+downloads/likes, a **quant dropdown** with sizes, and — richer than LM Studio — **live KV-quant +
+context-size controls** driving a memory bar + `Fits/Tight/TooLarge` badge + a `~N tok/s` estimate
+that updates as the user changes any knob). The "Download" button runs the existing verified
+download (HF `lfs.oid` sha256) → sidecar serve → seat. The **external-endpoint path stays equally
+prominent** on the same screen (an "I run my own server / LM Studio on my network" tab → the existing
+`add_provider`).
+
+## Revised build slices (supersede REVISION 2026-07-22's S2/S3; S1/S4 stand)
+
+- **S1 — Probe v2** — **DONE** (`1c8bca0`). The calculator's hardware input. No change.
+- **S2′ — HF search + GGUF metadata reader** (replaces "catalog v2 curation"). `models/hf_search.rs`
+  (search + tree→quants+sha256) + `models/gguf_meta.rs` (repo summary + ranged header parse, honest
+  fallback). Reuses `download::host_allowed`. Gate: search returns real results (env-gated live test
+  hitting HF, self-skipping offline, mirroring the existing live-test pattern) + pure parsers
+  (tag→capabilities, filename→quant, GGUF header bytes→`ModelSpec`) unit-tested with fixtures.
+- **S3′ — the calculator engine** (repurposes §B's math). `models/calculator.rs` pure
+  `calculate(hw, model, input) -> CalcOutput` + the KV/weights/overhead/TPS/fit formulas above.
+  Gate: pure fixture tests — KV scales with context×n_kv_heads×kv_quant; Q4_0 cache halves KV vs
+  F16; a long context flips `Fits`→`TooLarge`; MoE active-fraction makes TPS ~10× a same-size dense;
+  Unknown bandwidth → `predicted_tokens_per_sec: None` + a "fit only" note; refuse-loudly when
+  nothing fits. (`bundled_catalog` becomes the small Staff-picks seed, not the install list.)
+- **S4 — Sidecar** — unchanged (§D), plus: pass the user-chosen `--ctx-size` from the calculator
+  through `build_args` (the §D coordination point already flagged), and `--cache-type-k/v` from the
+  chosen KV quant.
+- **S5 — Search + calculator UI + first-run + BYO-GGUF + external-endpoint path** (replaces the
+  static onboarding catalog step). The interactive screen above.
+
+## Invariants — all still upheld
+verified-before-runnable (HF `lfs.oid` sha256 verified against downloaded bytes — now at
+selection/download time, no pre-curation) · host allowlist (HF only, incl. search + ranged header
+reads) · privacy gate (sidecar Local+Private, `--host 127.0.0.1`) · `--no-default-features` (search/
+calc/metadata are pure/std+reqwest, no new features; sidecar stays behind `local-runner`) ·
+refuse-loudly (calculator says so + points external when nothing fits) · **honest Unknown** (Unknown
+bandwidth → no TPS number; failed GGUF header read → KV marked approximate, never silently guessed).
+
+## Open (for Lukas / the UX pass)
+- Staff-picks seed source: the repurposed §C list vs. a live "top GGUF from trusted publishers" query
+  (or both). Default recommendation: a tiny trusted seed + live search as the primary path.
+- Which capability badges to surface (vision / tool-use / reasoning) and from what signal (HF tags
+  are coarse; the GGUF `general.*`/chat-template can refine) — the screenshot shows all three.
+- Whether the calculator also exposes an "auto-pick best quant for my machine" one-click (the §B
+  ranking, now over search results) alongside the manual interactive knobs — likely yes.
