@@ -958,6 +958,20 @@ calc/metadata are pure/std+reqwest, no new features; sidecar stays behind `local
 refuse-loudly (calculator says so + points external when nothing fits) · **honest Unknown** (Unknown
 bandwidth → no TPS number; failed GGUF header read → KV marked approximate, never silently guessed).
 
+**⚠ TRUST-ROOT HONESTY (added by the 2026-07-22 independent review — the paragraph above
+originally overclaimed).** "Verified-before-runnable is unchanged" is true only in the narrow
+bytes-match-a-hash sense. Pre-redirect, the expected sha256 was maintainer-curated and pinned in
+`catalog.json` — an out-of-band trust root independent of the download source. Post-redirect it is
+**self-reported by the same host at the same time** as the file (`lfs.oid`). That still catches
+transport/CDN corruption and partial downloads; it can NO longer catch a malicious or compromised
+HF repo (whoever controls the repo controls both bytes and hash). This is the same posture LM
+Studio accepts, and it's a reasonable tradeoff for a live search — but it must be taken knowingly,
+so **S2′ carries a compensating REQUIREMENT: Staff-picks / default rows are limited to a
+trusted-publisher allowlist (official orgs + `lmstudio-community`/`ggml-org`/`unsloth`/`bartowski`),
+and an arbitrary-search result outside that list is visibly labeled ("community model — provenance
+is the publisher's") before download.** The repo-trust decision then sits with the user per model,
+never silently.
+
 ## Open (for Lukas / the UX pass)
 - Staff-picks seed source: the repurposed §C list vs. a live "top GGUF from trusted publishers" query
   (or both). Default recommendation: a tiny trusted seed + live search as the primary path.

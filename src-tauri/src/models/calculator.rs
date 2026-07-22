@@ -417,11 +417,17 @@ mod tests {
 
     #[test]
     fn growing_context_flips_fit_from_fits_to_too_large() {
-        // Small pool + a model whose KV balloons with context.
-        let hw = mac(8, Some(100.0));
-        let (m, wbytes) = dense_8b(5.0); // 5 GB weights on ~8 GB machine
+        // 16 GB pool: 5 GB weights + 0.5 GB KV @4k + 0.5 GB overhead = 6 GB,
+        // comfortably under the 0.7×13 GB comfort line → genuinely Fits. At
+        // 128k the KV alone is 16 GB (32× the 4k figure) → over the whole
+        // 13 GB pool → TooLarge. Both tiers asserted so the FLIP is proven,
+        // not just monotonic KV growth (a prior fixture was 8 GB and was
+        // TooLarge at BOTH ends — the 2026-07-22 audit caught it).
+        let hw = mac(16, Some(100.0));
+        let (m, wbytes) = dense_8b(5.0);
         let short = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 4096 });
         let long = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 131072 });
+        assert_eq!(short.fit, Fit::Fits, "the short-context case must actually fit");
         assert!(long.kv_cache_bytes > short.kv_cache_bytes);
         assert_eq!(long.fit, Fit::TooLarge, "a huge context must push it over");
         assert!(long.notes.iter().any(|n| n.contains("Too large")));
@@ -429,14 +435,19 @@ mod tests {
 
     #[test]
     fn lighter_kv_cache_can_rescue_a_tight_fit() {
+        // 16 GB pool (13 GB available, 9.1 GB comfort line), 6 GB weights,
+        // 64k context: F16 KV = 8 GB → 14.5 GB required → TooLarge; Q4_0 KV
+        // = 2 GB → 8.5 GB → Fits. The FIT-TIER rescue is asserted, not just
+        // smaller byte counts (a prior fixture stayed TooLarge under both
+        // quants — the 2026-07-22 audit caught it).
         let hw = mac(16, Some(200.0));
-        // Pick a weight size where f16 KV at long context is over the comfort
-        // line but q4_0 KV brings it back.
-        let (m, wbytes) = dense_8b(9.0);
-        let heavy = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 131072 });
-        let light = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::Q4_0, context_len: 131072 });
+        let (m, wbytes) = dense_8b(6.0);
+        let heavy = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 65536 });
+        let light = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::Q4_0, context_len: 65536 });
         assert!(light.kv_cache_bytes < heavy.kv_cache_bytes);
         assert!(light.total_required_bytes < heavy.total_required_bytes);
+        assert_eq!(heavy.fit, Fit::TooLarge, "f16 KV at 64k must overflow this machine");
+        assert_eq!(light.fit, Fit::Fits, "q4_0 KV must rescue the same model+context to a real fit");
     }
 
     #[test]
