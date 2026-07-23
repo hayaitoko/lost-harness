@@ -83,22 +83,26 @@ pub trait SkillDrafter: Send + Sync {
     /// caller uses it to decide whether to attempt a reflection at all.
     fn available(&self) -> bool;
 
-    /// Draft skills from `turns`. Best-effort: an error or empty result means
-    /// "propose nothing". MUST NOT egress to a cloud model.
+    /// Draft skills from `turns` for `profile`. Best-effort: an error or empty
+    /// result means "propose nothing". MUST NOT egress to a cloud model.
+    /// `profile` names the DB the (local, $0) model call is booked against (B10).
     fn draft<'a>(
         &'a self,
         turns: &'a [ChatMessage],
+        profile: &'a str,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<DraftedSkill>>> + Send + 'a>>;
 }
 
 /// Production drafter — a LOCAL, private model ONLY.
 pub struct LocalModelDrafter {
     model_manager: Arc<ModelManager>,
+    /// For booking the (local, $0) drafting call to the profile's usage ledger (B10).
+    storage: Arc<Storage>,
 }
 
 impl LocalModelDrafter {
-    pub fn new(model_manager: Arc<ModelManager>) -> Self {
-        Self { model_manager }
+    pub fn new(model_manager: Arc<ModelManager>, storage: Arc<Storage>) -> Self {
+        Self { model_manager, storage }
     }
 
     /// The first registered provider that is both `Local` AND private by URL —
@@ -119,6 +123,7 @@ impl SkillDrafter for LocalModelDrafter {
     fn draft<'a>(
         &'a self,
         turns: &'a [ChatMessage],
+        profile: &'a str,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<DraftedSkill>>> + Send + 'a>> {
         Box::pin(async move {
             let Some(local) = self.local_provider() else {
@@ -147,6 +152,9 @@ impl SkillDrafter for LocalModelDrafter {
                 ChatMessage::user(excerpt),
             ];
             let out = client.complete(&model, messages).await?;
+            // B10: book this local ($0) call to the profile's usage ledger
+            // (shared helper with memory-flush; best-effort, never fails drafting).
+            crate::agent::memory_flush::book_local_usage(&self.storage, profile, &model, &local.id);
             Ok(parse_drafts(&out))
         })
     }
@@ -329,10 +337,11 @@ fn skill_name_exists(global: &crate::storage::GlobalDb, name: &str) -> bool {
 pub(crate) async fn run_reflect(
     drafter: Arc<dyn SkillDrafter>,
     storage: Arc<Storage>,
+    profile: &str,
     turns: Vec<ChatMessage>,
     now: i64,
 ) -> anyhow::Result<usize> {
-    let drafts = drafter.draft(&turns).await?;
+    let drafts = drafter.draft(&turns, profile).await?;
     if drafts.is_empty() {
         return Ok(0);
     }
@@ -421,7 +430,7 @@ pub(crate) async fn run_new_chat_reflect(
             return Ok(0); // already reflected this conversation.
         }
     }
-    run_reflect(drafter, storage, turns, now).await
+    run_reflect(drafter, storage, &profile, turns, now).await
 }
 
 #[cfg(test)]
@@ -447,6 +456,7 @@ mod tests {
         fn draft<'a>(
             &'a self,
             _turns: &'a [ChatMessage],
+            _profile: &'a str,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<DraftedSkill>>> + Send + 'a>> {
             let d = self.drafts.clone();
             Box::pin(async move { Ok(d) })
@@ -567,7 +577,7 @@ mod tests {
             }],
         });
 
-        let saved = run_reflect(drafter, Arc::clone(&storage), vec![user("...")], 42)
+        let saved = run_reflect(drafter, Arc::clone(&storage), "personal", vec![user("...")], 42)
             .await
             .unwrap();
         assert_eq!(saved, 1);
@@ -617,7 +627,7 @@ mod tests {
                 capabilities: vec![],
             }],
         });
-        let saved = run_reflect(drafter, Arc::clone(&storage), vec![user("x")], 1)
+        let saved = run_reflect(drafter, Arc::clone(&storage), "personal", vec![user("x")], 1)
             .await
             .unwrap();
         assert_eq!(saved, 0, "a skill with an existing name is not re-drafted");
@@ -769,7 +779,7 @@ mod tests {
         let storage = Arc::new(Storage::open(&root).unwrap());
         let drafter: Arc<dyn SkillDrafter> =
             Arc::new(FakeDrafter { available: true, drafts: vec![] });
-        let saved = run_reflect(drafter, Arc::clone(&storage), vec![asst("hi")], 1)
+        let saved = run_reflect(drafter, Arc::clone(&storage), "personal", vec![asst("hi")], 1)
             .await
             .unwrap();
         assert_eq!(saved, 0);

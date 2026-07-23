@@ -255,9 +255,14 @@ pub enum RiskClass {
     Safe,
     /// Mutates local state the user owns (write/edit/delete files).
     Write,
-    /// Reaches beyond this machine (network egress, email). Reserved.
+    /// Reaches beyond this machine (network egress). In use: `fetch_url`,
+    /// `shell_exec` when its sandbox allows network, MCP tools whose server
+    /// declares network access. Always floors to an Ask (never auto-approved
+    /// headless — see B5).
     External,
-    /// Irreversible or high-blast-radius. Reserved.
+    /// Irreversible or high-blast-radius. In use: `delete_file`, `save_skill`,
+    /// `search_skills`, and any tool a body marks Dangerous. Structurally
+    /// Once-only (invariant #8 — a Dangerous grant can never be "Always").
     Dangerous,
 }
 

@@ -229,6 +229,7 @@ impl AgentLoop {
         tools: Arc<ToolDispatcher>,
     ) -> Self {
         let model_manager_for_flush = Arc::clone(&model_manager);
+        let storage_for_flush = Arc::clone(&storage);
         Self {
             gate,
             model_manager,
@@ -239,6 +240,7 @@ impl AgentLoop {
             cloud_safe_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             fact_extractor: Arc::new(crate::agent::memory_flush::LocalModelExtractor::new(
                 Arc::clone(&model_manager_for_flush),
+                storage_for_flush,
             )),
             flush_classifier: None,
             flush_marks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),

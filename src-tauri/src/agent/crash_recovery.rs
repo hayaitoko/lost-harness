@@ -214,10 +214,27 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
         .context("crash-recovery: persisting interrupted-tool event")?;
         terminalized.push(conv.id.clone());
 
-        // TODO(item 5, once tool_audit exists): also insert an audit row
-        // here with outcome = "interrupted". Not required for this
-        // item's acceptance criteria — the message row above is already
-        // a durable, visibly-reported event on its own.
+        // B10: also record the interruption in the append-only `tool_audit`
+        // observer lane, so the Activity pane shows a crash-interrupted tool
+        // call — not only the repair message. The tool's identity/args aren't
+        // reliably recoverable from a half-written fence, so they're an honest
+        // "unknown"/empty; the `outcome = "interrupted"` is the signal that
+        // matters. Same transaction as the repair row above → atomic.
+        tx.execute(
+            "INSERT INTO tool_audit
+             (ts, conversation_id, tool_name, canonical_args, fingerprint, risk, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                repair.created_at,
+                conv.id,
+                "unknown",
+                "",
+                "",
+                "unknown",
+                "interrupted",
+            ],
+        )
+        .context("crash-recovery: persisting interrupted-tool audit row")?;
     }
 
     // Expire persisted pending-approval artifacts. No-op today:

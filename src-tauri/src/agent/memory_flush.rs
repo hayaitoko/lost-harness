@@ -69,22 +69,27 @@ pub trait DurableFactExtractor: Send + Sync {
     /// turns swept) at all.
     fn available(&self) -> bool;
 
-    /// Extract durable facts from `turns`. Best-effort: an error or empty result
-    /// means "save nothing". MUST NOT egress to a cloud model.
+    /// Extract durable facts from `turns` for `profile`. Best-effort: an error
+    /// or empty result means "save nothing". MUST NOT egress to a cloud model.
+    /// `profile` names the DB the (local, $0) model call is booked against (B10).
     fn extract<'a>(
         &'a self,
         turns: &'a [ChatMessage],
+        profile: &'a str,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>>;
 }
 
 /// Production extractor — a LOCAL, private model ONLY.
 pub struct LocalModelExtractor {
     model_manager: Arc<ModelManager>,
+    /// For booking the (local, $0) extraction call to the profile's usage ledger
+    /// (B10 — the non-stream `complete()` path was previously invisible to Usage).
+    storage: Arc<Storage>,
 }
 
 impl LocalModelExtractor {
-    pub fn new(model_manager: Arc<ModelManager>) -> Self {
-        Self { model_manager }
+    pub fn new(model_manager: Arc<ModelManager>, storage: Arc<Storage>) -> Self {
+        Self { model_manager, storage }
     }
 
     /// The first registered provider that is both `Local` AND private by URL —
@@ -105,6 +110,7 @@ impl DurableFactExtractor for LocalModelExtractor {
     fn extract<'a>(
         &'a self,
         turns: &'a [ChatMessage],
+        profile: &'a str,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>> {
         Box::pin(async move {
             let Some(local) = self.local_provider() else {
@@ -136,8 +142,35 @@ impl DurableFactExtractor for LocalModelExtractor {
                 ChatMessage::user(excerpt),
             ];
             let out = client.complete(&model, messages).await?;
+            // B10: book this local ($0) call to the profile's usage ledger —
+            // the non-stream complete() path was previously invisible to Usage.
+            // Best-effort (a ledger write never fails extraction), mirroring the
+            // streamed path in loop_mod. The endpoint is local+private by the
+            // guard above, so cost is $0, never guessed.
+            book_local_usage(&self.storage, profile, &model, &local.id);
             Ok(parse_facts(&out))
         })
+    }
+}
+
+/// Book a local (on-device, $0) model call to `profile`'s usage ledger.
+/// Best-effort + non-conversation-scoped (`conversation_id: None`). Shared by the
+/// memory-flush extractor and the skill-reflect drafter (B10).
+pub(crate) fn book_local_usage(storage: &Storage, profile: &str, model: &str, provider_id: &str) {
+    let book = || -> anyhow::Result<()> {
+        storage.open_profile(profile)?.record_usage(&crate::storage::UsageEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: None,
+            model: model.to_string(),
+            provider_id: Some(provider_id.to_string()),
+            provider_kind: "local".to_string(),
+            cost_usd: Some(0.0), // local/private endpoint — always $0, never a guess
+            created_at: chrono::Utc::now().timestamp(),
+        })?;
+        Ok(())
+    };
+    if let Err(e) = book() {
+        tracing::warn!(error = %e, profile, "failed to book local usage event to the ledger");
     }
 }
 
@@ -244,7 +277,7 @@ pub(crate) async fn run_flush(
     turns: Vec<ChatMessage>,
     now: i64,
 ) -> anyhow::Result<usize> {
-    let facts = extractor.extract(&turns).await?;
+    let facts = extractor.extract(&turns, &profile).await?;
     if facts.is_empty() {
         return Ok(0);
     }
@@ -392,6 +425,7 @@ mod tests {
         fn extract<'a>(
             &'a self,
             _turns: &'a [ChatMessage],
+            _profile: &'a str,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>> {
             let f = self.facts.clone();
             Box::pin(async move { Ok(f) })
@@ -631,6 +665,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(saved, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn book_local_usage_records_a_zero_cost_local_call() {
+        // B10: the non-stream complete() path (memory-flush / skill-reflect)
+        // now books to the per-profile usage ledger. A local call is $0 with a
+        // KNOWN cost (never "unknown"/guessed).
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-book-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(Storage::open(&root).unwrap());
+        let before = storage.open_profile("personal").unwrap().usage_summary().unwrap();
+        book_local_usage(&storage, "personal", "qwen3-0.6b", "local-runner:x");
+        let after = storage.open_profile("personal").unwrap().usage_summary().unwrap();
+        assert_eq!(after.total_calls, before.total_calls + 1, "the local complete() call is booked");
+        assert_eq!(after.known_cost_usd, before.known_cost_usd, "a local call adds $0");
+        assert_eq!(after.unknown_cost_calls, before.unknown_cost_calls, "local $0 is known, not unknown");
         let _ = std::fs::remove_dir_all(root);
     }
 }

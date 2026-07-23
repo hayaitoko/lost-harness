@@ -249,7 +249,10 @@ pub fn run() {
             // Gated at runtime by the global `skill_reflect_enabled` toggle
             // (default off); drafts are always Pending (human-reviewed).
             .with_skill_drafter(Arc::new(
-                crate::agent::skill_reflect::LocalModelDrafter::new(Arc::clone(&model_manager)),
+                crate::agent::skill_reflect::LocalModelDrafter::new(
+                    Arc::clone(&model_manager),
+                    Arc::clone(&storage),
+                ),
             ));
             // M8 S4: hand the loop the lazy-spawn seam (when a sidecar resolved).
             #[cfg(feature = "local-runner")]
