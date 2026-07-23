@@ -443,6 +443,10 @@ pub async fn send_message(
     state: State<'_, AppState>,
     args: SendMessageArgs,
 ) -> Result<SendMessageResponse, String> {
+    // B3: enforce the profile-name allowlist at the IPC boundary too — this is
+    // the one command that uses `args.profile` (for routing/labels) before it
+    // reaches `open_profile`, so a padded/confusable name must be rejected here.
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     let binding = parse_binding(&args.binding)
         .map_err(|e| format!("invalid binding {:?}: {e}", args.binding))?;
     let session_mode = args

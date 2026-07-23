@@ -735,6 +735,31 @@ fn storage_open_profile_rejects_path_traversal() {
     }
 }
 
+#[test]
+fn storage_open_profile_rejects_whitespace_padding_and_confusables() {
+    // B3 (2026-07-18 gap): whitespace-padded and confusable names are three
+    // distinct, confusable `.db` files. The ASCII allowlist rejects them all.
+    let dir = tempdir();
+    let storage = Storage::open(&dir).unwrap();
+    for bad in [
+        " work",        // leading space
+        "work ",        // trailing space
+        "wo\trk",       // internal tab
+        "wo rk",        // internal space
+        "work\n",       // trailing newline
+        "wоrk",         // Cyrillic 'о' homoglyph
+        "wo\u{200b}rk", // zero-width space
+        "café",         // non-ASCII (combining/accent)
+        &"x".repeat(65),// too long
+    ] {
+        assert!(storage.open_profile(bad).is_err(), "must reject {bad:?}");
+    }
+    // The four real names the app generates still open fine.
+    for good in ["personal", "work", "school", "developer", "my-profile_2"] {
+        assert!(storage.open_profile(good).is_ok(), "must accept {good:?}");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Wave 1 — per-profile memory settings + walled-memory physical separation
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1096,3 +1096,61 @@ fn curated_summary_prefix_is_byte_stable_across_turns() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ── B1: seat-routing regression (the one HIGH from the 2026-07-21 audit) ────
+// A seat may PREFER a cloud model (resolve_seat is privacy-blind by design,
+// models/seat.rs:9-13), but a helper dispatched under a Private binding through
+// run_subagent must never reach a cloud client — the gate blocks it BEFORE any
+// client is built (agent/gate.rs Private+cloud → hard Block, short-circuited in
+// process_message before stream_to_provider/get_client). No test pinned this
+// end-to-end until now (the invariant held by construction only).
+#[tokio::test]
+async fn run_subagent_blocks_a_cloud_seat_under_a_private_binding_without_touching_any_client() {
+    use crate::agent::loop_mod::AgentLoop;
+    use crate::classifier::RulesClassifier;
+    use crate::models::ModelManager;
+
+    let dir = tempdir();
+    let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+    let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
+
+    let mm = Arc::new(ModelManager::new());
+    // A seat bound to a cloud provider (resolve_seat would return exactly this).
+    // The host is RFC-2606 `.invalid` — it can NEVER resolve — so if a future
+    // regression let this Private-bound helper reach get_client/stream, the DNS
+    // failure would surface loudly instead of the test passing for the wrong
+    // reason. (Deliberately NO local provider registered: Private+cloud is a
+    // hard Block, never RouteLocal — a local provider would mask a Block→reroute
+    // regression.)
+    let cloud = Provider::new(
+        "seat-cloud",
+        "Seated Cloud",
+        "https://cloud.example.invalid/v1",
+        Some("sk-test".into()),
+        ProviderKind::Cloud,
+    );
+    mm.add_provider(cloud.clone());
+
+    let agent = AgentLoop::new(gate, Arc::clone(&mm), Arc::clone(&storage), Arc::new(echo_allow_dispatcher()));
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.run_subagent(
+            "You are a helper.",
+            &[],
+            &cloud.id,
+            "gpt-x",
+            "personal",
+            Binding::Private,
+            "summarize this for me",
+        ),
+    )
+    .await
+    .expect("run_subagent must be blocked at the gate — never hang reaching a cloud endpoint")
+    .expect("run_subagent returns Ok(reason) on a gate Block, never Err");
+
+    assert!(
+        outcome.to_lowercase().contains("private") && outcome.to_lowercase().contains("cloud"),
+        "a cloud-seated helper under Private must be blocked before any client is touched, got: {outcome}"
+    );
+}

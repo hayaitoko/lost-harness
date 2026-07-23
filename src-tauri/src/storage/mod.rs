@@ -51,6 +51,35 @@ pub(crate) fn ensure_sqlite_vec_registered() {
     });
 }
 
+/// Validate a profile name (B3, closing the 2026-07-18 whitespace/confusable
+/// gap). A **strict ASCII allowlist** (`[A-Za-z0-9_-]`, ≤64 chars) rather than a
+/// Unicode denylist: blocking homoglyphs/confusables one-by-one is an arms race
+/// (Cyrillic а/е/о, zero-width joiners, combining marks, NFKC lookalikes…),
+/// while allowlisting sidesteps the whole class AND every real name the app has
+/// generated (`personal`/`work`/`school`/`developer`) passes. This also rejects
+/// all whitespace-padding (`" work"`, `"work "`, `"wo\trk"`) — three confusable,
+/// distinct `.db` files otherwise. `pub(crate)` so the `send_message` IPC
+/// boundary enforces the same rule before it touches `args.profile`.
+pub(crate) fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("invalid profile name: empty");
+    }
+    if name.len() > 64 {
+        anyhow::bail!("invalid profile name: too long ({} chars)", name.len());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        anyhow::bail!(
+            "invalid profile name: {name:?} (only ASCII letters, digits, '_' and '-' allowed)"
+        );
+    }
+    // Defense-in-depth: the allowlist already excludes '.', but keep the
+    // explicit traversal guard in case the allowlist is ever loosened.
+    if name.starts_with('.') || name.contains("..") {
+        anyhow::bail!("invalid profile name: {name:?}");
+    }
+    Ok(())
+}
+
 /// Top-level storage handle. Owns the global DB and a registry of
 /// open per-profile DBs. Cheap to clone (`Arc` inside) so it can be
 /// passed to the agent loop, IPC handlers, and TRM concurrently.
@@ -180,15 +209,10 @@ impl Storage {
         if let Some(existing) = self.inner.profiles.lock().get(name) {
             return Ok(existing.clone());
         }
-        // Sanitize: caller is responsible, but refuse path traversal.
-        if name.is_empty()
-            || name.contains('/')
-            || name.contains('\\')
-            || name.contains("..")
-            || name.starts_with('.')
-        {
-            anyhow::bail!("invalid profile name: {name:?}");
-        }
+        // Strict validation (B3): rejects path traversal AND whitespace-padded /
+        // confusable names — see `validate_profile_name`. Only ever-validated
+        // names reach the cache (inserted below, after this check).
+        validate_profile_name(name)?;
         let path = self
             .inner
             .base_path
