@@ -118,6 +118,37 @@ fn test_app() -> App<MockRuntime> {
             ipc::calculate_model_fit,
             ipc::get_sandbox_config,
             ipc::set_sandbox_config,
+            // B8: the rest of the registered surface (every command except the
+            // two that take a bare `AppHandle` — send_message, download_model —
+            // which structurally can't register under MockRuntime).
+            ipc::resolve_tool_approval,
+            ipc::resolve_ask_human,
+            ipc::get_usage_summary,
+            ipc::list_skills,
+            ipc::set_skill_approval,
+            ipc::delete_skill,
+            ipc::get_skill_reflect_enabled,
+            ipc::set_skill_reflect_enabled,
+            ipc::list_seat_bindings,
+            ipc::set_seat_binding,
+            ipc::delete_seat_binding,
+            ipc::list_agent_types,
+            ipc::set_agent_type_approval,
+            ipc::delete_agent_type,
+            ipc::install_pack,
+            ipc::probe_hardware,
+            ipc::list_model_catalog,
+            ipc::list_local_models,
+            ipc::remove_local_model,
+            ipc::list_tool_rules,
+            ipc::delete_tool_rule,
+            ipc::explain_classification,
+            ipc::list_memory,
+            ipc::save_memory,
+            ipc::delete_memory,
+            ipc::set_memory_pinned,
+            ipc::get_memory_settings,
+            ipc::set_memory_settings,
         ])
         .build(mock_context(noop_assets()))
         .expect("failed to build mock app");
@@ -663,4 +694,89 @@ fn sandbox_config_old_broken_shape_is_rejected() {
     let res = call(&webview, "get_sandbox_config", json!({"profile": "personal"}));
     let err = res.expect_err("flat/unwrapped args must NOT dispatch");
     assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
+}
+
+// ── B8: contract coverage across the whole registered surface ──────────────
+// Two data-driven sweeps pin the Tauri-v2 `{args:{…}}` envelope for every
+// args-taking command and prove every no-arg command actually dispatches.
+// (send_message / download_model are excluded — they take a bare AppHandle and
+// can't register under MockRuntime; they're covered by agent::loop_tests / the
+// download path respectively.)
+
+#[test]
+fn every_args_taking_command_rejects_the_unwrapped_envelope() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    // A body WITHOUT the `{args:{…}}` wrapper — the exact regression these
+    // contract tests guard. Tauri v2 looks for the `args` key and, finding
+    // none, rejects at the IPC layer before the command body runs, regardless
+    // of the flat fields present here.
+    let flat = json!({
+        "profile": "personal", "id": "x", "seat": "s", "provider_id": "p", "model": "m",
+        "status": "approved", "enabled": true, "content": "c", "text": "t", "pinned": true,
+        "decision": "approve", "json": "{}", "answer": "a"
+    });
+    let args_cmds = [
+        "resolve_tool_approval",
+        "resolve_ask_human",
+        "get_usage_summary",
+        "set_skill_approval",
+        "delete_skill",
+        "set_skill_reflect_enabled",
+        "list_seat_bindings",
+        "set_seat_binding",
+        "delete_seat_binding",
+        "set_agent_type_approval",
+        "delete_agent_type",
+        "install_pack",
+        "list_tool_rules",
+        "delete_tool_rule",
+        "explain_classification",
+        "list_memory",
+        "save_memory",
+        "delete_memory",
+        "set_memory_pinned",
+        "get_memory_settings",
+        "set_memory_settings",
+        "remove_local_model",
+    ];
+    for cmd in args_cmds {
+        let res = call(&webview, cmd, flat.clone());
+        let err = res.err().unwrap_or_else(|| panic!("{cmd}: an unwrapped body must be rejected, not accepted"));
+        assert!(
+            is_ipc_arg_rejection(err.as_str().unwrap_or_default()),
+            "{cmd}: expected an IPC arg-envelope rejection, got: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn every_no_arg_command_dispatches() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    // A no-arg command takes only `State`, so an empty body dispatches into the
+    // body (which may then return a domain result/error) — but NEVER an
+    // arg-shape rejection, and never "command not found" (i.e. it's registered).
+    let no_arg_cmds = [
+        "list_skills",
+        "get_skill_reflect_enabled",
+        "list_agent_types",
+        "probe_hardware",
+        "list_model_catalog",
+        "list_local_models",
+    ];
+    for cmd in no_arg_cmds {
+        let res = call(&webview, cmd, json!({}));
+        if let Err(e) = res {
+            let msg = e.as_str().unwrap_or_default();
+            assert!(
+                !is_ipc_arg_rejection(msg),
+                "{cmd}: a no-arg command must dispatch, got an arg rejection: {msg}"
+            );
+            assert!(
+                !msg.contains("not found"),
+                "{cmd}: must be registered, got: {msg}"
+            );
+        }
+    }
 }
