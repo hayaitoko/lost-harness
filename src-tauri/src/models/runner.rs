@@ -1537,4 +1537,92 @@ mod tests {
         sup.stop("live-test").await;
         assert!(!sup.is_running("live-test"));
     }
+
+    /// A5 — the FULL live E2E chain (design §D + the 22b redirect): HF search →
+    /// pick the tiny model → download → sha-verify → sidecar spawn → real
+    /// /v1/chat/completions → clean teardown. This is the one test that proves
+    /// A1 (search/metadata/download) + A2 (sidecar) work together end-to-end on
+    /// real bytes. Opt-in via `LHP_E2E_LIVE=1` (it downloads ~0.6 GB, so it must
+    /// be requested explicitly); self-skips otherwise. `LHP_LLAMA_SERVER_BIN`
+    /// overrides the vendored binary.
+    #[tokio::test]
+    async fn live_e2e_search_download_spawn_chat_teardown() {
+        if std::env::var_os("LHP_E2E_LIVE").is_none() {
+            eprintln!("skipping live E2E — set LHP_E2E_LIVE=1 to run (downloads ~0.6 GB)");
+            return;
+        }
+        use crate::models::hf_search::{self, SearchSort};
+
+        // 1. HF SEARCH — prove discovery returns real rows for the tiny model.
+        let hits = hf_search::search("qwen3 0.6b", SearchSort::Downloads, 20)
+            .await
+            .expect("HF search");
+        assert!(!hits.is_empty(), "search returns rows for qwen3-0.6b");
+
+        // 2. Resolve the specific tiny repo's quants; pick the SMALLEST complete
+        //    single-file quant (kindest download) — carries the real lfs.oid sha.
+        const REPO: &str = "Qwen/Qwen3-0.6B-GGUF";
+        let detail = hf_search::model_detail(REPO).await.expect("model detail");
+        let quant = detail
+            .quants
+            .iter()
+            .filter(|q| q.complete && q.files.len() == 1)
+            .min_by_key(|q| q.total_size_bytes)
+            .expect("a complete single-file quant");
+        let file = &quant.files[0];
+        assert_eq!(file.sha256.len(), 64, "a real 64-hex oid to verify against");
+
+        // 3. DOWNLOAD → VERIFY (the verified-before-runnable invariant on real bytes).
+        let dir = std::env::temp_dir().join(format!("lhp-e2e-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join("model.gguf.partial");
+        let gguf = dir.join("model.gguf");
+        crate::models::download::download_to_partial(&file.url, &partial, |_, _| {})
+            .await
+            .expect("download");
+        crate::models::download::verify_and_install(&partial, &gguf, &file.sha256)
+            .expect("sha256 verifies — bytes match the HF-reported oid");
+        assert!(gguf.exists() && !partial.exists());
+
+        // 4. SPAWN the real vendored sidecar against the verified file.
+        let bin = std::env::var_os("LHP_LLAMA_SERVER_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("vendor/llama-cpp/macos-arm64/llama-server")
+            });
+        let sup = Arc::new(LocalRunnerSupervisor::new(
+            Arc::new(TokioSpawner),
+            Arc::new(HttpHealthCheck::new()),
+            SupervisorConfig::default(),
+        ));
+        let port = pick_free_port().unwrap();
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        let cmd = build_args(&bin, &gguf, port, 4, Some(2048), Some(KvCacheQuant::F16));
+        sup.ensure_started("e2e", cmd, base_url.clone())
+            .await
+            .expect("sidecar becomes healthy");
+
+        // 5. Real chat round-trip through the ModelClient.
+        let provider = Provider::new("e2e", "E2E", &base_url, None, ProviderKind::Local);
+        let client = crate::models::ModelClient::new(provider).unwrap();
+        let models = client.list_models().await.expect("GET /v1/models");
+        assert!(!models.is_empty());
+        let reply = client
+            .complete(
+                &models[0],
+                vec![crate::models::ChatMessage {
+                    role: "user".into(),
+                    content: "Reply with exactly the word: pong".into(),
+                }],
+            )
+            .await
+            .expect("chat completion");
+        assert!(!reply.trim().is_empty(), "the model answered: {reply:?}");
+
+        // 6. Clean teardown + cleanup.
+        sup.stop("e2e").await;
+        assert!(!sup.is_running("e2e"), "sidecar stopped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
