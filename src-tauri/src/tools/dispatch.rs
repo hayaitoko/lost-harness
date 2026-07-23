@@ -65,6 +65,15 @@ struct RunState {
     /// real dispatches, so eviction is defensive, not load-bearing under
     /// default config).
     recent_fingerprints: VecDeque<String>,
+    /// C2: a fresh nonce per run (one user message), stamped by `begin_run`.
+    /// Scopes the durability journal's idempotency key PER ISSUANCE: a
+    /// double-fire within one run dedups/replays, while a DELIBERATE re-issue
+    /// of the identical action on a later message (which re-passed the whole
+    /// gate chain, incl. a fresh Once approval for Dangerous) legitimately
+    /// re-runs — the review caught that a lifetime-scoped key would replay a
+    /// stale result forever. Empty (tests that never begin_run) still scopes
+    /// by conversation.
+    run_nonce: String,
 }
 
 /// The result of dispatching one tool call. Every non-`Ok` variant is a
@@ -181,6 +190,15 @@ pub struct ToolDispatcher {
     /// audit writer, a persist error is surfaced (logged loudly) — a failed
     /// rule never yields a silent standing grant.
     rule_writer: Option<Arc<dyn crate::hooks::ToolRuleWriter>>,
+    /// C2 (2.5): the durability journal. When wired, every MUTATING tool
+    /// execution (Write/External/Dangerous) writes a `work_items` journal row
+    /// BEFORE the effect and finishes it after, idempotency-keyed by the call's
+    /// `ActionFingerprint` — a double-fired action executes once (the recorded
+    /// outcome is replayed), a crash mid-action leaves a reconcilable `running`
+    /// row (boot terminalizes it), and when the journal is wired but UNWRITABLE
+    /// the action is refused loudly (never an unrecorded effect). `None`
+    /// (tests / `empty()`) = unjournaled, the pre-C2 behavior.
+    journal: Option<Arc<crate::storage::Storage>>,
 }
 
 impl ToolDispatcher {
@@ -195,6 +213,7 @@ impl ToolDispatcher {
             run_state: Mutex::new(RunState::default()),
             audit_writer: None,
             rule_writer: None,
+            journal: None,
         }
     }
 
@@ -247,6 +266,9 @@ impl ToolDispatcher {
             run_state: Mutex::new(RunState::default()),
             audit_writer: self.audit_writer.clone(),
             rule_writer: self.rule_writer.clone(),
+            // C2: sub-dispatchers (cron/delegate helpers) journal too — unattended
+            // mutating actions need durability most.
+            journal: self.journal.clone(),
         }
     }
 
@@ -280,6 +302,171 @@ impl ToolDispatcher {
     pub fn with_rule_writer(mut self, writer: Arc<dyn crate::hooks::ToolRuleWriter>) -> Self {
         self.rule_writer = Some(writer);
         self
+    }
+
+    /// C2: wire the durability journal (the per-profile `work_items` store).
+    pub fn with_journal(mut self, storage: Arc<crate::storage::Storage>) -> Self {
+        self.journal = Some(storage);
+        self
+    }
+
+    /// C4: hot-register a tool at runtime (an approved skill becoming callable).
+    /// Passes through to the registry; refuses a name that would shadow an
+    /// existing tool. The gating chain applies to it like any other tool — the
+    /// chain resolves by name at dispatch time, never from a boot-time snapshot.
+    pub fn hot_register(&self, tool: Box<dyn crate::tools::Tool>) -> bool {
+        self.registry.register_dynamic(tool)
+    }
+
+    /// C4: remove a hot-registered tool (a skill rejected or deleted). Static
+    /// boot-time tools are untouchable.
+    pub fn hot_unregister(&self, name: &str) -> bool {
+        self.registry.unregister_dynamic(name)
+    }
+
+    /// C4 (review finding #1): lazily resolve a `skill_*` tool name against the
+    /// APPROVED skills in storage when the registry misses. Closes the primary
+    /// minting path — a skill approved via `save_skill`'s own Dangerous prompt
+    /// (which has no dispatcher handle) becomes callable the moment the model
+    /// invokes it, not only after a restart. Also self-heals a slug-collision
+    /// unregister (finding #3): a wrongly-removed wrapper re-registers on its
+    /// next call. Fires only for names with the `skill_` prefix, only when the
+    /// journal's storage handle is wired, and only via `SkillTool::for_skill`
+    /// (which wraps NOTHING but Approved skills — the inertness invariant holds).
+    fn lazy_resolve_skill(&self, name: &str) -> Option<Arc<dyn crate::tools::Tool>> {
+        if !name.starts_with("skill_") {
+            return None;
+        }
+        let storage = self.journal.as_ref()?;
+        let skills = storage.global().list_approved_skills().ok()?;
+        let skill = skills
+            .iter()
+            .find(|s| crate::tools::skills::skill_tool_name(&s.name) == name)?;
+        let tool = crate::tools::skills::SkillTool::for_skill(skill, Arc::clone(storage))?;
+        // Best-effort registration for future calls; the lookup below serves
+        // THIS call either way.
+        self.registry.register_dynamic(Box::new(tool));
+        self.registry.get(name)
+    }
+
+    /// C2 (2.5): run one MUTATING tool call through the durability journal.
+    /// Write-before-effect: the journal row is durably `running` BEFORE
+    /// `tool.run` fires, and finished (`done`/`failed` + the recorded outcome)
+    /// after. Idempotency semantics, keyed by the call's `ActionFingerprint`:
+    ///   - a prior `done` row REPLAYS its recorded result (a double-fired action
+    ///     executes once — the effect never happens twice);
+    ///   - a prior `running` row refuses (in-flight double-fire);
+    ///   - a prior `failed` row (incl. a crash the boot pass terminalized)
+    ///     allows the re-run — the effect didn't complete, and re-issuing the
+    ///     action passed the WHOLE gate chain again (a Dangerous call needed a
+    ///     fresh Once approval), so re-running is the human-confirmed recovery.
+    /// Fail-closed: with the journal wired, an unwritable/unreadable journal
+    /// REFUSES the action loudly — never an unrecorded mutating effect.
+    async fn run_journaled(
+        &self,
+        storage: &Arc<crate::storage::Storage>,
+        tool: &dyn crate::tools::Tool,
+        ev: &EventContext,
+        run_ctx: &ExecCtx,
+        fingerprint: &str,
+        canonical: &str,
+    ) -> ToolOutcome {
+        use crate::queue::{WorkItem, WorkKind, WorkState};
+        let refuse = |e: &dyn std::fmt::Display| {
+            ToolOutcome::Err(format!(
+                "action journal unavailable ({e}) — refusing to run a mutating action unrecorded"
+            ))
+        };
+        let db = match storage.open_profile(&run_ctx.profile) {
+            Ok(db) => db,
+            Err(e) => return refuse(&e),
+        };
+        // PER-ISSUANCE scope (review fix): conversation + run nonce + args
+        // fingerprint. Dedup protects against duplicate deliveries of ONE
+        // issuance (a double-fire, a crash-replay of an unfinished turn) — a
+        // deliberate re-issue on a later message gets a fresh nonce and
+        // legitimately re-runs, instead of replaying a stale result forever.
+        let run_nonce = self
+            .run_state
+            .lock()
+            .expect("run_state mutex poisoned")
+            .run_nonce
+            .clone();
+        let jkey = format!("action:{}:{run_nonce}:{fingerprint}", run_ctx.conversation_id);
+        match db.find_work_item_by_claim_key(&jkey) {
+            // A recorded SUCCESS is immutable — replay, never re-run.
+            Ok(Some(prior)) if prior.state == WorkState::Done => {
+                let raw = prior.result_json.unwrap_or_default();
+                let value =
+                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+                return ToolOutcome::Ok(value);
+            }
+            // In-flight double-fire (or a crash row boot hasn't reconciled yet).
+            Ok(Some(prior)) if prior.state == WorkState::Running => {
+                return ToolOutcome::Err(
+                    "this exact action is already in flight (double-fire refused)".to_string(),
+                );
+            }
+            Ok(_) => {} // no prior, or a failed prior → retry path below
+            Err(e) => return refuse(&e),
+        }
+        let now = chrono::Utc::now().timestamp();
+        let mut item = WorkItem::queued(WorkKind::MutatingAction, canonical.to_string(), now);
+        item.claim_key = Some(jkey.clone());
+        item.idempotency_key = Some(fingerprint.to_string());
+        item.source_ref = Some(run_ctx.conversation_id.clone());
+        // INSERT OR IGNORE: `Ok(false)` = a prior (failed) row already holds the
+        // key — its row is reused below (the retry bumps `attempts` in place).
+        if let Err(e) = db.insert_work_item(&item) {
+            return refuse(&e);
+        }
+        let row_id = match db.find_work_item_by_claim_key(&jkey) {
+            Ok(Some(row)) => row.id,
+            Ok(None) => return refuse(&"journal row vanished after write"),
+            Err(e) => return refuse(&e),
+        };
+        // queued/failed → running: the intent is now durable, BEFORE the effect.
+        // `Ok(false)` = the row raced to done/running meanwhile.
+        match db.start_work_attempt(&row_id, now) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Review fix: if the racer that beat us already FINISHED
+                // successfully, honor the executes-once semantics by replaying
+                // its recorded result (not surfacing a spurious error).
+                if let Ok(Some(prior)) = db.get_work_item(&row_id) {
+                    if prior.state == WorkState::Done {
+                        let raw = prior.result_json.unwrap_or_default();
+                        let value =
+                            serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+                        return ToolOutcome::Ok(value);
+                    }
+                }
+                return ToolOutcome::Err(
+                    "this exact action is already in flight (double-fire refused)".to_string(),
+                );
+            }
+            Err(e) => return refuse(&e),
+        }
+        let result = tool.run(ev.input.clone(), run_ctx).await;
+        let finished = chrono::Utc::now().timestamp();
+        // Finishing is best-effort: the EFFECT already happened — misreporting a
+        // completed effect as refused would be worse than a stale `running` row
+        // (which the boot pass terminalizes like any crash).
+        let fin = match &result {
+            ToolResult::Ok(v) => {
+                db.finish_work_item(&row_id, WorkState::Done, Some(&v.to_string()), None, finished)
+            }
+            ToolResult::Err(e) => {
+                db.finish_work_item(&row_id, WorkState::Failed, None, Some(e), finished)
+            }
+        };
+        if let Err(e) = fin {
+            tracing::warn!(error = %e, "durability journal: failed to finish a journal row");
+        }
+        match result {
+            ToolResult::Ok(v) => ToolOutcome::Ok(v),
+            ToolResult::Err(e) => ToolOutcome::Err(e),
+        }
     }
 
     /// Build one `AuditEntry` from the dispatch inputs and hand it to
@@ -357,12 +544,16 @@ impl ToolDispatcher {
         let mut state = self.run_state.lock().expect("run_state mutex poisoned");
         state.dispatch_count = 0;
         state.recent_fingerprints.clear();
+        // C2: a fresh issuance scope for the durability journal.
+        state.run_nonce = Uuid::new_v4().to_string();
     }
 
     /// The system-prompt fragment teaching the fenced dialect and listing
     /// the tools available in this environment. `""` if there are none.
     pub fn catalog(&self) -> String {
-        render_tool_catalog(&self.registry.available_tools(&self.env))
+        let tools = self.registry.available_tools(&self.env);
+        let refs: Vec<&dyn crate::tools::Tool> = tools.iter().map(|t| t.as_ref()).collect();
+        render_tool_catalog(&refs)
     }
 
     /// The OpenAI function-call `tools` array for this body's available tools
@@ -448,7 +639,8 @@ impl ToolDispatcher {
         binding: Binding,
         is_cloud: bool,
     ) -> ToolOutcome {
-        let Some(tool) = self.registry.get(&call.name) else {
+        let Some(tool) = self.registry.get(&call.name).or_else(|| self.lazy_resolve_skill(&call.name))
+        else {
             return ToolOutcome::Unknown(format!("no tool named '{}'", call.name));
         };
 
@@ -550,6 +742,22 @@ impl ToolDispatcher {
                         binding,
                         ..ctx.clone()
                     };
+
+                    // C2 (2.5): the durability journal — write-before-effect +
+                    // idempotency for MUTATING tools (Safe reads have no effect
+                    // to protect). The idempotency key IS the ActionFingerprint
+                    // (tool + canonical args) — one primitive, no second hash.
+                    let mutating = matches!(
+                        tool.risk(),
+                        RiskClass::Write | RiskClass::External | RiskClass::Dangerous
+                    );
+                    if mutating {
+                        if let Some(storage) = &self.journal {
+                            return self
+                                .run_journaled(storage, tool.as_ref(), &ev, &run_ctx, &fingerprint, &canonical)
+                                .await;
+                        }
+                    }
                     return match tool.run(ev.input.clone(), &run_ctx).await {
                         ToolResult::Ok(v) => ToolOutcome::Ok(v),
                         ToolResult::Err(e) => ToolOutcome::Err(e),
@@ -3223,5 +3431,229 @@ mod tests {
             other => panic!("shell_exec `rm -rf /` must be sandbox-denied, got {other:?}"),
         }
     }
-}
 
+    // ── C2 (2.5): the durability journal — write-before-effect + idempotency ──
+
+    /// A counting MUTATING tool (risk Write): counts real executions; the first
+    /// run can be forced to fail (then clears the flag) for the retry test.
+    struct CountingWriteTool {
+        runs: Arc<AtomicUsize>,
+        fail_first: Arc<AtomicBool>,
+    }
+    impl Tool for CountingWriteTool {
+        fn name(&self) -> &str {
+            "mutate_thing"
+        }
+        fn risk(&self) -> RiskClass {
+            RiskClass::Write
+        }
+        fn requires(&self) -> &[Capability] {
+            &[]
+        }
+        fn run<'a>(
+            &'a self,
+            input: ToolInput,
+            _ctx: &'a ExecCtx,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let fail = self.fail_first.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    ToolResult::Err("transient failure".to_string())
+                } else {
+                    ToolResult::Ok(input.args)
+                }
+            })
+        }
+    }
+
+    fn journaled_dispatcher(
+        runs: Arc<AtomicUsize>,
+        fail_first: bool,
+    ) -> (ToolDispatcher, Arc<crate::storage::Storage>, std::path::PathBuf) {
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-journal-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(crate::storage::Storage::open(&root).unwrap());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingWriteTool {
+            runs,
+            fail_first: Arc::new(AtomicBool::new(fail_first)),
+        }));
+        let dispatcher = ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty())
+            .with_journal(Arc::clone(&storage));
+        (dispatcher, storage, root)
+    }
+
+    #[tokio::test]
+    async fn c2_double_fired_mutating_action_executes_once() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (dispatcher, storage, root) = journaled_dispatcher(Arc::clone(&runs), false);
+        let args = serde_json::json!({"x": 1});
+
+        let first = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert_eq!(first, ToolOutcome::Ok(args.clone()), "first fire runs and succeeds");
+        // The double-fire: the identical call REPLAYS the recorded outcome.
+        let second = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert_eq!(second, ToolOutcome::Ok(args.clone()), "the recorded result is replayed");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the EFFECT ran exactly once");
+
+        // The journal row: done, kind mutating_action, idempotency-keyed.
+        let fp = crate::hooks::ActionFingerprint::of("mutate_thing", &args);
+        let db = storage.open_profile("personal").unwrap();
+        let row = db.find_work_item_by_claim_key(&format!("action:conv-1::{fp}")).unwrap().expect("journal row");
+        assert_eq!(row.kind, crate::queue::WorkKind::MutatingAction);
+        assert_eq!(row.state, crate::queue::WorkState::Done);
+        assert_eq!(row.idempotency_key.as_deref(), Some(fp.as_str()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn c2_failed_attempt_can_be_retried_and_attempts_are_counted() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (dispatcher, storage, root) = journaled_dispatcher(Arc::clone(&runs), true);
+        let args = serde_json::json!({"y": 2});
+
+        let first = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert!(matches!(first, ToolOutcome::Err(_)), "the forced first failure surfaces");
+        // A retry after failure RE-RUNS (the effect did not complete — re-running
+        // is the recovery), it is not replay-blocked like a recorded success.
+        let second = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert_eq!(second, ToolOutcome::Ok(args.clone()));
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "failed → retried → ran again");
+
+        let fp = crate::hooks::ActionFingerprint::of("mutate_thing", &args);
+        let db = storage.open_profile("personal").unwrap();
+        let row = db.find_work_item_by_claim_key(&format!("action:conv-1::{fp}")).unwrap().unwrap();
+        assert_eq!(row.state, crate::queue::WorkState::Done);
+        assert_eq!(row.attempts, 2, "one row, two attempts");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn c2_crash_interrupted_action_refuses_in_flight_then_reruns_after_reconcile() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (dispatcher, storage, root) = journaled_dispatcher(Arc::clone(&runs), false);
+        let args = serde_json::json!({"z": 3});
+        let fp = crate::hooks::ActionFingerprint::of("mutate_thing", &args);
+        let db = storage.open_profile("personal").unwrap();
+
+        // Simulate a crash mid-action: a journal row stuck `running` (the
+        // write-before-effect landed; the process died before finish).
+        let now = 1_000;
+        let mut item = crate::queue::WorkItem::queued(
+            crate::queue::WorkKind::MutatingAction,
+            "mutate_thing {}".to_string(),
+            now,
+        );
+        item.claim_key = Some(format!("action:conv-1::{fp}"));
+        item.idempotency_key = Some(fp.clone());
+        db.insert_work_item(&item).unwrap();
+        assert!(db.start_work_attempt(&item.id, now).unwrap());
+
+        // Before reconciliation: the identical dispatch is refused (in-flight).
+        let refused = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert!(matches!(refused, ToolOutcome::Err(_)), "a running row refuses a double-run");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the tool never ran");
+
+        // The boot pass terminalizes the orphaned row (crash reconcile)...
+        assert_eq!(db.terminalize_orphaned_work(2_000).unwrap(), 1);
+        // ...after which a re-issued action (which re-passed the whole gate
+        // chain) re-runs as the recovery.
+        let rerun = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert_eq!(rerun, ToolOutcome::Ok(args.clone()));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn c2_safe_tools_skip_the_journal() {
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-journal-safe-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(crate::storage::Storage::open(&root).unwrap());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool)); // Safe
+        let dispatcher = ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty())
+            .with_journal(Arc::clone(&storage));
+
+        let args = serde_json::json!({"q": 1});
+        let out = dispatcher.dispatch(&call("echo", args.clone()), &ctx(), Binding::Public, true).await;
+        assert_eq!(out, ToolOutcome::Ok(args.clone()));
+        // No journal row for a Safe read — nothing to protect, and journaling
+        // every read would bloat the table for zero durability value.
+        let fp = crate::hooks::ActionFingerprint::of("echo", &args);
+        let db = storage.open_profile("personal").unwrap();
+        assert!(db.find_work_item_by_claim_key(&format!("action:conv-1::{fp}")).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn c4_a_freshly_approved_skill_resolves_lazily_without_restart() {
+        // Review finding #1: a skill approved via save_skill's own prompt (no
+        // dispatcher handle) must be callable IMMEDIATELY — the registry miss
+        // falls through to a lazy storage lookup of APPROVED skills.
+        let mut root = std::env::temp_dir();
+        root.push(format!("lhp-lazyskill-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(crate::storage::Storage::open(&root).unwrap());
+        storage
+            .global()
+            .insert_skill(&crate::storage::Skill {
+                id: "lz1".into(),
+                name: "Fold Laundry".into(),
+                description: "how to fold".into(),
+                content: "1. fold it".into(),
+                capabilities_required: vec![],
+                approval_status: crate::storage::SkillApproval::Approved,
+                path: String::new(),
+                version: "1".into(),
+                created_at: 1,
+            })
+            .unwrap();
+        // An EMPTY registry — the skill is nowhere until the lazy lookup fires.
+        let dispatcher = ToolDispatcher::new(ToolRegistry::new(), HookChain::new(), BodyEnv::empty())
+            .with_journal(Arc::clone(&storage));
+        let out = dispatcher
+            .dispatch(&call("skill_fold_laundry", serde_json::json!({})), &ctx(), Binding::Public, true)
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => assert!(v["playbook"].as_str().unwrap().contains("fold it")),
+            other => panic!("expected the lazily-resolved playbook, got {other:?}"),
+        }
+        // A PENDING skill never lazily resolves (the inertness invariant).
+        storage
+            .global()
+            .set_skill_approval("lz1", crate::storage::SkillApproval::Rejected)
+            .unwrap();
+        let dispatcher2 = ToolDispatcher::new(ToolRegistry::new(), HookChain::new(), BodyEnv::empty())
+            .with_journal(Arc::clone(&storage));
+        let refused = dispatcher2
+            .dispatch(&call("skill_fold_laundry", serde_json::json!({})), &ctx(), Binding::Public, true)
+            .await;
+        assert!(matches!(refused, ToolOutcome::Unknown(_)), "a rejected skill is INERT, got {refused:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn c2_a_new_run_reexecutes_a_previously_recorded_action() {
+        // Review fix (per-issuance scope): the identical action DELIBERATELY
+        // re-issued on a LATER user message (a new run → fresh nonce) must
+        // re-run — the journal dedups duplicate deliveries of one issuance,
+        // never a lifetime "replay a stale result forever".
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (dispatcher, _storage, root) = journaled_dispatcher(Arc::clone(&runs), false);
+        let args = serde_json::json!({"again": true});
+
+        dispatcher.begin_run(); // user message #1
+        let a = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert_eq!(a, ToolOutcome::Ok(args.clone()));
+        // Same run: the double-fire replays, executes once.
+        let b = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert_eq!(b, ToolOutcome::Ok(args.clone()));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "in-run double-fire executes once");
+
+        dispatcher.begin_run(); // user message #2 — a fresh issuance
+        let c = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        assert_eq!(c, ToolOutcome::Ok(args.clone()));
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "a deliberate re-issue on a new run RE-RUNS");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

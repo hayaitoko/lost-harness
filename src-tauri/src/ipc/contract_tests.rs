@@ -64,13 +64,15 @@ fn test_app() -> App<MockRuntime> {
 
     let model_manager = Arc::new(ModelManager::new());
     let gate = PrivacyGate::new(Arc::new(HeuristicClassifier::new()));
+    // `send_message` (the only command that uses the dispatcher for real work)
+    // isn't registered in this harness, so an inert dispatcher is enough. C4:
+    // shared between the loop and AppState (skill hot-registration commands).
+    let tools = Arc::new(crate::tools::ToolDispatcher::empty());
     let agent_loop = Arc::new(AgentLoop::new(
         gate,
         Arc::clone(&model_manager),
         Arc::clone(&storage),
-        // `send_message` (the only command that uses the dispatcher) isn't
-        // registered in this harness, so an inert dispatcher is enough.
-        Arc::new(crate::tools::ToolDispatcher::empty()),
+        Arc::clone(&tools),
     ));
 
     let state = AppState {
@@ -81,6 +83,7 @@ fn test_app() -> App<MockRuntime> {
         ask_human: Arc::new(crate::ipc::ask_human::AskHumanRegistry::new()),
         classifier: Arc::new(HeuristicClassifier::new()),
         embedder: None,
+        tools,
         // Default profile (total_ram 0) — the calculator contract test only
         // checks the command dispatches + returns a CalcOutput shape, not fit.
         hardware: Arc::new(Default::default()),

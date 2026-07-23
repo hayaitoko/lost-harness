@@ -25,6 +25,13 @@ pub enum WorkKind {
     AgentDispatch,
     /// An inbound server-companion result to apply locally (Wave 6).
     ServerResult,
+    /// C2 (2.5): a durability-journal row for one MUTATING tool execution —
+    /// written BEFORE the effect, finished after, idempotency-keyed by the
+    /// call's `ActionFingerprint` so a double-fired action executes once and a
+    /// crash mid-action leaves a reconcilable `running` row (terminalized by
+    /// the boot pass), never silent half-state. Not claimable by the work
+    /// runner — the dispatcher drives these rows synchronously.
+    MutatingAction,
 }
 
 impl WorkKind {
@@ -33,6 +40,7 @@ impl WorkKind {
             WorkKind::Cron => "cron",
             WorkKind::AgentDispatch => "agent_dispatch",
             WorkKind::ServerResult => "server_result",
+            WorkKind::MutatingAction => "mutating_action",
         }
     }
 
@@ -43,6 +51,7 @@ impl WorkKind {
             "cron" => Some(WorkKind::Cron),
             "agent_dispatch" => Some(WorkKind::AgentDispatch),
             "server_result" => Some(WorkKind::ServerResult),
+            "mutating_action" => Some(WorkKind::MutatingAction),
             _ => None,
         }
     }
@@ -173,7 +182,12 @@ mod tests {
 
     #[test]
     fn kind_and_state_round_trip_through_strings() {
-        for k in [WorkKind::Cron, WorkKind::AgentDispatch, WorkKind::ServerResult] {
+        for k in [
+            WorkKind::Cron,
+            WorkKind::AgentDispatch,
+            WorkKind::ServerResult,
+            WorkKind::MutatingAction,
+        ] {
             assert_eq!(WorkKind::from_str(k.as_str()), Some(k));
         }
         assert_eq!(WorkKind::from_str("nope"), None);

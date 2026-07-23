@@ -78,7 +78,7 @@ tauri = { version = "2.11", features = ["test"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
-default = ["onnx-classifier", "local-runner"]
+default = ["onnx-classifier", "local-runner", "computer-use"]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
 # The trained ONNX privacy classifier (bge-small + distilbert ensemble). Default
@@ -90,3 +90,9 @@ onnx-classifier = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 # (tokio::process + reqwest are already deps); the feature exists so
 # `--no-default-features` builds a core with no sidecar surface at all.
 local-runner = []
+# C6 / M5 logic half: the `ui_*` act-tool skeletons + OnScreenActionHook over
+# the ComputerBackend seam. No new deps this slice (no native backend — the
+# production registration uses the refuse-loudly UnavailableBackend); the
+# feature exists NOW so the on-target native slice has a real switch to attach
+# GUI deps to, and `--no-default-features` already excludes the whole surface.
+computer-use = []

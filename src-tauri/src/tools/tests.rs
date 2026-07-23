@@ -26,10 +26,10 @@ fn restricted_to_excludes_every_tool_not_in_the_allowlist() {
     assert!(sub.get("echo").is_some());
     assert!(sub.get("screenshot").is_none(), "a tool outside the belt is not lookupable");
     assert!(sub.get("sync_file").is_none());
-    let names: Vec<&str> = sub
+    let names: Vec<String> = sub
         .available_tools(&BodyEnv::app_default())
         .into_iter()
-        .map(|t| t.name())
+        .map(|t| t.name().to_string())
         .collect();
     assert_eq!(names, vec!["echo"], "only the allowed tool is listable");
 }
@@ -52,12 +52,12 @@ fn restricted_to_still_applies_the_env_capability_filter() {
     // Network) is allowed but an env with neither can't offer it.
     let sub = registry().restricted_to(&allow(&["echo", "sync_file"]));
     let bare = BodyEnv::empty();
-    let names: Vec<&str> = sub.available_tools(&bare).into_iter().map(|t| t.name()).collect();
+    let names: Vec<String> = sub.available_tools(&bare).into_iter().map(|t| t.name().to_string()).collect();
     assert_eq!(names, vec!["echo"], "sync_file is allowed but ungranted by this env");
     // With the capabilities present, the allowed tool becomes available.
     let full = BodyEnv::new([Capability::Filesystem, Capability::Network]);
-    let names2: Vec<&str> = sub.available_tools(&full).into_iter().map(|t| t.name()).collect();
-    assert!(names2.contains(&"sync_file") && names2.contains(&"echo"));
+    let names2: Vec<String> = sub.available_tools(&full).into_iter().map(|t| t.name().to_string()).collect();
+    assert!(names2.iter().any(|n| n == "sync_file") && names2.iter().any(|n| n == "echo"));
 }
 
 #[test]
@@ -71,14 +71,14 @@ fn restricted_to_empty_allowlist_yields_an_empty_belt() {
 fn no_requirements_tool_available_everywhere() {
     let r = registry();
     let empty_env = BodyEnv::empty();
-    let names: Vec<&str> = r
+    let names: Vec<String> = r
         .available_tools(&empty_env)
         .into_iter()
-        .map(|t| t.name())
+        .map(|t| t.name().to_string())
         .collect();
-    assert!(names.contains(&"echo"), "echo has no requirements, should always be available");
-    assert!(!names.contains(&"screenshot"));
-    assert!(!names.contains(&"sync_file"));
+    assert!(names.iter().any(|n| n == "echo"), "echo has no requirements, should always be available");
+    assert!(!names.iter().any(|n| n == "screenshot"));
+    assert!(!names.iter().any(|n| n == "sync_file"));
 }
 
 #[test]
@@ -86,32 +86,32 @@ fn display_tool_hidden_on_no_display_env() {
     let r = registry();
     // Headless-server-shaped env: no Display capability.
     let headless = BodyEnv::headless_server_default();
-    let names: Vec<&str> = r
+    let names: Vec<String> = r
         .available_tools(&headless)
         .into_iter()
-        .map(|t| t.name())
+        .map(|t| t.name().to_string())
         .collect();
     assert!(
-        !names.contains(&"screenshot"),
+        !names.iter().any(|n| n == "screenshot"),
         "a Display-requiring tool must be hidden on a no-Display env, got {names:?}"
     );
     // Filesystem+Network tool should still be available server-side.
-    assert!(names.contains(&"sync_file"));
-    assert!(names.contains(&"echo"));
+    assert!(names.iter().any(|n| n == "sync_file"));
+    assert!(names.iter().any(|n| n == "echo"));
 }
 
 #[test]
 fn display_tool_available_on_app_env() {
     let r = registry();
     let app_env = BodyEnv::app_default();
-    let names: Vec<&str> = r
+    let names: Vec<String> = r
         .available_tools(&app_env)
         .into_iter()
-        .map(|t| t.name())
+        .map(|t| t.name().to_string())
         .collect();
-    assert!(names.contains(&"screenshot"));
-    assert!(names.contains(&"sync_file"));
-    assert!(names.contains(&"echo"));
+    assert!(names.iter().any(|n| n == "screenshot"));
+    assert!(names.iter().any(|n| n == "sync_file"));
+    assert!(names.iter().any(|n| n == "echo"));
 }
 
 #[test]

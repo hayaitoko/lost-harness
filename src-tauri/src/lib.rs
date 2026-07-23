@@ -234,11 +234,32 @@ pub fn run() {
                 Arc::clone(&model_manager),
             ));
 
+            // C4: register every ALREADY-APPROVED skill as a callable Tool at
+            // boot — skills approved in a prior session stay callable across
+            // restarts. Best-effort (a bad row is skipped, never bricks boot);
+            // the wrapper re-checks approval from storage at every call anyway.
+            match storage.global().list_approved_skills() {
+                Ok(skills) => {
+                    for skill in &skills {
+                        if let Some(tool) = crate::tools::skills::SkillTool::for_skill(
+                            skill,
+                            Arc::clone(&storage),
+                        ) {
+                            tools.hot_register(Box::new(tool));
+                        }
+                    }
+                    if !skills.is_empty() {
+                        tracing::info!(count = skills.len(), "registered approved skills as tools");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "couldn't load approved skills as tools"),
+            }
+
             let agent_loop = AgentLoop::new(
                 gate,
                 Arc::clone(&model_manager),
                 Arc::clone(&storage),
-                tools,
+                Arc::clone(&tools),
             )
             .with_embedder(embedder.clone())
             // Wave 3.5: enable the pre-compaction flush (local-model durable
@@ -296,6 +317,8 @@ pub fn run() {
                 ask_human,
                 classifier: Arc::clone(&classifier),
                 embedder,
+                // C4: the live dispatcher, for hot-(un)registering skill tools.
+                tools: Arc::clone(&tools),
                 hardware,
                 #[cfg(feature = "local-runner")]
                 local_runner: local_runner_ctx,
@@ -608,6 +631,10 @@ fn build_tool_dispatcher(
     };
     use crate::tools::{BodyEnv, RiskClass, ToolRegistry};
 
+    // C2: keep a handle for the durability journal (Storage is Arc-backed —
+    // cheap clone), taken up front before `storage` is moved below.
+    let journal_storage = storage.clone();
+
     let workspace = base_path.join("workspace");
     if let Err(e) = std::fs::create_dir_all(&workspace) {
         tracing::warn!(
@@ -797,8 +824,36 @@ fn build_tool_dispatcher(
         &audit_writer,
     ))));
 
+    // C6 / M5 logic half: the `ui_*` act-tool skeletons + the OnScreenActionHook,
+    // over the refuse-loudly UnavailableBackend (no native backend this slice —
+    // the tools are registered + fully gated, and every actuation honestly
+    // errors "no native backend in this build"). The hook appends AFTER the
+    // generic gates: correct because an irreversible target's `covers_once`
+    // floor is checked before the Once grant is consumed at the execution arm,
+    // and a Session grant passing PermissionHook still can't cover it.
+    #[cfg(feature = "computer-use")]
+    {
+        use crate::tools::computer_backend::{ComputerBackend, UnavailableBackend};
+        use crate::tools::computer_tools::{
+            UiClickTool, UiDragTool, UiKeyTool, UiScrollTool, UiTypeTool,
+        };
+        let backend: Arc<dyn ComputerBackend> = Arc::new(UnavailableBackend);
+        registry.register(Box::new(UiScrollTool::new(Arc::clone(&backend))));
+        registry.register(Box::new(UiClickTool::new(Arc::clone(&backend))));
+        registry.register(Box::new(UiTypeTool::new(Arc::clone(&backend))));
+        registry.register(Box::new(UiKeyTool::new(Arc::clone(&backend))));
+        registry.register(Box::new(UiDragTool::new(Arc::clone(&backend))));
+        chain.register_gating(Box::new(
+            crate::hooks::on_screen_action::OnScreenActionHook::new(backend)
+                .with_ledger(Arc::clone(&ledger)),
+        ));
+    }
+
     ToolDispatcher::new(registry, chain, env)
         .with_approval(ledger, approver)
         .with_audit_writer(audit_writer)
         .with_rule_writer(rule_writer)
+        // C2: the durability journal — every mutating tool execution writes a
+        // work_items row before the effect (idempotency-keyed, crash-reconciled).
+        .with_journal(Arc::new(journal_storage))
 }

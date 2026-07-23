@@ -24,6 +24,10 @@ use std::sync::{Arc, Mutex};
 
 pub mod ask_human;
 pub mod calling;
+#[cfg(feature = "computer-use")]
+pub mod computer_backend;
+#[cfg(feature = "computer-use")]
+pub mod computer_tools;
 pub mod computer_use;
 pub mod cron;
 pub mod delegate;
@@ -71,6 +75,29 @@ pub enum Capability {
     /// signal a headless server is happy to offer but a foregrounded app
     /// may want to bound.
     LongCompute,
+}
+
+impl Capability {
+    /// C4: parse the stringly-typed capability names skills declare
+    /// (`skills::KNOWN_CAPABILITIES`) into the enum. Must stay in lock-step
+    /// with that allowlist — a test asserts every known string parses, so an
+    /// approved skill can never silently lose a `requires()` gate to a naming
+    /// drift. Unknown strings are `None` (fail closed at the caller).
+    pub fn from_capability_str(s: &str) -> Option<Capability> {
+        Some(match s {
+            "Filesystem" => Capability::Filesystem,
+            "Network" => Capability::Network,
+            "Shell" => Capability::Shell,
+            "Display" => Capability::Display,
+            "Audio" => Capability::Audio,
+            "ComputerUse" => Capability::ComputerUse,
+            "Email" => Capability::Email,
+            "Calendar" => Capability::Calendar,
+            "WebResearch" => Capability::WebResearch,
+            "LongCompute" => Capability::LongCompute,
+            _ => return None,
+        })
+    }
 }
 
 // ── BodyEnv ──────────────────────────────────────────────────────────────
@@ -265,9 +292,10 @@ pub enum RiskClass {
     /// declares network access. Always floors to an Ask (never auto-approved
     /// headless — see B5).
     External,
-    /// Irreversible or high-blast-radius. In use: `delete_file`, `save_skill`,
-    /// `search_skills`, and any tool a body marks Dangerous. Structurally
-    /// Once-only (invariant #8 — a Dangerous grant can never be "Always").
+    /// Irreversible or high-blast-radius. In use: `shell_exec`, `save_skill`
+    /// (a standing playbook must never be minted unreviewed), and any
+    /// Shell-capability skill wrapper. Structurally Once-only (invariant #8 —
+    /// a Dangerous grant can never be "Always").
     Dangerous,
 }
 
@@ -372,11 +400,20 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<std::sync::Arc<dyn Tool>>,
+    /// C4: hot-registered tools (approved-skill wrappers), added/removed at
+    /// runtime through `&self`. Kept SEPARATE from the boot-time static set so
+    /// `register` keeps its construction-time `&mut` signature and the static
+    /// registrations stay untouched. A dynamic name can never SHADOW a static
+    /// tool or another dynamic one (`register_dynamic` refuses duplicates).
+    dynamic: parking_lot::RwLock<Vec<std::sync::Arc<dyn Tool>>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self {
+            tools: Vec::new(),
+            dynamic: parking_lot::RwLock::new(Vec::new()),
+        }
     }
 
     /// Register a tool. Order of registration is preserved and reflected
@@ -384,6 +421,31 @@ impl ToolRegistry {
     /// `register(Box::new(MyTool))`); it's converted to `Arc` internally.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(std::sync::Arc::from(tool));
+    }
+
+    /// C4: hot-register a tool at RUNTIME (an approved skill becoming callable).
+    /// Refuses (returns `false`) when the name already exists — a dynamic tool
+    /// can never shadow a built-in (or double-register itself).
+    pub fn register_dynamic(&self, tool: Box<dyn Tool>) -> bool {
+        let name = tool.name().to_string();
+        if self.tools.iter().any(|t| t.name() == name) {
+            return false;
+        }
+        let mut dynamic = self.dynamic.write();
+        if dynamic.iter().any(|t| t.name() == name) {
+            return false;
+        }
+        dynamic.push(std::sync::Arc::from(tool));
+        true
+    }
+
+    /// C4: remove a hot-registered tool (a skill rejected or deleted). Static
+    /// (boot-time) tools are untouchable — returns whether something was removed.
+    pub fn unregister_dynamic(&self, name: &str) -> bool {
+        let mut dynamic = self.dynamic.write();
+        let before = dynamic.len();
+        dynamic.retain(|t| t.name() != name);
+        dynamic.len() != before
     }
 
     /// A bounded sub-registry: exactly the registered tools whose name is in
@@ -394,48 +456,68 @@ impl ToolRegistry {
     /// tool not in `allowed` is physically absent from the result, so it can't be
     /// listed (`available_tools`/catalog) OR looked up (`get`) — enforcement is
     /// the registry's contents, not a filter that some call site might skip.
+    /// C4 note: the sub-registry SNAPSHOTS the dynamic set at this moment (into
+    /// its static list, with an empty dynamic slot of its own) — a helper's
+    /// frozen belt can never widen because a skill was approved mid-run.
     pub fn restricted_to(&self, allowed: &std::collections::HashSet<String>) -> ToolRegistry {
+        let dynamic = self.dynamic.read();
         ToolRegistry {
             tools: self
                 .tools
                 .iter()
+                .chain(dynamic.iter())
                 .filter(|t| allowed.contains(t.name()))
                 .cloned()
                 .collect(),
+            dynamic: parking_lot::RwLock::new(Vec::new()),
         }
     }
 
     /// How many tools are registered, regardless of availability.
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.tools.len() + self.dynamic.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.tools.is_empty() && self.dynamic.read().is_empty()
     }
 
-    /// Look up a registered tool by name, regardless of availability in
-    /// any particular environment.
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
+    /// Look up a registered tool by name, regardless of availability in any
+    /// particular environment. Returns an owned `Arc` (C4: dynamic entries live
+    /// behind a lock, so a borrow can't escape it — and the dispatcher holds
+    /// the tool across `.await` anyway).
+    pub fn get(&self, name: &str) -> Option<std::sync::Arc<dyn Tool>> {
+        if let Some(t) = self.tools.iter().find(|t| t.name() == name) {
+            return Some(std::sync::Arc::clone(t));
+        }
+        self.dynamic
+            .read()
             .iter()
             .find(|t| t.name() == name)
-            .map(|t| t.as_ref())
+            .map(std::sync::Arc::clone)
     }
 
     /// Every registered tool's name (regardless of env). Used to build a
     /// full-belt-but-headless sub-dispatcher for unattended cron runs.
     pub fn all_names(&self) -> std::collections::HashSet<String> {
-        self.tools.iter().map(|t| t.name().to_string()).collect()
+        let dynamic = self.dynamic.read();
+        self.tools
+            .iter()
+            .chain(dynamic.iter())
+            .map(|t| t.name().to_string())
+            .collect()
     }
 
     /// The tools usable in `env` — every registered tool whose
-    /// `requires()` is satisfied by `env`.
-    pub fn available_tools(&self, env: &BodyEnv) -> Vec<&dyn Tool> {
+    /// `requires()` is satisfied by `env`. Owned `Arc`s (C4: the dynamic slice
+    /// lives behind a lock).
+    pub fn available_tools(&self, env: &BodyEnv) -> Vec<std::sync::Arc<dyn Tool>> {
+        let dynamic = self.dynamic.read();
         self.tools
             .iter()
+            .chain(dynamic.iter())
             .filter(|t| t.available(env))
-            .map(|t| t.as_ref())
+            .cloned()
             .collect()
     }
 }

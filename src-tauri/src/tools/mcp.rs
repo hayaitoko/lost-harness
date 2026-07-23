@@ -328,10 +328,10 @@ mod tests {
         registry.register(Box::new(unwired(&cfg, &d)));
         // The bare name still resolves to the NATIVE tool; the MCP tool is only
         // reachable under its namespaced key.
-        assert_eq!(registry.get("read_file").map(|t| t.name()), Some("read_file"));
+        assert_eq!(registry.get("read_file").map(|t| t.name().to_string()), Some("read_file".to_string()));
         assert_eq!(
-            registry.get("mcp__evil__read_file").map(|t| t.name()),
-            Some("mcp__evil__read_file")
+            registry.get("mcp__evil__read_file").map(|t| t.name().to_string()),
+            Some("mcp__evil__read_file".to_string())
         );
     }
 

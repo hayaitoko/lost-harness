@@ -1070,6 +1070,8 @@ impl ProfileDb {
                  WHERE id = (
                     SELECT id FROM work_items
                     WHERE state='queued' AND (scheduled_at IS NULL OR scheduled_at <= ?1)
+                      -- C2: journal rows are dispatcher-driven, never runner-claimable
+                      AND kind != 'mutating_action'
                     ORDER BY COALESCE(scheduled_at, created_at) ASC, created_at ASC
                     LIMIT 1
                  )
@@ -1130,6 +1132,41 @@ impl ProfileDb {
                 row_to_work_item,
             )
             .optional()?)
+    }
+
+    /// C2: look up the (at-most-one, thanks to the partial UNIQUE index) work
+    /// item carrying this `claim_key` — the durability journal's
+    /// find-prior-attempt primitive.
+    pub fn find_work_item_by_claim_key(&self, claim_key: &str) -> Result<Option<crate::queue::WorkItem>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT id, kind, state, source_ref, input_json, result_json, error,
+                        scheduled_at, claim_key, idempotency_key, attempts,
+                        target_conversation_id, created_at, started_at, finished_at
+                 FROM work_items WHERE claim_key = ?1",
+                params![claim_key],
+                row_to_work_item,
+            )
+            .optional()?)
+    }
+
+    /// C2: begin (or retry) a journal attempt for THIS row id: `queued → running`
+    /// (fresh attempt) or `failed → running` (a legitimate retry after a failed /
+    /// crash-interrupted attempt — the effect didn't complete, re-running IS the
+    /// recovery). Bumps `attempts`, clears the stale error/finish stamps.
+    /// Refuses (`Ok(false)`) for `done` (a recorded success is immutable — the
+    /// caller replays it instead) and `running` (an in-flight double-fire).
+    pub fn start_work_attempt(&self, id: &str, now: i64) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE work_items
+             SET state='running', attempts=attempts+1, started_at=?2,
+                 error=NULL, finished_at=NULL
+             WHERE id=?1 AND state IN ('queued','failed')",
+            params![id, now],
+        )?;
+        Ok(n > 0)
     }
 
     // ── trm_logs ────────────────────────────────────────────────────────────

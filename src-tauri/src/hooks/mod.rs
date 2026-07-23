@@ -72,6 +72,8 @@ pub mod audit;
 pub mod budget;
 pub mod first_use;
 pub mod headless;
+#[cfg(feature = "computer-use")]
+pub mod on_screen_action;
 pub mod permission;
 pub mod privacy_filter;
 pub mod protected_path;

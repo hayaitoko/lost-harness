@@ -167,6 +167,20 @@ async fn run_one_item(agent_loop: Arc<AgentLoop>, db: Arc<ProfileDb>, profile: S
             );
             return;
         }
+        WorkKind::MutatingAction => {
+            // C2: journal rows are dispatcher-driven, never runner-claimable —
+            // `claim_next_due_work` excludes them at the SQL level; this arm is
+            // the defensive net if one is ever handed here anyway.
+            let now = chrono::Utc::now().timestamp();
+            let _ = db.finish_work_item(
+                &item.id,
+                WorkState::Failed,
+                None,
+                Some("mutating_action journal rows are not runner-claimable"),
+                now,
+            );
+            return;
+        }
     }
 
     let payload: serde_json::Value = match serde_json::from_str(&item.input_json) {

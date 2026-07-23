@@ -71,6 +71,10 @@ pub struct AppState {
     /// when a profile has semantic search enabled (Wave 1.2); `None` ⇒ no model
     /// dir configured, saves stay keyword-indexed.
     pub embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
+    /// C4: the live tool dispatcher (same `Arc` the agent loop drives). Held so
+    /// `set_skill_approval`/`delete_skill` can hot-register an approved skill
+    /// as a callable Tool and unregister it on rejection/delete.
+    pub tools: Arc<crate::tools::ToolDispatcher>,
     /// A4: the machine's hardware profile, probed ONCE at boot and cached here.
     /// `hardware::probe()` shells out to `system_profiler` (hundreds of ms per
     /// call), so `probe_hardware` / `list_model_catalog` / `calculate_model_fit`
@@ -673,11 +677,33 @@ pub fn set_skill_approval(
     args: SkillApprovalArgs,
 ) -> Result<bool, String> {
     let status = crate::storage::SkillApproval::from_str(&args.status);
-    state
+    let changed = state
         .storage
         .global()
         .set_skill_approval(&args.id, status)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // C4: keep the live tool registry in lock-step with the approval state.
+    // Approved → hot-register the skill as a callable Tool; anything else →
+    // unregister it. Best-effort AFTER the storage write (the DB is the source
+    // of truth; SkillTool::run re-checks it at call time anyway).
+    if changed {
+        if let Ok(Some(skill)) = state.storage.global().get_skill(&args.id) {
+            let tool_name = crate::tools::skills::skill_tool_name(&skill.name);
+            match skill.approval_status {
+                crate::storage::SkillApproval::Approved => {
+                    if let Some(tool) =
+                        crate::tools::skills::SkillTool::for_skill(&skill, Arc::clone(&state.storage))
+                    {
+                        state.tools.hot_register(Box::new(tool));
+                    }
+                }
+                _ => {
+                    state.tools.hot_unregister(&tool_name);
+                }
+            }
+        }
+    }
+    Ok(changed)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -688,6 +714,14 @@ pub struct DeleteSkillArgs {
 /// Delete a saved skill (two-click confirm in the UI). Returns whether a row was removed.
 #[tauri::command]
 pub fn delete_skill(state: State<'_, AppState>, args: DeleteSkillArgs) -> Result<bool, String> {
+    // C4: unregister the live Tool BEFORE the row goes away ("never a live Tool
+    // serving a deleted skill" — the remove_local_model stop-before-delete
+    // precedent). Needs the name to compute the tool id, so read first.
+    if let Ok(Some(skill)) = state.storage.global().get_skill(&args.id) {
+        state
+            .tools
+            .hot_unregister(&crate::tools::skills::skill_tool_name(&skill.name));
+    }
     state
         .storage
         .global()
