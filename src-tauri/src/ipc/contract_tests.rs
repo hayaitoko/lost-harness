@@ -121,6 +121,7 @@ fn test_app() -> App<MockRuntime> {
             ipc::get_budget_settings,
             ipc::set_budget_settings,
             ipc::reset_budget_settings,
+            ipc::cancel_message,
             // B8: the rest of the registered surface (every command except the
             // two that take a bare `AppHandle` — send_message, download_model —
             // which structurally can't register under MockRuntime).

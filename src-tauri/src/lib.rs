@@ -342,6 +342,7 @@ pub fn run() {
             ipc::get_budget_settings,
             ipc::set_budget_settings,
             ipc::reset_budget_settings,
+            ipc::cancel_message,
             ipc::download_model,
             ipc::list_local_models,
             ipc::remove_local_model,

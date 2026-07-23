@@ -1440,3 +1440,91 @@ async fn b6_ordinary_assistant_turn_is_replayed_unwrapped() {
     assert!(!m.content.contains("UNTRUSTED"), "it is NOT guard-wrapped");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ── C7 (M6 Slice 4a): cooperative cancellation through the REAL process_message.
+// A cancel mid-stream breaks the SSE drain loop and persists aborted:true. ─────
+
+#[tokio::test]
+async fn c7_cancel_message_aborts_an_in_flight_streaming_turn() {
+    use crate::agent::loop_mod::{AgentLoop, ModelStreamer};
+    use crate::classifier::RulesClassifier;
+    use crate::models::ModelManager;
+
+    // A streamer whose SSE stream NEVER yields (pends forever) — so the turn is
+    // genuinely stuck mid-drain when we cancel it, proving the cancel (not a
+    // natural stream end) is what breaks the loop.
+    struct PendingStreamer(Provider);
+    impl ModelStreamer for PendingStreamer {
+        fn provider(&self) -> &Provider {
+            &self.0
+        }
+        fn stream<'a>(
+            &'a self,
+            _m: &'a str,
+            _msgs: Vec<ChatMessage>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Ok(SseStream::from_byte_stream(
+                    tokio_stream::pending::<Result<Vec<u8>, reqwest::Error>>(),
+                ))
+            })
+        }
+    }
+
+    let cloud = cloud_provider("cloudco");
+    let dir = tempdir();
+    let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+    let mm = Arc::new(ModelManager::new());
+    mm.add_provider(cloud.clone());
+    let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
+    let agent = Arc::new(
+        AgentLoop::new(gate, mm, Arc::clone(&storage), Arc::new(echo_allow_dispatcher()))
+            .with_model_streamer_override(Arc::new(PendingStreamer(cloud.clone())) as Arc<dyn ModelStreamer>),
+    );
+    b7_seed_conversation(&storage, "cc");
+
+    // Spawn the turn — it hangs in the drain loop on the pending stream.
+    let agent2 = Arc::clone(&agent);
+    let handle = tokio::spawn(async move {
+        agent2
+            .process_message(
+                "hi".into(),
+                "cc".into(),
+                Binding::Public,
+                cloud.id.clone(),
+                "m".into(),
+                "personal".into(),
+                crate::hooks::SessionMode::Normal,
+                &b7_sink(),
+            )
+            .await
+    });
+
+    // Cancel once the token is registered (begin_cancellable runs at turn start).
+    loop {
+        if agent.cancel_conversation("cc") {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // The cancel must UNBLOCK the turn (never hang) and persist aborted:true.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("cancel must break the stalled turn, not hang")
+        .expect("task joined")
+        .expect("process_message returns Ok on a cancel, never Err");
+    let msgs = storage
+        .open_profile("personal")
+        .unwrap()
+        .list_messages_by_conversation("cc")
+        .unwrap();
+    assert!(
+        msgs.iter().any(|m| m.role == "assistant" && m.aborted),
+        "the cancelled turn persists an aborted assistant message"
+    );
+    // The registry entry is cleaned up on exit — a second cancel finds nothing.
+    assert!(!agent.cancel_conversation("cc"), "the token is removed on turn exit");
+    let _ = std::fs::remove_dir_all(dir);
+}

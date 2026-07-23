@@ -794,6 +794,14 @@ export async function resetBudgetSettings(profile: string): Promise<BudgetSettin
   return null;
 }
 
+/** C7: cancel the in-flight streaming turn for a conversation. Returns whether
+ *  there was something to cancel (false if it already finished). */
+export async function cancelMessage(conversationId: string): Promise<boolean> {
+  if (isTauri())
+    return tauriInvoke<boolean>("cancel_message", { args: { conversation_id: conversationId } });
+  return false;
+}
+
 /** A downloaded local model. Mirrors `LocalModelInfo` in `ipc/mod.rs`. */
 export interface LocalModel {
   id: string;

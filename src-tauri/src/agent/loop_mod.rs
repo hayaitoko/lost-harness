@@ -218,6 +218,12 @@ pub struct AgentLoop {
     /// (the Allow→cloud history guard, redact-and-send, and usage booking are
     /// tested through the real loop, not a reimplementation).
     streamer_override: Option<Arc<dyn ModelStreamer>>,
+    /// C7 (M6 Slice 4a): in-flight cancellation tokens keyed by conversation_id.
+    /// `cancel_message` flips the token; `stream_to_provider`'s SSE drain loop
+    /// observes it cooperatively and breaks. Same `parking_lot::Mutex<HashMap>`
+    /// idiom as `summary_cache`; touched only via the two tiny methods below,
+    /// never `stream_lock`, so a cancel can never deadlock the turn it interrupts.
+    cancellations: parking_lot::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
 }
 
 /// A borrowed lazy-runner reference for the free-fn reroute path
@@ -274,6 +280,7 @@ impl AgentLoop {
             local_runner: None,
             stream_lock: tokio::sync::Mutex::new(()),
             streamer_override: None,
+            cancellations: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -329,6 +336,31 @@ impl AgentLoop {
         self
     }
 
+    /// C7: register a fresh cancellation token for a conversation's turn and
+    /// return a clone for the loop to observe. Overwrites any stale leftover
+    /// (a prior turn's cleanup should have removed it; defensive).
+    fn begin_cancellable(&self, conversation_id: &str) -> tokio_util::sync::CancellationToken {
+        let token = tokio_util::sync::CancellationToken::new();
+        self.cancellations
+            .lock()
+            .insert(conversation_id.to_string(), token.clone());
+        token
+    }
+
+    /// C7: cancel the in-flight streaming turn for `conversation_id`, if one
+    /// exists. Returns whether there was something to cancel. Takes ONLY the
+    /// internal registry lock (never `stream_lock`), so it can't deadlock
+    /// against the `process_message` it interrupts.
+    pub fn cancel_conversation(&self, conversation_id: &str) -> bool {
+        match self.cancellations.lock().get(conversation_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Attach the memory embedder handle (meaning-lane hybrid search).
     /// Builder-style so existing constructions stay valid; `None` keeps
     /// keyword-only.
@@ -352,6 +384,7 @@ impl AgentLoop {
     ///  4. Persist the user message, build the request, stream the
     ///     response, emit one `stream:token` per delta, then persist the
     ///     final assistant message.
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_message(
         &self,
         content: String,
@@ -363,12 +396,47 @@ impl AgentLoop {
         session_mode: crate::hooks::SessionMode,
         sink: &Arc<dyn ResultSink>,
     ) -> Result<String> {
-        // Serialize streams — one in-flight message per agent loop.
-        // We hold the guard for the entire method so the storage /
-        // model_manager accesses below don't race with another concurrent
-        // process_message call.
+        // Serialize streams — one in-flight message per agent loop. Held for the
+        // whole turn so the storage / model_manager accesses below don't race
+        // with another concurrent process_message call.
         let _stream_guard = self.stream_lock.lock().await;
+        // C7: register a cancellation token for this turn. The thin wrapper
+        // removes the registry entry on every NORMAL exit path (Ok, Err, or any
+        // early `return` inside the inner body) without a manual guard type. A
+        // panic-unwind would skip the remove — but there are no reachable panics
+        // on this path, and `begin_cancellable` overwrites on the next turn, so a
+        // hypothetical leaked entry is self-healing.
+        let cancel_token = self.begin_cancellable(&conversation_id);
+        let result = self
+            .process_message_inner(
+                content,
+                conversation_id.clone(),
+                binding,
+                provider_id,
+                model,
+                profile,
+                session_mode,
+                cancel_token,
+                sink,
+            )
+            .await;
+        self.cancellations.lock().remove(&conversation_id);
+        result
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn process_message_inner(
+        &self,
+        content: String,
+        conversation_id: String,
+        binding: Binding,
+        provider_id: String,
+        model: String,
+        profile: String,
+        session_mode: crate::hooks::SessionMode,
+        cancel_token: tokio_util::sync::CancellationToken,
+        sink: &Arc<dyn ResultSink>,
+    ) -> Result<String> {
         // C1: the budget governor (attended path). A human is NEVER hard-blocked
         // — an over-cap turn only surfaces a non-blocking banner and proceeds.
         // The unattended HALT lives in `work_runner` (before the model call ever
@@ -458,6 +526,7 @@ impl AgentLoop {
                                     is_cloud,
                                     Some(redaction),
                                     session_mode,
+                                    cancel_token.clone(),
                                     sink,
                                 )
                                 .await;
@@ -487,6 +556,7 @@ impl AgentLoop {
                         local_is_cloud,
                         None,
                         session_mode,
+                        cancel_token.clone(),
                         sink,
                     )
                     .await;
@@ -532,6 +602,7 @@ impl AgentLoop {
                             local_is_cloud,
                             None,
                             session_mode,
+                            cancel_token.clone(),
                             sink,
                         )
                         .await;
@@ -548,6 +619,7 @@ impl AgentLoop {
                         is_cloud,
                         None,
                         session_mode,
+                        cancel_token.clone(),
                         sink,
                     )
                     .await;
@@ -1303,6 +1375,10 @@ impl AgentLoop {
         // Q11: the conversation's permission mode, threaded into `ExecCtx` for
         // this turn's tool calls.
         session_mode: crate::hooks::SessionMode,
+        // C7: cooperative cancellation — the SSE drain loop breaks when this
+        // fires (a `cancel_message` IPC flipped it), and the persisted turn is
+        // marked `aborted`.
+        cancel_token: tokio_util::sync::CancellationToken,
         sink: &Arc<dyn ResultSink>,
     ) -> Result<String> {
         // `provider`/`client`/`is_cloud`/`routing_decision` are mutable because
@@ -1535,7 +1611,23 @@ impl AgentLoop {
             // Wave 3.2: this round's reported token usage (if the endpoint sent
             // it), used to book a real cost to the ledger below.
             let mut round_usage: Option<(u32, u32)> = None;
-            while let Some(event) = sse.next_event().await {
+            // C7: cooperative cancellation — pull the next SSE event OR observe a
+            // cancel, whichever resolves first. `biased` makes the cancel branch
+            // win a tie (favor responsiveness — cooperative check-and-yield at
+            // the next natural await point, never preemptive).
+            let mut was_cancelled = false;
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        was_cancelled = true;
+                        break;
+                    }
+                    maybe = sse.next_event() => match maybe {
+                        Some(e) => e,
+                        None => break,
+                    },
+                };
                 match event {
                     crate::models::sse::SseEvent::Delta(delta) => {
                         assembled.push_str(&delta);
@@ -1610,7 +1702,10 @@ impl AgentLoop {
                 routing_decision: Some(routing_decision.to_string()),
                 thinking_content: None,
                 error: None,
-                aborted: is_round_cap_stop,
+                // C7: a cancelled turn is ALSO marked aborted (distinguishable
+                // from a crash for the same reason as round-cap: a crash kills
+                // the process before this row is ever written).
+                aborted: is_round_cap_stop || was_cancelled,
                 created_at: chrono::Utc::now().timestamp(),
             };
             profile_db
@@ -1659,8 +1754,10 @@ impl AgentLoop {
             }
             final_text = persisted_content;
 
-            // On the last permitted round, stop without dispatching more tools.
-            if is_round_cap_stop {
+            // On the last permitted round, or once cancelled, stop without
+            // dispatching more tools (C7: a cancelled turn never proceeds into
+            // the next round's tool dispatch).
+            if is_round_cap_stop || was_cancelled {
                 break;
             }
 

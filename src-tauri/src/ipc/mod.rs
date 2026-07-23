@@ -932,6 +932,25 @@ pub fn reset_budget_settings(
     Ok(BudgetSettings { cap_usd: None })
 }
 
+// ── cancel_message (C7 — M6 Slice 4a: cooperative turn cancellation) ────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CancelMessageArgs {
+    pub conversation_id: String,
+}
+
+/// Flip the in-flight cancellation token for a conversation's current streaming
+/// turn, if one exists (the SSE drain loop then breaks cooperatively and the
+/// turn persists `aborted: true`). Touches ONLY the agent loop's cancellation
+/// registry — never `stream_lock` — so it can't block behind or deadlock the
+/// in-flight `process_message` it interrupts. Returns `false` when nothing was
+/// in flight (already finished / never started) — not an error, a client racing
+/// a fast reply is expected.
+#[tauri::command]
+pub fn cancel_message(state: State<'_, AppState>, args: CancelMessageArgs) -> Result<bool, String> {
+    Ok(state.agent_loop.cancel_conversation(&args.conversation_id))
+}
+
 /// A downloaded/registered local model for the Settings model-manager (M8 S6).
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalModelInfo {

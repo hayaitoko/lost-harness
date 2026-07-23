@@ -32,6 +32,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 sqlite-vec = "0.1.9"
 reqwest = { version = "0.12", features = ["stream", "json"] }
 tokio-stream = "0.1"
+# C7: CancellationToken for cooperative message cancellation (already resolved
+# transitively at 0.7.18 — this just promotes it to a direct dep).
+tokio-util = "0.7"
 # Used by storage + IPC (message_id generation, timestamps)
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
