@@ -101,7 +101,7 @@ impl GatingHook for FirstUseConfirmHook {
             return HookResult::Continue;
         }
         let fp = ActionFingerprint::from_ctx(ctx);
-        if self.ledger.covers(&ctx.tool_name, &fp) {
+        if self.ledger.covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended) {
             return HookResult::Continue;
         }
         HookResult::Ask(format!(

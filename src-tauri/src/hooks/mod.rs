@@ -214,6 +214,18 @@ pub struct EventContext {
     /// Set by `PrivacyFilterHook` (or any future hook) when this request
     /// must not leave the device. See `RoutingRequirement`.
     pub routing: RoutingRequirement,
+    /// The resolved per-profile classifier config (PLAN §11), loaded by the
+    /// dispatcher and consulted by `PrivacyFilterHook` (B4). Defaults to
+    /// `ClassifierConfig::default()` so contexts/tests that don't set it gate at
+    /// the default thresholds exactly as before — the load-bearing back-compat.
+    pub classifier_cfg: crate::classifier::ClassifierConfig,
+    /// Whether a HUMAN is present for this dispatch (B5). `true` for the
+    /// interactive dispatcher (an approver is wired); `false` for cron/delegate/
+    /// headless sub-dispatchers (`approver: None`). Used with `risk` to stop an
+    /// interactively-granted Session-scope `External` approval from silently
+    /// satisfying a later byte-identical headless/cron dispatch. Defaults `true`
+    /// (the safe/interactive assumption).
+    pub attended: bool,
 }
 
 impl EventContext {
@@ -234,6 +246,8 @@ impl EventContext {
             risk: RiskClass::Safe,
             session_mode: SessionMode::Normal,
             routing: RoutingRequirement::Unconstrained,
+            classifier_cfg: crate::classifier::ClassifierConfig::default(),
+            attended: true,
         }
     }
 
@@ -258,12 +272,29 @@ impl EventContext {
             risk: RiskClass::Safe,
             session_mode: SessionMode::Normal,
             routing: RoutingRequirement::Unconstrained,
+            classifier_cfg: crate::classifier::ClassifierConfig::default(),
+            attended: true,
         }
     }
 
     /// Stamp the resolved tool's risk (dispatcher sets this from `Tool::risk()`).
     pub fn with_risk(mut self, risk: RiskClass) -> Self {
         self.risk = risk;
+        self
+    }
+
+    /// Stamp the resolved per-profile classifier config (B4). The dispatcher
+    /// loads it once per dispatch; `PrivacyFilterHook` gates tool-action content
+    /// at these thresholds instead of the defaults.
+    pub fn with_classifier_config(mut self, cfg: crate::classifier::ClassifierConfig) -> Self {
+        self.classifier_cfg = cfg;
+        self
+    }
+
+    /// Stamp whether a human is attending this dispatch (B5). The dispatcher
+    /// sets this from `approver.is_some()`.
+    pub fn with_attended(mut self, attended: bool) -> Self {
+        self.attended = attended;
         self
     }
 

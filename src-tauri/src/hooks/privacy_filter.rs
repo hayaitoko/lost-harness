@@ -15,7 +15,6 @@
 //!     than a convention someone can forget.
 
 use crate::agent::gate::{GateDecision, PrivacyGate};
-use crate::classifier::ClassifierConfig;
 use crate::hooks::{EventContext, GatingHook, HookEvent, HookResult, RoutingRequirement};
 
 pub struct PrivacyFilterHook {
@@ -38,27 +37,19 @@ impl GatingHook for PrivacyFilterHook {
             return HookResult::Continue;
         }
 
-        // Tool-action content is gated at the DEFAULT classifier thresholds.
-        // The per-profile strictness knob (PLAN §11) is threaded into the
-        // message-egress gate (`AgentLoop::process_message`) but NOT here yet —
-        // carrying the profile's `ClassifierConfig` through `EventContext` from
-        // the dispatcher is a tracked follow-up (see HANDOFF).
-        //
-        // Honest scope note: for a profile configured STRICTER than default,
-        // tool-action content in the borderline band is gated *less* strictly
-        // here than the same profile's chat messages — a real inconsistency, not
-        // "always safe." Two things bound it: (1) it is no leakier than the
-        // pre-Round-1 baseline (the whole app used these same fixed constants
-        // everywhere before), and (2) the rules-layer floor (SSN/keys/email/…)
-        // is un-tunable and still fires regardless of thresholds, so structured
-        // PII in tool args is always caught. Free-text semantic PII in the
-        // narrow (profile_tau_band, 0.05) window is the residual gap the
-        // follow-up closes.
-        let cfg = ClassifierConfig::default();
-        match self
-            .gate
-            .check(&ctx.binding, &ctx.content, ctx.is_cloud_endpoint, &cfg)
-        {
+        // B4 (gap CLOSED): tool-action content is gated at the PROFILE's
+        // classifier config — the dispatcher loads it for the turn and threads it
+        // through `EventContext::classifier_cfg` (mirroring
+        // `AgentLoop::process_message`'s per-profile load), so a profile's tool
+        // calls and its chat messages now share identical thresholds. (The
+        // rules-layer floor for structured PII stays un-tunable and fires
+        // regardless of thresholds — unchanged.)
+        match self.gate.check(
+            &ctx.binding,
+            &ctx.content,
+            ctx.is_cloud_endpoint,
+            &ctx.classifier_cfg,
+        ) {
             GateDecision::Allow => HookResult::Continue,
             GateDecision::Block(reason) => HookResult::Deny(reason),
             GateDecision::RouteLocal => {
@@ -163,5 +154,51 @@ mod tests {
             .with_cloud(true);
         ctx.event = HookEvent::PostToolUse;
         assert_eq!(h.on_event(&mut ctx), HookResult::Continue);
+    }
+
+    #[test]
+    fn tool_action_gates_at_the_profiles_classifier_config_not_the_default() {
+        // B4: the hook must consult `ctx.classifier_cfg`. The rules/heuristic
+        // classifiers ignore the config (only the trained ONNX ensemble grades
+        // on tau), so we use a spy whose `classify_with` DOES respond — a
+        // behavioral flip proves the profile's config threaded from the
+        // EventContext actually reaches the gate.
+        use crate::classifier::{Classification, Classifier, ClassifierConfig, Label};
+
+        struct ConfigSpyClassifier;
+        impl Classifier for ConfigSpyClassifier {
+            fn classify(&self, _t: &str) -> Classification {
+                Classification { label: Label::Public, confidence: 1.0, raw_output: vec![], spans: vec![] }
+            }
+            fn classify_with(&self, _t: &str, cfg: &ClassifierConfig) -> Classification {
+                // A "strict" profile (tiny tau_band) → Private; otherwise Public.
+                let label = if cfg.tau_band < 0.01 { Label::Private } else { Label::Public };
+                Classification { label, confidence: 1.0, raw_output: vec![], spans: vec![] }
+            }
+        }
+
+        let h = PrivacyFilterHook::new(PrivacyGate::new(Arc::new(ConfigSpyClassifier)));
+
+        // DEFAULT config (tau_band 0.05) → Public → Continue, unconstrained.
+        let mut lax = EventContext::pre_tool_use("shell_exec")
+            .with_binding(Binding::Auto)
+            .with_content("anything")
+            .with_cloud(true);
+        assert_eq!(h.on_event(&mut lax), HookResult::Continue);
+        assert_eq!(lax.routing, RoutingRequirement::Unconstrained, "default config allows");
+
+        // A STRICTER profile config → Private → RouteLocal (routing annotated).
+        let strict = ClassifierConfig { tau_band: 0.005, ..Default::default() };
+        let mut ctx = EventContext::pre_tool_use("shell_exec")
+            .with_binding(Binding::Auto)
+            .with_content("anything")
+            .with_cloud(true)
+            .with_classifier_config(strict);
+        assert_eq!(h.on_event(&mut ctx), HookResult::Continue, "RouteLocal maps to Continue");
+        assert!(
+            ctx.routing.is_local_required(),
+            "the profile's stricter config must route the tool action local, got {:?}",
+            ctx.routing
+        );
     }
 }

@@ -487,7 +487,16 @@ impl ToolDispatcher {
                 // the SessionModeHook (plan denies mutations; accept-edits
                 // auto-approves Write only — never External/Dangerous).
                 .with_risk(tool.risk())
-                .with_session_mode(ctx.session_mode);
+                .with_session_mode(ctx.session_mode)
+                // B4: gate tool-action content at THIS profile's strictness (not
+                // the defaults) — the config the loop resolved for this turn.
+                .with_classifier_config(ctx.classifier_cfg.clone())
+                // B5: mark the dispatch attended iff a human approver is wired
+                // (the interactive dispatcher). Cron/delegate/headless
+                // sub-dispatchers have `approver: None` → unattended, so an
+                // interactively-granted Session `External` grant can't satisfy a
+                // later headless replay.
+                .with_attended(self.approver.is_some());
 
             match self.chain.run_gating(&mut ev) {
                 (HookResult::Continue | HookResult::Allow, _) => {

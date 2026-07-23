@@ -409,7 +409,7 @@ impl GatingHook for PermissionHook {
                 // A prior interactive approval may already cover this exact
                 // action (or this whole tool). If so, don't ask again.
                 let fp = ActionFingerprint::from_ctx(ctx);
-                if self.ledger.covers(&ctx.tool_name, &fp) {
+                if self.ledger.covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended) {
                     HookResult::Continue
                 } else {
                     HookResult::Ask(format!("tool '{}' requires confirmation", ctx.tool_name))

@@ -1396,6 +1396,15 @@ impl AgentLoop {
             // dispatcher re-stamps it from the `binding` arg at the tool.run
             // boundary too; both are the same value.
             binding,
+            // B4: the profile's classifier config, so the dispatcher gates tool
+            // actions at the SAME strictness as this profile's chat messages
+            // (loaded once per turn, best-effort → defaults; matches the
+            // message-egress load above).
+            classifier_cfg: self
+                .storage
+                .open_profile(&profile)
+                .and_then(|db| db.classifier_config())
+                .unwrap_or_default(),
         };
 
         // Bound the tool loop so a model that keeps calling tools can't run

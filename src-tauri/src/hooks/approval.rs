@@ -162,6 +162,29 @@ impl ApprovalLedger {
             || self.session_tools.lock().unwrap().contains(tool_name)
     }
 
+    /// Like [`Self::covers`], but risk-and-attendance aware (B5). An UNATTENDED
+    /// dispatch (cron / delegate helper / headless — `approver: None`) of an
+    /// `External`-risk call is NOT satisfied by a `Session`/`Always` grant:
+    /// only a fresh `Once` fingerprint grant counts. This closes the cron
+    /// replay loophole — `ActionFingerprint` is tool+args only (no session
+    /// discriminator), so without this an interactively-granted Session-scope
+    /// External approval would silently satisfy a byte-identical headless
+    /// dispatch later in the same app session. Attended calls, and every
+    /// non-`External` risk, resolve exactly as [`Self::covers`] (so
+    /// `accept_edits`'s documented auto-approve-Write-on-cron still holds).
+    pub fn covers_for(
+        &self,
+        tool_name: &str,
+        fingerprint: &str,
+        risk: RiskClass,
+        attended: bool,
+    ) -> bool {
+        if !attended && risk == RiskClass::External {
+            return self.once_fps.lock().unwrap().contains(fingerprint);
+        }
+        self.covers(tool_name, fingerprint)
+    }
+
     /// Is this fingerprint covered by a `Once` grant specifically — ignores
     /// session/tool-wide coverage. Used by floor-style hooks
     /// (`ProtectedPathHook`) that must never be satisfiable by a standing
@@ -549,5 +572,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn covers_for_excludes_external_session_grants_from_unattended_replay() {
+        // B5 (cron replay loophole): ActionFingerprint is tool+args only (no
+        // session discriminator), so a Session-scope External grant made
+        // interactively would otherwise satisfy a byte-identical headless/cron
+        // dispatch later in the same app session. covers_for closes that.
+        let ledger = ApprovalLedger::new();
+        let fp = "fetch_url|https://example.com";
+        ledger.grant(GrantTarget::Fingerprint(fp.into()), GrantScope::Session);
+
+        // Attended (a human is present): the session grant covers — unchanged.
+        assert!(ledger.covers_for("fetch_url", fp, RiskClass::External, true));
+        // UNATTENDED + External: the session grant must NOT satisfy a headless
+        // replay — only a fresh Once grant would.
+        assert!(
+            !ledger.covers_for("fetch_url", fp, RiskClass::External, false),
+            "a Session External grant must not cover an unattended (cron/headless) dispatch"
+        );
+        // Unattended + a non-External risk: session grant still covers, so
+        // accept_edits' documented auto-approve-Write-on-cron is unaffected.
+        assert!(ledger.covers_for("write_file", fp, RiskClass::Write, false));
+
+        // A fresh Once grant DOES cover even an unattended External call.
+        let fp2 = "fetch_url|https://other.com";
+        ledger.grant(GrantTarget::Fingerprint(fp2.into()), GrantScope::Once);
+        assert!(ledger.covers_for("fetch_url", fp2, RiskClass::External, false));
     }
 }

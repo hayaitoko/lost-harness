@@ -241,6 +241,11 @@ pub struct ExecCtx {
     /// helper stays local, never silently downgraded to Auto/cloud. Defaults to
     /// `Auto` for any context that doesn't stamp it.
     pub binding: crate::agent::gate::Binding,
+    /// B4: the turn's resolved per-profile classifier config. The dispatcher
+    /// stamps it onto each tool call's `EventContext` so `PrivacyFilterHook`
+    /// gates tool-action content at the profile's strictness — not the defaults.
+    /// `Default` (default thresholds) for any context that doesn't set it.
+    pub classifier_cfg: crate::classifier::ClassifierConfig,
 }
 
 // ── RiskClass ──────────────────────────────────────────────────────────────
