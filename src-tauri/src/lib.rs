@@ -282,6 +282,9 @@ pub fn run() {
                 });
             }
 
+            // A4: probe hardware ONCE at boot and cache it (probe() shells out to
+            // system_profiler — hundreds of ms; the model IPC reads this snapshot).
+            let hardware = Arc::new(crate::models::hardware::probe());
             let state = AppState {
                 agent_loop,
                 model_manager,
@@ -290,6 +293,7 @@ pub fn run() {
                 ask_human,
                 classifier: Arc::clone(&classifier),
                 embedder,
+                hardware,
                 #[cfg(feature = "local-runner")]
                 local_runner: local_runner_ctx,
             };
@@ -327,6 +331,9 @@ pub fn run() {
             ipc::install_pack,
             ipc::probe_hardware,
             ipc::list_model_catalog,
+            ipc::search_models,
+            ipc::get_model_detail,
+            ipc::calculate_model_fit,
             ipc::download_model,
             ipc::list_local_models,
             ipc::remove_local_model,

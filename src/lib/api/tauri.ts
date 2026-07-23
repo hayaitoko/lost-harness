@@ -566,16 +566,154 @@ export interface CatalogModel {
   installable: boolean;
 }
 
+/** One enumerated GPU (best-effort; `null` fields = the OS didn't report them). */
+export interface GpuInfo {
+  name: string;
+  is_unified: boolean;
+  vram_bytes: number | null;
+  core_count: number | null;
+}
+
 export interface HardwareProfile {
   total_ram_bytes: number;
   cpu_cores: number;
   os: string;
   arch: string;
+  // Probe v2 (M8) — all honest-optional. `null`/absent = "not known", never a
+  // fabricated value. See `models/hardware.rs`.
+  cpu_brand?: string | null;
+  /** Apple-Silicon family, snake_case (e.g. "m3_max"); null if not/unmapped. */
+  apple_chip_family?: string | null;
+  unified_memory?: boolean;
+  /** Estimated memory bandwidth (GB/s); null when the chip family is unknown. */
+  mem_bandwidth_gbps?: number | null;
+  /** null = enumeration didn't run (NOT "no GPU"); [] = ran, found none. */
+  gpus?: GpuInfo[] | null;
 }
 
-/** Probe this machine (RAM/cores/os/arch) for model sizing. */
+/** Probe this machine for model sizing (RAM/cores/os/arch + Probe-v2 bandwidth/
+ *  GPU/unified-memory). Served from the boot-time cache. */
 export async function probeHardware(): Promise<HardwareProfile | null> {
   if (isTauri()) return tauriInvoke<HardwareProfile>("probe_hardware", {});
+  return null;
+}
+
+// ── M8 S2′/S3′ — HF model search + interactive calculator ──────────────────
+
+/** How much we vouch for a model's bytes (the compensating trust-root control). */
+export type Provenance = "trusted" | "community";
+export type SearchSort = "downloads" | "likes" | "trending" | "last_modified";
+export type KvCacheQuant = "f16" | "q8_0" | "q4_0";
+export type Fit = "fits" | "tight" | "too_large";
+export type SpeedTier = "fast" | "usable" | "slow" | "unknown";
+export type PoolKind = "unified_memory" | "discrete_vram" | "cpu_ram";
+
+/** One HF search-result row. `downloads`/`likes` are null when HF omits them. */
+export interface HfModelSummary {
+  id: string;
+  publisher: string;
+  downloads: number | null;
+  likes: number | null;
+  tags: string[];
+  provenance: Provenance;
+}
+
+/** One physical GGUF file within a quant. */
+export interface QuantFile {
+  quant: string | null;
+  filename: string;
+  url: string;
+  sha256: string;
+  size_bytes: number;
+  part: { index: number; total: number } | null;
+}
+
+/** One logical downloadable quant — a single file or a complete multi-part set.
+ *  `total_size_bytes` is the SUM across parts (the calculator's weight size). */
+export interface QuantGroup {
+  quant: string | null;
+  total_size_bytes: number;
+  files: QuantFile[];
+  /** false = an incomplete part set — surfaced but not safely downloadable. */
+  complete: boolean;
+}
+
+/** A model's architecture facts (from the GGUF header or repo summary). */
+export interface ModelSpec {
+  architecture: string;
+  total_params_b: number;
+  active_params_b: number;
+  n_layers: number;
+  n_kv_heads: number;
+  head_dim: number;
+  native_context_len: number;
+  /** false = geometry estimated (KV size is approximate — show the caveat). */
+  kv_exact: boolean;
+}
+
+/** The detail view: discovery fields (flattened) + a representative ModelSpec. */
+export interface ModelDetailResponse {
+  id: string;
+  publisher: string;
+  provenance: Provenance;
+  quants: QuantGroup[];
+  /** null when the architecture couldn't be read — the calculator can't run. */
+  spec: ModelSpec | null;
+  spec_notes: string[];
+}
+
+/** The user's chosen calculator knobs. */
+export interface CalcInput {
+  weight_file_bytes: number;
+  kv_quant: KvCacheQuant;
+  context_len: number;
+}
+
+/** The full calculator result. `predicted_tokens_per_sec` is null when
+ *  bandwidth is unknown — never a fabricated number. */
+export interface CalcOutput {
+  weights_bytes: number;
+  kv_cache_bytes: number;
+  overhead_bytes: number;
+  total_required_bytes: number;
+  available_bytes: number;
+  pool_kind: PoolKind;
+  fit: Fit;
+  full_gpu_offload: boolean;
+  predicted_tokens_per_sec: number | null;
+  speed_tier: SpeedTier;
+  notes: string[];
+}
+
+/** Search HuggingFace for GGUF models. Empty query → the trusted Staff-picks
+ *  default; a query searches live (community results carry a provenance label). */
+export async function searchModels(
+  query: string,
+  sort?: SearchSort,
+  limit?: number,
+): Promise<HfModelSummary[]> {
+  if (isTauri())
+    return tauriInvoke<HfModelSummary[]>("search_models", { args: { query, sort, limit } });
+  return [];
+}
+
+/** A model's quants (grouped, multi-part aware) + a representative ModelSpec. */
+export async function getModelDetail(modelId: string): Promise<ModelDetailResponse | null> {
+  if (isTauri())
+    return tauriInvoke<ModelDetailResponse>("get_model_detail", { args: { model_id: modelId } });
+  return null;
+}
+
+/** The interactive calculator: fit + tokens/sec for THIS machine, as a function
+ *  of weight quant (file size), KV-cache quant, and context. Pure + instant. */
+export async function calculateModelFit(
+  modelSpec: ModelSpec,
+  calcInput: CalcInput,
+): Promise<CalcOutput | null> {
+  if (isTauri())
+    return tauriInvoke<CalcOutput>("calculate_model_fit", {
+      args: { model_spec: modelSpec, calc_input: calcInput },
+    });
   return null;
 }
 

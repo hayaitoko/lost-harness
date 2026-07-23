@@ -71,6 +71,11 @@ pub struct AppState {
     /// when a profile has semantic search enabled (Wave 1.2); `None` ⇒ no model
     /// dir configured, saves stay keyword-indexed.
     pub embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
+    /// A4: the machine's hardware profile, probed ONCE at boot and cached here.
+    /// `hardware::probe()` shells out to `system_profiler` (hundreds of ms per
+    /// call), so `probe_hardware` / `list_model_catalog` / `calculate_model_fit`
+    /// read this snapshot instead of re-probing.
+    pub hardware: Arc<crate::models::hardware::HardwareProfile>,
     /// M8 S4: the bundled-sidecar context (supervisor + resolved binary).
     /// `None` ⇒ no sidecar binary resolved at boot — local models need an
     /// external runner. Used by `remove_local_model` (stop-before-delete) and
@@ -686,18 +691,122 @@ pub fn delete_skill(state: State<'_, AppState>, args: DeleteSkillArgs) -> Result
         .map_err(|e| e.to_string())
 }
 
-/// Probe this machine's hardware for the M8 onboarding (RAM, cores, OS/arch).
+/// Probe this machine's hardware for M8 (RAM, cores, OS/arch, + Probe-v2:
+/// bandwidth/GPU/unified-memory). Serves the boot-time cached snapshot (A4) —
+/// `probe()` shells out to `system_profiler`, so we never re-probe per call.
 #[tauri::command]
-pub fn probe_hardware() -> crate::models::hardware::HardwareProfile {
-    crate::models::hardware::probe()
+pub fn probe_hardware(state: State<'_, AppState>) -> crate::models::hardware::HardwareProfile {
+    (*state.hardware).clone()
 }
 
 /// The curated model catalog, each entry annotated with its fit against the
-/// probed hardware (Wave 5.3 / M8). Works offline (bundled catalog).
+/// cached hardware profile (Wave 5.3 / M8). Works offline (bundled catalog).
 #[tauri::command]
-pub fn list_model_catalog() -> Vec<crate::models::catalog::CatalogEntryView> {
-    let profile = crate::models::hardware::probe();
-    crate::models::catalog::catalog_for(&profile)
+pub fn list_model_catalog(
+    state: State<'_, AppState>,
+) -> Vec<crate::models::catalog::CatalogEntryView> {
+    crate::models::catalog::catalog_for(&state.hardware)
+}
+
+// ── M8 S2′/S3′ — HF search + interactive calculator IPC (A3) ──────────────
+
+/// Args for [`search_models`]. `sort` ∈ {downloads,likes,trending,last_modified}
+/// (default downloads); an empty `query` returns the trusted-publisher
+/// Staff-picks default.
+#[derive(Debug, Deserialize)]
+pub struct SearchModelsArgs {
+    pub query: String,
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Search HuggingFace for GGUF models (M8 S2′). An empty query returns the
+/// trusted-publisher Staff-picks default; a non-empty query searches live and
+/// surfaces community results, each carrying its provenance label. Networked.
+#[tauri::command]
+pub async fn search_models(
+    args: SearchModelsArgs,
+) -> Result<Vec<crate::models::hf_search::HfModelSummary>, String> {
+    use crate::models::hf_search::{search, staff_picks, SearchSort};
+    let limit = args.limit.unwrap_or(25);
+    let q = args.query.trim();
+    let result = if q.is_empty() {
+        staff_picks(limit).await
+    } else {
+        let sort = match args.sort.as_deref() {
+            Some("likes") => SearchSort::Likes,
+            Some("trending") => SearchSort::Trending,
+            Some("last_modified") => SearchSort::LastModified,
+            _ => SearchSort::Downloads,
+        };
+        search(q, sort, limit).await
+    };
+    result.map_err(|e| e.to_string())
+}
+
+/// The detail view for one model (M8 S2′): its quants (grouped, multi-part
+/// aware, with sizes + provenance) PLUS a one-time [`ModelSpec`] read. All quants
+/// of a model share the same architecture geometry, so a single header read
+/// serves the interactive calculator for every quant. `spec: None` when the
+/// architecture couldn't be read — the UI shows the discovery view but can't run
+/// the calculator (honest, never a fabricated spec).
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelDetailResponse {
+    #[serde(flatten)]
+    pub detail: crate::models::hf_search::HfModelDetail,
+    pub spec: Option<crate::models::calculator::ModelSpec>,
+    pub spec_notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetModelDetailArgs {
+    pub model_id: String,
+}
+
+/// Fetch a model's quants + a representative [`ModelSpec`] (M8 S2′). Networked.
+#[tauri::command]
+pub async fn get_model_detail(args: GetModelDetailArgs) -> Result<ModelDetailResponse, String> {
+    let detail = crate::models::hf_search::model_detail(&args.model_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    // All quants share the architecture geometry — read the spec once from a
+    // representative complete quant's first file.
+    let repr_url = detail
+        .quants
+        .iter()
+        .find(|q| q.complete)
+        .and_then(|q| q.files.first())
+        .map(|f| f.url.clone());
+    let (spec, spec_notes) = match repr_url {
+        Some(url) => match crate::models::gguf_meta::read_model_spec(&args.model_id, &url).await {
+            Ok((s, notes)) => (Some(s), notes),
+            Err(e) => (None, vec![format!("Couldn't read model architecture: {e}")]),
+        },
+        None => (None, vec!["No downloadable quant found for this model.".to_string()]),
+    };
+    Ok(ModelDetailResponse { detail, spec, spec_notes })
+}
+
+/// Args for [`calculate_model_fit`] — the model's architecture spec (from
+/// [`get_model_detail`]) and the user's chosen knobs (weight-file size, KV-cache
+/// quant, context length).
+#[derive(Debug, Deserialize)]
+pub struct CalculateModelFitArgs {
+    pub model_spec: crate::models::calculator::ModelSpec,
+    pub calc_input: crate::models::calculator::CalcInput,
+}
+
+/// The interactive calculator (M8 S3′): cached-probe × ModelSpec × CalcInput →
+/// CalcOutput. PURE + instant (no I/O) — reads the cached hardware snapshot so
+/// the UI recomputes on every slider drag without re-probing or re-fetching.
+#[tauri::command]
+pub fn calculate_model_fit(
+    state: State<'_, AppState>,
+    args: CalculateModelFitArgs,
+) -> crate::models::calculator::CalcOutput {
+    crate::models::calculator::calculate(&state.hardware, &args.model_spec, &args.calc_input)
 }
 
 /// A downloaded/registered local model for the Settings model-manager (M8 S6).

@@ -81,6 +81,9 @@ fn test_app() -> App<MockRuntime> {
         ask_human: Arc::new(crate::ipc::ask_human::AskHumanRegistry::new()),
         classifier: Arc::new(HeuristicClassifier::new()),
         embedder: None,
+        // Default profile (total_ram 0) — the calculator contract test only
+        // checks the command dispatches + returns a CalcOutput shape, not fit.
+        hardware: Arc::new(Default::default()),
         #[cfg(feature = "local-runner")]
         local_runner: None,
     };
@@ -110,6 +113,9 @@ fn test_app() -> App<MockRuntime> {
             ipc::set_classifier_settings,
             ipc::set_redaction_enabled,
             ipc::reset_classifier_settings,
+            ipc::search_models,
+            ipc::get_model_detail,
+            ipc::calculate_model_fit,
         ])
         .build(mock_context(noop_assets()))
         .expect("failed to build mock app");
@@ -498,4 +504,100 @@ fn set_classifier_settings_old_broken_shape_is_rejected() {
         is_ipc_arg_rejection(msg),
         "expected an IPC-level arg-deserialization rejection, got: {msg}"
     );
+}
+
+// ── M8 S2′/S3′ model IPC (A3) ──────────────────────────────────────────────
+
+#[test]
+fn calculate_model_fit_correct_shape_dispatches_and_returns_calc_output() {
+    // The interactive calculator is PURE (no network) — the contract test runs
+    // the full happy path against the cached (default) hardware profile.
+    let app = test_app();
+    let webview = test_webview(&app);
+    let body = json!({
+        "args": {
+            "model_spec": {
+                "architecture": "llama",
+                "total_params_b": 8.0,
+                "active_params_b": 8.0,
+                "n_layers": 32,
+                "n_kv_heads": 8,
+                "head_dim": 128,
+                "native_context_len": 8192,
+                "kv_exact": true
+            },
+            "calc_input": {
+                "weight_file_bytes": 5_000_000_000u64,
+                "kv_quant": "f16",
+                "context_len": 8192
+            }
+        }
+    });
+    let res = call(&webview, "calculate_model_fit", body);
+    let ok = res.expect("correctly-wrapped args must dispatch and succeed");
+    let value: Value = ok.deserialize().expect("response must be valid JSON");
+    // A CalcOutput shape: the fit verdict + the byte breakdown must be present.
+    assert!(value["fit"].is_string(), "expected a fit verdict: {value:?}");
+    assert!(value["total_required_bytes"].is_number());
+    assert!(value["kv_cache_bytes"].is_number());
+    assert!(value.get("notes").is_some());
+}
+
+#[test]
+fn calculate_model_fit_old_broken_shape_is_rejected() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    // Flat, no `args` wrapper — the pre-fix bridge shape.
+    let body = json!({
+        "model_spec": {"architecture": "llama", "total_params_b": 8.0, "active_params_b": 8.0,
+            "n_layers": 32, "n_kv_heads": 8, "head_dim": 128, "native_context_len": 8192, "kv_exact": true},
+        "calc_input": {"weight_file_bytes": 5_000_000_000u64, "kv_quant": "f16", "context_len": 8192}
+    });
+    let res = call(&webview, "calculate_model_fit", body);
+    let err = res.expect_err("flat/unwrapped args must NOT dispatch");
+    assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
+}
+
+// The two networked commands (search_models / get_model_detail) are contract-
+// tested for the ARG-ENVELOPE shape only — dispatching the happy path would hit
+// HuggingFace, so their positive path is covered by the env-gated live tests +
+// the pure parser unit tests in `models/hf_search.rs`. The wrong-shape rejection
+// below still catches the real regression these tests exist for: the Tauri-v2
+// `{args:{…}}` nesting.
+
+#[test]
+fn search_models_old_broken_shape_is_rejected() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let body = json!({"query": "qwen", "sort": "downloads"}); // no `args` wrapper
+    let res = call(&webview, "search_models", body);
+    let err = res.expect_err("flat/unwrapped args must NOT dispatch");
+    assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
+}
+
+#[test]
+fn get_model_detail_old_broken_shape_is_rejected() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let body = json!({"model_id": "Qwen/Qwen3-0.6B-GGUF"}); // no `args` wrapper
+    let res = call(&webview, "get_model_detail", body);
+    let err = res.expect_err("flat/unwrapped args must NOT dispatch");
+    assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
+}
+
+#[test]
+fn model_ipc_args_deserialize_from_the_wire_shape() {
+    // Network-free positive coverage of the two networked commands' arg structs
+    // (the happy-path dispatch would hit HF): the JSON the frontend sends must
+    // deserialize into the args, defaults and all.
+    let s: super::SearchModelsArgs =
+        serde_json::from_value(json!({"query": "qwen3", "sort": "likes", "limit": 10})).unwrap();
+    assert_eq!(s.query, "qwen3");
+    assert_eq!(s.limit, Some(10));
+    // Optional fields default when absent.
+    let s2: super::SearchModelsArgs = serde_json::from_value(json!({"query": ""})).unwrap();
+    assert!(s2.sort.is_none() && s2.limit.is_none());
+    let d: super::GetModelDetailArgs =
+        serde_json::from_value(json!({"model_id": "org/repo"})).unwrap();
+    assert_eq!(d.model_id, "org/repo");
 }
