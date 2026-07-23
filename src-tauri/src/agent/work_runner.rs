@@ -80,35 +80,39 @@ pub fn spawn_work_runner(agent_loop: Arc<AgentLoop>, storage: Arc<Storage>) {
                     };
                     tauri::async_runtime::spawn(async move {
                         let _permit = permit; // held for the whole run
-                        // Wave 4.3c review fix: supervise the run so a PANIC
-                        // inside run_subagent/process_message still terminalizes
-                        // the work item — otherwise it would sit `running` until
-                        // the next boot's crash reconcile. Run in an inner task
-                        // and, if its JoinHandle reports a panic, fail the item.
-                        let item_id = item.id.clone();
-                        let db_supervise = Arc::clone(&db_for_task);
-                        let inner = tauri::async_runtime::spawn(run_one_item(
-                            agent_loop,
-                            db_for_task,
-                            profile_for_task,
-                            item,
-                        ));
-                        if inner.await.is_err() {
-                            let now = chrono::Utc::now().timestamp();
-                            let _ = db_supervise.finish_work_item(
-                                &item_id,
-                                WorkState::Failed,
-                                None,
-                                Some("helper panicked"),
-                                now,
-                            );
-                        }
+                        supervise_one_item(agent_loop, db_for_task, profile_for_task, item).await;
                     });
                 }
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
+}
+
+/// Supervise [`run_one_item`] (Wave 4.3c review fix): run it in an inner task so
+/// a PANIC inside `run_subagent`/`process_message` still terminalizes the work
+/// item (`Failed` / "helper panicked") instead of leaving it `running` until the
+/// next boot's crash reconcile. Extracted from the drain loop so the panic path
+/// is directly testable (B6).
+async fn supervise_one_item(
+    agent_loop: Arc<AgentLoop>,
+    db: Arc<ProfileDb>,
+    profile: String,
+    item: WorkItem,
+) {
+    let item_id = item.id.clone();
+    let db_supervise = Arc::clone(&db);
+    let inner = tauri::async_runtime::spawn(run_one_item(agent_loop, db, profile, item));
+    if inner.await.is_err() {
+        let now = chrono::Utc::now().timestamp();
+        let _ = db_supervise.finish_work_item(
+            &item_id,
+            WorkState::Failed,
+            None,
+            Some("helper panicked"),
+            now,
+        );
+    }
 }
 
 /// Run one claimed item to completion (or failure) and finish it. Never
@@ -371,6 +375,138 @@ mod tests {
         // the cron:<id>@<minute> claim_key).
         schedule_due_cron_jobs_at(&db, now, local);
         assert!(db.claim_next_due_work(now + 1).unwrap().is_none(), "no double-fire within the minute");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ── B6: the untested work_runner safety-nets — the wall-clock deadline and
+    // the panic supervisor (Wave 4.3c review fixes). ─────────────────────────
+
+    use crate::agent::gate::PrivacyGate;
+    use crate::agent::loop_mod::{AgentLoop, ModelStreamer};
+    use crate::classifier::RulesClassifier;
+    use crate::models::sse::SseStream;
+    use crate::models::{ChatMessage, ModelManager, Provider, ProviderKind};
+    use std::pin::Pin;
+
+    /// A streamer whose stream() never resolves — makes run_subagent hang so the
+    /// HELPER_DEADLINE timeout fires.
+    struct StallStreamer(Provider);
+    impl ModelStreamer for StallStreamer {
+        fn provider(&self) -> &Provider {
+            &self.0
+        }
+        fn stream<'a>(
+            &'a self,
+            _m: &'a str,
+            _msgs: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A streamer that PANICS when polled — simulates an unexpected bug inside
+    /// the helper run, so the panic supervisor must terminalize the item.
+    struct PanicStreamer(Provider);
+    impl ModelStreamer for PanicStreamer {
+        fn provider(&self) -> &Provider {
+            &self.0
+        }
+        fn stream<'a>(
+            &'a self,
+            _m: &'a str,
+            _msgs: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>> {
+            Box::pin(async { panic!("boom — a bug inside the helper run") })
+        }
+    }
+
+    fn cloud() -> Provider {
+        Provider::new("cloudco", "Cloud", "https://api.cloudco.example/v1", None, ProviderKind::Cloud)
+    }
+
+    fn agent_with(streamer: Arc<dyn ModelStreamer>, storage: Arc<Storage>) -> Arc<AgentLoop> {
+        let mm = Arc::new(ModelManager::new());
+        mm.add_provider(cloud());
+        let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
+        Arc::new(
+            AgentLoop::new(gate, mm, storage, Arc::new(crate::tools::ToolDispatcher::empty()))
+                .with_model_streamer_override(streamer),
+        )
+    }
+
+    fn dispatch_item(now: i64) -> WorkItem {
+        let payload = serde_json::json!({
+            "agent_name": "helper",
+            "system_prompt": "you are a helper",
+            "tools_allowlist": [],
+            "provider": "cloudco",
+            "model": "gpt-x",
+            "task": "do the thing",
+            "profile": "personal",
+            "binding": "public"  // bypass the classifier → straight to the (fake) cloud stream
+        })
+        .to_string();
+        WorkItem::queued(WorkKind::AgentDispatch, payload, now)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_times_out_a_stalled_helper_and_fails_the_item() {
+        let (storage, root) = temp_storage();
+        let storage = Arc::new(storage);
+        let db = storage.open_profile("personal").unwrap();
+        let agent = agent_with(Arc::new(StallStreamer(cloud())), Arc::clone(&storage));
+
+        let now = 1_000_000;
+        let item = dispatch_item(now);
+        let id = item.id.clone();
+        db.insert_work_item(&item).unwrap();
+        let claimed = db.claim_next_due_work(now).unwrap().expect("claimed");
+
+        // run_one_item stalls at the fake stream; advance the virtual clock past
+        // HELPER_DEADLINE (300s) and the timeout must finalize the item. Use
+        // `tokio::spawn` (NOT tauri's spawn) so the task runs on THIS test's
+        // paused runtime — otherwise the timeout would burn 300s of real time.
+        let db2 = Arc::clone(&db);
+        let handle = tokio::spawn(run_one_item(agent, db2, "personal".into(), claimed));
+        tokio::task::yield_now().await; // let the spawned task reach its stalled await
+        tokio::time::advance(HELPER_DEADLINE + std::time::Duration::from_secs(1)).await;
+        handle.await.unwrap();
+
+        let done = db.get_work_item(&id).unwrap().expect("item exists");
+        assert_eq!(done.state, WorkState::Failed, "a stalled helper must be Failed, not stuck running");
+        assert!(
+            done.error.as_deref().unwrap_or("").to_lowercase().contains("timed out")
+                || done.error.as_deref().unwrap_or("").to_lowercase().contains("timeout"),
+            "the failure must name the timeout, got: {:?}",
+            done.error
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn supervise_finalizes_a_panicked_helper_instead_of_leaving_it_running() {
+        let (storage, root) = temp_storage();
+        let storage = Arc::new(storage);
+        let db = storage.open_profile("personal").unwrap();
+        let agent = agent_with(Arc::new(PanicStreamer(cloud())), Arc::clone(&storage));
+
+        let now = 2_000_000;
+        let item = dispatch_item(now);
+        let id = item.id.clone();
+        db.insert_work_item(&item).unwrap();
+        let claimed = db.claim_next_due_work(now).unwrap().expect("claimed");
+
+        // supervise_one_item runs run_one_item in an inner task; the panic there
+        // must be caught and the item finalized Failed (never left running).
+        supervise_one_item(agent, Arc::clone(&db), "personal".into(), claimed).await;
+
+        let done = db.get_work_item(&id).unwrap().expect("item exists");
+        assert_eq!(done.state, WorkState::Failed, "a panicked helper must be Failed, not stuck running");
+        assert!(
+            done.error.as_deref().unwrap_or("").contains("panicked"),
+            "the failure must name the panic, got: {:?}",
+            done.error
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

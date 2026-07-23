@@ -567,12 +567,17 @@ impl AgentLoop {
     ) -> Result<String> {
         let belt: std::collections::HashSet<String> = tools_allowlist.iter().cloned().collect();
         let restricted = Arc::new(self.tools.restricted(&belt));
-        let sub = AgentLoop::new(
+        let mut sub = AgentLoop::new(
             self.gate.clone(),
             Arc::clone(&self.model_manager),
             Arc::clone(&self.storage),
             restricted,
         );
+        // The helper's sub-loop uses the same model transport as the parent —
+        // in production this is always `None` (real `ModelClient`, unchanged);
+        // in tests it carries the injected fake so B6/B7 can drive the helper
+        // path end-to-end.
+        sub.streamer_override.clone_from(&self.streamer_override);
 
         let db = self
             .storage
