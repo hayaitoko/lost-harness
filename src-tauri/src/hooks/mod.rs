@@ -69,6 +69,7 @@ use crate::tools::{RiskClass, ToolInput};
 
 pub mod approval;
 pub mod audit;
+pub mod budget;
 pub mod first_use;
 pub mod headless;
 pub mod permission;

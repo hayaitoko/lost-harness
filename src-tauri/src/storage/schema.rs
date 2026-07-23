@@ -18,7 +18,7 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 7;
 /// `classifier_settings` in the classifier settings round,
 /// `memory_settings` in Wave 1 memory) bumps `PROFILE_SCHEMA_VERSION`
 /// without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 10;
+pub const PROFILE_SCHEMA_VERSION: i32 = 11;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)
@@ -400,6 +400,13 @@ CREATE TABLE IF NOT EXISTS sandbox_config (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     config_json TEXT NOT NULL,
     updated_at  INTEGER NOT NULL
+);
+
+-- C1: per-profile budget cap (spend governor). NULL/no row = uncapped.
+CREATE TABLE IF NOT EXISTS budget_settings (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    cap_usd    REAL,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);

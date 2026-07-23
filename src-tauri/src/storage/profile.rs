@@ -960,6 +960,69 @@ impl ProfileDb {
         )?)
     }
 
+    /// Usage rolled up over events at/after `since_ts` (Unix seconds) — the
+    /// windowed variant the budget governor (C1) reads, e.g. from the start of
+    /// the current month. `usage_summary()` (all-time) still backs the Settings
+    /// "Usage" view.
+    pub fn usage_summary_since(&self, since_ts: i64) -> Result<UsageSummary> {
+        Ok(self.conn.lock().query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+             FROM usage_events WHERE created_at >= ?1",
+            params![since_ts],
+            |r| {
+                Ok(UsageSummary {
+                    total_calls: r.get::<_, i64>(0)? as usize,
+                    known_cost_usd: r.get::<_, f64>(1)?,
+                    unknown_cost_calls: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
+                })
+            },
+        )?)
+    }
+
+    // ── budget_settings (C1 — the spend governor's per-profile cap) ───────────
+
+    /// This profile's spend cap in USD, or `None` when uncapped (no row / NULL).
+    pub fn budget_cap(&self) -> Result<Option<f64>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row("SELECT cap_usd FROM budget_settings WHERE id = 1", [], |r| {
+                r.get::<_, Option<f64>>(0)
+            })
+            .optional()
+            .context("read budget_settings row")?
+            .flatten())
+    }
+
+    /// Set (or clear, with `None`) this profile's spend cap. A negative cap is
+    /// clamped to 0 (a cap can't be below zero).
+    pub fn set_budget_cap(&self, cap_usd: Option<f64>) -> Result<()> {
+        let cap = cap_usd.map(|c| if c < 0.0 { 0.0 } else { c });
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO budget_settings (id, cap_usd, updated_at)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET cap_usd = excluded.cap_usd, updated_at = excluded.updated_at",
+                params![cap, now],
+            )
+            .context("upsert budget_settings row")?;
+        Ok(())
+    }
+
+    /// Clear the cap entirely (uncapped). Returns whether a row was removed.
+    pub fn reset_budget_cap(&self) -> Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .execute("DELETE FROM budget_settings WHERE id = 1", [])
+            .context("delete budget_settings row")?;
+        Ok(n > 0)
+    }
+
     // ── work_items (Wave 4.4 — the one-queue-model substrate) ─────────────────
 
     /// Enqueue a work item. Uses `INSERT OR IGNORE`, so a duplicate `claim_key`

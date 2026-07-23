@@ -765,6 +765,35 @@ export async function setSandboxConfig(
   return null;
 }
 
+// ── budget_settings (C1 — the spend governor) ──────────────────────────────
+
+/** This profile's spend cap. `cap_usd` null ⇒ uncapped. Mirrors `BudgetSettings`. */
+export interface BudgetSettings {
+  cap_usd: number | null;
+}
+
+/** This profile's spend cap. */
+export async function getBudgetSettings(profile: string): Promise<BudgetSettings | null> {
+  if (isTauri()) return tauriInvoke<BudgetSettings>("get_budget_settings", { args: { profile } });
+  return null;
+}
+
+/** Set (or clear, with `null`) this profile's spend cap. */
+export async function setBudgetSettings(
+  profile: string,
+  capUsd: number | null,
+): Promise<BudgetSettings | null> {
+  if (isTauri())
+    return tauriInvoke<BudgetSettings>("set_budget_settings", { args: { profile, cap_usd: capUsd } });
+  return null;
+}
+
+/** Clear this profile's spend cap (uncapped). */
+export async function resetBudgetSettings(profile: string): Promise<BudgetSettings | null> {
+  if (isTauri()) return tauriInvoke<BudgetSettings>("reset_budget_settings", { args: { profile } });
+  return null;
+}
+
 /** A downloaded local model. Mirrors `LocalModelInfo` in `ipc/mod.rs`. */
 export interface LocalModel {
   id: string;

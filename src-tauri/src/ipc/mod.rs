@@ -876,6 +876,62 @@ fn validate_sandbox_config(cfg: &crate::hooks::SandboxConfig) -> Result<(), Stri
     Ok(())
 }
 
+// ── budget_settings (C1 — the spend governor's per-profile cap) ────────────
+
+/// This profile's spend cap. `cap_usd = null` ⇒ uncapped.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetSettings {
+    pub cap_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetBudgetSettingsArgs {
+    pub profile: String,
+}
+
+#[tauri::command]
+pub fn get_budget_settings(
+    state: State<'_, AppState>,
+    args: GetBudgetSettingsArgs,
+) -> Result<BudgetSettings, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    Ok(BudgetSettings { cap_usd: db.budget_cap().map_err(|e| e.to_string())? })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetBudgetSettingsArgs {
+    pub profile: String,
+    /// The cap in USD; `null` clears it (uncapped).
+    #[serde(default)]
+    pub cap_usd: Option<f64>,
+}
+
+/// Set (or clear, with `cap_usd: null`) this profile's spend cap. Echoes the
+/// value now in effect.
+#[tauri::command]
+pub fn set_budget_settings(
+    state: State<'_, AppState>,
+    args: SetBudgetSettingsArgs,
+) -> Result<BudgetSettings, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    db.set_budget_cap(args.cap_usd).map_err(|e| e.to_string())?;
+    Ok(BudgetSettings { cap_usd: db.budget_cap().map_err(|e| e.to_string())? })
+}
+
+/// Clear the cap entirely (uncapped).
+#[tauri::command]
+pub fn reset_budget_settings(
+    state: State<'_, AppState>,
+    args: GetBudgetSettingsArgs,
+) -> Result<BudgetSettings, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    db.reset_budget_cap().map_err(|e| e.to_string())?;
+    Ok(BudgetSettings { cap_usd: None })
+}
+
 /// A downloaded/registered local model for the Settings model-manager (M8 S6).
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalModelInfo {

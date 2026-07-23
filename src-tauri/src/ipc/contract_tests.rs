@@ -118,6 +118,9 @@ fn test_app() -> App<MockRuntime> {
             ipc::calculate_model_fit,
             ipc::get_sandbox_config,
             ipc::set_sandbox_config,
+            ipc::get_budget_settings,
+            ipc::set_budget_settings,
+            ipc::reset_budget_settings,
             // B8: the rest of the registered surface (every command except the
             // two that take a bare `AppHandle` — send_message, download_model —
             // which structurally can't register under MockRuntime).
@@ -696,6 +699,36 @@ fn sandbox_config_old_broken_shape_is_rejected() {
     assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
 }
 
+// ── budget_settings (C1) ───────────────────────────────────────────────────
+
+#[test]
+fn set_then_get_budget_settings_round_trips_and_reset_clears() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    call(&webview, "set_budget_settings", json!({"args": {"profile": "personal", "cap_usd": 12.5}}))
+        .expect("set a cap");
+    let got = call(&webview, "get_budget_settings", json!({"args": {"profile": "personal"}}))
+        .expect("get")
+        .deserialize::<Value>()
+        .unwrap();
+    assert_eq!(got["cap_usd"], 12.5, "the cap round-trips");
+    call(&webview, "reset_budget_settings", json!({"args": {"profile": "personal"}})).expect("reset");
+    let after = call(&webview, "get_budget_settings", json!({"args": {"profile": "personal"}}))
+        .expect("get")
+        .deserialize::<Value>()
+        .unwrap();
+    assert!(after["cap_usd"].is_null(), "reset → uncapped (null)");
+}
+
+#[test]
+fn budget_settings_old_broken_shape_is_rejected() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let res = call(&webview, "get_budget_settings", json!({"profile": "personal"})); // no `args`
+    let err = res.expect_err("flat/unwrapped args must NOT dispatch");
+    assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
+}
+
 // ── B8: contract coverage across the whole registered surface ──────────────
 // Two data-driven sweeps pin the Tauri-v2 `{args:{…}}` envelope for every
 // args-taking command and prove every no-arg command actually dispatches.
@@ -739,6 +772,9 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "get_memory_settings",
         "set_memory_settings",
         "remove_local_model",
+        "get_budget_settings",
+        "set_budget_settings",
+        "reset_budget_settings",
     ];
     for cmd in args_cmds {
         let res = call(&webview, cmd, flat.clone());

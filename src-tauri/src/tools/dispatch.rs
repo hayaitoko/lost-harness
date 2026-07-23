@@ -228,6 +228,14 @@ impl ToolDispatcher {
         self.restricted(&self.registry.all_names())
     }
 
+    /// Whether a human is present for this dispatcher's turns (an interactive
+    /// approver is wired). The single source of truth for "attended" — the B5
+    /// tool-approval floor and the C1 budget governor both read it, so they can
+    /// never disagree about whether a session is unattended.
+    pub fn is_attended(&self) -> bool {
+        self.approver.is_some()
+    }
+
     pub fn restricted(&self, allowed: &std::collections::HashSet<String>) -> ToolDispatcher {
         ToolDispatcher {
             registry: self.registry.restricted_to(allowed),

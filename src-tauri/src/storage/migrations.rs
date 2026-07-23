@@ -374,6 +374,20 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
             updated_at  INTEGER NOT NULL
         );",
     },
+    Migration {
+        version: 11,
+        // C1: per-profile budget cap (the spend governor). One row (id=1); a
+        // NULL `cap_usd` (or no row) = uncapped, the safe default. The governor
+        // reads this against the usage ledger to WARN attended chat / HALT
+        // unattended work. Same dual-definition convention (also in
+        // PROFILE_SCHEMA_SQL).
+        name: "budget_settings_table",
+        sql: "CREATE TABLE IF NOT EXISTS budget_settings (
+            id         INTEGER PRIMARY KEY CHECK (id = 1),
+            cap_usd    REAL,
+            updated_at INTEGER NOT NULL
+        );",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.

@@ -21,7 +21,9 @@
 
 use tauri::AppHandle;
 
-use crate::agent::loop_mod::{emit_error, emit_memory_event, LocalReroutePayload, StreamTokenPayload};
+use crate::agent::loop_mod::{
+    emit_error, emit_memory_event, BudgetWarningPayload, LocalReroutePayload, StreamTokenPayload,
+};
 
 /// One method per `.emit(...)` call site the agent loop had. Each method's
 /// parameters carry exactly the fields the corresponding event payload struct
@@ -53,6 +55,12 @@ pub trait ResultSink: Send + Sync {
     /// decision fails, or the model stream itself errors. `source` is
     /// "gate" | "routing" | "model".
     fn error(&self, conversation_id: &str, error: &str, source: &'static str);
+
+    /// C1: `stream:budget_warning` — a NON-BLOCKING banner when an attended chat
+    /// turn is over its spend cap. The turn still proceeds (a human is never
+    /// hard-blocked); the UI surfaces the warning. Default no-op so headless /
+    /// test sinks (where no one is watching) simply ignore it.
+    fn budget_warning(&self, _conversation_id: &str, _message: &str) {}
 }
 
 /// Production [`ResultSink`]: wraps a live Tauri `AppHandle` and reconstructs
@@ -110,6 +118,17 @@ impl ResultSink for TauriResultSink {
 
     fn error(&self, conversation_id: &str, error: &str, source: &'static str) {
         emit_error(&self.app, conversation_id, error.to_string(), source);
+    }
+
+    fn budget_warning(&self, conversation_id: &str, message: &str) {
+        use tauri::Emitter;
+        let payload = BudgetWarningPayload {
+            conversation_id: conversation_id.to_string(),
+            message: message.to_string(),
+        };
+        if let Err(e) = self.app.emit("stream:budget_warning", payload) {
+            tracing::warn!(error = %e, "failed to emit stream:budget_warning");
+        }
     }
 }
 

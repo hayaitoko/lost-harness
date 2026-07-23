@@ -80,6 +80,14 @@ pub struct LocalReroutePayload {
     pub to_provider: String,
 }
 
+/// Payload of `stream:budget_warning` (C1) — a non-blocking banner when an
+/// attended chat turn is over its spend cap. The turn proceeds regardless.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetWarningPayload {
+    pub conversation_id: String,
+    pub message: String,
+}
+
 /// Payload of the `memory:event` event — the non-silent memory signal (PLAN
 /// §9). Emitted when the agent recalls saved notes for an answer. Carries only
 /// a kind + count, never the recalled content itself.
@@ -356,6 +364,26 @@ impl AgentLoop {
         // model_manager accesses below don't race with another concurrent
         // process_message call.
         let _stream_guard = self.stream_lock.lock().await;
+
+        // C1: the budget governor (attended path). A human is NEVER hard-blocked
+        // — an over-cap turn only surfaces a non-blocking banner and proceeds.
+        // The unattended HALT lives in `work_runner` (before the model call ever
+        // fires). `is_attended()` is false in a `run_subagent` sub-loop (headless
+        // dispatcher), so this fires only for real interactive turns. Best-effort:
+        // a settings/ledger read error defaults open — a governor check must never
+        // block the send path.
+        if self.tools.is_attended() {
+            let since = crate::hooks::budget::month_start_ts(chrono::Utc::now());
+            let cap = self.storage.open_profile(&profile).and_then(|db| db.budget_cap());
+            let sum = self.storage.open_profile(&profile).and_then(|db| db.usage_summary_since(since));
+            if let (Ok(cap), Ok(sum)) = (cap, sum) {
+                if let crate::hooks::budget::BudgetVerdict::Warn(reason) =
+                    crate::hooks::budget::evaluate(cap, &sum, true)
+                {
+                    sink.budget_warning(&conversation_id, &reason);
+                }
+            }
+        }
 
         // ── 1. Resolve provider + classify endpoint ──────────────────────
         let provider = self

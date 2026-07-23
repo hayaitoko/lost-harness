@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
+use crate::hooks::budget::{self, BudgetVerdict};
 use crate::queue::{WorkItem, WorkKind, WorkState};
 use crate::storage::{Message, ProfileDb, Storage};
 
@@ -115,6 +116,36 @@ async fn supervise_one_item(
     }
 }
 
+/// Evaluate this profile's budget for an about-to-run UNATTENDED model call
+/// (C1). **Fail-closed** (review finding): if the cap or the ledger can't be
+/// read, HALT rather than let an over-cap job run free on a transient DB error —
+/// the same "unknown ⇒ possibly over" philosophy `budget::evaluate` applies to
+/// unknown COST, extended to an unknown BUDGET STATE. (The attended WARN path in
+/// `loop_mod` defaults OPEN instead — a missed banner is fine, but a human is
+/// never hard-blocked.) `attended` is threaded so the fail-closed direction is
+/// explicit, though production only calls this unattended.
+///
+/// **Known limitation (soft ceiling — deferred hard cap):** the check is a
+/// per-item PRECHECK and spend is booked post-hoc (after each model round), so
+/// concurrently-claimed items (up to `MAX_CONCURRENT_HELPERS`) can each pass
+/// before any books cost, and a single item's tool loop can make several model
+/// calls after one check. The cap therefore HALTS runaway unattended spend
+/// within a bounded margin (≈ in-flight cost), not to the exact dollar — a hard
+/// per-dollar cap needs cost RESERVATION across the async model call, deferred
+/// as its own feature.
+fn budget_verdict_for(db: &ProfileDb, attended: bool) -> BudgetVerdict {
+    let since = budget::month_start_ts(chrono::Utc::now());
+    match (db.budget_cap(), db.usage_summary_since(since)) {
+        (Ok(cap), Ok(sum)) => budget::evaluate(cap, &sum, attended),
+        // Read failure on the UNATTENDED path → fail closed.
+        _ if !attended => BudgetVerdict::Halt(
+            "budget check unavailable (couldn't read the spend ledger) — halting to fail closed"
+                .to_string(),
+        ),
+        _ => BudgetVerdict::Ok,
+    }
+}
+
 /// Run one claimed item to completion (or failure) and finish it. Never
 /// panics on a malformed payload or a failed helper run — every path ends in
 /// a `finish_work_item` call, so a bad item can never sit `running` forever.
@@ -173,6 +204,16 @@ async fn run_one_item(agent_loop: Arc<AgentLoop>, db: Arc<ProfileDb>, profile: S
     let task = payload.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let profile = payload.get("profile").and_then(|v| v.as_str()).unwrap_or("personal").to_string();
     let binding = parse_binding_lenient(payload.get("binding").and_then(|v| v.as_str()).unwrap_or("auto"));
+
+    // C1: the budget governor. An UNATTENDED helper HALTS before it spends if
+    // this profile is over its cap (or spend is unknowable → fail-closed). Same
+    // "every path ends in finish_work_item" idiom as the malformed-payload /
+    // panic / timeout paths — the model call never fires, so no more can be spent.
+    if let BudgetVerdict::Halt(reason) = budget_verdict_for(&db, false) {
+        let now = chrono::Utc::now().timestamp();
+        let _ = db.finish_work_item(&item.id, WorkState::Failed, None, Some(&format!("budget: {reason}")), now);
+        return;
+    }
 
     // Wave 4.3c review fix: a wall-clock deadline so a stalled model stream
     // can't hang a helper forever (and, at MAX_CONCURRENT_HELPERS stalls,
@@ -290,6 +331,15 @@ async fn run_cron_item(agent_loop: &AgentLoop, db: &ProfileDb, profile: &str, it
     let job_id = payload.get("job_id").and_then(|v| v.as_str()).map(str::to_string);
     let target = item.target_conversation_id.clone();
     let now = chrono::Utc::now().timestamp();
+
+    // C1: a cron turn is unattended — HALT before spending if over the cap.
+    if let BudgetVerdict::Halt(reason) = budget_verdict_for(db, false) {
+        let _ = db.finish_work_item(&item.id, WorkState::Failed, None, Some(&format!("budget: {reason}")), now);
+        if let Some(id) = &job_id {
+            let _ = db.record_cron_run(id, "failed");
+        }
+        return;
+    }
 
     if prompt.trim().is_empty() {
         let _ = db.finish_work_item(&item.id, WorkState::Failed, None, Some("cron: empty prompt"), now);
@@ -478,6 +528,42 @@ mod tests {
             done.error.as_deref().unwrap_or("").to_lowercase().contains("timed out")
                 || done.error.as_deref().unwrap_or("").to_lowercase().contains("timeout"),
             "the failure must name the timeout, got: {:?}",
+            done.error
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn budget_governor_halts_an_unattended_helper_over_the_cap() {
+        // C1: an over-budget unattended helper is Failed BEFORE the model call
+        // fires (the StallStreamer would hang if reached — proving the halt
+        // short-circuits before streaming).
+        let (storage, root) = temp_storage();
+        let storage = Arc::new(storage);
+        let db = storage.open_profile("personal").unwrap();
+        db.set_budget_cap(Some(1.0)).unwrap();
+        db.record_usage(&crate::storage::UsageEvent {
+            id: "u1".into(),
+            conversation_id: None,
+            model: "gpt".into(),
+            provider_id: Some("cloud".into()),
+            provider_kind: "cloud".into(),
+            cost_usd: Some(5.0), // $5 spent vs a $1 cap → over
+            created_at: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+        let agent = agent_with(Arc::new(StallStreamer(cloud())), Arc::clone(&storage));
+        let now = 3_000_000;
+        let item = dispatch_item(now);
+        let id = item.id.clone();
+        db.insert_work_item(&item).unwrap();
+        let claimed = db.claim_next_due_work(now).unwrap().expect("claimed");
+        run_one_item(agent, Arc::clone(&db), "personal".into(), claimed).await;
+        let done = db.get_work_item(&id).unwrap().expect("item");
+        assert_eq!(done.state, WorkState::Failed, "over-budget unattended work must halt");
+        assert!(
+            done.error.as_deref().unwrap_or("").contains("budget"),
+            "the failure names the budget, got: {:?}",
             done.error
         );
         let _ = std::fs::remove_dir_all(root);
