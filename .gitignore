@@ -1,6 +1,7 @@
 # Rust / Cargo
 src-tauri/target/
-src-tauri/Cargo.lock
+# Cargo.lock IS committed — this is a shipped application, not a library, so the
+# exact dependency graph must be reproducible across the dev box and CI.
 **/*.rs.bk
 *.pdb
 

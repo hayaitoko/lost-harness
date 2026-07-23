@@ -62,23 +62,42 @@ user message
 These are the guarantees the whole product rests on. Each subsystem doc says where
 its own are enforced; the cross-cutting ones:
 
-- **The privacy filter fails closed.** Sensitive content is never silently sent to
-  the cloud. `RouteLocal` only proceeds on a provider that is both local *and*
-  private, else the call errors rather than falling back (agent). A tool call flagged
-  `LocalRequired` on a cloud endpoint is denied outright (tools/dispatch) — a second,
-  independent enforcement point.
-- **The sandbox floor is non-overridable.** The hardline danger denylist runs before
-  any ask-capable hook and nothing (no setting, no "just let it run") can disable it
-  (hooks).
+- **The privacy filter fails closed — for the classified chat turn.** A turn the §7
+  classifier flags is never silently sent to the cloud: `RouteLocal` only proceeds on a
+  provider that is both local *and* private, else the call errors rather than falling
+  back (agent), and a tool call flagged `LocalRequired` on a cloud endpoint is denied
+  outright (tools/dispatch) — a second, independent enforcement point. **Scope the
+  2026-07-23 external review pinned down (see the ledger in `HANDOFF.md`):** this
+  guarantee is *the model-endpoint egress of a classified chat turn*. It does **not**
+  currently cover (a) a `Public`-binding turn, which bypasses the classifier for the
+  current message by design (F4); (b) a tool whose *own* destination is off-box — the
+  `is_cloud` signal is derived from the **model** endpoint, so a `Private` conversation
+  on a local model can still hand private args to a Remote-tier MCP / `External` tool
+  (F2); or (c) non-chat egress like `search_models` hitting HuggingFace (F13). Treat the
+  invariant as "classified chat content respects routing," not "nothing sensitive ever
+  leaves the device."
+- **The sandbox floor cannot be disabled — but it is a pattern denylist, not a semantic
+  guarantee.** The hardline danger denylist runs before any ask-capable hook and no
+  setting can turn it off (hooks). It is substring matching over command text, so
+  obfuscation (`$IFS`, quoting, alternate interpreters, base64) can evade the *pattern*
+  match (F8) — this is defense-in-depth *behind* the mandatory per-call human approval
+  and the deny-by-default Seatbelt jail, not a standalone semantic command-safety
+  guarantee. It also does not govern an MCP server's *own child process* (F1).
 - **Parse only the model's own current-turn output** for tool calls, and guard-wrap
-  all untrusted tool output. Content the agent merely *read* can never forge a call
-  (tools/calling).
+  all untrusted tool output. Content the agent merely *read* can never *forge* a tool
+  call (tools/calling). Scope (F9): guard-wrap makes the data/instruction boundary
+  structurally unforgeable but does not stop *indirect* prompt injection — untrusted
+  content can still persuade the model to emit a *legitimate new* call; the approval
+  gate on Write/External/Dangerous tools is what bounds that.
 - **"Asked" is not "approved."** An unattended agent cannot self-grant a gated tool
   by attempting it; only a recorded approval flips a call through (hooks/approval).
 - **Workspace confinement.** The fs tools cannot touch anything outside `workspace/` —
   not via `..`, absolute paths, or symlinks (tools/fs).
-- **Audit logs never store plaintext.** `trm_logs` stores a hash of the message, never
-  the text (storage / agent).
+- **Routing logs hash the message; the tool-audit trail does not.** `trm_logs` stores a
+  hash of the message, never the text (storage / agent). Note (F11): the append-only
+  `tool_audit` table *does* persist canonical tool arguments verbatim, which can include
+  sensitive values, and has no retention sweep yet — so "audit logs never store
+  plaintext" holds for `trm_logs` only.
 
 ## How to run, test, build
 

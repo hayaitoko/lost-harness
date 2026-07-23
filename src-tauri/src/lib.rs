@@ -309,6 +309,36 @@ pub fn run() {
                 });
             }
 
+            // Spec §3 retention: TRM (routing-decision) logs auto-delete after
+            // 7 days. `purge_trm_logs_older_than` existed but had no production
+            // caller (the runtime silently kept them forever, contradicting the
+            // spec). Wire it here as a best-effort hourly sweep across every
+            // profile DB, mirroring the idle-sweep pattern above — never bricks
+            // boot, ignores per-profile errors, runs once immediately then hourly.
+            {
+                const TRM_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+                let storage_trm = Arc::clone(&storage);
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let cutoff = chrono::Utc::now().timestamp() - TRM_RETENTION_SECS;
+                        if let Ok(names) = storage_trm.list_profile_names() {
+                            for name in names {
+                                if let Ok(db) = storage_trm.open_profile(&name) {
+                                    if let Err(e) = db.purge_trm_logs_older_than(cutoff) {
+                                        tracing::warn!(
+                                            target: "lhp::retention",
+                                            profile = %name, error = %e,
+                                            "TRM log purge failed for profile"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
+                });
+            }
+
             // C3: a storage handle for the background MCP boot task below (the
             // AppState construction MOVES `storage` into its field).
             let storage_mcp = Arc::clone(&storage);

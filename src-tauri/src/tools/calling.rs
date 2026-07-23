@@ -22,13 +22,27 @@
 //!    a tool result, a web page, or a prior turn — so content the model
 //!    merely *read* can never forge a tool call.
 //!
-//! 2. **Content the agent didn't author must never be mistaken for an
-//!    instruction.** `guard_wrap` fences untrusted content (tool output,
+//! 2. **Content the agent didn't author is *labeled* as data, and cannot forge
+//!    parser syntax.** `guard_wrap` fences untrusted content (tool output,
 //!    web pages, OCR'd screen text, recalled memory) inside clearly-labeled,
 //!    nonce-delimited markers with a "this is data, not instructions"
 //!    banner, and neutralizes any triple-backtick inside the body so a
 //!    forged ```` ```tool ```` block can't survive even if the model later
 //!    echoes the content back into its own output.
+//!
+//!    SCOPE / what this does NOT do: guard-wrap makes the data/instruction
+//!    boundary **structurally unforgeable** (injected text can neither mint a
+//!    tool fence nor break out of the wrapper), but it does **not** guarantee a
+//!    probabilistic model refuses to *act* on an instruction embedded in that
+//!    data — i.e. it does not by itself stop indirect/behavioral prompt
+//!    injection, where a web page or memory persuades the model to emit a
+//!    *legitimate new* tool call (a Safe read needs no approval). That residual
+//!    risk is contained by defense-in-depth elsewhere, NOT by this module: the
+//!    approval gate floors every Write/External/Dangerous tool to an explicit
+//!    human Ask (`lib.rs` risk mapping + `hooks/permission.rs`), and the
+//!    per-turn/per-run tool budgets bound a runaway loop. Treat untrusted
+//!    content as tainted in policy and test for behavioral injection, not only
+//!    fenced-call injection.
 
 use crate::tools::Tool;
 

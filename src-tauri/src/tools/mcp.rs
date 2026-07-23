@@ -5,18 +5,21 @@
 //! tool; risk derived so a foreign hint can only ever *raise* risk; foreign
 //! names/descriptions sanitized before they reach the model's system prompt.
 //!
-//! **Scope: the trust/gating spine only.** No MCP wire transport
-//! (stdio/SSE/HTTP JSON-RPC) exists in this codebase — [`UnwiredTransport`] is
-//! an inert placeholder that fails loudly. Building a real client (spawn stdio
-//! children, JSON-RPC handshake, `tools/list`/`tools/call`) is separate,
-//! larger follow-up work — the same "shape now, mechanism later" split item 7
-//! used for `SandboxedSpawn`. `build_tool_dispatcher` does NOT register any MCP
-//! server yet (no persisted server-config store / registration UI exists).
-//!
-//! Because nothing in the production path constructs these types yet (only the
-//! tests do), the module is intentionally dead code until a transport +
-//! registration surface land — hence the module-level allow. Every type here
-//! is the public spine those follow-ups plug into.
+//! **Scope: the trust/gating spine.** This module owns MCP's *trust* surface
+//! (`McpTool`, namespacing, risk derivation, sanitization) and the transport
+//! *trait*. As of C3 (2026-07-23) a real **stdio** JSON-RPC transport exists in
+//! [`super::mcp_stdio`] (`StdioMcpTransport` — spawn child, `initialize`
+//! handshake, `tools/list`/`tools/call`), and the production path DOES now
+//! construct these types: `mcp_stdio::bring_up_server` builds each foreign
+//! tool through `McpTool::new`, registration lands via the `register_mcp_server`
+//! IPC command, and enabled servers are re-spawned at boot (`lib.rs`).
+//! [`UnwiredTransport`] remains as the inert, fail-loud fallback/test
+//! placeholder for a server that has no live transport. The SSE/HTTP transports
+//! are still future work. NOTE: the trust spine gates every MCP *tool call*,
+//! but the spawned server *process itself* is currently un-sandboxed (see the
+//! external-review ledger, F1) — unlike `ShellExecTool`'s Seatbelt jail.
+//! The module-level `allow(dead_code)` stays only because the not-yet-wired
+//! transports/types remain.
 #![allow(dead_code)]
 
 use std::future::Future;
