@@ -36,6 +36,7 @@ pub mod exec;
 pub mod fetch;
 pub mod fs;
 pub mod mcp;
+pub mod mcp_stdio;
 pub mod memory;
 pub mod session_search;
 pub mod skills;

@@ -67,6 +67,39 @@ fn row_to_model_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelEntry> {
     })
 }
 
+/// C3: one persisted MCP server config. `args`/`capabilities` are stored as
+/// JSON arrays; `tier` is `"local"`/`"remote"` (unknown values fail closed to
+/// remote at the consumer). The live transport (a spawned child) is derived
+/// session state — only the CONFIG persists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServerRow {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub tier: String,
+    pub trusted_read_only: bool,
+    pub capabilities: Vec<String>,
+    pub enabled: bool,
+    pub created_at: i64,
+}
+
+fn row_to_mcp_server(r: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerRow> {
+    let args_json: String = r.get(3)?;
+    let caps_json: String = r.get(6)?;
+    Ok(McpServerRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        command: r.get(2)?,
+        args: serde_json::from_str(&args_json).unwrap_or_default(),
+        tier: r.get(4)?,
+        trusted_read_only: r.get::<_, i64>(5)? != 0,
+        capabilities: serde_json::from_str(&caps_json).unwrap_or_default(),
+        enabled: r.get::<_, i64>(7)? != 0,
+        created_at: r.get(8)?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryFact {
     pub id: String,
@@ -570,6 +603,61 @@ impl GlobalDb {
             .conn
             .lock()
             .execute("DELETE FROM endpoints WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    // ── mcp_servers (C3 — persisted MCP server configs) ─────────────────────
+
+    pub fn insert_mcp_server(&self, s: &McpServerRow) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO mcp_servers
+             (id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                s.id,
+                s.name,
+                s.command,
+                serde_json::to_string(&s.args).unwrap_or_else(|_| "[]".into()),
+                s.tier,
+                s.trusted_read_only as i64,
+                serde_json::to_string(&s.capabilities).unwrap_or_else(|_| "[]".into()),
+                s.enabled as i64,
+                s.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_mcp_servers(&self) -> Result<Vec<McpServerRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at
+             FROM mcp_servers ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_mcp_server)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_mcp_server(&self, id: &str) -> Result<Option<McpServerRow>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at
+                 FROM mcp_servers WHERE id = ?1",
+                params![id],
+                row_to_mcp_server,
+            )
+            .optional()?)
+    }
+
+    pub fn delete_mcp_server(&self, id: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .execute("DELETE FROM mcp_servers WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
 

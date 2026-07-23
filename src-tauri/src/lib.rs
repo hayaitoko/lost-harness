@@ -255,6 +255,9 @@ pub fn run() {
                 Err(e) => tracing::warn!(error = %e, "couldn't load approved skills as tools"),
             }
 
+            // C3: the live MCP runtime (spawned children, derived session state).
+            let mcp_runtime = Arc::new(crate::tools::mcp_stdio::McpRuntime::new());
+
             let agent_loop = AgentLoop::new(
                 gate,
                 Arc::clone(&model_manager),
@@ -306,6 +309,10 @@ pub fn run() {
                 });
             }
 
+            // C3: a storage handle for the background MCP boot task below (the
+            // AppState construction MOVES `storage` into its field).
+            let storage_mcp = Arc::clone(&storage);
+
             // A4: probe hardware ONCE at boot and cache it (probe() shells out to
             // system_profiler — hundreds of ms; the model IPC reads this snapshot).
             let hardware = Arc::new(crate::models::hardware::probe());
@@ -319,11 +326,68 @@ pub fn run() {
                 embedder,
                 // C4: the live dispatcher, for hot-(un)registering skill tools.
                 tools: Arc::clone(&tools),
+                // C3: the live MCP server registry.
+                mcp: Arc::clone(&mcp_runtime),
                 hardware,
                 #[cfg(feature = "local-runner")]
                 local_runner: local_runner_ctx,
             };
             app.manage(state);
+
+            // C3: bring persisted MCP servers back up in the background
+            // (best-effort — a missing server binary logs and skips; the row
+            // stays listed as not-running so the user can see + fix it).
+            {
+                let tools_mcp = Arc::clone(&tools);
+                let runtime_mcp = Arc::clone(&mcp_runtime);
+                tauri::async_runtime::spawn(async move {
+                    let rows = match storage_mcp.global().list_mcp_servers() {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "couldn't load persisted MCP servers");
+                            return;
+                        }
+                    };
+                    for row in rows.into_iter().filter(|r| r.enabled) {
+                        match crate::tools::mcp_stdio::bring_up_server(&row, &tools_mcp, &runtime_mcp)
+                            .await
+                        {
+                            Ok(tools) => {
+                                // Review fix (boot-vs-remove race): the user may
+                                // have REMOVED this server while the sequential
+                                // bring-up was still working through earlier rows
+                                // (each can burn a full RPC timeout). If the row
+                                // is gone, tear the live half straight back down —
+                                // never a running, invisible server without a row.
+                                match storage_mcp.global().get_mcp_server(&row.id) {
+                                    Ok(Some(_)) => tracing::info!(
+                                        server = %row.name,
+                                        tools = tools.len(),
+                                        "MCP server up"
+                                    ),
+                                    _ => {
+                                        tracing::warn!(
+                                            server = %row.name,
+                                            "MCP server row removed during boot bring-up — tearing down"
+                                        );
+                                        crate::tools::mcp_stdio::tear_down_server(
+                                            &row.id,
+                                            &tools_mcp,
+                                            &runtime_mcp,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                server = %row.name,
+                                error = %e,
+                                "MCP server failed to start (listed as not-running)"
+                            ),
+                        }
+                    }
+                });
+            }
 
             tracing::info!("Tauri app initialized; M1 commands registered");
             Ok(())
@@ -366,6 +430,9 @@ pub fn run() {
             ipc::set_budget_settings,
             ipc::reset_budget_settings,
             ipc::cancel_message,
+            ipc::register_mcp_server,
+            ipc::list_mcp_servers,
+            ipc::remove_mcp_server,
             ipc::download_model,
             ipc::list_local_models,
             ipc::remove_local_model,
@@ -386,16 +453,29 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Lost Harness")
         .run(|app_handle, event| {
-            // M8 S4 teardown — never a zombie: on app exit, best-effort
-            // stop_all over every live sidecar (the pidfile reap at next boot
-            // is the net for a hard crash that never reaches this).
-            #[cfg(feature = "local-runner")]
+            // Exit teardown — never a zombie: on app exit, best-effort stop of
+            // every live sidecar (M8 S4; the pidfile reap at next boot is the
+            // net for a hard crash that never reaches this) and every spawned
+            // MCP child (C3).
             if matches!(event, tauri::RunEvent::Exit) {
                 use tauri::Manager;
                 if let Some(state) = app_handle.try_state::<AppState>() {
+                    #[cfg(feature = "local-runner")]
                     if let Some(ctx) = &state.local_runner {
                         let sup = Arc::clone(&ctx.supervisor);
                         tauri::async_runtime::block_on(async move { sup.stop_all().await });
+                    }
+                    // C3 (review nit): kill spawned MCP children on exit —
+                    // kill_on_drop only fires if the Child is dropped, and a
+                    // process exit doesn't drop AppState; a stdin-EOF-ignoring
+                    // server would otherwise outlive the app.
+                    let entries: Vec<_> = state.mcp.servers.lock().drain().collect();
+                    if !entries.is_empty() {
+                        tauri::async_runtime::block_on(async move {
+                            for (_, entry) in entries {
+                                entry.transport.shutdown().await;
+                            }
+                        });
                     }
                 }
             }

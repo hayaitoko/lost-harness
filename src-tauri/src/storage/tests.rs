@@ -62,17 +62,17 @@ fn fresh_in_memory_profile_has_all_tables() {
 
 #[test]
 fn schema_version_is_current_after_init_global() {
-    // Global schema is now v7 (v2 memory buckets + FTS5; v3 private-bucket
+    // Global schema is now v8 (v2 memory buckets + FTS5; v3 private-bucket
     // vector table for the meaning lane; v4 endpoints.supports_native_tools;
     // v5 skills metadata columns — Wave 4.1; v6 agent_types — Wave 4.3;
-    // v7 model_catalog.sha256+status — Wave 5.3 / M8).
+    // v7 model_catalog.sha256+status — Wave 5.3 / M8; v8 mcp_servers — C3).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 7);
+    assert_eq!(v, 8); // C3 added mcp_servers (v8)
 }
 
 #[test]

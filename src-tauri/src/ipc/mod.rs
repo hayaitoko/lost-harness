@@ -75,6 +75,10 @@ pub struct AppState {
     /// `set_skill_approval`/`delete_skill` can hot-register an approved skill
     /// as a callable Tool and unregister it on rejection/delete.
     pub tools: Arc<crate::tools::ToolDispatcher>,
+    /// C3: the live MCP server registry (spawned stdio children + their
+    /// registered tool names). The persisted config lives in `mcp_servers`;
+    /// this is derived session state.
+    pub mcp: Arc<crate::tools::mcp_stdio::McpRuntime>,
     /// A4: the machine's hardware profile, probed ONCE at boot and cached here.
     /// `hardware::probe()` shells out to `system_profiler` (hundreds of ms per
     /// call), so `probe_hardware` / `list_model_catalog` / `calculate_model_fit`
@@ -964,6 +968,152 @@ pub fn reset_budget_settings(
     let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
     db.reset_budget_cap().map_err(|e| e.to_string())?;
     Ok(BudgetSettings { cap_usd: None })
+}
+
+// ── MCP servers (C3 — registration/list/remove over the stdio transport) ────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegisterMcpServerArgs {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// "local" | "remote" (anything else fails closed to remote).
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub trusted_read_only: bool,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// What `register_mcp_server` / `list_mcp_servers` return per server.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpServerInfo {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub tier: String,
+    pub trusted_read_only: bool,
+    pub enabled: bool,
+    /// Whether a live child is currently running for this server.
+    pub running: bool,
+    /// The namespaced tool names currently registered (empty when not running).
+    pub tools: Vec<String>,
+}
+
+/// Register an MCP server: SPAWN + handshake + `tools/list` FIRST (fail-closed
+/// — a server that can't come up is never persisted), then persist the config
+/// and hot-register its tools through the untouched trust spine. Returns the
+/// server + its namespaced tools.
+#[tauri::command]
+pub async fn register_mcp_server(
+    state: State<'_, AppState>,
+    args: RegisterMcpServerArgs,
+) -> Result<McpServerInfo, String> {
+    if args.name.trim().is_empty() || args.command.trim().is_empty() {
+        return Err("an MCP server needs a non-empty name and command".to_string());
+    }
+    // Review fix (#2): reject a sanitized-NAMESPACE collision with an existing
+    // server. The `mcp__{server}__{tool}` separator is collision-free per
+    // (server, tool) — so the only cross-server collision domain is the server
+    // segment itself; letting two servers share it would let the EARLIER one
+    // silently pre-claim (and answer for) the later one's tool names.
+    let new_seg = crate::tools::mcp::sanitize_name_segment(args.name.trim());
+    let existing = state.storage.global().list_mcp_servers().map_err(|e| e.to_string())?;
+    if let Some(clash) = existing
+        .iter()
+        .find(|r| crate::tools::mcp::sanitize_name_segment(&r.name) == new_seg)
+    {
+        return Err(format!(
+            "an MCP server named \"{}\" already occupies the \"{new_seg}\" tool namespace — \
+             remove it first or pick a distinct name",
+            clash.name
+        ));
+    }
+    // Review fix (#7): unknown capability strings fail CLOSED — a typo must not
+    // silently shrink a tool's requirements (widening its availability).
+    for c in &args.capabilities {
+        if crate::tools::Capability::from_capability_str(c).is_none() {
+            return Err(format!(
+                "unknown capability \"{c}\" — valid names match the skill capability list"
+            ));
+        }
+    }
+    let row = crate::storage::McpServerRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: args.name.trim().to_string(),
+        command: args.command.trim().to_string(),
+        args: args.args,
+        tier: match args.tier.as_deref() {
+            Some("local") => "local".to_string(),
+            _ => "remote".to_string(), // ambiguous ⇒ remote (the stricter tier)
+        },
+        trusted_read_only: args.trusted_read_only,
+        capabilities: args.capabilities,
+        enabled: true,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    // Fail-closed ordering: bring the server up BEFORE persisting anything.
+    let tools = crate::tools::mcp_stdio::bring_up_server(&row, &state.tools, &state.mcp).await?;
+    if let Err(e) = state.storage.global().insert_mcp_server(&row) {
+        // Persist failed → tear the live half back down; never a half-state.
+        crate::tools::mcp_stdio::tear_down_server(&row.id, &state.tools, &state.mcp).await;
+        return Err(format!("couldn't persist the MCP server config: {e}"));
+    }
+    Ok(McpServerInfo {
+        id: row.id,
+        name: row.name,
+        command: row.command,
+        args: row.args,
+        tier: row.tier,
+        trusted_read_only: row.trusted_read_only,
+        enabled: row.enabled,
+        running: true,
+        tools,
+    })
+}
+
+/// The persisted MCP servers, annotated with live status.
+#[tauri::command]
+pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>, String> {
+    let rows = state.storage.global().list_mcp_servers().map_err(|e| e.to_string())?;
+    let live = state.mcp.servers.lock();
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let entry = live.get(&r.id);
+            McpServerInfo {
+                running: entry.is_some(),
+                tools: entry.map(|e| e.tool_names.clone()).unwrap_or_default(),
+                id: r.id,
+                name: r.name,
+                command: r.command,
+                args: r.args,
+                tier: r.tier,
+                trusted_read_only: r.trusted_read_only,
+                enabled: r.enabled,
+            }
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoveMcpServerArgs {
+    pub id: String,
+}
+
+/// Remove an MCP server: unregister its tools + kill its child BEFORE deleting
+/// the row ("never a live Tool serving a deleted config" — the delete_skill /
+/// remove_local_model precedent). Returns whether a row was removed.
+#[tauri::command]
+pub async fn remove_mcp_server(
+    state: State<'_, AppState>,
+    args: RemoveMcpServerArgs,
+) -> Result<bool, String> {
+    crate::tools::mcp_stdio::tear_down_server(&args.id, &state.tools, &state.mcp).await;
+    state.storage.global().delete_mcp_server(&args.id).map_err(|e| e.to_string())
 }
 
 // ── cancel_message (C7 — M6 Slice 4a: cooperative turn cancellation) ────────

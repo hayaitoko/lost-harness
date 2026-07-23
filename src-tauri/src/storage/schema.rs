@@ -9,7 +9,7 @@
 
 /// Returns the current schema version for the GLOBAL database.
 /// Bump when adding a new global migration.
-pub const GLOBAL_SCHEMA_VERSION: i32 = 7;
+pub const GLOBAL_SCHEMA_VERSION: i32 = 8;
 
 /// Returns the current schema version for each PROFILE database.
 /// Bump when adding a new per-profile migration. Profile and global
@@ -47,6 +47,8 @@ pub const GLOBAL_TABLES: &[&str] = &[
     "app_settings",
     // 8. agent_types — declarative agent-type personas (Wave 4.3), globally shared
     "agent_types",
+    // 9. mcp_servers — persisted MCP server configs (C3), globally shared
+    "mcp_servers",
 ];
 
 /// CREATE TABLE statements for global.db (in dependency order).
@@ -124,6 +126,22 @@ CREATE TABLE IF NOT EXISTS agent_types (
     trigger_examples  TEXT NOT NULL DEFAULT '[]',
     approval_status   TEXT NOT NULL DEFAULT 'pending',
     source            TEXT NOT NULL DEFAULT 'user',
+    created_at        INTEGER NOT NULL
+);
+
+-- C3: persisted MCP server configs (the registration store). `args` and
+-- `capabilities` are JSON arrays of strings; `tier` is "local" | "remote"
+-- (ambiguous ⇒ remote, matching McpTrustTier::default). The runtime transport
+-- (a spawned child) is derived session state — never persisted here.
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    command           TEXT NOT NULL,
+    args              TEXT NOT NULL DEFAULT '[]',
+    tier              TEXT NOT NULL DEFAULT 'remote',
+    trusted_read_only INTEGER NOT NULL DEFAULT 0,
+    capabilities      TEXT NOT NULL DEFAULT '[]',
+    enabled           INTEGER NOT NULL DEFAULT 1,
     created_at        INTEGER NOT NULL
 );
 

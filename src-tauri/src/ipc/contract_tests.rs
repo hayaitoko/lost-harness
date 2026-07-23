@@ -84,6 +84,7 @@ fn test_app() -> App<MockRuntime> {
         classifier: Arc::new(HeuristicClassifier::new()),
         embedder: None,
         tools,
+        mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new()),
         // Default profile (total_ram 0) — the calculator contract test only
         // checks the command dispatches + returns a CalcOutput shape, not fit.
         hardware: Arc::new(Default::default()),
@@ -125,6 +126,9 @@ fn test_app() -> App<MockRuntime> {
             ipc::set_budget_settings,
             ipc::reset_budget_settings,
             ipc::cancel_message,
+            ipc::register_mcp_server,
+            ipc::list_mcp_servers,
+            ipc::remove_mcp_server,
             // B8: the rest of the registered surface (every command except the
             // two that take a bare `AppHandle` — send_message, download_model —
             // which structurally can't register under MockRuntime).
@@ -779,6 +783,8 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "get_budget_settings",
         "set_budget_settings",
         "reset_budget_settings",
+        "register_mcp_server",
+        "remove_mcp_server",
     ];
     for cmd in args_cmds {
         let res = call(&webview, cmd, flat.clone());
@@ -798,6 +804,7 @@ fn every_no_arg_command_dispatches() {
     // body (which may then return a domain result/error) — but NEVER an
     // arg-shape rejection, and never "command not found" (i.e. it's registered).
     let no_arg_cmds = [
+        "list_mcp_servers",
         "list_skills",
         "get_skill_reflect_enabled",
         "list_agent_types",

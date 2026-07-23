@@ -802,6 +802,49 @@ export async function cancelMessage(conversationId: string): Promise<boolean> {
   return false;
 }
 
+// ── MCP servers (C3 — stdio wire transport) ────────────────────────────────
+
+/** One registered MCP server + its live status. Mirrors `McpServerInfo`. */
+export interface McpServer {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  /** "local" | "remote" (remote is the stricter default). */
+  tier: string;
+  trusted_read_only: boolean;
+  enabled: boolean;
+  running: boolean;
+  /** The namespaced tool names currently registered (mcp__server__tool). */
+  tools: string[];
+}
+
+/** Register an MCP server (spawn + handshake first — fail-closed; persisted on
+ *  success). Returns the server + its namespaced tools. */
+export async function registerMcpServer(server: {
+  name: string;
+  command: string;
+  args?: string[];
+  tier?: "local" | "remote";
+  trusted_read_only?: boolean;
+  capabilities?: string[];
+}): Promise<McpServer | null> {
+  if (isTauri()) return tauriInvoke<McpServer>("register_mcp_server", { args: server });
+  return null;
+}
+
+/** The persisted MCP servers, annotated with live status. */
+export async function listMcpServers(): Promise<McpServer[]> {
+  if (isTauri()) return tauriInvoke<McpServer[]>("list_mcp_servers", {});
+  return [];
+}
+
+/** Remove an MCP server (its tools unregister + its child dies BEFORE the row). */
+export async function removeMcpServer(id: string): Promise<boolean> {
+  if (isTauri()) return tauriInvoke<boolean>("remove_mcp_server", { args: { id } });
+  return false;
+}
+
 /** A downloaded local model. Mirrors `LocalModelInfo` in `ipc/mod.rs`. */
 export interface LocalModel {
   id: string;

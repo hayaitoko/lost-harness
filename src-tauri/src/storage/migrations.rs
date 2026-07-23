@@ -189,6 +189,24 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE model_catalog ADD COLUMN sha256 TEXT NOT NULL DEFAULT '';
               ALTER TABLE model_catalog ADD COLUMN status TEXT NOT NULL DEFAULT 'ready';",
     },
+    Migration {
+        version: 8,
+        // C3: the persisted MCP server-config store. Same dual-definition
+        // convention (also in GLOBAL_SCHEMA_SQL) — a no-op on a fresh install,
+        // a real upgrade on a v7 DB.
+        name: "mcp_servers_table",
+        sql: "CREATE TABLE IF NOT EXISTS mcp_servers (
+            id                TEXT PRIMARY KEY,
+            name              TEXT NOT NULL,
+            command           TEXT NOT NULL,
+            args              TEXT NOT NULL DEFAULT '[]',
+            tier              TEXT NOT NULL DEFAULT 'remote',
+            trusted_read_only INTEGER NOT NULL DEFAULT 0,
+            capabilities      TEXT NOT NULL DEFAULT '[]',
+            enabled           INTEGER NOT NULL DEFAULT 1,
+            created_at        INTEGER NOT NULL
+        );",
+    },
 ];
 
 /// All per-profile DB migrations, in order.
