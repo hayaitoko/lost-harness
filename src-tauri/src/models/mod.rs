@@ -22,6 +22,8 @@ pub mod gguf_meta;
 pub mod hardware;
 pub mod hf_search;
 pub mod pricing;
+#[cfg(feature = "local-runner")]
+pub mod runner;
 pub mod seat;
 pub mod sse;
 

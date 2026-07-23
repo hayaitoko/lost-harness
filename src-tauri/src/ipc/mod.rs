@@ -71,6 +71,12 @@ pub struct AppState {
     /// when a profile has semantic search enabled (Wave 1.2); `None` ⇒ no model
     /// dir configured, saves stay keyword-indexed.
     pub embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
+    /// M8 S4: the bundled-sidecar context (supervisor + resolved binary).
+    /// `None` ⇒ no sidecar binary resolved at boot — local models need an
+    /// external runner. Used by `remove_local_model` (stop-before-delete) and
+    /// the app-exit teardown.
+    #[cfg(feature = "local-runner")]
+    pub local_runner: Option<Arc<crate::models::runner::LocalRunnerContext>>,
 }
 
 // ── Response types ───────────────────────────────────────────────────────
@@ -730,8 +736,23 @@ pub struct RemoveModelArgs {
 /// Delete a downloaded model — its file AND its `model_catalog` row (M8 S6). A
 /// seat that pointed at it falls back to `inherit` automatically at resolve time
 /// (resolve_seat inherits when the provider is gone), so no dangling reference.
+/// M8 S4: the model's sidecar (if running) is stopped BEFORE the file is
+/// deleted, and its derived provider is unregistered — never a runner serving
+/// a deleted file.
 #[tauri::command]
-pub fn remove_local_model(state: State<'_, AppState>, args: RemoveModelArgs) -> Result<bool, String> {
+pub async fn remove_local_model(
+    state: State<'_, AppState>,
+    args: RemoveModelArgs,
+) -> Result<bool, String> {
+    #[cfg(feature = "local-runner")]
+    {
+        if let Some(ctx) = &state.local_runner {
+            ctx.supervisor.stop(&args.id).await;
+        }
+        state
+            .model_manager
+            .remove_provider(&crate::models::runner::provider_id_for(&args.id));
+    }
     let global = state.storage.global();
     if let Ok(Some(m)) = global.get_model(&args.id) {
         // Best-effort file delete (the row removal is the source of truth).

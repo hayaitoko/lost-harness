@@ -187,8 +187,24 @@ pub struct AgentLoop {
     /// Wave 4.2: per-conversation high-water — a prior conversation is reflected
     /// at most once per process run. `Arc` so the detached reflect task shares it.
     reflect_marks: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// M8 S4: the bundled-sidecar context (supervisor + resolved binary), when
+    /// the feature is on AND the vendored binary resolved at boot. `None` ⇒
+    /// `find_or_start_local_provider` degrades to the plain snapshot lookup —
+    /// exactly the pre-S4 behavior. `lib.rs` sets it.
+    #[cfg(feature = "local-runner")]
+    local_runner: Option<Arc<crate::models::runner::LocalRunnerContext>>,
     stream_lock: tokio::sync::Mutex<()>,
 }
+
+/// A borrowed lazy-runner reference for the free-fn reroute path
+/// ([`resolve_turn_outcome`]): the sidecar context + the storage it reads the
+/// model catalog from. A cfg-stable alias so callers (incl. tests) can always
+/// pass `None` regardless of feature flags.
+#[cfg(feature = "local-runner")]
+pub(crate) type LocalRunnerRef<'a> =
+    Option<(&'a crate::models::runner::LocalRunnerContext, &'a Storage)>;
+#[cfg(not(feature = "local-runner"))]
+pub(crate) type LocalRunnerRef<'a> = Option<std::convert::Infallible>;
 
 /// A cached cloud-safety verdict for a conversation's replayable history.
 #[derive(Debug, Clone)]
@@ -228,8 +244,22 @@ impl AgentLoop {
             flush_marks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             skill_drafter: None,
             reflect_marks: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            #[cfg(feature = "local-runner")]
+            local_runner: None,
             stream_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Wire the bundled-sidecar context (M8 S4). Without it the loop never
+    /// lazy-spawns — `RouteLocal` requires an already-registered local provider,
+    /// the pre-S4 behavior. `lib.rs` sets it when the vendored binary resolves.
+    #[cfg(feature = "local-runner")]
+    pub fn with_local_runner(
+        mut self,
+        ctx: Arc<crate::models::runner::LocalRunnerContext>,
+    ) -> Self {
+        self.local_runner = Some(ctx);
+        self
     }
 
     /// Wire the flush's fact classifier (Wave 3.5). Without it the pre-compaction
@@ -384,8 +414,9 @@ impl AgentLoop {
                 // `Local` AND whose `base_url` is private; this catches the
                 // case where someone marked a Cloud provider pointing at
                 // localhost (rare but possible) and gives the user a way
-                // out.
-                let local = self.find_local_provider().ok_or_else(|| {
+                // out. The empty-snapshot case lazily starts the bundled
+                // sidecar for a downloaded model first (M8 S4).
+                let local = self.find_or_start_local_provider().await.ok_or_else(|| {
                     anyhow!("gate routed to local model, but no local provider is registered")
                 })?;
                 let local_is_cloud = !is_private_endpoint(&local.base_url);
@@ -424,7 +455,7 @@ impl AgentLoop {
                         &classifier_cfg,
                     )
                 {
-                    let Some(local) = self.find_local_provider() else {
+                    let Some(local) = self.find_or_start_local_provider().await else {
                         let reason = "This conversation can't be safely continued on a cloud \
                                       model (it contains earlier private content, or is too long \
                                       to verify), and no local model is configured to continue it \
@@ -1135,6 +1166,54 @@ impl AgentLoop {
             .find(|p| p.is_local() && p.is_private())
     }
 
+    /// The borrowed lazy-runner reference for the free-fn reroute path.
+    #[cfg(feature = "local-runner")]
+    fn local_runner_ref(&self) -> LocalRunnerRef<'_> {
+        self.local_runner
+            .as_deref()
+            .map(|ctx| (ctx, self.storage.as_ref()))
+    }
+    #[cfg(not(feature = "local-runner"))]
+    fn local_runner_ref(&self) -> LocalRunnerRef<'_> {
+        None
+    }
+
+    /// [`Self::find_local_provider`], with the M8 S4 lazy-spawn seam behind it:
+    /// when the snapshot has no local provider but a downloaded `ready` model
+    /// exists and the bundled sidecar is wired, bring the sidecar up and
+    /// register it — so `RouteLocal` stops failing on a machine that has a
+    /// model but no external runner. Failure to start degrades to `None`
+    /// (the caller's existing refuse-loudly path), never a panic or a hang.
+    async fn find_or_start_local_provider(&self) -> Option<Provider> {
+        if let Some(p) = self.find_local_provider() {
+            return Some(p);
+        }
+        #[cfg(feature = "local-runner")]
+        if let Some(ctx) = &self.local_runner {
+            match crate::models::runner::ensure_running(
+                &ctx.supervisor,
+                &self.model_manager,
+                &self.storage,
+                &ctx.paths,
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(p) => return Some(p),
+                Err(e) => {
+                    tracing::info!(
+                        target: "lhp::runner",
+                        error = %e,
+                        "lazy sidecar start unavailable — falling through to refuse-loudly"
+                    );
+                }
+            }
+        }
+        None
+    }
+
     /// Persist the user message, then run the agentic loop: stream a turn,
     /// execute any tool calls the model made **in its own output**, feed the
     /// (guard-wrapped) results back, and repeat until the model answers
@@ -1550,6 +1629,7 @@ impl AgentLoop {
                     &|from, to, reason| {
                         sink.local_reroute(&conv_id, reason, from, to);
                     },
+                    self.local_runner_ref(),
                 )
                 .await?;
             provider = new_provider;
@@ -1707,6 +1787,49 @@ fn reroute_banner(local_provider_name: &str) -> String {
 /// round's `client.stream_chat(...)?` as a propagated error — there is no
 /// catch-and-retry-on-cloud path here, and none must be added.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// M8 S4: bring the bundled sidecar up (when wired) and retry
+/// `enforce_local_routing` exactly once over the refreshed snapshot. The
+/// structural guarantee is preserved — the retry goes through the SAME
+/// `enforce_local_routing`, never a hand-rolled predicate. `None` on any
+/// failure (no runner wired, no ready model, spawn failed) — the caller's
+/// hard-deny stands.
+#[cfg_attr(not(feature = "local-runner"), allow(unused_variables))]
+async fn lazy_start_then_retry(
+    model_manager: &ModelManager,
+    routing: &RoutingRequirement,
+    local_runner: LocalRunnerRef<'_>,
+) -> Option<(Provider, ModelClient)> {
+    #[cfg(feature = "local-runner")]
+    if let Some((ctx, storage)) = local_runner {
+        match crate::models::runner::ensure_running(
+            &ctx.supervisor,
+            model_manager,
+            storage,
+            &ctx.paths,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {
+                let candidates = model_manager.list_providers();
+                if let Ok(local) = enforce_local_routing(routing, &candidates) {
+                    return model_manager.get_client(&local.id).map(|c| (local.clone(), c));
+                }
+            }
+            Err(e) => {
+                tracing::info!(
+                    target: "lhp::runner",
+                    error = %e,
+                    "lazy sidecar start for tool reroute unavailable"
+                );
+            }
+        }
+    }
+    None
+}
+
 pub(crate) async fn resolve_turn_outcome(
     tools: &ToolDispatcher,
     model_manager: &ModelManager,
@@ -1721,6 +1844,10 @@ pub(crate) async fn resolve_turn_outcome(
     // inside the reroute loop, and `stream_to_provider`'s future must stay
     // `Send` for the Tauri command boundary.
     on_reroute: &(dyn Fn(&str, &str, &str) + Send + Sync),
+    // M8 S4: when the reroute finds NO local provider in the snapshot, this
+    // (if wired) lazily starts the bundled sidecar and the lookup retries
+    // once. `None` (tests, feature-off) = the pre-S4 hard-deny behavior.
+    local_runner: LocalRunnerRef<'_>,
 ) -> Result<(Option<ChatMessage>, Provider, ModelClient, bool, &'static str)> {
     // Backstop, not a designed retry count — `remaining` strictly shrinks
     // each pass, so a reroute chain terminates naturally; hitting the cap
@@ -1759,7 +1886,12 @@ pub(crate) async fn resolve_turn_outcome(
                     Ok(local) => model_manager
                         .get_client(&local.id)
                         .map(|c| (local.clone(), c)),
-                    Err(_) => None,
+                    Err(_) => {
+                        // M8 S4: empty snapshot — lazily start the bundled
+                        // sidecar, then retry the SAME structural check once
+                        // (never hand-rolled). Failure stays the hard-deny.
+                        lazy_start_then_retry(model_manager, &routing, local_runner).await
+                    }
                 };
                 match found {
                     Some((local, local_client)) => {

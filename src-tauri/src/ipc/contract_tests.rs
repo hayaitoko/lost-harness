@@ -81,6 +81,8 @@ fn test_app() -> App<MockRuntime> {
         ask_human: Arc::new(crate::ipc::ask_human::AskHumanRegistry::new()),
         classifier: Arc::new(HeuristicClassifier::new()),
         embedder: None,
+        #[cfg(feature = "local-runner")]
+        local_runner: None,
     };
 
     let app = mock_builder()

@@ -89,6 +89,53 @@ pub fn run() {
             let model_manager = Arc::new(ModelManager::new());
             hydrate_providers_from_storage(&storage, &model_manager);
 
+            // M8 S4 boot pass (right after provider hydration, same discipline
+            // as crash-recovery): reap sidecars orphaned by a hard crash of the
+            // previous run, then integrity-sweep the model catalog — a missing
+            // or truncated model file is quarantined, never silently served
+            // (verified-before-runnable corollary 3). Cheap existence+size
+            // checks only; full re-hash is an opt-in Settings action. Does NOT
+            // spawn anything — spawn stays lazy. Best-effort, never bricks boot.
+            #[cfg(feature = "local-runner")]
+            {
+                let pid_dir = base_path.join("models").join("local");
+                let reaped = crate::models::runner::reap_orphan_sidecars(&pid_dir);
+                if reaped > 0 {
+                    tracing::warn!(reaped, "reaped orphaned sidecar process(es) at boot");
+                }
+                let report =
+                    crate::models::runner::sweep_local_model_integrity_at_boot(&storage, false);
+                if !report.quarantined.is_empty() {
+                    tracing::warn!(
+                        quarantined = ?report.quarantined,
+                        "boot integrity sweep quarantined local model(s)"
+                    );
+                }
+            }
+
+            // M8 S4: the bundled llama.cpp sidecar context. `None` when no
+            // binary resolves (e.g. a build without the vendored tree) — local
+            // models then need an external runner, exactly the pre-S4 behavior.
+            #[cfg(feature = "local-runner")]
+            let local_runner_ctx: Option<Arc<crate::models::runner::LocalRunnerContext>> =
+                match resolve_sidecar_bin(app) {
+                    Some(bin) => {
+                        tracing::info!(bin = %bin.display(), "bundled llama.cpp sidecar available");
+                        Some(Arc::new(crate::models::runner::LocalRunnerContext {
+                            supervisor: Arc::new(crate::models::runner::LocalRunnerSupervisor::real(
+                                base_path.join("models").join("local"),
+                            )),
+                            paths: crate::models::runner::SidecarPaths { bin },
+                        }))
+                    }
+                    None => {
+                        tracing::info!(
+                            "no sidecar binary resolved — local models need an external runner"
+                        );
+                        None
+                    }
+                };
+
             // Privacy classifier. The trained ONNX ensemble (bge-small +
             // distilbert, INT8) fused with the layer-0 rules, loaded from
             // <storage>/models/classifier/ if its models are installed;
@@ -187,25 +234,30 @@ pub fn run() {
                 Arc::clone(&model_manager),
             ));
 
-            let agent_loop = Arc::new(
-                AgentLoop::new(
-                    gate,
-                    Arc::clone(&model_manager),
-                    Arc::clone(&storage),
-                    tools,
-                )
-                .with_embedder(embedder.clone())
-                // Wave 3.5: enable the pre-compaction flush (local-model durable
-                // -fact extraction over about-to-be-trimmed turns).
-                .with_flush_classifier(Arc::clone(&classifier))
-                // Wave 4.2: enable autonomous skill drafting (local-model
-                // reflection over a finished conversation → a Pending draft).
-                // Gated at runtime by the global `skill_reflect_enabled` toggle
-                // (default off); drafts are always Pending (human-reviewed).
-                .with_skill_drafter(Arc::new(
-                    crate::agent::skill_reflect::LocalModelDrafter::new(Arc::clone(&model_manager)),
-                )),
-            );
+            let agent_loop = AgentLoop::new(
+                gate,
+                Arc::clone(&model_manager),
+                Arc::clone(&storage),
+                tools,
+            )
+            .with_embedder(embedder.clone())
+            // Wave 3.5: enable the pre-compaction flush (local-model durable
+            // -fact extraction over about-to-be-trimmed turns).
+            .with_flush_classifier(Arc::clone(&classifier))
+            // Wave 4.2: enable autonomous skill drafting (local-model
+            // reflection over a finished conversation → a Pending draft).
+            // Gated at runtime by the global `skill_reflect_enabled` toggle
+            // (default off); drafts are always Pending (human-reviewed).
+            .with_skill_drafter(Arc::new(
+                crate::agent::skill_reflect::LocalModelDrafter::new(Arc::clone(&model_manager)),
+            ));
+            // M8 S4: hand the loop the lazy-spawn seam (when a sidecar resolved).
+            #[cfg(feature = "local-runner")]
+            let agent_loop = match &local_runner_ctx {
+                Some(ctx) => agent_loop.with_local_runner(Arc::clone(ctx)),
+                None => agent_loop,
+            };
+            let agent_loop = Arc::new(agent_loop);
 
             // Wave 4.3c/4.4: the background runner that drains `work_items`
             // and actually executes a `delegate` dispatch (see
@@ -217,6 +269,19 @@ pub fn run() {
                 Arc::clone(&storage),
             );
 
+            // M8 S4: periodic idle sweep — an unused sidecar shuts down after
+            // ~10 min (in-flight-guarded; a long generation is never killed).
+            #[cfg(feature = "local-runner")]
+            if let Some(ctx) = &local_runner_ctx {
+                let sup = Arc::clone(&ctx.supervisor);
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        sup.idle_sweep().await;
+                    }
+                });
+            }
+
             let state = AppState {
                 agent_loop,
                 model_manager,
@@ -225,6 +290,8 @@ pub fn run() {
                 ask_human,
                 classifier: Arc::clone(&classifier),
                 embedder,
+                #[cfg(feature = "local-runner")]
+                local_runner: local_runner_ctx,
             };
             app.manage(state);
 
@@ -277,9 +344,83 @@ pub fn run() {
             ipc::get_memory_settings,
             ipc::set_memory_settings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Lost Harness");
+        .build(tauri::generate_context!())
+        .expect("error while building Lost Harness")
+        .run(|app_handle, event| {
+            // M8 S4 teardown — never a zombie: on app exit, best-effort
+            // stop_all over every live sidecar (the pidfile reap at next boot
+            // is the net for a hard crash that never reaches this).
+            #[cfg(feature = "local-runner")]
+            if matches!(event, tauri::RunEvent::Exit) {
+                use tauri::Manager;
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    if let Some(ctx) = &state.local_runner {
+                        let sup = Arc::clone(&ctx.supervisor);
+                        tauri::async_runtime::block_on(async move { sup.stop_all().await });
+                    }
+                }
+            }
+            let _ = (&app_handle, &event);
+        });
 }
+
+/// Resolve the vendored `llama-server` binary (M8 S4). Order: the
+/// `LHP_LLAMA_SERVER_BIN` env override (dev/live-test) → the app bundle's
+/// resources (`bundle.resources` maps `vendor/llama-cpp` → `llama-cpp`) → the
+/// repo's vendor tree (debug/`tauri dev` fallback). `None` = no sidecar; local
+/// models then need an external runner (honest degradation, logged).
+#[cfg(feature = "local-runner")]
+fn resolve_sidecar_bin(app: &tauri::App) -> Option<PathBuf> {
+    use tauri::Manager;
+    let bin = 'find: {
+        if let Some(p) = std::env::var_os("LHP_LLAMA_SERVER_BIN").map(PathBuf::from) {
+            if p.is_file() {
+                break 'find Some(p);
+            }
+            tracing::warn!(path = %p.display(), "LHP_LLAMA_SERVER_BIN set but not a file — ignoring");
+        }
+        if let Ok(p) = app.path().resolve(
+            "llama-cpp/macos-arm64/llama-server",
+            tauri::path::BaseDirectory::Resource,
+        ) {
+            if p.is_file() {
+                break 'find Some(p);
+            }
+        }
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/llama-cpp/macos-arm64/llama-server");
+        if dev.is_file() {
+            break 'find Some(dev);
+        }
+        None
+    }?;
+    // Finding #4: a `bundle.resources` copy can lose its executable bit through
+    // the packaging pipeline (unlike Tauri's `externalBin`, which the design
+    // deliberately can't use — the sidecar is 9 dylibs, not one file). Set +x
+    // defensively so the lazy spawn doesn't fail with EACCES on a shipped build.
+    // (Gatekeeper/notarization coverage of `Resources/` is the design's flagged
+    // build-verify item — it requires a real packaged build to check, so it's
+    // out of headless scope.)
+    ensure_executable(&bin);
+    Some(bin)
+}
+
+/// Ensure `path` has the owner-executable bit set (best-effort; unix only).
+#[cfg(unix)]
+fn ensure_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        let mode = perms.mode();
+        if mode & 0o111 != 0o111 {
+            perms.set_mode(mode | 0o755);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &std::path::Path) {}
 
 /// Resolve the storage root: `$HOME/Documents/Lost-Harness/`.
 /// Falls back to `~/Documents/Lost-Harness/` if `HOME` is unset.

@@ -69,12 +69,21 @@ libc = "0.2"
 # M1 agent-loop integration tests. Keeps the test-only symbol out of
 # release builds.
 tauri = { version = "2.11", features = ["test"] }
+# tokio::time::{pause, advance} for the sidecar supervisor's backoff/idle
+# tests (M8 S4) — virtual time, no real sleeping. Dev-only; features unify
+# additively with the main dependency.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
-default = ["onnx-classifier"]
+default = ["onnx-classifier", "local-runner"]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
 # The trained ONNX privacy classifier (bge-small + distilbert ensemble). Default
 # on; disable with `--no-default-features` to build the rules-only fallback with
 # no native ONNX Runtime dependency.
 onnx-classifier = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+# The bundled llama.cpp sidecar (M8 S4): `models/runner.rs` — spawn/supervise
+# `llama-server` from the vendored `vendor/llama-cpp` tree. No extra crates
+# (tokio::process + reqwest are already deps); the feature exists so
+# `--no-default-features` builds a core with no sidecar surface at all.
+local-runner = []

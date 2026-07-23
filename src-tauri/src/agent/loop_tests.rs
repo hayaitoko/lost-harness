@@ -603,6 +603,7 @@ async fn resolve_turn_outcome_reroutes_to_local_and_hides_reason() {
         true,
         "allow",
         &move |_from, _to, reason| fired2.lock().push(reason.to_string()),
+        None, // no lazy runner in tests — pre-S4 behavior
     )
     .await
     .expect("resolve ok");
@@ -663,6 +664,7 @@ async fn resolve_turn_outcome_no_local_candidate_stays_cloud_with_hard_deny() {
         &move |_, _, _| {
             fired2.fetch_add(1, Ordering::SeqCst);
         },
+        None, // no lazy runner in tests — pre-S4 behavior
     )
     .await
     .expect("resolve ok");
