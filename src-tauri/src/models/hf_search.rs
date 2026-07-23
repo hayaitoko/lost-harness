@@ -384,8 +384,15 @@ fn resolve_url(model_id: &str, path: &str) -> String {
 
 #[derive(Debug, Deserialize)]
 struct RawSearchRow {
-    #[serde(alias = "modelId")]
-    id: String,
+    // The live HF API returns BOTH `id` and `modelId` (identical values). A
+    // serde `alias` makes them collide ("duplicate field `id`") when both are
+    // present — the real-API bug the A5 live run caught — so read them as
+    // SEPARATE optional fields and prefer `id` (canonical in the current API;
+    // `modelId` is the older name — accepting either is future/back-proof).
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "modelId")]
+    model_id: Option<String>,
     // Option, not bare u64: HF can emit `null` for counts it can't compute, and
     // `#[serde(default)]` alone only covers a MISSING field — an explicit null
     // would otherwise fail the whole page. Absent stays absent (honest), never 0.
@@ -397,22 +404,24 @@ struct RawSearchRow {
     tags: Option<Vec<String>>,
 }
 
-/// Parse the JSON body of a `/api/models` search response into summaries. Pure.
+/// Parse the JSON body of a `/api/models` search response into summaries. A row
+/// with no usable id at all is skipped (never a blank entry). Pure.
 pub fn parse_search_results(json: &str) -> anyhow::Result<Vec<HfModelSummary>> {
     let rows: Vec<RawSearchRow> = serde_json::from_str(json)?;
     Ok(rows
         .into_iter()
-        .map(|r| {
-            let publisher = publisher_of(&r.id).to_string();
+        .filter_map(|r| {
+            let id = r.id.or(r.model_id).filter(|s| !s.is_empty())?;
+            let publisher = publisher_of(&id).to_string();
             let provenance = provenance_of(&publisher);
-            HfModelSummary {
-                id: r.id,
+            Some(HfModelSummary {
+                id,
                 publisher,
                 downloads: r.downloads,
                 likes: r.likes,
                 tags: r.tags.unwrap_or_default(),
                 provenance,
-            }
+            })
         })
         .collect())
 }
@@ -681,15 +690,18 @@ mod tests {
 
     #[test]
     fn search_results_parse_and_carry_provenance() {
-        // Shape verified live in the design doc: id/downloads/likes/tags —
-        // including explicit nulls, which real APIs emit.
+        // Mirrors the REAL HF API: a row carries BOTH `id` and `modelId`
+        // (identical) — the A5 live run proved this, and a naive serde alias
+        // errors "duplicate field `id`" on it. Plus explicit nulls, a
+        // `modelId`-only (older-API) row, and a no-id row (must be skipped).
         let json = r#"[
-            {"id":"Qwen/Qwen3-0.6B-GGUF","downloads":123456,"likes":42,"tags":["gguf","conversational"]},
+            {"_id":"x","id":"Qwen/Qwen3-0.6B-GGUF","modelId":"Qwen/Qwen3-0.6B-GGUF","downloads":123456,"likes":42,"tags":["gguf","conversational"]},
             {"id":"randomuser/mystery-gguf","downloads":null,"likes":null,"tags":null},
-            {"modelId":"unsloth/Qwen3-4B-GGUF","tags":["gguf","moe"]}
+            {"modelId":"unsloth/Qwen3-4B-GGUF","tags":["gguf","moe"]},
+            {"likes":3,"tags":["gguf"]}
         ]"#;
         let out = parse_search_results(json).unwrap();
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 3, "the no-id row is skipped");
         assert_eq!(out[0].id, "Qwen/Qwen3-0.6B-GGUF");
         assert_eq!(out[0].publisher, "Qwen");
         assert_eq!(out[0].provenance, Provenance::Trusted);
