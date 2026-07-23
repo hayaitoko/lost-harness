@@ -7,16 +7,16 @@
   (storage, classifier + embedder, model manager, privacy gate, approval
   spine, tool dispatcher, agent loop, background work runner) and hands them
   to Tauri via `.manage()`. The command surface has grown a lot since this
-  doc was last written straight through — **44 commands** registered in
+  doc was last written straight through — **45 commands** registered in
   `lib.rs`'s `invoke_handler!` (`lib.rs:234-279`), not the 5-command M1
   surface an earlier version of this doc described, and `AppState` carries
   **7** `Arc` fields, not 4.
 
-- **Command surface — all 44, grouped by area** (`lib.rs:234-279`; every name
+- **Command surface — all 45, grouped by area** (`lib.rs:234-279`; every name
   is a fn in `ipc/mod.rs`):
-  - **conversation/chat** (7) — `get_app_version`, `get_active_profile`,
-    `list_profiles`, `list_conversations`, `create_conversation`,
-    `get_messages`, `send_message`.
+  - **conversation/chat** (8) — `get_app_version`, `get_active_profile`,
+    `set_active_profile`, `list_profiles`, `list_conversations`,
+    `create_conversation`, `get_messages`, `send_message`.
   - **providers/models** (4) — `list_providers`, `add_provider`,
     `remove_provider`, `list_models`.
   - **classifier/privacy** (5) — `get_classifier_settings`,
@@ -265,17 +265,18 @@
 - **Gotchas / watch-items**
   - **`contract_tests.rs`'s `MockRuntime` harness only registers 14 of the
     44 production commands** (`contract_tests.rs:96-111`): `get_app_version`,
-    `get_active_profile`, `list_profiles`, `list_conversations`,
-    `create_conversation`, `get_messages`, `list_providers`, `add_provider`,
-    `remove_provider`, `list_models`, `get_classifier_settings`,
-    `set_classifier_settings`, `set_redaction_enabled`,
-    `reset_classifier_settings`. Of those, only **six command-groups** have
-    an actual correct-shape/broken-shape test pair:
-    `create_conversation`, `list_conversations`, `get_messages`,
-    `add_provider`, `list_models`, and the classifier-settings group
-    (exercised together as one round-trip test,
-    `classifier_settings_round_trip_through_real_ipc`,
-    `contract_tests.rs:419-483`, plus one broken-shape test at 486-499).
+    `get_active_profile`, `set_active_profile`, `list_profiles`,
+    `list_conversations`, `create_conversation`, `get_messages`,
+    `list_providers`, `add_provider`, `remove_provider`, `list_models`,
+    `get_classifier_settings`, `set_classifier_settings`,
+    `set_redaction_enabled`, `reset_classifier_settings`. Of those, only
+    **seven command-groups** have real coverage: a correct-shape/broken-shape
+    test pair for `create_conversation`, `list_conversations`, `get_messages`,
+    `add_provider`, `list_models`; the classifier-settings group (one
+    round-trip test, `classifier_settings_round_trip_through_real_ipc`,
+    plus one broken-shape test); and the active-profile group (a set→get
+    round-trip, `active_profile_round_trips_through_real_ipc`, plus a
+    validation-rejection test, `set_active_profile_rejects_a_confusable_name`).
     **Every command added since the M1 surface — all of memory, skills,
     seats, agent types, packs, hardware/catalog/download, tool rules,
     `explain_classification`, `get_usage_summary`, `resolve_tool_approval`,
@@ -284,13 +285,19 @@
     can't compile against `MockRuntime`; covered instead by
     `agent::loop_tests` for business logic, never through real IPC arg
     deserialization).
-  - **`get_active_profile` and `list_profiles` are still stubs.**
-    `get_active_profile` (`ipc/mod.rs:254-257`) always returns `"personal"`;
-    `list_profiles` (`ipc/mod.rs:261-269`) always returns the same
-    hardcoded 4-name list. No per-profile routing is wired at this layer —
-    the frontend's `profiles.ts` store carries the real state client-side
-    (`switchProfile` is a local/`localStorage`-only no-op backend-wise, per
-    `frontend-svelte.md`).
+  - **`get_active_profile` now persists; `list_profiles` is still a stub.**
+    `get_active_profile` reads the `active_profile` row from `global.db`'s
+    `app_settings` (via `GlobalDb::active_profile`), falling back to
+    `"personal"` only when nothing is stored yet or the stored value fails the
+    profile-name allowlist. Its writer is `set_active_profile`, which validates
+    the id with `crate::storage::validate_profile_name` before the write; the
+    frontend's `switchProfile` (`stores/profiles.ts`) calls it through
+    `api.setActiveProfile`, so the last-used profile survives an app restart.
+    `list_profiles` (`ipc/mod.rs`) is unchanged — still the hardcoded 4-name
+    list; no per-profile routing is wired at this layer beyond the active-id
+    round-trip. Round-trip + validation are locked by
+    `active_profile_round_trips_through_real_ipc` /
+    `set_active_profile_rejects_a_confusable_name` in `contract_tests.rs`.
   - **`get_app_version` returns a hardcoded literal** `"0.1.0-m1"`
     (`ipc/mod.rs:247-250`), not `tauri.conf.json`'s `version` (`"0.1.0"`) or
     `CARGO_PKG_VERSION`. Unchanged from the original M1 surface — still
@@ -395,11 +402,14 @@
     `vite.config.ts`'s `rollupOptions.input`.
 
 - **Tests**
-  - `src-tauri/src/ipc/mod.rs::tests` (bottom of file, `ipc/mod.rs:1724-1844`)
-    — unit tests for `get_app_version`, `list_profiles`, `get_active_profile`,
-    `parse_binding`, `parse_kind`, the API-key-omission guarantee on
-    `ProviderInfo`, and the four `latest_assistant_routing` tests
-    (`ipc/mod.rs:1810-1843`) that pin the real-routing-decision fix.
+  - `src-tauri/src/ipc/mod.rs::tests` (bottom of file) — unit tests for
+    `get_app_version`, `list_profiles`, `parse_binding`, `parse_kind`, the
+    API-key-omission guarantee on `ProviderInfo`, and the four
+    `latest_assistant_routing` tests that pin the real-routing-decision fix.
+    (`get_active_profile` is no longer a bare-fn unit test here — now that it
+    takes `State<AppState>` and reads the persisted `app_settings` row, its
+    default + round-trip is covered through the real IPC boundary in
+    `contract_tests` and at the storage layer in `storage::tests`.)
   - `src-tauri/src/ipc/mod.rs::explain_tests` (`ipc/mod.rs:1399-1459`) —
     unit tests for `build_explanation`/`category_display`, the pure mapping
     behind `explain_classification`'s "why" sidebar: rule spans get labels

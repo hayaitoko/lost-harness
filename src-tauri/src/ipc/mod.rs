@@ -283,11 +283,44 @@ pub fn get_app_version() -> String {
     "0.1.0-m1".to_string()
 }
 
-/// Returns the id of the currently active profile. M1 just returns the
-/// default; per-profile routing lands when the UI ships the cycle chip.
+/// Returns the id of the currently active profile — the one the user last
+/// switched to, persisted in `global.db`'s `app_settings` so it survives a
+/// restart. Falls back to `"personal"` when nothing is stored yet (fresh
+/// install) or the stored value is somehow unreadable/invalid.
+/// `set_active_profile` is the writer; the frontend's `switchProfile` calls it.
 #[tauri::command]
-pub fn get_active_profile() -> String {
-    "personal".to_string()
+pub fn get_active_profile(state: State<'_, AppState>) -> String {
+    state
+        .storage
+        .global()
+        .active_profile()
+        // Defense-in-depth: only trust a stored value that still passes the
+        // allowlist (it was validated on write; this guards a loosened schema
+        // or a hand-edited db). Anything else falls back to the default.
+        .filter(|id| crate::storage::validate_profile_name(id).is_ok())
+        .unwrap_or_else(|| "personal".to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetActiveProfileArgs {
+    pub id: String,
+}
+
+/// Persist the active-profile choice so it survives an app restart (writes the
+/// `active_profile` row in `global.db`'s `app_settings`). Validates the id
+/// against the same allowlist every profile-scoped command uses, so a
+/// padded/confusable name can't be stored and later routed as a distinct db.
+#[tauri::command]
+pub fn set_active_profile(
+    state: State<'_, AppState>,
+    args: SetActiveProfileArgs,
+) -> Result<(), String> {
+    crate::storage::validate_profile_name(&args.id).map_err(|e| e.to_string())?;
+    state
+        .storage
+        .global()
+        .set_active_profile(&args.id)
+        .map_err(|e| e.to_string())
 }
 
 /// Lists the profile ids known to the app. Matches the four-profile design
@@ -2270,10 +2303,12 @@ mod tests {
         assert!(p.contains(&"developer".to_string()));
     }
 
-    #[test]
-    fn active_profile_defaults_to_personal() {
-        assert_eq!(get_active_profile(), "personal");
-    }
+    // `get_active_profile` now takes `State<AppState>` (reads the persisted
+    // `app_settings` row), so its default + round-trip is covered through the
+    // real IPC boundary in `contract_tests` (`active_profile_round_trips_*`)
+    // and at the storage layer in `storage::tests`
+    // (`active_profile_defaults_to_none_and_round_trips`), not as a bare-fn
+    // unit test here.
 
     #[test]
     fn parse_binding_accepts_known_values() {

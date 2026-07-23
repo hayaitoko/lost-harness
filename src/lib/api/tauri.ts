@@ -9,6 +9,7 @@
 // Backend contract (must stay in sync with `src-tauri/src/ipc/mod.rs`):
 //   - `get_app_version() -> String`
 //   - `get_active_profile() -> String`
+//   - `set_active_profile(args: { id }) -> ()`
 //   - `list_profiles() -> Vec<String>`
 //   - `list_providers() -> Vec<ProviderInfo>`
 //   - `remove_provider(id) -> bool`
@@ -210,6 +211,26 @@ export async function getActiveProfile(): Promise<string> {
   }
   const stored = localStorage.getItem("lh.activeProfile");
   return stored ?? "personal";
+}
+
+/**
+ * Persists the active-profile choice so it survives an app restart. In Tauri
+ * this writes the `active_profile` row in `global.db`'s `app_settings` (read
+ * back by `getActiveProfile` on boot); in the browser fallback it writes the
+ * same `lh.activeProfile` localStorage key `getActiveProfile` reads.
+ */
+export async function setActiveProfile(id: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("set_active_profile", { args: { id } });
+    return;
+  }
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("lh.activeProfile", id);
+    }
+  } catch {
+    // localStorage may be unavailable (private mode, SSR); non-fatal.
+  }
 }
 
 /** Returns the list of profile ids known to the app. */

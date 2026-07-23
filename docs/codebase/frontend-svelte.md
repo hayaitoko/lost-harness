@@ -219,6 +219,18 @@ src/lib/api/tauri.ts` is more reliable right now than reading the header.
   because merging across profiles would carry the old profile's rows over as
   "local-only" entries and leave a stale `activeConversationId` pointing at
   a conversation the new profile's DB doesn't have.
+- **The active profile now persists across restarts.** `switchProfile`
+  (`stores/profiles.ts`) calls `api.setActiveProfile(id)`, which in Tauri
+  writes the `active_profile` row in `global.db`'s `app_settings` (backend
+  `set_active_profile`, validated with `validate_profile_name`) and in the
+  browser fallback writes the `lh.activeProfile` localStorage key. On boot,
+  `hydrate()` reads it back via `api.getActiveProfile()` and prefers that
+  value — which is now the real persisted choice, not the old hardcoded
+  `"personal"` stub. The persist call is best-effort (wrapped in try/catch): a
+  failure must not block the in-session switch. Because `App.svelte` awaits
+  `hydrateProfiles()` *before* `hydrateConversations()`, the restored profile
+  id is already set when `hydrateConversations()` reads it — so a restart
+  reopens the last-used profile *and* its conversation list.
 - **A `Block` gate decision never adopts the server's `message_id`** in
   `sendMessage()`'s error path — on Block, the backend persisted no message
   row, so `response.message_id` is unrelated/throwaway; adopting it risks a

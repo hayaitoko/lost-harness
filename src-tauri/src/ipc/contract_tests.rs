@@ -105,6 +105,7 @@ fn test_app() -> App<MockRuntime> {
         .invoke_handler(tauri::generate_handler![
             ipc::get_app_version,
             ipc::get_active_profile,
+            ipc::set_active_profile,
             ipc::list_profiles,
             ipc::list_conversations,
             ipc::create_conversation,
@@ -561,6 +562,60 @@ fn list_models_old_broken_shape_is_rejected() {
     // And must NOT be the domain error — proves it never reached
     // `ModelManager::list_models_for`.
     assert!(!msg.contains("unknown provider"), "leaked into command body: {msg}");
+}
+
+// ── active_profile (set → get round-trip) ──────────────────────────────
+//
+// The regression this locks: `get_active_profile` used to be a hardcoded
+// "personal" stub, so a restart always reset the UI to Personal. It now reads
+// back what `set_active_profile` persisted — this exercises that end-to-end
+// through the real IPC boundary (a fresh `test_app()` = a simulated restart).
+
+#[test]
+fn active_profile_round_trips_through_real_ipc() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // Fresh install: nothing persisted yet → the default.
+    let got = call(&webview, "get_active_profile", json!({}))
+        .expect("get_active_profile must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got, "personal", "a fresh install defaults to personal");
+
+    // Switch to "work" and persist it.
+    call(&webview, "set_active_profile", json!({ "args": { "id": "work" } }))
+        .expect("set_active_profile must dispatch and succeed");
+
+    // Read it back through IPC — this is exactly what boot-time `hydrate()`
+    // sees. Before the fix this stayed "personal"; now it's the stored choice.
+    let got = call(&webview, "get_active_profile", json!({}))
+        .expect("get_active_profile must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got, "work", "the persisted profile must survive a (simulated) restart");
+}
+
+#[test]
+fn set_active_profile_rejects_a_confusable_name() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // A whitespace-padded name maps to a distinct `.db` file — the allowlist
+    // rejects it as a DOMAIN error (the command ran and validated), not an
+    // arg-shape rejection. Proves `validate_profile_name` guards this writer.
+    let res = call(&webview, "set_active_profile", json!({ "args": { "id": "work " } }));
+    let err = res.expect_err("a padded/confusable name must be rejected");
+    let msg = err.as_str().unwrap_or_default();
+    assert!(
+        !is_ipc_arg_rejection(msg),
+        "expected a domain-level validation error, got an arg rejection: {msg}"
+    );
+    assert!(msg.contains("invalid profile name"), "expected the validator's message, got: {msg}");
+
+    // A rejected set persists nothing — the read still returns the default.
+    let got = call(&webview, "get_active_profile", json!({}))
+        .expect("get_active_profile must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got, "personal", "a rejected set must not have written a row");
 }
 
 // ── classifier settings (PLAN §11) ─────────────────────────────────────

@@ -1537,6 +1537,26 @@ impl GlobalDb {
         self.set_app_setting(Self::SKILL_REFLECT_KEY, if enabled { "1" } else { "0" })
     }
 
+    /// The app_settings key for the active-profile choice — the profile the UI
+    /// was last switched to. Global (app-wide selection state, not per-profile),
+    /// read on boot so the choice survives a restart.
+    const ACTIVE_PROFILE_KEY: &'static str = "active_profile";
+
+    /// The persisted active-profile id, or `None` when the user has never
+    /// switched (fresh install). Swallows a read error to `None` — an absent row
+    /// and an unreadable one both let the caller fall back to its default
+    /// (`"personal"`), matching `skill_reflect_enabled`'s fail-soft read.
+    pub fn active_profile(&self) -> Option<String> {
+        self.get_app_setting(Self::ACTIVE_PROFILE_KEY).ok().flatten()
+    }
+
+    /// Persist the active-profile id (backs the UI's `switchProfile`). The
+    /// caller validates the name with `validate_profile_name` before this write,
+    /// so a padded/confusable name never reaches the row.
+    pub fn set_active_profile(&self, id: &str) -> Result<()> {
+        self.set_app_setting(Self::ACTIVE_PROFILE_KEY, id)
+    }
+
     pub fn list_app_settings(&self) -> Result<Vec<AppSetting>> {
         let conn = self.conn.lock();
         let mut stmt =

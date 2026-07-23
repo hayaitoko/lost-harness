@@ -395,6 +395,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc::get_app_version,
             ipc::get_active_profile,
+            ipc::set_active_profile,
             ipc::list_profiles,
             ipc::list_conversations,
             ipc::create_conversation,

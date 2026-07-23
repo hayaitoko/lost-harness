@@ -985,6 +985,23 @@ fn global_endpoints_and_memory_round_trip() {
     );
 }
 
+#[test]
+fn active_profile_defaults_to_none_and_round_trips() {
+    let g = GlobalDb::open_in_memory().unwrap();
+
+    // Fresh db: nothing stored yet. `get_active_profile` maps this None to
+    // "personal", but the storage layer reports the honest absence.
+    assert_eq!(g.active_profile(), None, "a fresh db has no stored active profile");
+
+    // Persist a choice and read it back.
+    g.set_active_profile("work").unwrap();
+    assert_eq!(g.active_profile().as_deref(), Some("work"));
+
+    // A second write overwrites (single app_settings row, not append).
+    g.set_active_profile("school").unwrap();
+    assert_eq!(g.active_profile().as_deref(), Some("school"));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Memory system (PLAN §9): sensitivity buckets + FTS5 search + curated summary
 // ─────────────────────────────────────────────────────────────────────────────

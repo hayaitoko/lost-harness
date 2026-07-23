@@ -1,9 +1,10 @@
 // Lost Harness — Profile state (Svelte stores).
 //
 // The four profiles (personal / work / school / developer) map to distinct
-// model defaults, tool policies, and sensitivity routing. The M1 stub only
-// tracks the list and active id; the real impl will read from the profile
-// manager and watch for external switches (CLI flag, IPC, system event).
+// model defaults, tool policies, and sensitivity routing. The active id now
+// persists across restarts: `switchProfile` writes it through
+// `set_active_profile` (global.db `app_settings`; localStorage in the browser
+// fallback), and `hydrate()` reads it back via `get_active_profile` on boot.
 
 import { writable, derived, get, type Readable } from "svelte/store";
 import * as api from "../api/tauri";
@@ -50,13 +51,14 @@ export async function switchProfile(id: string): Promise<void> {
   }
   if (get(activeProfileId) === id) return;
   activeProfileId.set(id);
-  // Persist locally so the browser fallback (no Tauri) survives reloads.
+  // Persist the choice so it survives an app restart. In Tauri this writes the
+  // global.db `app_settings` row that `get_active_profile` reads back on boot;
+  // in the browser fallback it writes the `lh.activeProfile` localStorage key.
+  // Best-effort — a persistence failure must not block the in-session switch.
   try {
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem("lh.activeProfile", id);
-    }
+    await api.setActiveProfile(id);
   } catch {
-    // localStorage may be unavailable (private mode, SSR); non-fatal.
+    // Non-fatal: the switch still applies for this session.
   }
   // The chat stores still hold the previous profile's conversations. Clear
   // them BEFORE rehydrating: hydrateConversations() merges rather than
