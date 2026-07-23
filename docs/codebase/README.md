@@ -84,7 +84,7 @@ its own are enforced; the cross-cutting ones:
 
 ```bash
 # from the repo root
-cd src-tauri && cargo test --lib      # Rust unit/contract tests (542 as of 2026-07-21)
+cd src-tauri && cargo test --lib      # Rust unit/contract tests (675 as of 2026-07-23)
 cd src-tauri && cargo build           # Rust core
 npm run tauri dev                     # full app (native window) — see gotcha below
 npm run build && npm run check        # frontend build + svelte-check
@@ -189,5 +189,6 @@ against the code as of this pass:
   nothing in the catalog is installable until the real hashes are filled in
   before release.
 
-*Regenerated 2026-07-21 against 542 tests / HEAD `ca54251`. If you change a
+*Regenerated 2026-07-21 against 542 tests / HEAD `ca54251`; test count refreshed
+2026-07-23 to 675 (Rounds A+B+C + the two frontend bug fixes). If you change a
 subsystem materially, update its doc — a wrong doc is worse than none.*
