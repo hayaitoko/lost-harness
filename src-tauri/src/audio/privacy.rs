@@ -22,9 +22,9 @@ use std::sync::Arc;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
 use crate::classifier::{Classifier, ClassifierConfig};
 
-/// Whether a piece of speech (a TTS reply prefix, or an STT transcript) may be
-/// sent to a CLOUD speech service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether a piece of speech (a TTS reply prefix, or raw STT audio) may be sent
+/// to a CLOUD speech service.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioEgressDecision {
     /// Cleared for a cloud STT/TTS service.
     Allow,
@@ -32,6 +32,15 @@ pub enum AudioEgressDecision {
     /// audio channel for this turn). The caller emits a non-silent
     /// `voice:privacy_withheld` event (mirrors `stream:local_reroute`).
     Withhold,
+    /// B9: a `Public`-bound TTS reply hit the un-tunable floor. The design
+    /// mandates ONE confirm via the approval spine before withholding, not an
+    /// automatic block. Carries the [`ActionFingerprint`](crate::hooks::approval::ActionFingerprint)
+    /// pinning THIS exact `cumulative_prefix` — the caller asks an
+    /// `ApprovalPrompter` under `RiskClass::External` and, on approve, records a
+    /// `Once`+this-fingerprint grant; [`AudioEgressGate::resolve_confirm`]
+    /// re-resolves it to `Allow` only via `ApprovalLedger::covers_once` (a
+    /// standing Session/Tool grant can never satisfy it).
+    ConfirmRequired(String),
 }
 
 /// Re-vets speech egress at the cloud STT/TTS boundary. Wraps a `PrivacyGate`
@@ -65,12 +74,17 @@ impl AudioEgressGate {
                 // `Public` binding bypasses the tunable classifier in the text
                 // gate (the user chose cloud for TEXT). The un-tunable FLOOR
                 // still applies at the AUDIO boundary: if it flags structured
-                // secrets/PII, withhold (the design raises one confirm; the
-                // conservative primitive answer is Withhold-pending-confirm).
+                // secrets/PII, the design raises ONE confirm via the approval
+                // spine (B9) rather than silently blocking — a spoken secret is
+                // a deliberate, human-visible act, not an automatic egress.
                 if *binding == Binding::Public
                     && !crate::classifier::rules::detect(cumulative_prefix).is_empty()
                 {
-                    AudioEgressDecision::Withhold
+                    let fp = crate::hooks::approval::ActionFingerprint::of(
+                        "tts_cloud_egress",
+                        &serde_json::json!({ "text": cumulative_prefix }),
+                    );
+                    AudioEgressDecision::ConfirmRequired(fp)
                 } else {
                     AudioEgressDecision::Allow
                 }
@@ -81,17 +95,48 @@ impl AudioEgressGate {
         }
     }
 
-    /// The same boundary for raw microphone audio bound for a CLOUD STT: the only
-    /// pre-cloud-STT text we can gate is the transcript, under the identical
-    /// policy. (Local STT is the default → `Allow`.)
-    pub fn stt_egress(
-        &self,
-        transcript: &str,
-        binding: &Binding,
-        is_cloud_stt: bool,
-        cfg: &ClassifierConfig,
+    /// B9: the pre-cloud-STT decision — **content-free**. Unlike TTS (where we
+    /// gate the model's own reply TEXT), raw microphone audio CANNOT be
+    /// classified before it's transcribed, so the earlier "classify the
+    /// transcript" delegation was wrong (there is no transcript yet at the point
+    /// this decision must be made). The decision is BINDING-based: cloud STT is
+    /// permitted only when the user explicitly chose cloud for this conversation
+    /// (`Public`); under `Auto`/`Private` the raw audio must be transcribed by a
+    /// LOCAL engine (`Withhold`) — we never ship unvetted audio to a cloud
+    /// service on a guess about its contents. Local STT (the default) is `Allow`.
+    pub fn stt_egress(&self, binding: &Binding, is_cloud_stt: bool) -> AudioEgressDecision {
+        if !is_cloud_stt {
+            return AudioEgressDecision::Allow; // local STT never crosses an egress boundary
+        }
+        match binding {
+            // The user explicitly opted this conversation into cloud.
+            Binding::Public => AudioEgressDecision::Allow,
+            // Content-unknown (pre-transcription) → keep it on a local engine.
+            Binding::Auto | Binding::Private => AudioEgressDecision::Withhold,
+        }
+    }
+
+    /// B9: re-resolve a [`AudioEgressDecision::ConfirmRequired`] AFTER the caller
+    /// has run the one-confirm round-trip (asked an `ApprovalPrompter` under
+    /// `RiskClass::External` and, on approve, recorded
+    /// `ledger.grant(GrantTarget::Fingerprint(fp), GrantScope::Once)`). Returns
+    /// `Allow` iff the ledger holds a fresh `Once`+this-fingerprint grant
+    /// ([`ApprovalLedger::covers_once`]) — a standing `Session`/`Tool` grant can
+    /// never satisfy this floor. `Allow`/`Withhold` pass through unchanged.
+    pub fn resolve_confirm(
+        decision: AudioEgressDecision,
+        ledger: &crate::hooks::approval::ApprovalLedger,
     ) -> AudioEgressDecision {
-        self.tts_egress(transcript, binding, is_cloud_stt, cfg)
+        match decision {
+            AudioEgressDecision::ConfirmRequired(fp) => {
+                if ledger.covers_once(&fp) {
+                    AudioEgressDecision::Allow
+                } else {
+                    AudioEgressDecision::Withhold
+                }
+            }
+            other => other,
+        }
     }
 }
 
@@ -142,19 +187,69 @@ mod tests {
     }
 
     #[test]
-    fn public_binding_still_applies_the_floor_to_audio() {
+    fn public_binding_raises_one_confirm_for_a_floor_hit_on_audio() {
         let g = gate();
-        // Public → the text classifier is bypassed, but the un-tunable floor
-        // still withholds a structured secret from a CLOUD voice service.
-        assert_eq!(
-            g.tts_egress("the api key is sk-live-abcdef0123456789abcdef", &Binding::Public, true, &cfg()),
-            AudioEgressDecision::Withhold
-        );
-        // A benign Public reply is allowed to cloud TTS.
+        // B9: Public bypasses the tunable text classifier, but the un-tunable
+        // floor on a structured secret at the CLOUD voice boundary raises ONE
+        // confirm (carrying a fingerprint of this exact text), not a silent block.
+        match g.tts_egress("the api key is sk-live-abcdef0123456789abcdef", &Binding::Public, true, &cfg()) {
+            AudioEgressDecision::ConfirmRequired(fp) => assert_eq!(fp.len(), 64, "a sha256 fingerprint"),
+            other => panic!("expected ConfirmRequired, got {other:?}"),
+        }
+        // A benign Public reply is allowed to cloud TTS with no confirm.
         assert_eq!(
             g.tts_egress("sounds good, see you then", &Binding::Public, true, &cfg()),
             AudioEgressDecision::Allow
         );
+    }
+
+    #[test]
+    fn stt_egress_is_content_free_and_binding_based() {
+        // B9: the pre-transcription STT decision can't depend on content (there
+        // is no transcript yet) — it's binding-based.
+        let g = gate();
+        // Local STT never egresses, whatever the binding.
+        assert_eq!(g.stt_egress(&Binding::Auto, false), AudioEgressDecision::Allow);
+        assert_eq!(g.stt_egress(&Binding::Private, false), AudioEgressDecision::Allow);
+        // Cloud STT: only Public (explicit opt-in); Auto/Private keep it local.
+        assert_eq!(g.stt_egress(&Binding::Public, true), AudioEgressDecision::Allow);
+        assert_eq!(g.stt_egress(&Binding::Auto, true), AudioEgressDecision::Withhold);
+        assert_eq!(g.stt_egress(&Binding::Private, true), AudioEgressDecision::Withhold);
+    }
+
+    #[test]
+    fn one_confirm_round_trip_flips_confirm_required_to_allow() {
+        use crate::hooks::approval::{ApprovalLedger, GrantScope, GrantTarget};
+        let g = gate();
+        let secret = "the api key is sk-live-abcdef0123456789abcdef";
+        let decision = g.tts_egress(secret, &Binding::Public, true, &cfg());
+        let fp = match &decision {
+            AudioEgressDecision::ConfirmRequired(fp) => fp.clone(),
+            other => panic!("expected ConfirmRequired, got {other:?}"),
+        };
+
+        let ledger = ApprovalLedger::new();
+        // No grant yet → the confirm is unresolved → Withhold.
+        assert_eq!(
+            AudioEgressGate::resolve_confirm(decision.clone(), &ledger),
+            AudioEgressDecision::Withhold
+        );
+        // The user approves ONE confirm for this exact text.
+        ledger.grant(GrantTarget::Fingerprint(fp.clone()), GrantScope::Once);
+        assert_eq!(AudioEgressGate::resolve_confirm(decision, &ledger), AudioEgressDecision::Allow);
+
+        // A Session/Tool grant can NEVER satisfy this floor (covers_once semantics).
+        let ledger2 = ApprovalLedger::new();
+        ledger2.grant(GrantTarget::Fingerprint(fp.clone()), GrantScope::Session);
+        let d2 = g.tts_egress(secret, &Binding::Public, true, &cfg());
+        assert_eq!(AudioEgressGate::resolve_confirm(d2, &ledger2), AudioEgressDecision::Withhold);
+
+        // The fingerprint pins THIS text — a different reply yields a different fp.
+        if let AudioEgressDecision::ConfirmRequired(fp2) =
+            g.tts_egress("api key is sk-live-9999999999999999999999", &Binding::Public, true, &cfg())
+        {
+            assert_ne!(fp, fp2, "the confirm fingerprint pins the exact reply text");
+        }
     }
 
     #[test]
