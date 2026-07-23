@@ -45,7 +45,7 @@
 use std::sync::Arc;
 
 use crate::hooks::{EventContext, ObserverHook};
-use crate::storage::{ProfileDb, ToolAuditRow};
+use crate::storage::ToolAuditRow;
 
 // ── AuditEntry ────────────────────────────────────────────────────────────
 
@@ -66,8 +66,8 @@ pub struct AuditEntry {
     pub conversation_id: String,
     pub tool_name: String,
     /// The same canonical string the gating chain saw
-    /// (`format!("{} {}", call.name, call.args)`), size-capped via
-    /// `truncate_args` before persisting.
+    /// (`format!("{} {}", call.name, call.args)`), size-capped in memory and
+    /// replaced by a redacted marker before SQLite persistence.
     pub canonical_args: String,
     /// The same `ActionFingerprint` hash the chain used to pin any
     /// Once grant. Copying it (rather than re-deriving) keeps the
@@ -154,15 +154,13 @@ pub fn outcome_gate_by(outcome: &crate::tools::dispatch::ToolOutcome) -> Option<
 
 // ── truncate_args ────────────────────────────────────────────────────────
 
-/// Size cap on the stored `canonical_args` string. ~4KB matches the
-/// spec's "size-capped" wording (Q9) and keeps a single
+/// Size cap on the in-memory `canonical_args` string. ~4KB keeps a single
 /// `shell_exec {"cmd":"<4KB of args>"}` row well under the SQLite
 /// page boundary. If a call's canonical form exceeds this, the suffix
 /// is replaced with `"…[truncated]"` and a byte-size annotation is
 /// appended in the same row so the Activity pane can flag that more
-/// existed. The fingerprint and the original (uncapped) canonical are
-/// the auditable identity — this cap is purely a storage bound, not a
-/// semantic one.
+/// existed. The action fingerprint is the durable audit identity; the raw
+/// canonical string is redacted before SQLite persistence.
 pub const CAPTURED_ARGS_CAP: usize = 4 * 1024;
 
 pub fn truncate_args(s: &str) -> String {
@@ -219,7 +217,7 @@ impl AuditWriter for StorageAuditWriter {
             ts: chrono::Utc::now().timestamp(),
             conversation_id: entry.conversation_id.clone(),
             tool_name: entry.tool_name.clone(),
-            canonical_args: entry.canonical_args.clone(),
+            canonical_args: format!("[redacted; fingerprint={}]", entry.fingerprint),
             fingerprint: entry.fingerprint.clone(),
             risk: entry.risk.clone(),
             outcome: entry.outcome.clone(),
@@ -363,6 +361,35 @@ mod tests {
         let t = truncate_args(&s);
         // Result is well-formed UTF-8.
         assert!(t.chars().last().is_some());
+    }
+
+    #[test]
+    fn storage_writer_never_persists_raw_tool_arguments() {
+        let root = std::env::temp_dir().join(format!("lhp-audit-redact-{}", uuid::Uuid::new_v4()));
+        let storage = crate::storage::Storage::open(&root).unwrap();
+        let writer = StorageAuditWriter::new(storage.clone());
+        writer.write_audit(&AuditEntry {
+            profile: "personal".into(),
+            conversation_id: "conv".into(),
+            tool_name: "shell_exec".into(),
+            canonical_args: "shell_exec {\"token\":\"secret-value\"}".into(),
+            fingerprint: "abc123".into(),
+            risk: "Dangerous".into(),
+            outcome: "denied".into(),
+            gate_by: Some("sandbox".into()),
+            grant_used: None,
+            decision: None,
+            endpoint_kind: "local".into(),
+            duration_ms: 1,
+        });
+        let rows = storage
+            .open_profile("personal")
+            .unwrap()
+            .list_tool_audit("conv")
+            .unwrap();
+        assert_eq!(rows[0].canonical_args, "[redacted; fingerprint=abc123]");
+        assert!(!rows[0].canonical_args.contains("secret-value"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

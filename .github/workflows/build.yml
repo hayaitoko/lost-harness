@@ -75,15 +75,26 @@ jobs:
         working-directory: src-tauri
         run: cargo build --verbose
 
-      - name: cargo clippy
+      - name: cargo clippy (correctness gate)
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true   # M0: stub modules may produce warnings; tighten in M1
+        # The repository still carries non-correctness warning debt. Make
+        # correctness findings release-blocking now; tighten to `-D warnings`
+        # once the tracked warning backlog is cleared.
+        run: cargo clippy --all-targets -- -D clippy::correctness
 
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --verbose
 
+      - name: cargo audit (advisory)
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: src-tauri
+        continue-on-error: true
+
       # ── Frontend build ──────────────────────────────────────────────────
       - name: Frontend build
-        run: npm run build
+        run: |
+          npm run check
+          npm run build

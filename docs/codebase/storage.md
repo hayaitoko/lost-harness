@@ -310,17 +310,18 @@
     pure extension-load smoke test, unrelated to how production actually
     queries `memory_vectors`. Don't conflate the two when reasoning about
     what's proven.
-  - **`purge_trm_logs_older_than` still has no caller outside tests.** The
-    7-day TRM-log retention policy (`profile.rs:1112-1120`, citing spec §3)
-    remains a helper method only — a background task to invoke it on a
-    schedule has still not been built.
-  - **`api_key_encrypted` is still not actually encrypted.** `endpoints`'s
-    `api_key_encrypted BLOB` column (`schema.rs:69`) just stores whatever
-    bytes the caller passes (`insert_endpoint`/`update_endpoint`,
-    `global.rs:510-566`); `hydrate_providers_from_storage`
-    (`src-tauri/src/lib.rs:304-332`) reads it back with a bare
-    `String::from_utf8`, and the comment at `lib.rs:321-323` still says
-    "encryption is M4+ work." Don't assume API keys are protected at rest.
+  - **Retention is a live hourly boot task.** `lib.rs` invokes the dedicated
+    purge methods across every profile: TRM routing logs after 7 days,
+    terminal (`done`/`failed`/`cancelled`) work items after 30 days, and
+    redacted tool-audit rows after 90 days. Queued/running/parked work is never
+    purged; usage events are retained because budgets and spend history depend
+    on them.
+  - **Provider secrets live in the OS credential store.** The historical SQL
+    column is still named `api_key_encrypted` for schema compatibility, but new
+    rows contain only the opaque `keychain:v1` marker. `secrets.rs` migrates any
+    legacy plaintext blob at boot, replacing it only after the Keychain/
+    Credential Manager/libsecret write succeeds. Provider hydration reads the
+    credential store; tests use the in-memory `ProviderSecretStore` fake.
   - **`ProfileDb::name` is public and set once at open time**
     (`profile.rs:227`, `pub name: String`) — not re-derived from the file
     path on access. A `.db` file renamed on disk out-of-band leaves an

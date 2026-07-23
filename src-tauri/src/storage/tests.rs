@@ -927,7 +927,7 @@ fn global_endpoints_and_memory_round_trip() {
         id: "ep-anthropic".into(),
         name: "Anthropic".into(),
         base_url: "https://api.anthropic.com".into(),
-        api_key_encrypted: Some(b"fake-encrypted-bytes".to_vec()),
+        api_key_marker: Some(b"legacy-plaintext-bytes".to_vec()),
         kind: "anthropic".into(),
         created_at: now,
         supports_native_tools: true,
@@ -938,8 +938,8 @@ fn global_endpoints_and_memory_round_trip() {
     assert_eq!(eps[0].name, "Anthropic");
     assert!(eps[0].supports_native_tools, "the native-tools flag must round-trip through storage");
     assert_eq!(
-        eps[0].api_key_encrypted.as_deref(),
-        Some(b"fake-encrypted-bytes".as_slice())
+        eps[0].api_key_marker.as_deref(),
+        Some(b"legacy-plaintext-bytes".as_slice())
     );
 
     // Memory fact with tags (JSON array).
@@ -1281,6 +1281,53 @@ fn tool_audit_appends_only_no_update_path() {
     // ToolAuditRow; we only see add/list. Just confirm we can re-read.
     let rows = p.list_tool_audit("conv").unwrap();
     assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn retention_purges_only_expired_terminal_and_audit_rows() {
+    let p = ProfileDb::open_in_memory("personal").unwrap();
+    let now = 2_000_000_000_i64;
+
+    // Direct SQL setup keeps the retention test focused on age/state policy.
+    {
+        let conn = p.raw();
+        for (id, state, finished_at) in [
+            ("old-done", "done", Some(now - 31 * 86_400)),
+            ("old-failed", "failed", Some(now - 31 * 86_400)),
+            ("old-running", "running", None),
+            ("recent-done", "done", Some(now - 29 * 86_400)),
+        ] {
+            conn.execute(
+                "INSERT INTO work_items
+                 (id, kind, state, input_json, attempts, created_at, finished_at)
+                 VALUES (?1, 'agent_dispatch', ?2, '{}', 0, ?3, ?4)",
+                rusqlite::params![id, state, now - 40 * 86_400, finished_at],
+            )
+            .unwrap();
+        }
+        for (conversation, ts) in [
+            ("old", now - 91 * 86_400),
+            ("recent", now - 89 * 86_400),
+        ] {
+            conn.execute(
+                "INSERT INTO tool_audit
+                 (ts, conversation_id, tool_name, canonical_args, fingerprint, risk, outcome)
+                 VALUES (?1, ?2, 'echo', '[redacted]', 'fp', 'Safe', 'ok')",
+                rusqlite::params![ts, conversation],
+            )
+            .unwrap();
+        }
+    }
+
+    assert_eq!(p.purge_terminal_work_items_older_than(now - 30 * 86_400).unwrap(), 2);
+    assert!(p.get_work_item("old-done").unwrap().is_none());
+    assert!(p.get_work_item("old-failed").unwrap().is_none());
+    assert!(p.get_work_item("old-running").unwrap().is_some());
+    assert!(p.get_work_item("recent-done").unwrap().is_some());
+
+    assert_eq!(p.purge_tool_audit_older_than(now - 90 * 86_400).unwrap(), 1);
+    assert!(p.list_tool_audit("old").unwrap().is_empty());
+    assert_eq!(p.list_tool_audit("recent").unwrap().len(), 1);
 }
 
 #[test]

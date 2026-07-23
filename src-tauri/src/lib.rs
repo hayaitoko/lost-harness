@@ -22,6 +22,7 @@ mod models; // M4: Model manager (local + cloud)
 mod packs; // M7 (Wave 4.5): Capability Packs — installable skill+agent+cron bundles
 mod platform; // M5: cross-platform computer use (cfg'd submodules)
 mod queue; // M4 (Wave 4.4): the one-queue-model substrate (deferred work)
+mod secrets; // provider credentials: OS keychain + test seam + legacy migration
 mod storage; // M1+: SQLite, sqlite-vec, sled/redb
 mod tools; // M3: Tool registry + implementations
 
@@ -61,6 +62,24 @@ pub fn run() {
                 .map_err(|e| format!("failed to open storage at {}: {e}", base_path.display()))?;
             let storage = Arc::new(storage);
 
+            // Provider credentials are held by the OS credential store. Move
+            // any legacy plaintext endpoint blobs before hydrating clients;
+            // migration is idempotent and clears each blob only after the
+            // corresponding keychain write succeeds.
+            let provider_secrets: Arc<dyn crate::secrets::ProviderSecretStore> =
+                Arc::new(crate::secrets::OsProviderSecretStore::new());
+            let secret_migration = crate::secrets::migrate_legacy_provider_secrets(
+                storage.global(),
+                provider_secrets.as_ref(),
+            );
+            if secret_migration.failed > 0 {
+                tracing::warn!(
+                    migrated = secret_migration.migrated,
+                    failed = secret_migration.failed,
+                    "some legacy provider keys could not be moved to the OS keychain"
+                );
+            }
+
             // Crash-recovery boot pass (Q3 do-now item 4): terminalize any
             // conversation left mid-tool-call by an unclean shutdown of the
             // previous run, before the agent loop or any IPC command touches
@@ -87,7 +106,11 @@ pub fn run() {
             // Load persisted providers from global.db::endpoints and
             // hydrate the in-memory ModelManager.
             let model_manager = Arc::new(ModelManager::new());
-            hydrate_providers_from_storage(&storage, &model_manager);
+            hydrate_providers_from_storage(
+                &storage,
+                &model_manager,
+                provider_secrets.as_ref(),
+            );
 
             // M8 S4 boot pass (right after provider hydration, same discipline
             // as crash-recovery): reap sidecars orphaned by a hard crash of the
@@ -309,27 +332,48 @@ pub fn run() {
                 });
             }
 
-            // Spec §3 retention: TRM (routing-decision) logs auto-delete after
-            // 7 days. `purge_trm_logs_older_than` existed but had no production
-            // caller (the runtime silently kept them forever, contradicting the
-            // spec). Wire it here as a best-effort hourly sweep across every
-            // profile DB, mirroring the idle-sweep pattern above — never bricks
-            // boot, ignores per-profile errors, runs once immediately then hourly.
+            // Retention sweep: routing decisions for 7 days, terminal work for
+            // 30 days, and redacted tool audit observations for 90 days. Usage
+            // events are intentionally retained because they back month-to-date
+            // budgets and spend history. Best-effort across every profile DB:
+            // never brick boot, run once immediately, then hourly.
             {
                 const TRM_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
-                let storage_trm = Arc::clone(&storage);
+                const WORK_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+                const TOOL_AUDIT_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
+                let storage_retention = Arc::clone(&storage);
                 tauri::async_runtime::spawn(async move {
                     loop {
-                        let cutoff = chrono::Utc::now().timestamp() - TRM_RETENTION_SECS;
-                        if let Ok(names) = storage_trm.list_profile_names() {
+                        let now = chrono::Utc::now().timestamp();
+                        if let Ok(names) = storage_retention.list_profile_names() {
                             for name in names {
-                                if let Ok(db) = storage_trm.open_profile(&name) {
-                                    if let Err(e) = db.purge_trm_logs_older_than(cutoff) {
-                                        tracing::warn!(
-                                            target: "lhp::retention",
-                                            profile = %name, error = %e,
-                                            "TRM log purge failed for profile"
-                                        );
+                                if let Ok(db) = storage_retention.open_profile(&name) {
+                                    let results = [
+                                        (
+                                            "TRM log",
+                                            db.purge_trm_logs_older_than(now - TRM_RETENTION_SECS),
+                                        ),
+                                        (
+                                            "terminal work-item",
+                                            db.purge_terminal_work_items_older_than(
+                                                now - WORK_RETENTION_SECS,
+                                            ),
+                                        ),
+                                        (
+                                            "tool-audit",
+                                            db.purge_tool_audit_older_than(
+                                                now - TOOL_AUDIT_RETENTION_SECS,
+                                            ),
+                                        ),
+                                    ];
+                                    for (kind, result) in results {
+                                        if let Err(e) = result {
+                                            tracing::warn!(
+                                                target: "lhp::retention",
+                                                profile = %name, kind, error = %e,
+                                                "retention purge failed for profile"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -350,6 +394,7 @@ pub fn run() {
                 agent_loop,
                 model_manager,
                 storage,
+                provider_secrets,
                 approvals,
                 ask_human,
                 classifier: Arc::clone(&classifier),
@@ -596,6 +641,7 @@ fn dirs_home_fallback() -> Option<PathBuf> {
 fn hydrate_providers_from_storage(
     storage: &Storage,
     mm: &ModelManager,
+    secrets: &dyn crate::secrets::ProviderSecretStore,
 ) {
     let endpoints = match storage.global().list_endpoints() {
         Ok(eps) => eps,
@@ -610,12 +656,17 @@ fn hydrate_providers_from_storage(
             "cloud" => ProviderKind::Cloud,
             _ => ProviderKind::Custom,
         };
-        // `api_key_encrypted` is stored as raw bytes (encryption is
-        // M4+ work). Treat the bytes as UTF-8; fall back to None on
-        // any decode error rather than crashing the app on a bad row.
-        let api_key = ep
-            .api_key_encrypted
-            .and_then(|b| String::from_utf8(b).ok());
+        let api_key = if ep.has_keychain_secret() {
+            match secrets.get(&ep.id) {
+                Ok(secret) => secret,
+                Err(e) => {
+                    tracing::warn!(endpoint = %ep.id, error = %e, "provider keychain read failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let provider = Provider::new(ep.id, ep.name, ep.base_url, api_key, kind)
             .with_native_tools(ep.supports_native_tools);
         mm.add_provider(provider);

@@ -79,6 +79,7 @@ fn test_app() -> App<MockRuntime> {
         agent_loop,
         model_manager,
         storage,
+        provider_secrets: Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
         approvals: Arc::new(crate::ipc::approval::ApprovalRegistry::new()),
         ask_human: Arc::new(crate::ipc::ask_human::AskHumanRegistry::new()),
         classifier: Arc::new(HeuristicClassifier::new()),
@@ -474,6 +475,11 @@ fn update_provider_correct_shape_dispatches_and_keeps_stored_key() {
         .get_provider(&id)
         .expect("provider still registered");
     assert_eq!(provider.api_key.as_deref(), Some("sk-test-secret"));
+    assert_eq!(
+        state.provider_secrets.get(&id).unwrap().as_deref(),
+        Some("sk-test-secret"),
+        "the provider secret is held by the credential-store seam"
+    );
     assert_eq!(provider.base_url, "http://10.0.0.100:8000/v1");
     assert!(provider.supports_native_tools);
     let ep = state
@@ -486,7 +492,11 @@ fn update_provider_correct_shape_dispatches_and_keeps_stored_key() {
     assert_eq!(ep.base_url, "http://10.0.0.100:8000/v1");
     assert_eq!(ep.kind, "local");
     assert!(ep.supports_native_tools);
-    assert_eq!(ep.api_key_encrypted.as_deref(), Some(b"sk-test-secret".as_slice()));
+    assert_eq!(
+        ep.api_key_marker.as_deref(),
+        Some(crate::secrets::KEYCHAIN_MARKER),
+        "SQLite stores only the keychain marker, never the provider secret"
+    );
 }
 
 #[test]

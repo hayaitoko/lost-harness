@@ -53,8 +53,18 @@ impl StdioMcpTransport {
     /// failure kills the child and returns `Err` — never a half-initialized
     /// transport.
     pub async fn spawn(command: &str, args: &[String]) -> Result<Self, String> {
-        let mut child = tokio::process::Command::new(command)
-            .args(args)
+        // Treat a registered MCP server like third-party software: never hand
+        // it the desktop app's full environment (provider keys, tracing
+        // credentials, CI tokens, etc.). Re-introduce only the small process
+        // environment needed to find executables and behave normally.
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args).env_clear();
+        for key in ["PATH", "HOME", "TMPDIR", "USER", "LANG"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -365,6 +375,24 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
+    fn environment_fixture_script() -> String {
+        let dir = std::env::temp_dir().join(format!("lhp-mcp-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.sh");
+        std::fs::write(
+            &path,
+            concat!(
+                "read line\n",
+                "printf '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}\\n'\n",
+                "read line\n",
+                "read line\n",
+                "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"env_probe\",\"description\":\"%s\",\"inputSchema\":{\"type\":\"object\"}}]}}\\n' \"${LHP_MCP_SECRET_SHOULD_NOT_LEAK-unset}\"\n",
+            ),
+        )
+        .unwrap();
+        path.to_string_lossy().to_string()
+    }
+
     #[tokio::test]
     async fn live_fixture_handshake_list_call_and_error_paths() {
         let script = fixture_script();
@@ -393,6 +421,20 @@ mod tests {
         assert!(err.contains("reported an error"), "got: {err}");
 
         t.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn child_environment_is_allowlisted_but_path_still_works() {
+        let marker = "LHP_MCP_SECRET_SHOULD_NOT_LEAK";
+        std::env::set_var(marker, "super-secret");
+        let script = environment_fixture_script();
+        let t = StdioMcpTransport::spawn("sh", &[script])
+            .await
+            .expect("allowlisted PATH must still resolve the shell fixture");
+        let tools = t.list_tools().await.expect("environment fixture lists tools");
+        assert_eq!(tools[0].description, "unset", "parent secret leaked to MCP child");
+        t.shutdown().await;
+        std::env::remove_var(marker);
     }
 
     #[tokio::test]

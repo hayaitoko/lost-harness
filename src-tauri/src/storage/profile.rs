@@ -149,8 +149,8 @@ pub struct Folder {
 /// (observer lane, never gates). Denied/asked/unknown/unavailable/err calls
 /// are rows too — refusals are the interesting audit entries.
 ///
-/// `canonical_args` is size-capped on write (see `CAPTURED_ARGS_CAP` in
-/// `hooks::audit`) so a long file body can't blow up a row.
+/// `canonical_args` contains only a redacted marker plus the already-derived
+/// action fingerprint. Raw tool arguments are deliberately never retained.
 /// All times are Unix seconds (UTC).
 #[derive(Debug, Clone)]
 pub struct ToolAuditRow {
@@ -1219,13 +1219,35 @@ impl ProfileDb {
         Ok(n)
     }
 
+    /// Remove terminal deferred-work records after the operational recovery
+    /// window. Queued/running/parked rows are live state and are never purged.
+    pub fn purge_terminal_work_items_older_than(&self, cutoff: i64) -> Result<usize> {
+        let n = self.conn.lock().execute(
+            "DELETE FROM work_items
+             WHERE state IN ('done', 'failed', 'cancelled')
+               AND finished_at IS NOT NULL
+               AND finished_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
+    /// Delete old audit observations as a dedicated retention operation. The
+    /// operational API remains append-only: callers can insert/list but cannot
+    /// edit individual observations.
+    pub fn purge_tool_audit_older_than(&self, cutoff: i64) -> Result<usize> {
+        let n = self
+            .conn
+            .lock()
+            .execute("DELETE FROM tool_audit WHERE ts < ?1", params![cutoff])?;
+        Ok(n)
+    }
+
     // ── tool_audit (item 5, Fable Q9) ─────────────────────────────────────
     //
-    // Append-only: only `add_tool_audit` (INSERT) and `list_tool_audit`
-    // (SELECT) — no UPDATE, no DELETE. The table is the post-hoc record
-    // lane; refusing to mutate rows keeps the audit chain defensible
-    // (a future "purge after N days" can only be a separate retention
-    // background task, not an in-band UPDATE).
+    // Append-only during its retention window: the operational surface exposes
+    // INSERT + SELECT only. The age-based purge above is a separate background
+    // retention operation; individual observations cannot be edited/deleted.
 
     /// Insert one audit row. `id` is ignored (the column is AUTOINCREMENT)
     /// — the inserted `id` is reflected in the row after this call via

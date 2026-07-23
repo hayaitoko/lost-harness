@@ -62,20 +62,20 @@ user message
 These are the guarantees the whole product rests on. Each subsystem doc says where
 its own are enforced; the cross-cutting ones:
 
-- **The privacy filter fails closed — for the classified chat turn.** A turn the §7
+- **The privacy filter fails closed — for the classified chat turn and each tool's
+  own destination.** A turn the §7
   classifier flags is never silently sent to the cloud: `RouteLocal` only proceeds on a
   provider that is both local *and* private, else the call errors rather than falling
   back (agent), and a tool call flagged `LocalRequired` on a cloud endpoint is denied
   outright (tools/dispatch) — a second, independent enforcement point. **Scope the
   2026-07-23 external review pinned down (see the ledger in `HANDOFF.md`):** this
-  guarantee is *the model-endpoint egress of a classified chat turn*. It does **not**
-  currently cover (a) a `Public`-binding turn, which bypasses the classifier for the
-  current message by design (F4); (b) a tool whose *own* destination is off-box — the
-  `is_cloud` signal is derived from the **model** endpoint, so a `Private` conversation
-  on a local model can still hand private args to a Remote-tier MCP / `External` tool
-  (F2); or (c) non-chat egress like `search_models` hitting HuggingFace (F13). Treat the
-  invariant as "classified chat content respects routing," not "nothing sensitive ever
-  leaves the device."
+  guarantee now covers both the model endpoint and a tool's own off-box destination:
+  `Tool::egresses_offbox` is folded into the dispatch gate, Remote-tier MCP tools can
+  never be downgraded below `External`, and rerouting only the model cannot authorize
+  a remote tool. A `Public`-binding turn still bypasses the classifier by deliberate
+  product decision (F4). Explicit, user-driven network surfaces such as the Settings
+  model search/download IPC remain outside the chat gate and must identify their
+  destination in their UI (F13).
 - **The sandbox floor cannot be disabled — but it is a pattern denylist, not a semantic
   guarantee.** The hardline danger denylist runs before any ask-capable hook and no
   setting can turn it off (hooks). It is substring matching over command text, so
@@ -93,17 +93,18 @@ its own are enforced; the cross-cutting ones:
   by attempting it; only a recorded approval flips a call through (hooks/approval).
 - **Workspace confinement.** The fs tools cannot touch anything outside `workspace/` —
   not via `..`, absolute paths, or symlinks (tools/fs).
-- **Routing logs hash the message; the tool-audit trail does not.** `trm_logs` stores a
-  hash of the message, never the text (storage / agent). Note (F11): the append-only
-  `tool_audit` table *does* persist canonical tool arguments verbatim, which can include
-  sensitive values, and has no retention sweep yet — so "audit logs never store
-  plaintext" holds for `trm_logs` only.
+- **Persisted routing/audit logs do not retain message or tool-argument plaintext.**
+  `trm_logs` stores a message hash, never the text. The production
+  `StorageAuditWriter` replaces canonical tool arguments with a redacted marker plus
+  the existing action fingerprint before inserting `tool_audit`. The hourly retention
+  sweep keeps TRM logs for 7 days, terminal work items for 30 days, and tool-audit rows
+  for 90 days; usage events are intentionally retained for budgets and spend history.
 
 ## How to run, test, build
 
 ```bash
 # from the repo root
-cd src-tauri && cargo test --lib      # Rust unit/contract tests (675 as of 2026-07-23)
+cd src-tauri && cargo test --lib      # Rust unit/contract tests (683 as of 2026-07-23)
 cd src-tauri && cargo build           # Rust core
 npm run tauri dev                     # full app (native window) — see gotcha below
 npm run build && npm run check        # frontend build + svelte-check
@@ -209,5 +210,5 @@ against the code as of this pass:
   before release.
 
 *Regenerated 2026-07-21 against 542 tests / HEAD `ca54251`; test count refreshed
-2026-07-23 to 675 (Rounds A+B+C + the two frontend bug fixes). If you change a
+2026-07-23 to 683 (external-review fix batch included). If you change a
 subsystem materially, update its doc — a wrong doc is worse than none.*

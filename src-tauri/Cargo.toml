@@ -67,6 +67,18 @@ ndarray = { version = "0.16", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Provider credentials live in the operating system's credential store. Pin to
+# keyring 3.x because the crate's declared MSRV (1.75) matches this project's
+# Rust 1.77 floor; keyring 4.x currently requires Rust 1.88.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
 [dev-dependencies]
 # tauri::test::{mock_app, mock_builder, MockRuntime} — only used by the
 # M1 agent-loop integration tests. Keeps the test-only symbol out of

@@ -74,3 +74,48 @@ pub fn is_private_endpoint(base_url: &str) -> bool {
         || lower.ends_with(".internal")
         || lower.ends_with(".ts.net")
 }
+
+/// Returns whether `base_url` is considered private solely because its host
+/// carries a trusted private-network name suffix. These names are not resolved
+/// or authenticated here, so the UI must tell the user that this trust is safe
+/// only on a network they control.
+pub fn is_private_endpoint_trusted_by_name(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let lower = host.to_ascii_lowercase();
+    lower.ends_with(".local")
+        || lower.ends_with(".lan")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".ts.net")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_by_name_distinguishes_names_from_private_literals() {
+        for url in [
+            "http://model.local:1234/v1",
+            "http://host.lan/v1",
+            "https://node.internal/v1",
+            "https://machine.tailnet.ts.net/v1",
+        ] {
+            assert!(is_private_endpoint(url));
+            assert!(is_private_endpoint_trusted_by_name(url));
+        }
+        for url in [
+            "http://localhost:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://10.0.0.5/v1",
+            "https://api.example.com/v1",
+            "not a url",
+        ] {
+            assert!(!is_private_endpoint_trusted_by_name(url));
+        }
+    }
+}

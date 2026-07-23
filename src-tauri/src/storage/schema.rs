@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS endpoints (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL,
     base_url            TEXT NOT NULL,
-    api_key_encrypted   BLOB,
+    api_key_encrypted   BLOB,                 -- historical name; keychain:v1 marker only
     kind                TEXT NOT NULL,
     created_at          INTEGER NOT NULL
 );

@@ -66,6 +66,8 @@ export interface ProviderInfo {
   kind: string;
   /** Whether the provider's endpoint is a private/LAN address. */
   is_private: boolean;
+  /** Private only by DNS/mDNS/tailnet name; UI should warn once about network trust. */
+  trusted_by_name: boolean;
   /** Q1: whether the endpoint supports OpenAI-style native structured tool calls. */
   supports_native_tools: boolean;
 }
@@ -1288,7 +1290,14 @@ function browserListProviders(): ProviderInfo[] {
   if (typeof localStorage === "undefined") return [];
   try {
     const raw = localStorage.getItem(BROWSER_PROVIDERS_KEY);
-    return raw ? (JSON.parse(raw) as ProviderInfo[]) : [];
+    const providers = raw ? (JSON.parse(raw) as ProviderInfo[]) : [];
+    // Backfill the F5 trust-source flag for browser-dev records saved before
+    // the field existed; the native IPC always supplies it.
+    return providers.map((provider) => ({
+      ...provider,
+      trusted_by_name:
+        provider.trusted_by_name ?? browserTrustedByName(provider.base_url),
+    }));
   } catch {
     return [];
   }
@@ -1300,6 +1309,14 @@ function browserPersistProviders(list: ProviderInfo[]): void {
     localStorage.setItem(BROWSER_PROVIDERS_KEY, JSON.stringify(list));
   } catch {
     // non-fatal
+  }
+}
+
+function browserTrustedByName(baseUrl: string): boolean {
+  try {
+    return /\.(local|lan|internal|ts\.net)$/i.test(new URL(baseUrl).hostname);
+  } catch {
+    return false;
   }
 }
 
@@ -1317,6 +1334,7 @@ function browserAddProvider(
     base_url: baseUrl,
     kind,
     is_private: kind === "local",
+    trusted_by_name: browserTrustedByName(baseUrl),
     supports_native_tools: supportsNativeTools,
   };
   const list = browserListProviders();
@@ -1338,6 +1356,7 @@ function browserUpdateProvider(
     base_url: baseUrl,
     kind,
     is_private: kind === "local",
+    trusted_by_name: browserTrustedByName(baseUrl),
     supports_native_tools: supportsNativeTools,
   };
   const list = browserListProviders();

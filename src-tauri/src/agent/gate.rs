@@ -102,8 +102,10 @@ impl PrivacyGate {
         cfg: &ClassifierConfig,
     ) -> (GateDecision, Option<Classification>) {
         match binding {
-            // User explicitly chose cloud for this conversation — bypass the
-            // classifier entirely.
+            // Deliberate product decision (2026-07-23 external-review triage):
+            // Public is a pure user privacy waiver and rules-only classifier
+            // fallback stays permissive. Do not silently add a classifier floor
+            // here; changing this requires an explicit product decision.
             Binding::Public => (GateDecision::Allow, None),
 
             // User explicitly chose private. Cloud endpoints are never OK

@@ -652,6 +652,12 @@ impl ToolDispatcher {
             ));
         }
 
+        // The privacy gate must describe the destination of THIS action, not
+        // only the model serving the conversation. A remote MCP/fetch call is
+        // cloud egress even when a local model proposed it.
+        let tool_egresses_offbox = tool.egresses_offbox();
+        let effective_is_cloud = is_cloud || tool_egresses_offbox;
+
         // A canonical, greppable form of the call for the pattern-matching
         // hooks (Sandbox denylist, Permission rules).
         let canonical = format!("{} {}", call.name, call.args);
@@ -678,7 +684,7 @@ impl ToolDispatcher {
                 // privacy filter reads).
                 .with_command_text(tool.match_text(&call.args))
                 .with_binding(binding)
-                .with_cloud(is_cloud)
+                .with_cloud(effective_is_cloud)
                 .with_conversation_id(ctx.conversation_id.as_str())
                 // Per-profile persisted `tool_rules` resolve against this
                 // profile (SqlitePolicySource); empty = pre-Q8 behavior.
@@ -711,11 +717,20 @@ impl ToolDispatcher {
                     // cloud endpoint, running the tool would feed its result to
                     // the cloud next turn, so refuse (fail loud) rather than let
                     // the annotation be a silent no-op.
-                    if ev.routing.is_local_required() && is_cloud {
+                    if ev.routing.is_local_required() && effective_is_cloud {
                         let reason = match &ev.routing {
                             RoutingRequirement::LocalRequired { reason } => reason.clone(),
                             RoutingRequirement::Unconstrained => "must stay on-device".to_string(),
                         };
+                        // Rerouting the MODEL cannot make an off-box TOOL local.
+                        // Refuse this call instead of returning a reroute signal
+                        // that would loop back into the same unsafe destination.
+                        if tool_egresses_offbox {
+                            return ToolOutcome::Denied {
+                                by: "privacy_filter".to_string(),
+                                reason,
+                            };
+                        }
                         // Still never runs the tool on a cloud endpoint —
                         // invariant #2 intact. Typed distinctly from Denied so
                         // the caller (which owns providers; the dispatcher
@@ -1602,6 +1617,80 @@ mod tests {
             matches!(outcome, ToolOutcome::Ok(_)),
             "a must-stay-local call is fine on a local endpoint, got {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn private_binding_blocks_an_offbox_tool_even_on_a_local_model() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaggedSpyTool {
+            name: "remote_tool".to_string(),
+            risk: RiskClass::External,
+            ran: ran.clone(),
+        }));
+        let chain = build_pretooluse_chain_with_confirmed(
+            gate(),
+            Box::new(allow_policy(&["remote_tool"])),
+            &["remote_tool"],
+        );
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty());
+
+        let outcome = dispatcher
+            .dispatch(
+                &call("remote_tool", serde_json::json!({"note": "private payload"})),
+                &ctx(),
+                Binding::Private,
+                false, // local model; the tool destination is still off-box
+            )
+            .await;
+        assert!(
+            matches!(outcome, ToolOutcome::Denied { ref by, .. } if by == "privacy_filter"),
+            "Private + local model + off-box tool must be privacy-denied, got {outcome:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "the off-box tool must never run");
+    }
+
+    #[tokio::test]
+    async fn approval_cannot_override_auto_private_content_for_an_offbox_tool() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let asks = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TaggedSpyTool {
+            name: "remote_tool".to_string(),
+            risk: RiskClass::External,
+            ran: ran.clone(),
+        }));
+        let ledger = Arc::new(ApprovalLedger::new());
+        let mut policy = InMemoryPolicySource::new();
+        policy.set_mode("remote_tool", PermissionMode::Ask);
+        let chain = build_pretooluse_chain_full(
+            gate(),
+            Box::new(policy),
+            &[],
+            Arc::clone(&ledger),
+            None,
+        );
+        let prompter = Arc::new(MockPrompter {
+            response: MockResponse::ApproveOnceAction,
+            calls: asks.clone(),
+        });
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
+            .with_approval(ledger, Some(prompter));
+
+        let outcome = dispatcher
+            .dispatch(
+                &call("remote_tool", pii_args()),
+                &ctx(),
+                Binding::Auto,
+                false,
+            )
+            .await;
+        assert_eq!(asks.load(Ordering::SeqCst), 1, "the External floor still asks once");
+        assert!(
+            matches!(outcome, ToolOutcome::Denied { ref by, .. } if by == "privacy_filter"),
+            "approval must not override the privacy gate, got {outcome:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "private content must never reach the off-box tool");
     }
 
     // ── item 6: NeedsLocalReroute + TurnOutcome ──────────────────────────

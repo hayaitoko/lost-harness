@@ -99,9 +99,9 @@ pub struct McpToolDescriptor {
 
 // ── pure derivations ──────────────────────────────────────────────────────────
 
-/// A foreign hint may only ever RAISE risk; only explicit user config
-/// (`trusted_read_only`, set at registration) may LOWER it. See Q7 in
-/// `docs/tool-system-decisions.md`.
+/// A foreign hint may only ever RAISE risk. Explicit user trust may lower a
+/// LOCAL server's read-only tool, but a REMOTE server always remains External
+/// (or Dangerous) because the off-box destination is a non-negotiable floor.
 pub fn mcp_risk(
     tier: McpTrustTier,
     ann: &McpToolAnnotations,
@@ -111,8 +111,9 @@ pub fn mcp_risk(
         McpTrustTier::Local => RiskClass::Write,
         McpTrustTier::Remote => RiskClass::External,
     };
-    // Lower ONLY on explicit user trust + the server's read-only hint.
-    if ann.read_only_hint && trusted_read_only {
+    // Lower ONLY a local server on explicit user trust + read-only hint. A
+    // remote server's network destination can never be configured away.
+    if tier == McpTrustTier::Local && ann.read_only_hint && trusted_read_only {
         risk = RiskClass::Safe;
     }
     // Raise ALWAYS wins — unconditional, even over the Safe lowering above, so
@@ -229,6 +230,7 @@ pub struct McpTool {
     name: String,
     description: String,
     risk: RiskClass,
+    remote: bool,
     capabilities: Vec<Capability>,
     /// The server's REAL tool identifier, unmodified — the sanitized `name` is
     /// for the registry/catalog/gating; the wire call must use this.
@@ -250,6 +252,7 @@ impl McpTool {
             ),
             description: sanitize_mcp_description(&descriptor.description),
             risk: mcp_risk(cfg.tier, &descriptor.annotations, cfg.trusted_read_only),
+            remote: cfg.tier == McpTrustTier::Remote,
             capabilities: mcp_capabilities(cfg.tier, &cfg.capabilities),
             raw_tool_name: descriptor.name.clone(),
             transport,
@@ -268,6 +271,10 @@ impl Tool for McpTool {
 
     fn risk(&self) -> RiskClass {
         self.risk
+    }
+
+    fn egresses_offbox(&self) -> bool {
+        self.remote
     }
 
     fn requires(&self) -> &[Capability] {
@@ -357,13 +364,16 @@ mod tests {
     }
 
     #[test]
-    fn readonly_hint_lowers_only_when_server_trusted() {
+    fn readonly_hint_lowers_only_a_trusted_local_server() {
         let ann = McpToolAnnotations { read_only_hint: true, destructive_hint: false };
         // Not trusted → stays at tier default, NOT Safe.
         assert_eq!(mcp_risk(McpTrustTier::Remote, &ann, false), RiskClass::External);
         assert_eq!(mcp_risk(McpTrustTier::Local, &ann, false), RiskClass::Write);
-        // Trusted + read-only hint → Safe.
-        assert_eq!(mcp_risk(McpTrustTier::Remote, &ann, true), RiskClass::Safe);
+        // Remote remains External even when marked trusted/read-only: the
+        // network destination itself is the non-overridable floor.
+        assert_eq!(mcp_risk(McpTrustTier::Remote, &ann, true), RiskClass::External);
+        // A trusted local read-only server may still lower to Safe.
+        assert_eq!(mcp_risk(McpTrustTier::Local, &ann, true), RiskClass::Safe);
     }
 
     #[test]

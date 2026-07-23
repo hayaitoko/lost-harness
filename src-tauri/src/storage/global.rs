@@ -30,11 +30,20 @@ pub struct Endpoint {
     pub id: String,
     pub name: String,
     pub base_url: String,
-    pub api_key_encrypted: Option<Vec<u8>>,
+    /// Historical SQL column name: `api_key_encrypted`. New rows contain only
+    /// `secrets::KEYCHAIN_MARKER`; other bytes are legacy plaintext awaiting
+    /// the one-time boot migration.
+    pub api_key_marker: Option<Vec<u8>>,
     pub kind: String,
     pub created_at: i64,
     /// Q1: this endpoint's API supports OpenAI-style structured tool calls.
     pub supports_native_tools: bool,
+}
+
+impl Endpoint {
+    pub fn has_keychain_secret(&self) -> bool {
+        self.api_key_marker.as_deref() == Some(crate::secrets::KEYCHAIN_MARKER)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -548,7 +557,7 @@ impl GlobalDb {
                 ep.id,
                 ep.name,
                 ep.base_url,
-                ep.api_key_encrypted,
+                ep.api_key_marker,
                 ep.kind,
                 ep.created_at,
                 ep.supports_native_tools as i64
@@ -587,7 +596,7 @@ impl GlobalDb {
         id: &str,
         name: &str,
         base_url: &str,
-        api_key_encrypted: Option<&[u8]>,
+        api_key_marker: Option<&[u8]>,
         kind: &str,
         supports_native_tools: bool,
     ) -> Result<bool> {
@@ -598,11 +607,21 @@ impl GlobalDb {
             params![
                 name,
                 base_url,
-                api_key_encrypted,
+                api_key_marker,
                 kind,
                 supports_native_tools as i64,
                 id
             ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Replace a successfully-migrated legacy plaintext blob with the opaque
+    /// keychain-presence marker.
+    pub fn mark_endpoint_secret_in_keychain(&self, id: &str) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE endpoints SET api_key_encrypted = ?1 WHERE id = ?2",
+            params![crate::secrets::KEYCHAIN_MARKER, id],
         )?;
         Ok(n > 0)
     }
@@ -1579,7 +1598,7 @@ fn row_to_endpoint(r: &rusqlite::Row<'_>) -> rusqlite::Result<Endpoint> {
         id: r.get(0)?,
         name: r.get(1)?,
         base_url: r.get(2)?,
-        api_key_encrypted: r.get(3)?,
+        api_key_marker: r.get(3)?,
         kind: r.get(4)?,
         created_at: r.get(5)?,
         supports_native_tools: r.get::<_, i64>(6)? != 0,

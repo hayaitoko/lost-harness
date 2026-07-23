@@ -279,11 +279,11 @@
     the hole `seat.rs:8-13`'s doc comment calls out.
 
 - **Gotchas / watch-items**
-  - **`api_key_encrypted` is not actually encrypted** — unchanged from the
-    previous doc pass. `hydrate_providers_from_storage` (`lib.rs:304-332`)
-    reads it as raw bytes and does `String::from_utf8` directly
-    (`lib.rs:321-326`); the field name still promises something the code
-    doesn't provide.
+  - **Provider API keys are OS-credential-store-backed.** SQLite's historical
+    `api_key_encrypted` column now contains only a `keychain:v1` presence
+    marker. `secrets.rs` performs the idempotent legacy migration and
+    `hydrate_providers_from_storage` reads through `ProviderSecretStore`; CI
+    tests inject an in-memory fake and never require a logged-in keychain.
   - **Kind-parsing is still inconsistent between the two write paths.**
     `hydrate_providers_from_storage` (`lib.rs:316-319`) silently maps any
     unrecognized `kind` to `Custom`; the IPC `add_provider` command's

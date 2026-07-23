@@ -1,5 +1,17 @@
 # Handoff — external-review fix implementation (2026-07-23)
 
+> **COMPLETED 2026-07-23.** The build directives below are implemented and
+> verified. F12 generated the complete icon set, made clippy correctness
+> release-blocking, added advisory RustSec audit plus frontend type-check CI,
+> and a real debug Tauri bundle produced both `.app` and `.dmg`. F1 scrubs MCP
+> child environments and records the installation-warning contract. F5 exposes
+> `trusted_by_name`. F11 applies 7/30/90-day retention and redacts production
+> audit args. F2 gates each tool's own off-box destination and prevents Remote
+> MCP risk downgrades. F6 moves provider keys to the OS credential store with an
+> idempotent, failure-safe legacy migration. F3/F4 remain deliberately
+> permissive as directed. Final gates: **683 Rust tests**, clippy correctness,
+> no-default-features build, frontend check/build, and debug bundle all green.
+
 **For the next agent.** This continues the 2026-07-23 external security review
 (`docs/review.md`) triage. The review was ground-truthed by a 13-agent
 verification fan-out; full per-finding evidence lives in that workflow's journal

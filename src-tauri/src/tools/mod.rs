@@ -362,6 +362,14 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether invoking this tool itself sends data off this device. This is
+    /// independent of the model endpoint: a local model can still call a
+    /// remote MCP server or `fetch_url`. The dispatcher folds this into the
+    /// privacy gate so local inference never becomes an egress bypass.
+    fn egresses_offbox(&self) -> bool {
+        self.risk() == RiskClass::External
+    }
+
     /// The capabilities this tool needs from its running environment.
     fn requires(&self) -> &[Capability];
 

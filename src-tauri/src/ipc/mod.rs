@@ -57,6 +57,9 @@ pub struct AppState {
     pub agent_loop: Arc<AgentLoop>,
     pub model_manager: Arc<ModelManager>,
     pub storage: Arc<Storage>,
+    /// OS-backed provider credential store. SQLite contains only an opaque
+    /// presence marker; tests inject the in-memory implementation.
+    pub provider_secrets: Arc<dyn crate::secrets::ProviderSecretStore>,
     /// In-flight tool-approval prompts (§3.5). The dispatcher parks a request
     /// here and awaits it; `resolve_tool_approval` answers by id.
     pub approvals: Arc<ApprovalRegistry>,
@@ -119,6 +122,11 @@ pub struct ProviderInfo {
     pub base_url: String,
     pub kind: ProviderKind,
     pub is_private: bool,
+    /// True when locality is trusted only from a DNS/mDNS/tailnet suffix
+    /// (`.local`, `.lan`, `.internal`, `.ts.net`) rather than a loopback or
+    /// private IP literal. The provider UI must surface a one-time warning:
+    /// only use these endpoints on a network the user controls.
+    pub trusted_by_name: bool,
     pub supports_native_tools: bool,
 }
 
@@ -127,12 +135,14 @@ impl From<Provider> for ProviderInfo {
         // Compute `is_private` first — it takes `&self` and we want to
         // move `id`/`name`/`base_url`/`kind` afterwards.
         let is_private = p.is_private();
+        let trusted_by_name = crate::agent::egress::is_private_endpoint_trusted_by_name(&p.base_url);
         Self {
             id: p.id,
             name: p.name,
             base_url: p.base_url,
             kind: p.kind,
             is_private,
+            trusted_by_name,
             supports_native_tools: p.supports_native_tools,
         }
     }
@@ -422,6 +432,9 @@ pub fn add_provider(
         kind,
     )
     .with_native_tools(args.supports_native_tools);
+    if let Some(secret) = provider.api_key.as_deref() {
+        state.provider_secrets.set(&id, secret)?;
+    }
     state.model_manager.add_provider(provider.clone());
     // Persist so the flag (and the endpoint) survive a restart and hydrate
     // back on next boot. Best-effort: a storage failure logs but the
@@ -430,7 +443,10 @@ pub fn add_provider(
         id: id.clone(),
         name: provider.name.clone(),
         base_url: provider.base_url.clone(),
-        api_key_encrypted: provider.api_key.as_ref().map(|k| k.as_bytes().to_vec()),
+        api_key_marker: provider
+            .api_key
+            .as_ref()
+            .map(|_| crate::secrets::KEYCHAIN_MARKER.to_vec()),
         kind: args.kind.clone(),
         created_at: chrono::Utc::now().timestamp(),
         supports_native_tools: provider.supports_native_tools,
@@ -459,6 +475,9 @@ pub fn update_provider(
         kind,
     )
     .with_native_tools(args.supports_native_tools);
+    if let Some(secret) = provider.api_key.as_deref() {
+        state.provider_secrets.set(&args.id, secret)?;
+    }
     // `ModelManager::add_provider` replaces by id and drops the cached
     // client, so the next request is built from the new base URL/key.
     state.model_manager.add_provider(provider.clone());
@@ -466,7 +485,10 @@ pub fn update_provider(
     // UPDATE matching no row means the endpoint was never persisted (e.g.
     // the insert failed at add time) — insert it so the edit still
     // survives a restart.
-    let api_key_encrypted = provider.api_key.as_ref().map(|k| k.as_bytes().to_vec());
+    let api_key_marker = provider
+        .api_key
+        .as_ref()
+        .map(|_| crate::secrets::KEYCHAIN_MARKER.to_vec());
     let persisted = state
         .storage
         .global()
@@ -474,7 +496,7 @@ pub fn update_provider(
             &args.id,
             &provider.name,
             &provider.base_url,
-            api_key_encrypted.as_deref(),
+            api_key_marker.as_deref(),
             &args.kind,
             provider.supports_native_tools,
         )
@@ -486,7 +508,7 @@ pub fn update_provider(
                 id: args.id.clone(),
                 name: provider.name.clone(),
                 base_url: provider.base_url.clone(),
-                api_key_encrypted,
+                api_key_marker,
                 kind: args.kind.clone(),
                 created_at: chrono::Utc::now().timestamp(),
                 supports_native_tools: provider.supports_native_tools,
@@ -503,6 +525,12 @@ pub fn remove_provider(state: State<'_, AppState>, id: String) -> Result<bool, S
     if state.model_manager.get_provider(&id).is_none() {
         return Err(format!("unknown provider: {id}"));
     }
+    state.provider_secrets.delete(&id)?;
+    state
+        .storage
+        .global()
+        .delete_endpoint(&id)
+        .map_err(|e| e.to_string())?;
     state.model_manager.remove_provider(&id);
     Ok(true)
 }
@@ -1114,6 +1142,11 @@ pub struct McpServerInfo {
 /// — a server that can't come up is never persisted), then persist the config
 /// and hot-register its tools through the untouched trust spine. Returns the
 /// server + its namespaced tools.
+///
+/// SECURITY / UI CONTRACT: registration installs an unsandboxed executable
+/// that runs with the user's OS privileges and automatically restarts at app
+/// boot while enabled. Any UI exposing this command must present it as software
+/// installation and require explicit native confirmation before invoking it.
 #[tauri::command]
 pub async fn register_mcp_server(
     state: State<'_, AppState>,
