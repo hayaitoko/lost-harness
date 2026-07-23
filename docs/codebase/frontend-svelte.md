@@ -92,7 +92,7 @@ points at `src/app.html` explicitly — loading `/` 404s → blank white window.
 
 | Screen / component | Status | What's wired |
 |---|---|---|
-| `design/components/Sidebar.svelte` | **Wired** | Real `$conversations` list + row selection (`activeConversationId.set` + `hydrateMessages`), new-chat via `createConversation()`, profile switcher wired to `$profiles`/`switchProfile`. The section-nav links (Email/Whiteboard/Files/Scheduled-jobs) navigate via `nav.go(...)` — real navigation, but the destination screens themselves are still visual-only (below). The local-engine card's model name ("Qwen3-14B") is a hardcoded label, not read from the active provider/model. |
+| `design/components/Sidebar.svelte` | **Wired** | Real `$conversations` list + row selection (`activeConversationId.set` + `hydrateMessages`), new-chat via `createConversation()`, profile switcher wired to `$profiles`/`switchProfile` (a switch clears the chat stores and rehydrates the new profile's conversation list — see the Invariants note). The section-nav links (Email/Whiteboard/Files/Scheduled-jobs) navigate via `nav.go(...)` — real navigation, but the destination screens themselves are still visual-only (below). The local-engine card's model name ("Qwen3-14B") is a hardcoded label, not read from the active provider/model. |
 | `design/screens/MainScreen.svelte` | **Wired** (chat loop + routing + "why" panel; the other 4 side-panel tabs are sample data) | The chat loop: messages come from `$activeConversation`, sending goes through `chat.ts`'s `sendMessage` (streaming via `stream:token`/`stream:error`), the composer's Auto/Public/Private binding pill + the Q11 mode pill (Normal/Plan/Accept edits) feed `sendMessage` as per-send overrides, the model picker is built from `providersStore` (via `fetchModels` per provider, keyed by `providerId::name` so two providers can't collide on an identical model name), and each assistant message's `RoutingBadge` is driven by the **real** persisted `routing_decision`/`error_source`. The right-hand "Routing" panel tab calls `explainClassification(text, profile)` live and renders the classifier's actual spans (annotated highlight + hard-block flag) — the "why was this routed here" sidebar (PLAN §11) is real, not mocked. The panel's other 4 tabs (**Files in this chat**, **Background tasks**, **Sub-agents**, **Terminal**) render fixed inline sample markup (`heater-reply.md`/`lease.pdf`, a 62% progress bar, three fake sub-agent rows, a canned terminal transcript) — none of these four call into any store or IPC command. |
 | `design/screens/Settings.svelte` | **Mostly wired** (9 tabs; see breakdown below) | 7 of 9 tabs are real backend panes (privacy guard, permissions, models, memory, skills, agent types, usage); **Routing** is entirely local `$state`, and **Appearance** is wired only for its theme control — the rest of Appearance is cosmetic-only. |
 | `design/screens/Email.svelte`, `Whiteboard.svelte`, `Files.svelte`, `ScheduledJobs.svelte`, `Editor.svelte`, `Onboarding.svelte`, `EmptyState.svelte` | **Visual only** | Reachable via the section nav / a `#/<screen>` hash, render with sample data (`shell-data.ts` or inline), no backend calls. Don't assume any of these reflect real state. |
@@ -213,7 +213,12 @@ src/lib/api/tauri.ts` is more reliable right now than reading the header.
 - **`hydrateConversations()` must merge, not replace`** — overwriting the
   whole list would wipe out a transcript already loaded by
   `hydrateMessages()` for the active conversation. `design/components/Sidebar.svelte`
-  relies on the merged list for its conversation rows.
+  relies on the merged list for its conversation rows. The one deliberate
+  exception is a profile switch: `switchProfile` (`stores/profiles.ts`)
+  clears `conversations` + `activeConversationId` *before* rehydrating,
+  because merging across profiles would carry the old profile's rows over as
+  "local-only" entries and leave a stale `activeConversationId` pointing at
+  a conversation the new profile's DB doesn't have.
 - **A `Block` gate decision never adopts the server's `message_id`** in
   `sendMessage()`'s error path — on Block, the backend persisted no message
   row, so `response.message_id` is unrelated/throwaway; adopting it risks a

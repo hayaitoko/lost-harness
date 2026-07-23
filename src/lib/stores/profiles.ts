@@ -7,6 +7,11 @@
 
 import { writable, derived, get, type Readable } from "svelte/store";
 import * as api from "../api/tauri";
+import {
+  activeConversationId,
+  conversations,
+  hydrateConversations,
+} from "./chat";
 
 export interface Profile {
   id: string;
@@ -34,14 +39,16 @@ export const activeProfile: Readable<Profile | null> = derived(
 );
 
 /**
- * Switches the active profile. M1 stub: in-memory only and a no-op on the
- * backend. Real impl will call into the profile manager (notify the agent
- * loop, flush conversation caches, swap default model endpoints).
+ * Switches the active profile and reloads the conversation stores from the
+ * new profile's DB. Backend-wise this is still a no-op by design: every data
+ * command (`list_conversations`, `send_message`, …) takes an explicit
+ * `profile` arg, so the switch is purely frontend state.
  */
 export async function switchProfile(id: string): Promise<void> {
   if (!DEFAULT_PROFILES.some((p) => p.id === id)) {
     throw new Error(`Unknown profile: ${id}`);
   }
+  if (get(activeProfileId) === id) return;
   activeProfileId.set(id);
   // Persist locally so the browser fallback (no Tauri) survives reloads.
   try {
@@ -51,6 +58,15 @@ export async function switchProfile(id: string): Promise<void> {
   } catch {
     // localStorage may be unavailable (private mode, SSR); non-fatal.
   }
+  // The chat stores still hold the previous profile's conversations. Clear
+  // them BEFORE rehydrating: hydrateConversations() merges rather than
+  // replaces (see the invariant in docs/codebase/frontend-svelte.md), so a
+  // bare re-call would keep the old profile's rows as "local-only" entries —
+  // and a stale activeConversationId would make the next send_message hit a
+  // conversation id that doesn't exist in the new profile's DB.
+  activeConversationId.set(null);
+  conversations.set([]);
+  await hydrateConversations();
 }
 
 /**
