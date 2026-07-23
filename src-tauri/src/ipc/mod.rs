@@ -813,6 +813,69 @@ pub fn calculate_model_fit(
     crate::models::calculator::calculate(&state.hardware, &args.model_spec, &args.calc_input)
 }
 
+// ── sandbox_config (B2 — M7 Tier-K network ceiling reachable) ──────────────
+// Nothing wrote a `sandbox_config` row before this, so `ShellExecTool`'s
+// per-profile network ceiling took the "unconfigured → unconstrained" branch
+// for every real profile. These commands are the writer surface.
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetSandboxConfigArgs {
+    pub profile: String,
+}
+
+/// This profile's stored sandbox config, or the default when UNSET. A CORRUPT
+/// stored row propagates as an `Err` (never coerced to a default) — the
+/// storage layer fails closed and so must this command, so a garbled row can't
+/// silently loosen the shell's network ceiling.
+#[tauri::command]
+pub fn get_sandbox_config(
+    state: State<'_, AppState>,
+    args: GetSandboxConfigArgs,
+) -> Result<crate::hooks::SandboxConfig, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    // `?` propagates a corrupt-row Err; `unwrap_or_default` only fills the
+    // UNSET (None) case with the library default.
+    Ok(db.get_sandbox_config().map_err(|e| e.to_string())?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetSandboxConfigArgs {
+    pub profile: String,
+    pub config: crate::hooks::SandboxConfig,
+}
+
+/// Persist this profile's sandbox config. Validates before writing so a
+/// self-contradictory / empty-entry shape never reaches the JSON blob the shell
+/// path trusts. Echoes the validated config now in effect.
+#[tauri::command]
+pub fn set_sandbox_config(
+    state: State<'_, AppState>,
+    args: SetSandboxConfigArgs,
+) -> Result<crate::hooks::SandboxConfig, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    validate_sandbox_config(&args.config)?;
+    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    db.set_sandbox_config(&args.config).map_err(|e| e.to_string())?;
+    Ok(args.config)
+}
+
+/// Reject shapes that would be silently mis-stored: empty allowlist / exclusion
+/// entries (a blank domain/socket/command is never meaningful and would just be
+/// dead weight the shell path has to skip). Fail closed on bad input.
+fn validate_sandbox_config(cfg: &crate::hooks::SandboxConfig) -> Result<(), String> {
+    if cfg.network.allowed_domains.iter().any(|d| d.trim().is_empty()) {
+        return Err("sandbox_config: allowed_domains entries must not be empty".into());
+    }
+    if cfg.network.allow_unix_sockets.iter().any(|s| s.trim().is_empty()) {
+        return Err("sandbox_config: allow_unix_sockets entries must not be empty".into());
+    }
+    if cfg.excluded_commands.iter().any(|c| c.trim().is_empty()) {
+        return Err("sandbox_config: excluded_commands entries must not be empty".into());
+    }
+    Ok(())
+}
+
 /// A downloaded/registered local model for the Settings model-manager (M8 S6).
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalModelInfo {

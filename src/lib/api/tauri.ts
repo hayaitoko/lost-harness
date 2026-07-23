@@ -730,6 +730,41 @@ export async function downloadModel(id: string): Promise<{ id: string; name: str
   return { id, name: "", path: "" };
 }
 
+// ── sandbox_config (B2 — per-profile shell network ceiling) ────────────────
+
+/** Mirrors `SandboxNetworkConfig` in `hooks/sandbox.rs`. */
+export interface SandboxNetworkConfig {
+  allowed_domains: string[];
+  allow_localhost: boolean;
+  allow_unix_sockets: string[];
+}
+
+/** Mirrors `SandboxConfig` in `hooks/sandbox.rs`. A locked-down config
+ *  (no localhost, no allowed_domains) denies shell_exec the network outright. */
+export interface SandboxConfig {
+  enabled: boolean;
+  auto_allow_if_sandboxed: boolean;
+  excluded_commands: string[];
+  network: SandboxNetworkConfig;
+}
+
+/** This profile's sandbox config (the default when unset). Throws if the stored
+ *  row is corrupt — the shell path fails closed, so this surfaces it. */
+export async function getSandboxConfig(profile: string): Promise<SandboxConfig | null> {
+  if (isTauri()) return tauriInvoke<SandboxConfig>("get_sandbox_config", { args: { profile } });
+  return null;
+}
+
+/** Persist this profile's sandbox config (validated before write). */
+export async function setSandboxConfig(
+  profile: string,
+  config: SandboxConfig,
+): Promise<SandboxConfig | null> {
+  if (isTauri())
+    return tauriInvoke<SandboxConfig>("set_sandbox_config", { args: { profile, config } });
+  return null;
+}
+
 /** A downloaded local model. Mirrors `LocalModelInfo` in `ipc/mod.rs`. */
 export interface LocalModel {
   id: string;

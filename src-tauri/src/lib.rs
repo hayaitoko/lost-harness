@@ -337,6 +337,8 @@ pub fn run() {
             ipc::search_models,
             ipc::get_model_detail,
             ipc::calculate_model_fit,
+            ipc::get_sandbox_config,
+            ipc::set_sandbox_config,
             ipc::download_model,
             ipc::list_local_models,
             ipc::remove_local_model,

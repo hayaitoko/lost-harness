@@ -116,6 +116,8 @@ fn test_app() -> App<MockRuntime> {
             ipc::search_models,
             ipc::get_model_detail,
             ipc::calculate_model_fit,
+            ipc::get_sandbox_config,
+            ipc::set_sandbox_config,
         ])
         .build(mock_context(noop_assets()))
         .expect("failed to build mock app");
@@ -600,4 +602,65 @@ fn model_ipc_args_deserialize_from_the_wire_shape() {
     let d: super::GetModelDetailArgs =
         serde_json::from_value(json!({"model_id": "org/repo"})).unwrap();
     assert_eq!(d.model_id, "org/repo");
+}
+
+// ── sandbox_config (B2) ────────────────────────────────────────────────────
+
+#[test]
+fn set_then_get_sandbox_config_round_trips_the_ceiling() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let cfg = json!({
+        "enabled": true,
+        "auto_allow_if_sandboxed": false,
+        "excluded_commands": ["rm"],
+        "network": {"allowed_domains": ["example.com"], "allow_localhost": false, "allow_unix_sockets": []}
+    });
+    let set = call(&webview, "set_sandbox_config", json!({"args": {"profile": "personal", "config": cfg}}));
+    set.expect("a valid config must persist");
+    let got = call(&webview, "get_sandbox_config", json!({"args": {"profile": "personal"}}))
+        .expect("get must dispatch")
+        .deserialize::<Value>()
+        .unwrap();
+    assert_eq!(got["network"]["allow_localhost"], false, "the locked-down ceiling round-trips");
+    assert_eq!(got["network"]["allowed_domains"][0], "example.com");
+    assert_eq!(got["enabled"], true);
+}
+
+#[test]
+fn get_sandbox_config_returns_default_when_unset() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let got = call(&webview, "get_sandbox_config", json!({"args": {"profile": "personal"}}))
+        .expect("get must dispatch")
+        .deserialize::<Value>()
+        .unwrap();
+    // The library default: disabled, localhost allowed, no domains.
+    assert_eq!(got["enabled"], false);
+    assert_eq!(got["network"]["allow_localhost"], true);
+}
+
+#[test]
+fn set_sandbox_config_rejects_an_empty_allowlist_entry() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let cfg = json!({
+        "enabled": true, "auto_allow_if_sandboxed": false, "excluded_commands": [],
+        "network": {"allowed_domains": ["  "], "allow_localhost": true, "allow_unix_sockets": []}
+    });
+    let res = call(&webview, "set_sandbox_config", json!({"args": {"profile": "personal", "config": cfg}}));
+    let err = res.expect_err("an empty allowed_domain must be rejected");
+    let msg = err.as_str().unwrap_or_default();
+    assert!(msg.contains("must not be empty"), "expected a validation error, got: {msg}");
+    assert!(!is_ipc_arg_rejection(msg), "it's a domain-level validation error, not an arg-shape rejection");
+}
+
+#[test]
+fn sandbox_config_old_broken_shape_is_rejected() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    // No `args` wrapper.
+    let res = call(&webview, "get_sandbox_config", json!({"profile": "personal"}));
+    let err = res.expect_err("flat/unwrapped args must NOT dispatch");
+    assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
 }
