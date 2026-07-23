@@ -89,6 +89,24 @@ impl TestStreamer for FakeStreamer {
     }
 }
 
+// B7: FakeStreamer ALSO implements the REAL `ModelStreamer` trait, so it can be
+// injected into the REAL `AgentLoop::process_message` (via
+// `with_model_streamer_override`) — not just the `TestLoop` reimplementation.
+// Reuses the exact same canned-stream body as `stream_chunks` above.
+impl crate::agent::loop_mod::ModelStreamer for FakeStreamer {
+    fn provider(&self) -> &Provider {
+        &self.provider
+    }
+    fn stream<'a>(
+        &'a self,
+        model: &'a str,
+        messages: Vec<ChatMessage>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>>
+    {
+        Box::pin(async move { self.stream_chunks(model, messages).await })
+    }
+}
+
 // ── Test harness ────────────────────────────────────────────────────────
 
 /// Re-implementation of the relevant `AgentLoop::process_message` body
@@ -1153,4 +1171,161 @@ async fn run_subagent_blocks_a_cloud_seat_under_a_private_binding_without_touchi
         outcome.to_lowercase().contains("private") && outcome.to_lowercase().contains("cloud"),
         "a cloud-seated helper under Private must be blocked before any client is touched, got: {outcome}"
     );
+}
+
+// ── B7: real-loop harness — a fake ModelStreamer driven through the REAL
+// process_message (not the TestLoop reimplementation). Covers the three gaps
+// the reimplementation couldn't pin: the Allow→cloud history guard, redact-and-
+// send, and usage booking — all through the actual production code path. ──────
+
+/// Build a real `AgentLoop` (RulesClassifier gate, so SSN/email are detected)
+/// with the fake streamer injected and its cloud provider registered.
+fn b7_loop(fake: Arc<FakeStreamer>) -> (crate::agent::loop_mod::AgentLoop, Arc<Storage>, std::path::PathBuf) {
+    use crate::agent::loop_mod::AgentLoop;
+    use crate::classifier::RulesClassifier;
+    use crate::models::ModelManager;
+    let dir = tempdir();
+    let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+    let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
+    let mm = Arc::new(ModelManager::new());
+    mm.add_provider(<FakeStreamer as crate::agent::loop_mod::ModelStreamer>::provider(&fake).clone());
+    let agent = AgentLoop::new(gate, mm, Arc::clone(&storage), Arc::new(echo_allow_dispatcher()))
+        .with_model_streamer_override(Arc::clone(&fake) as Arc<dyn crate::agent::loop_mod::ModelStreamer>);
+    (agent, storage, dir)
+}
+
+fn b7_sink() -> Arc<dyn crate::agent::result_sink::ResultSink> {
+    Arc::new(crate::agent::result_sink::HeadlessSink)
+}
+
+fn b7_seed_conversation(storage: &Storage, conv: &str) {
+    storage
+        .open_profile("personal")
+        .unwrap()
+        .create_conversation(&crate::storage::Conversation {
+            id: conv.to_string(),
+            name: "c".to_string(),
+            pinned: false,
+            binding: "auto".to_string(),
+            folder_id: None,
+            color: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn b7_usage_is_booked_for_a_streamed_turn() {
+    // Gap 3: the streamed model call must be booked to the usage ledger.
+    let cloud = cloud_provider("cloudco");
+    let fake = Arc::new(FakeStreamer::new(cloud.clone(), sse_chunks_for("hello there")));
+    let (agent, storage, dir) = b7_loop(Arc::clone(&fake));
+    b7_seed_conversation(&storage, "c1");
+    // Public binding bypasses the classifier → a straight cloud send.
+    let out = agent
+        .process_message(
+            "what's the weather".into(),
+            "c1".into(),
+            Binding::Public,
+            cloud.id.clone(),
+            "gpt-x".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .unwrap();
+    assert!(out.contains("hello there"), "the fake reply streams back: {out:?}");
+    let summary = storage.open_profile("personal").unwrap().usage_summary().unwrap();
+    assert_eq!(summary.total_calls, 1, "the streamed call is booked to the ledger");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn b7_allow_on_cloud_refuses_when_prior_history_is_private_and_no_local_exists() {
+    // Gap 1: even a benign NEW message on cloud must not replay a conversation
+    // whose earlier turn is private. With no local model to continue privately,
+    // it refuses — and the private history NEVER reaches the cloud streamer.
+    let cloud = cloud_provider("cloudco");
+    let fake = Arc::new(FakeStreamer::new(cloud.clone(), sse_chunks_for("ok")));
+    let (agent, storage, dir) = b7_loop(Arc::clone(&fake)); // NO local provider
+    b7_seed_conversation(&storage, "cp");
+    storage
+        .open_profile("personal")
+        .unwrap()
+        .add_message(&Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: "cp".to_string(),
+            role: "user".to_string(),
+            content: "my SSN is 123-45-6789".to_string(),
+            model: None,
+            provider_id: None,
+            routing_decision: None,
+            thinking_content: None,
+            error: None,
+            aborted: false,
+            created_at: 1,
+        })
+        .unwrap();
+    let out = agent
+        .process_message(
+            "thanks".into(),
+            "cp".into(),
+            Binding::Auto,
+            cloud.id.clone(),
+            "gpt-x".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        fake.captured().is_none(),
+        "the private history must NEVER reach the cloud streamer"
+    );
+    let low = out.to_lowercase();
+    assert!(
+        low.contains("safely") || low.contains("private") || low.contains("local"),
+        "must refuse loudly rather than leak, got: {out}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn b7_redact_and_send_strips_the_value_before_cloud() {
+    // Gap 2: with redaction enabled, a redactable VALUE (an email) is blacked
+    // out BEFORE the turn is sent to cloud — the original never egresses.
+    let cloud = cloud_provider("cloudco");
+    let fake = Arc::new(FakeStreamer::new(cloud.clone(), sse_chunks_for("done")));
+    let (agent, storage, dir) = b7_loop(Arc::clone(&fake));
+    b7_seed_conversation(&storage, "cr");
+    storage
+        .open_profile("personal")
+        .unwrap()
+        .set_redaction_enabled(true)
+        .unwrap();
+    let _ = agent
+        .process_message(
+            "please email me at a@b.com about the invoice".into(),
+            "cr".into(),
+            Binding::Auto,
+            cloud.id.clone(),
+            "gpt-x".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .unwrap();
+    let sent = fake
+        .captured()
+        .expect("a redactable message IS sent to cloud (redacted), not withheld");
+    let joined: String = sent.iter().map(|m| m.content.clone()).collect();
+    assert!(
+        !joined.contains("a@b.com"),
+        "the email value must be redacted before cloud egress, sent: {joined:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

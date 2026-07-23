@@ -98,30 +98,35 @@ pub struct MemoryEventPayload {
 /// The slice of `ModelClient` the agent loop needs. Trait-ified so tests
 /// can inject canned responses without an HTTP server. Production code
 /// uses the blanket impl below; no runtime overhead (monomorphization).
-#[allow(async_fn_in_trait)]
 pub trait ModelStreamer: Send + Sync {
     fn provider(&self) -> &Provider;
     /// Open a streaming chat-completion. Mirrors the inherent
     /// `ModelClient::stream_chat` but with a different name so the trait
-    /// method doesn't collide with the inherent method (Rust forbids
-    /// that). The blanket impl below delegates to the inherent method.
-    async fn stream(
-        &self,
-        model: &str,
+    /// method doesn't collide with the inherent method (Rust forbids that).
+    /// Returns a boxed future so the trait is **dyn-compatible** — B7 injects a
+    /// `Arc<dyn ModelStreamer>` fake into the real loop (same shape as the
+    /// `DurableFactExtractor`/`SkillDrafter` injectable traits).
+    fn stream<'a>(
+        &'a self,
+        model: &'a str,
         messages: Vec<ChatMessage>,
-    ) -> Result<crate::models::sse::SseStream>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::models::sse::SseStream>> + Send + 'a>,
+    >;
 }
 
 impl ModelStreamer for ModelClient {
     fn provider(&self) -> &Provider {
         self.provider()
     }
-    async fn stream(
-        &self,
-        model: &str,
+    fn stream<'a>(
+        &'a self,
+        model: &'a str,
         messages: Vec<ChatMessage>,
-    ) -> Result<crate::models::sse::SseStream> {
-        ModelClient::stream_chat(self, model, messages).await
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::models::sse::SseStream>> + Send + 'a>,
+    > {
+        Box::pin(async move { ModelClient::stream_chat(self, model, messages).await })
     }
 }
 
@@ -194,6 +199,13 @@ pub struct AgentLoop {
     #[cfg(feature = "local-runner")]
     local_runner: Option<Arc<crate::models::runner::LocalRunnerContext>>,
     stream_lock: tokio::sync::Mutex<()>,
+    /// B7: a test-only injectable model streamer. `None` in production (one
+    /// `Option` check on the per-round stream path, always None there); set by
+    /// the `#[cfg(test)] with_model_streamer_override` builder so the REAL
+    /// `process_message` can be driven end-to-end against a canned transport
+    /// (the Allow→cloud history guard, redact-and-send, and usage booking are
+    /// tested through the real loop, not a reimplementation).
+    streamer_override: Option<Arc<dyn ModelStreamer>>,
 }
 
 /// A borrowed lazy-runner reference for the free-fn reroute path
@@ -249,6 +261,7 @@ impl AgentLoop {
             #[cfg(feature = "local-runner")]
             local_runner: None,
             stream_lock: tokio::sync::Mutex::new(()),
+            streamer_override: None,
         }
     }
 
@@ -293,6 +306,14 @@ impl AgentLoop {
         extractor: Arc<dyn crate::agent::memory_flush::DurableFactExtractor>,
     ) -> Self {
         self.fact_extractor = extractor;
+        self
+    }
+
+    /// B7: inject a fake [`ModelStreamer`] so the REAL `process_message` streams
+    /// against a canned transport (no HTTP). Tests only.
+    #[cfg(test)]
+    pub fn with_model_streamer_override(mut self, streamer: Arc<dyn ModelStreamer>) -> Self {
+        self.streamer_override = Some(streamer);
         self
     }
 
@@ -1454,14 +1475,23 @@ impl AgentLoop {
                 // (async, local-model, best-effort) BEFORE they leave the wire.
                 self.on_pre_compaction(&conversation_id, &profile, &compaction.trimmed, sink);
             }
-            let mut sse = client
-                .stream_chat_with_tools(
-                    &model,
-                    compaction.sent,
-                    if native_mode { native_spec.as_ref() } else { None },
-                )
-                .await
-                .with_context(|| format!("stream_chat to provider {}", provider.id))?;
+            // B7: a test-injected streamer (None in production) drives the REAL
+            // loop against a canned transport; the production arm below is
+            // byte-identical to before.
+            let mut sse = match &self.streamer_override {
+                Some(fake) => fake
+                    .stream(&model, compaction.sent)
+                    .await
+                    .with_context(|| format!("stream to provider {}", provider.id))?,
+                None => client
+                    .stream_chat_with_tools(
+                        &model,
+                        compaction.sent,
+                        if native_mode { native_spec.as_ref() } else { None },
+                    )
+                    .await
+                    .with_context(|| format!("stream_chat to provider {}", provider.id))?,
+            };
 
             let mut assembled = String::new();
             let mut native_frags: Vec<crate::models::sse::ToolCallFragment> = Vec::new();
