@@ -401,6 +401,7 @@ pub fn run() {
             ipc::get_messages,
             ipc::list_providers,
             ipc::add_provider,
+            ipc::update_provider,
             ipc::remove_provider,
             ipc::list_models,
             ipc::send_message,

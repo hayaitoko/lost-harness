@@ -111,6 +111,7 @@ fn test_app() -> App<MockRuntime> {
             ipc::get_messages,
             ipc::list_providers,
             ipc::add_provider,
+            ipc::update_provider,
             ipc::remove_provider,
             ipc::list_models,
             ipc::get_classifier_settings,
@@ -413,6 +414,103 @@ fn add_provider_old_broken_shape_is_rejected() {
     // any form (it wouldn't have been, since the command body never ran,
     // but this pins that invariant explicitly).
     assert!(!msg.contains("sk-test-secret"));
+}
+
+// ── update_provider ─────────────────────────────────────────────────────
+
+#[test]
+fn update_provider_correct_shape_dispatches_and_keeps_stored_key() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // Seed a provider to edit.
+    let added = call(
+        &webview,
+        "add_provider",
+        json!({
+            "args": {
+                "name": "OpenAI",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "sk-test-secret",
+                "kind": "cloud",
+            }
+        }),
+    )
+    .expect("seed add_provider must succeed");
+    let added: Value = added.deserialize().expect("seed response must be valid JSON");
+    let id = added["id"].as_str().expect("seed id").to_string();
+
+    // Edit with NO api_key — mirrors the Settings edit form, which never
+    // echoes the stored key back into the field.
+    let body = json!({
+        "args": {
+            "id": id,
+            "name": "Renamed",
+            "base_url": "http://10.0.0.100:8000/v1",
+            "kind": "local",
+            "supports_native_tools": true,
+        }
+    });
+    let ok = call(&webview, "update_provider", body)
+        .expect("correctly-wrapped args must dispatch and succeed");
+    let raw = match &ok {
+        InvokeResponseBody::Json(s) => s.clone(),
+        InvokeResponseBody::Raw(_) => panic!("expected a JSON response"),
+    };
+    // Same invariant as add_provider: the key never round-trips back.
+    assert!(!raw.contains("sk-test-secret"), "api key leaked: {raw}");
+    let value: Value = ok.deserialize().expect("response must be valid JSON");
+    assert_eq!(value["id"], id.as_str());
+    assert_eq!(value["name"], "Renamed");
+    assert_eq!(value["kind"], "local");
+    assert_eq!(value["supports_native_tools"], true);
+
+    // Absent api_key means "keep the stored key", not "clear it" — pin
+    // that in both the in-memory manager and the persisted endpoint row.
+    let state = app.state::<AppState>();
+    let provider = state
+        .model_manager
+        .get_provider(&id)
+        .expect("provider still registered");
+    assert_eq!(provider.api_key.as_deref(), Some("sk-test-secret"));
+    assert_eq!(provider.base_url, "http://10.0.0.100:8000/v1");
+    assert!(provider.supports_native_tools);
+    let ep = state
+        .storage
+        .global()
+        .get_endpoint(&id)
+        .expect("endpoint query")
+        .expect("endpoint row persisted");
+    assert_eq!(ep.name, "Renamed");
+    assert_eq!(ep.base_url, "http://10.0.0.100:8000/v1");
+    assert_eq!(ep.kind, "local");
+    assert!(ep.supports_native_tools);
+    assert_eq!(ep.api_key_encrypted.as_deref(), Some(b"sk-test-secret".as_slice()));
+}
+
+#[test]
+fn update_provider_unknown_id_is_domain_error() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    let body = json!({
+        "args": {
+            "id": "no-such-provider",
+            "name": "X",
+            "base_url": "http://localhost:1234/v1",
+            "kind": "custom",
+        }
+    });
+    let res = call(&webview, "update_provider", body);
+    let err = res.expect_err("unknown id must fail in the command body");
+    let msg = err.as_str().unwrap_or_default();
+    // A domain error, NOT an arg-shape rejection — proves the command is
+    // registered and the args deserialized.
+    assert!(
+        !is_ipc_arg_rejection(msg),
+        "expected a domain error, got an arg rejection: {msg}"
+    );
+    assert!(msg.contains("unknown provider"), "unexpected error: {msg}");
 }
 
 // ── list_models ─────────────────────────────────────────────────────────
@@ -758,6 +856,7 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "decision": "approve", "json": "{}", "answer": "a"
     });
     let args_cmds = [
+        "update_provider",
         "resolve_tool_approval",
         "resolve_ask_human",
         "get_usage_summary",

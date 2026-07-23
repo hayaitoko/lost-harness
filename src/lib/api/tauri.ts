@@ -14,6 +14,7 @@
 //   - `remove_provider(id) -> bool`
 //   - `send_message(args: { content, conversation_id, binding, provider_id, model, profile, mode }) -> SendMessageResponse`
 //   - `add_provider(args: { name, base_url, api_key, kind, supports_native_tools }) -> ProviderInfo`
+//   - `update_provider(args: { id, name, base_url, api_key, kind, supports_native_tools }) -> ProviderInfo`
 //   - `list_models(args: { provider_id }) -> Vec<String>`
 //   - `list_conversations(args: { profile }) -> Vec<ConversationInfo>`
 //   - `create_conversation(args: { name, binding, profile }) -> ConversationInfo`
@@ -250,6 +251,33 @@ export async function addProvider(
     });
   }
   return browserAddProvider(name, baseUrl, apiKey, kind, supportsNativeTools);
+}
+
+/**
+ * Updates an existing provider in place. A null/empty `apiKey` keeps the
+ * stored key (the edit form never echoes secrets back), it does not clear it.
+ */
+export async function updateProvider(
+  id: string,
+  name: string,
+  baseUrl: string,
+  apiKey: string | null,
+  kind: string,
+  supportsNativeTools: boolean,
+): Promise<ProviderInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ProviderInfo>("update_provider", {
+      args: {
+        id,
+        name,
+        base_url: baseUrl,
+        api_key: apiKey || null,
+        kind,
+        supports_native_tools: supportsNativeTools,
+      },
+    });
+  }
+  return browserUpdateProvider(id, name, baseUrl, kind, supportsNativeTools);
 }
 
 /** Removes a provider by id. */
@@ -1272,6 +1300,29 @@ function browserAddProvider(
   };
   const list = browserListProviders();
   list.push(info);
+  browserPersistProviders(list);
+  return info;
+}
+
+function browserUpdateProvider(
+  id: string,
+  name: string,
+  baseUrl: string,
+  kind: string,
+  supportsNativeTools: boolean,
+): ProviderInfo {
+  const info: ProviderInfo = {
+    id,
+    name,
+    base_url: baseUrl,
+    kind,
+    is_private: kind === "local",
+    supports_native_tools: supportsNativeTools,
+  };
+  const list = browserListProviders();
+  const idx = list.findIndex((p) => p.id === id);
+  if (idx >= 0) list[idx] = info;
+  else list.push(info);
   browserPersistProviders(list);
   return info;
 }

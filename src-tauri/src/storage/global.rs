@@ -589,11 +589,20 @@ impl GlobalDb {
         base_url: &str,
         api_key_encrypted: Option<&[u8]>,
         kind: &str,
+        supports_native_tools: bool,
     ) -> Result<bool> {
         let n = self.conn.lock().execute(
-            "UPDATE endpoints SET name = ?1, base_url = ?2, api_key_encrypted = ?3, kind = ?4
-             WHERE id = ?5",
-            params![name, base_url, api_key_encrypted, kind, id],
+            "UPDATE endpoints SET name = ?1, base_url = ?2, api_key_encrypted = ?3, kind = ?4,
+                 supports_native_tools = ?5
+             WHERE id = ?6",
+            params![
+                name,
+                base_url,
+                api_key_encrypted,
+                kind,
+                supports_native_tools as i64,
+                id
+            ],
         )?;
         Ok(n > 0)
     }

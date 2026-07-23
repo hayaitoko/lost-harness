@@ -187,22 +187,49 @@ export async function addProvider(
   const existingIdx = providersStore.providers.findIndex((x) => x.id === p.id);
 
   if (existingIdx >= 0) {
-    // Update existing — the backend add_provider always creates a new row,
-    // so for edits we update locally and persist. (A full update_provider
-    // IPC command lands in a later milestone.)
+    // Update existing — round-trip through the backend so the edit
+    // survives a restart (hydrateProviders re-pulls from global.db).
     const id = p.id!;
-    const next: Provider = {
-      id,
-      name: p.name.trim(),
-      baseUrl: p.baseUrl.trim(),
-      apiKey: p.apiKey ?? "",
-      kind: p.kind,
-      isPrivate: providersStore.providers[existingIdx].isPrivate,
-      supportsNativeTools: p.supportsNativeTools,
-    };
-    providersStore.providers[existingIdx] = next;
+    const existing = providersStore.providers[existingIdx];
+    // The edit form leaves the key field blank rather than echoing the
+    // stored secret; blank means "keep the stored key".
+    const apiKey = p.apiKey || existing.apiKey;
+    try {
+      const info = await api.updateProvider(
+        id,
+        p.name.trim(),
+        p.baseUrl.trim(),
+        p.apiKey || null,
+        p.kind,
+        p.supportsNativeTools,
+      );
+      providersStore.providers[existingIdx] = {
+        id: info.id,
+        name: info.name,
+        baseUrl: info.base_url,
+        apiKey,
+        kind: (info.kind as ProviderKind) ?? p.kind,
+        isPrivate: info.is_private,
+        supportsNativeTools: info.supports_native_tools,
+      };
+    } catch (err) {
+      // IPC error — update locally so the UI reflects the edit for this
+      // session; it may revert on next launch if the backend never saw it.
+      console.error("updateProvider IPC failed, using local fallback", err);
+      providersStore.providers[existingIdx] = {
+        id,
+        name: p.name.trim(),
+        baseUrl: p.baseUrl.trim(),
+        apiKey,
+        kind: p.kind,
+        isPrivate: existing.isPrivate,
+        supportsNativeTools: p.supportsNativeTools,
+      };
+    }
+    // Base URL or kind may have changed — drop the cached model list.
+    modelCache.delete(id);
     persistProviders();
-    return next;
+    return providersStore.providers[existingIdx];
   }
 
   // New provider — round-trip through the backend.

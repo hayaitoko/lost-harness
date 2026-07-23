@@ -235,6 +235,22 @@ pub struct AddProviderArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct UpdateProviderArgs {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    /// `None` keeps the stored key — the Settings edit form never echoes a
+    /// stored key back, so absence is not a request to clear it.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// "local" | "cloud" | "custom"
+    pub kind: String,
+    /// Q1: endpoint supports OpenAI-style native structured tool calls.
+    #[serde(default)]
+    pub supports_native_tools: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct CreateConversationArgs {
     pub name: String,
     /// Defaults to "auto" if omitted.
@@ -387,6 +403,64 @@ pub fn add_provider(
         supports_native_tools: provider.supports_native_tools,
     }) {
         tracing::warn!(error = %e, "failed to persist endpoint (in-memory only this session)");
+    }
+    Ok(provider.into())
+}
+
+#[tauri::command]
+pub fn update_provider(
+    state: State<'_, AppState>,
+    args: UpdateProviderArgs,
+) -> Result<ProviderInfo, String> {
+    let kind = parse_kind(&args.kind)?;
+    let existing = state
+        .model_manager
+        .get_provider(&args.id)
+        .ok_or_else(|| format!("unknown provider: {}", args.id))?;
+    let api_key = args.api_key.or(existing.api_key);
+    let provider = Provider::new(
+        args.id.clone(),
+        args.name,
+        args.base_url,
+        api_key,
+        kind,
+    )
+    .with_native_tools(args.supports_native_tools);
+    // `ModelManager::add_provider` replaces by id and drops the cached
+    // client, so the next request is built from the new base URL/key.
+    state.model_manager.add_provider(provider.clone());
+    // Persist with the same best-effort discipline as add_provider. An
+    // UPDATE matching no row means the endpoint was never persisted (e.g.
+    // the insert failed at add time) — insert it so the edit still
+    // survives a restart.
+    let api_key_encrypted = provider.api_key.as_ref().map(|k| k.as_bytes().to_vec());
+    let persisted = state
+        .storage
+        .global()
+        .update_endpoint(
+            &args.id,
+            &provider.name,
+            &provider.base_url,
+            api_key_encrypted.as_deref(),
+            &args.kind,
+            provider.supports_native_tools,
+        )
+        .and_then(|updated| {
+            if updated {
+                return Ok(());
+            }
+            state.storage.global().insert_endpoint(&crate::storage::Endpoint {
+                id: args.id.clone(),
+                name: provider.name.clone(),
+                base_url: provider.base_url.clone(),
+                api_key_encrypted,
+                kind: args.kind.clone(),
+                created_at: chrono::Utc::now().timestamp(),
+                supports_native_tools: provider.supports_native_tools,
+            })
+        });
+    if let Err(e) = persisted {
+        tracing::warn!(error = %e, "failed to persist endpoint update (in-memory only this session)");
     }
     Ok(provider.into())
 }
