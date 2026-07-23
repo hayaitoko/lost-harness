@@ -232,6 +232,17 @@ impl ApprovalLedger {
     pub fn consume_once(&self, fingerprint: &str) {
         self.once_fps.lock().unwrap().remove(fingerprint);
     }
+
+    /// Atomically check-AND-consume a one-time fingerprint grant under a single
+    /// lock acquisition. Returns whether a grant was present (and removed). Use
+    /// this over `covers_once` + `consume_once` on any path where two identical
+    /// dispatches could race between the check and the consume — a `Once` grant
+    /// must authorize EXACTLY one execution (review finding: the audio one-confirm
+    /// path was checking without consuming, so one confirm authorized unlimited
+    /// repeats of the same fingerprint).
+    pub fn take_once(&self, fingerprint: &str) -> bool {
+        self.once_fps.lock().unwrap().remove(fingerprint)
+    }
 }
 
 // ── Grant × risk matrix (Q8) ────────────────────────────────────────────────

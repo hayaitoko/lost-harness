@@ -247,7 +247,7 @@ impl EventContext {
             session_mode: SessionMode::Normal,
             routing: RoutingRequirement::Unconstrained,
             classifier_cfg: crate::classifier::ClassifierConfig::default(),
-            attended: true,
+            attended: false,
         }
     }
 
@@ -273,7 +273,7 @@ impl EventContext {
             session_mode: SessionMode::Normal,
             routing: RoutingRequirement::Unconstrained,
             classifier_cfg: crate::classifier::ClassifierConfig::default(),
-            attended: true,
+            attended: false,
         }
     }
 

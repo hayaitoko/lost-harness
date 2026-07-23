@@ -760,6 +760,22 @@ fn storage_open_profile_rejects_whitespace_padding_and_confusables() {
     }
 }
 
+#[test]
+fn storage_open_profile_case_folds_to_prevent_filesystem_aliasing() {
+    // Review finding: on a case-INSENSITIVE filesystem (macOS/Windows, what we
+    // ship on) `work.db` and `Work.db` are the SAME inode, so `"work"` and
+    // `"Work"` must resolve to the SAME cached handle — otherwise two "profiles"
+    // would silently share one physical DB and defeat isolation.
+    let dir = tempdir();
+    let storage = Storage::open(&dir).unwrap();
+    let lower = storage.open_profile("work").unwrap();
+    let upper = storage.open_profile("Work").unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&lower, &upper),
+        "case-variant names must resolve to the SAME profile handle, not two aliases"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Wave 1 — per-profile memory settings + walled-memory physical separation
 // ─────────────────────────────────────────────────────────────────────────────

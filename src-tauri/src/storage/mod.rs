@@ -205,25 +205,30 @@ impl Storage {
     /// Profile name is the file stem of `profiles/<name>.db`. Special
     /// characters in the name should be sanitized by the caller.
     pub fn open_profile(&self, name: &str) -> Result<Arc<ProfileDb>> {
-        // Fast path — already open.
-        if let Some(existing) = self.inner.profiles.lock().get(name) {
+        // Strict validation (B3): rejects path traversal AND whitespace-padded /
+        // confusable names — see `validate_profile_name`.
+        validate_profile_name(name)?;
+        // Canonicalize to lowercase (review finding): on a case-INSENSITIVE
+        // filesystem — macOS APFS / Windows NTFS, exactly what we ship on —
+        // `work.db` and `Work.db` are the SAME inode, so `"work"` and `"Work"`
+        // must map to the SAME cache key too. Otherwise two "profiles" would be
+        // cached as distinct handles over one physical DB and silently share
+        // data — defeating the very isolation B3 protects (a walled profile's
+        // "physically separate" store included). Folding here means the cache
+        // key and the filename always agree.
+        let name = name.to_ascii_lowercase();
+        // Fast path — already open (under the canonical key).
+        if let Some(existing) = self.inner.profiles.lock().get(&name) {
             return Ok(existing.clone());
         }
-        // Strict validation (B3): rejects path traversal AND whitespace-padded /
-        // confusable names — see `validate_profile_name`. Only ever-validated
-        // names reach the cache (inserted below, after this check).
-        validate_profile_name(name)?;
         let path = self
             .inner
             .base_path
             .join("profiles")
             .join(format!("{name}.db"));
-        let db = ProfileDb::open(&path, name)?;
+        let db = ProfileDb::open(&path, &name)?;
         let arc = Arc::new(db);
-        self.inner
-            .profiles
-            .lock()
-            .insert(name.to_string(), arc.clone());
+        self.inner.profiles.lock().insert(name, arc.clone());
         Ok(arc)
     }
 

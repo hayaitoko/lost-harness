@@ -129,7 +129,12 @@ impl AudioEgressGate {
     ) -> AudioEgressDecision {
         match decision {
             AudioEgressDecision::ConfirmRequired(fp) => {
-                if ledger.covers_once(&fp) {
+                // `take_once` CONSUMES the grant atomically — a confirm authorizes
+                // EXACTLY one cloud-TTS egress of this exact text. A second
+                // resolve of the same fingerprint (a retry, a re-render) finds no
+                // grant and re-withholds until the user confirms again (review
+                // finding: the old `covers_once` check left the grant standing).
+                if ledger.take_once(&fp) {
                     AudioEgressDecision::Allow
                 } else {
                     AudioEgressDecision::Withhold
@@ -236,7 +241,14 @@ mod tests {
         );
         // The user approves ONE confirm for this exact text.
         ledger.grant(GrantTarget::Fingerprint(fp.clone()), GrantScope::Once);
-        assert_eq!(AudioEgressGate::resolve_confirm(decision, &ledger), AudioEgressDecision::Allow);
+        assert_eq!(AudioEgressGate::resolve_confirm(decision.clone(), &ledger), AudioEgressDecision::Allow);
+        // ...and it's SINGLE-USE: the grant is consumed, so a second egress of
+        // the identical text re-withholds until the user confirms again.
+        assert_eq!(
+            AudioEgressGate::resolve_confirm(decision, &ledger),
+            AudioEgressDecision::Withhold,
+            "a Once confirm authorizes exactly one cloud-TTS egress"
+        );
 
         // A Session/Tool grant can NEVER satisfy this floor (covers_once semantics).
         let ledger2 = ApprovalLedger::new();

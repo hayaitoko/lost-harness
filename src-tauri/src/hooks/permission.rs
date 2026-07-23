@@ -392,6 +392,25 @@ impl GatingHook for PermissionHook {
 
         match self.resolve(ctx) {
             Some(PermissionMode::Allow) => {
+                // B5 defense-in-depth (review): an UNATTENDED (cron/headless)
+                // External call must NOT be waved through by a bare policy
+                // Allow. A persisted "always allow" is Write-only by
+                // construction (`persist_rule_allowed`), so an External Allow
+                // rule shouldn't exist — but enforce it at READ time too, so a
+                // mis-tagged / hand-edited External Allow rule can't bypass the
+                // cron-replay guard that `covers_for` installs on the Ask path.
+                // Require the same fresh-Once fingerprint evidence; absent it,
+                // fall to Ask (the unattended prompter parks/denies).
+                if ctx.risk == crate::tools::RiskClass::External && !ctx.attended {
+                    let fp = ActionFingerprint::from_ctx(ctx);
+                    if self.ledger.covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended) {
+                        return HookResult::Continue;
+                    }
+                    return HookResult::Ask(format!(
+                        "tool '{}' requires confirmation (unattended external call)",
+                        ctx.tool_name
+                    ));
+                }
                 // An EXPLICIT allow (whole-tool Allow mode or a matching
                 // allow-rule, incl. a persisted Q8 "always allow") is a
                 // definitive yes — mark it so `FirstUseConfirmHook` doesn't
