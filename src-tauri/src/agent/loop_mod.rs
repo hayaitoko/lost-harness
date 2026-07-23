@@ -78,6 +78,10 @@ pub struct LocalReroutePayload {
     pub reason: String,
     pub from_provider: String,
     pub to_provider: String,
+    /// C5: true when `to_provider` is the app's bundled sidecar (M8 S4 lazy
+    /// spawn) rather than a user-added local endpoint — lets the toast read
+    /// "started your local model" vs "switched to <name>".
+    pub to_is_bundled_runner: bool,
 }
 
 /// Payload of `stream:budget_warning` (C1) — a non-blocking banner when an
@@ -1700,8 +1704,8 @@ impl AgentLoop {
                     client,
                     is_cloud,
                     routing_decision,
-                    &|from, to, reason| {
-                        sink.local_reroute(&conv_id, reason, from, to);
+                    &|from, to, reason, to_is_bundled| {
+                        sink.local_reroute(&conv_id, reason, from, to, to_is_bundled);
                     },
                     self.local_runner_ref(),
                 )
@@ -1850,8 +1854,10 @@ fn reroute_banner(local_provider_name: &str) -> String {
 /// Pulled out of `stream_to_provider` as a free function so it's unit-testable
 /// without a live HTTP model endpoint — it never calls `stream_chat`.
 ///
-/// `on_reroute(from_name, to_name, reason)` fires exactly once per successful
-/// switch. This is the ONLY place `reason` — a privacy signal — is allowed to
+/// `on_reroute(from_name, to_name, reason, to_is_bundled_runner)` fires exactly
+/// once per successful switch (C5: the bool distinguishes the bundled sidecar
+/// from a user-added local endpoint, for the UI toast). This is the ONLY place
+/// `reason` — a privacy signal — is allowed to
 /// travel; it must never end up in the returned `ChatMessage` (which gets
 /// persisted and replayed into a future turn that may be on cloud). The
 /// returned message carries only the reason-free `reroute_banner`.
@@ -1917,7 +1923,7 @@ pub(crate) async fn resolve_turn_outcome(
     // `Send + Sync` because this reference is held across `.await` points
     // inside the reroute loop, and `stream_to_provider`'s future must stay
     // `Send` for the Tauri command boundary.
-    on_reroute: &(dyn Fn(&str, &str, &str) + Send + Sync),
+    on_reroute: &(dyn Fn(&str, &str, &str, bool) + Send + Sync),
     // M8 S4: when the reroute finds NO local provider in the snapshot, this
     // (if wired) lazily starts the bundled sidecar and the lookup retries
     // once. `None` (tests, feature-off) = the pre-S4 hard-deny behavior.
@@ -1969,7 +1975,7 @@ pub(crate) async fn resolve_turn_outcome(
                 };
                 match found {
                     Some((local, local_client)) => {
-                        on_reroute(&provider.name, &local.name, &reason);
+                        on_reroute(&provider.name, &local.name, &reason, local.is_bundled_runner());
                         let resumed = tools
                             .resume_after_local_switch(
                                 call,

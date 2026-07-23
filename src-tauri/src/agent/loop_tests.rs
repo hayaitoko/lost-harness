@@ -620,7 +620,7 @@ async fn resolve_turn_outcome_reroutes_to_local_and_hides_reason() {
         cloud_client,
         true,
         "allow",
-        &move |_from, _to, reason| fired2.lock().push(reason.to_string()),
+        &move |_from, _to, reason, _is_bundled| fired2.lock().push(reason.to_string()),
         None, // no lazy runner in tests — pre-S4 behavior
     )
     .await
@@ -679,7 +679,7 @@ async fn resolve_turn_outcome_no_local_candidate_stays_cloud_with_hard_deny() {
         cloud_client,
         true,
         "allow",
-        &move |_, _, _| {
+        &move |_, _, _, _| {
             fired2.fetch_add(1, Ordering::SeqCst);
         },
         None, // no lazy runner in tests — pre-S4 behavior

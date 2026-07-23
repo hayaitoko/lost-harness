@@ -44,6 +44,7 @@ pub trait ResultSink: Send + Sync {
         reason: &str,
         from_provider: &str,
         to_provider: &str,
+        to_is_bundled_runner: bool,
     );
 
     /// `memory:event` — the non-silent memory signal (PLAN §9). `kind` is
@@ -96,6 +97,7 @@ impl ResultSink for TauriResultSink {
         reason: &str,
         from_provider: &str,
         to_provider: &str,
+        to_is_bundled_runner: bool,
     ) {
         use tauri::Emitter;
         let payload = LocalReroutePayload {
@@ -103,6 +105,7 @@ impl ResultSink for TauriResultSink {
             reason: reason.to_string(),
             from_provider: from_provider.to_string(),
             to_provider: to_provider.to_string(),
+            to_is_bundled_runner,
         };
         if let Err(e) = self.app.emit("stream:local_reroute", payload) {
             tracing::warn!(error = %e, "failed to emit stream:local_reroute");
@@ -157,12 +160,14 @@ impl ResultSink for HeadlessSink {
         reason: &str,
         from_provider: &str,
         to_provider: &str,
+        to_is_bundled_runner: bool,
     ) {
         tracing::trace!(
             conversation_id = %conversation_id,
             reason = %reason,
             from_provider = %from_provider,
             to_provider = %to_provider,
+            to_is_bundled_runner,
             "headless sink: local_reroute dropped (no live listener)"
         );
     }

@@ -917,7 +917,8 @@ pub async fn ensure_running(
         .ensure_started(&row.id, cmd, base_url.clone())
         .await?;
 
-    let provider = Provider::new(&provider_id, &row.name, &base_url, None, ProviderKind::Local);
+    let provider = Provider::new(&provider_id, &row.name, &base_url, None, ProviderKind::Local)
+        .with_local_origin(crate::models::provider::LocalOrigin::BundledRunner);
     mm.add_provider(provider.clone());
     tracing::info!(
         target: "lhp::runner",
@@ -1417,6 +1418,7 @@ mod tests {
         assert_eq!(provider.id, "local-runner:tiny");
         assert!(provider.is_local(), "kind Local");
         assert!(provider.is_private(), "127.0.0.1 base_url is private");
+        assert!(provider.is_bundled_runner(), "C5: a runner-spawned provider is BundledRunner origin");
         assert!(provider.base_url.starts_with("http://127.0.0.1:"));
         assert!(mm.get_provider("local-runner:tiny").is_some(), "registered in the manager");
         // The spawned argv carried the model path + loopback host.
