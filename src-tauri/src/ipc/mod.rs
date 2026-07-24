@@ -2315,6 +2315,103 @@ fn parse_binding(s: &str) -> Result<Binding, String> {
     }
 }
 
+// ── scheduled jobs (the ScheduledJobs screen's read/toggle/delete surface) ──
+//
+// Thin, deliberately read-mostly IPC over the existing per-profile `cron_jobs`
+// store. CREATION stays agent-driven (the `manage_cron` tool, Dangerous —
+// standing automation is minted through the gate, never silently from a
+// settings form); the screen lists what exists and lets the human pause,
+// resume, or delete it. Enable/disable/delete are the human's kill switches,
+// so they need no approval gate of their own.
+
+/// One scheduled job, for the ScheduledJobs screen. Mirrors `CronJob`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CronJobInfo {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    pub schedule: String,
+    pub enabled: bool,
+    pub last_run_at: Option<i64>,
+    pub last_status: Option<String>,
+    pub target_conversation_id: Option<String>,
+}
+
+impl From<crate::storage::CronJob> for CronJobInfo {
+    fn from(j: crate::storage::CronJob) -> Self {
+        Self {
+            id: j.id,
+            name: j.name,
+            prompt: j.prompt,
+            schedule: j.schedule,
+            enabled: j.enabled,
+            last_run_at: j.last_run_at,
+            last_status: j.last_status,
+            target_conversation_id: j.target_conversation_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListCronJobsArgs {
+    pub profile: String,
+}
+
+/// This profile's scheduled jobs.
+#[tauri::command]
+pub fn list_cron_jobs(
+    state: State<'_, AppState>,
+    args: ListCronJobsArgs,
+) -> Result<Vec<CronJobInfo>, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.list_cron_jobs()
+        .map(|rows| rows.into_iter().map(Into::into).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetCronJobEnabledArgs {
+    pub profile: String,
+    pub id: String,
+    pub enabled: bool,
+}
+
+/// Pause/resume one scheduled job. Returns false if the id doesn't exist.
+#[tauri::command]
+pub fn set_cron_job_enabled(
+    state: State<'_, AppState>,
+    args: SetCronJobEnabledArgs,
+) -> Result<bool, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.set_cron_job_enabled(&args.id, args.enabled)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteCronJobArgs {
+    pub profile: String,
+    pub id: String,
+}
+
+/// Delete one scheduled job. Returns false if the id doesn't exist.
+#[tauri::command]
+pub fn delete_cron_job(
+    state: State<'_, AppState>,
+    args: DeleteCronJobArgs,
+) -> Result<bool, String> {
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.delete_cron_job(&args.id).map_err(|e| e.to_string())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

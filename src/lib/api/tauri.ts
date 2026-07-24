@@ -914,6 +914,49 @@ export async function cancelMessage(conversationId: string): Promise<boolean> {
   return false;
 }
 
+// ── scheduled jobs (the ScheduledJobs screen surface) ──────────────────────
+
+/** One scheduled job. Mirrors `CronJobInfo` in `ipc/mod.rs`. Creation is
+ *  agent-driven (the Dangerous `manage_cron` tool) — this surface only lists,
+ *  pauses/resumes, and deletes. */
+export interface CronJobInfo {
+  id: string;
+  name: string;
+  prompt: string;
+  schedule: string;
+  enabled: boolean;
+  last_run_at: number | null;
+  last_status: string | null;
+  target_conversation_id: string | null;
+}
+
+/** This profile's scheduled jobs. */
+export async function listCronJobs(profile: string): Promise<CronJobInfo[]> {
+  if (isTauri())
+    return tauriInvoke<CronJobInfo[]>("list_cron_jobs", { args: { profile } });
+  return [];
+}
+
+/** Pause/resume one job. Returns false if the id no longer exists. */
+export async function setCronJobEnabled(
+  profile: string,
+  id: string,
+  enabled: boolean,
+): Promise<boolean> {
+  if (isTauri())
+    return tauriInvoke<boolean>("set_cron_job_enabled", {
+      args: { profile, id, enabled },
+    });
+  return false;
+}
+
+/** Delete one job. Returns false if the id no longer exists. */
+export async function deleteCronJob(profile: string, id: string): Promise<boolean> {
+  if (isTauri())
+    return tauriInvoke<boolean>("delete_cron_job", { args: { profile, id } });
+  return false;
+}
+
 // ── MCP servers (C3 — stdio wire transport) ────────────────────────────────
 
 /** One registered MCP server + its live status. Mirrors `McpServerInfo`. */

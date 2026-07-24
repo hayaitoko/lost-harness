@@ -156,6 +156,9 @@ fn test_app() -> App<MockRuntime> {
             ipc::remove_local_model,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
+            ipc::list_cron_jobs,
+            ipc::set_cron_job_enabled,
+            ipc::delete_cron_job,
             ipc::explain_classification,
             ipc::list_memory,
             ipc::save_memory,
@@ -628,6 +631,82 @@ fn set_active_profile_rejects_a_confusable_name() {
     assert_eq!(got, "personal", "a rejected set must not have written a row");
 }
 
+// ── scheduled jobs (the ScheduledJobs screen surface) ──────────────────
+
+#[test]
+fn cron_jobs_list_toggle_delete_round_trip_through_real_ipc() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // Empty profile → empty list (correct nested-args shape dispatches).
+    let got = call(&webview, "list_cron_jobs", json!({ "args": { "profile": "personal" } }))
+        .expect("list_cron_jobs must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got, json!([]), "a fresh profile has no scheduled jobs");
+
+    // Seed one job directly at the storage layer (creation is agent-driven
+    // via the Dangerous manage_cron tool, not this IPC surface).
+    {
+        let state: tauri::State<'_, crate::AppState> = app.state();
+        let db = state.storage.open_profile("personal").expect("open profile");
+        db.insert_cron_job(&crate::storage::CronJob {
+            id: "cj-1".into(),
+            name: "morning brief".into(),
+            prompt: "summarize my day".into(),
+            schedule: "0 7 * * *".into(),
+            enabled: true,
+            last_run_at: None,
+            last_status: None,
+            target_conversation_id: None,
+        })
+        .expect("insert cron job");
+    }
+
+    // The list surfaces it.
+    let got = call(&webview, "list_cron_jobs", json!({ "args": { "profile": "personal" } }))
+        .expect("list_cron_jobs must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(got[0]["name"], "morning brief");
+    assert_eq!(got[0]["enabled"], true);
+
+    // Pause it through IPC; the change is visible on re-read.
+    let ok = call(
+        &webview,
+        "set_cron_job_enabled",
+        json!({ "args": { "profile": "personal", "id": "cj-1", "enabled": false } }),
+    )
+    .expect("set_cron_job_enabled must dispatch");
+    let ok: Value = ok.deserialize().expect("valid JSON");
+    assert_eq!(ok, true);
+    let got = call(&webview, "list_cron_jobs", json!({ "args": { "profile": "personal" } }))
+        .expect("list_cron_jobs must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got[0]["enabled"], false, "the pause must persist");
+
+    // Delete it; the list is empty again. An unknown id reports false.
+    let ok = call(
+        &webview,
+        "delete_cron_job",
+        json!({ "args": { "profile": "personal", "id": "cj-1" } }),
+    )
+    .expect("delete_cron_job must dispatch");
+    let ok: Value = ok.deserialize().expect("valid JSON");
+    assert_eq!(ok, true);
+    let got = call(&webview, "list_cron_jobs", json!({ "args": { "profile": "personal" } }))
+        .expect("list_cron_jobs must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got, json!([]));
+    let ok = call(
+        &webview,
+        "delete_cron_job",
+        json!({ "args": { "profile": "personal", "id": "cj-1" } }),
+    )
+    .expect("delete_cron_job must dispatch even for an unknown id");
+    let ok: Value = ok.deserialize().expect("valid JSON");
+    assert_eq!(ok, false, "deleting a gone id reports false, not an error");
+}
+
 // ── classifier settings (PLAN §11) ─────────────────────────────────────
 
 #[test]
@@ -936,6 +1015,9 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "install_pack",
         "list_tool_rules",
         "delete_tool_rule",
+        "list_cron_jobs",
+        "set_cron_job_enabled",
+        "delete_cron_job",
         "explain_classification",
         "list_memory",
         "save_memory",
