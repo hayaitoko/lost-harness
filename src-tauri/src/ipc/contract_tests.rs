@@ -159,6 +159,7 @@ fn test_app() -> App<MockRuntime> {
             ipc::list_cron_jobs,
             ipc::set_cron_job_enabled,
             ipc::delete_cron_job,
+            ipc::list_workspace_files,
             ipc::explain_classification,
             ipc::list_memory,
             ipc::save_memory,
@@ -707,6 +708,74 @@ fn cron_jobs_list_toggle_delete_round_trip_through_real_ipc() {
     assert_eq!(ok, false, "deleting a gone id reports false, not an error");
 }
 
+// ── workspace files (the Files screen surface) ─────────────────────────
+
+#[test]
+fn list_workspace_files_lists_and_confines_to_the_profile_tree() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // Fresh profile → empty listing (and the workspace dir is created).
+    let got = call(
+        &webview,
+        "list_workspace_files",
+        json!({ "args": { "profile": "personal", "subpath": "" } }),
+    )
+    .expect("list_workspace_files must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got, json!([]));
+
+    // Seed a file + a subdir directly on disk in the profile's Tier-P tree.
+    {
+        let state: tauri::State<'_, crate::AppState> = app.state();
+        let ws = crate::tools::fs::profile_workspace_path(
+            &state.storage.base_path().join("workspace"),
+            "personal",
+        );
+        std::fs::create_dir_all(ws.join("notes")).expect("mkdir notes");
+        std::fs::write(ws.join("draft.md"), b"hello").expect("write file");
+    }
+
+    let got = call(
+        &webview,
+        "list_workspace_files",
+        json!({ "args": { "profile": "personal", "subpath": "" } }),
+    )
+    .expect("list_workspace_files must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    let rows = got.as_array().expect("array");
+    assert_eq!(rows.len(), 2);
+    // Dirs sort first.
+    assert_eq!(rows[0]["name"], "notes");
+    assert_eq!(rows[0]["is_dir"], true);
+    assert_eq!(rows[1]["name"], "draft.md");
+    assert_eq!(rows[1]["size_bytes"], 5);
+
+    // Subpath browsing works…
+    let got = call(
+        &webview,
+        "list_workspace_files",
+        json!({ "args": { "profile": "personal", "subpath": "notes" } }),
+    )
+    .expect("subpath listing must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got, json!([]));
+
+    // …but traversal is a DOMAIN error (the command ran and refused), and a
+    // sibling profile's tree is unreachable via subpath from this profile.
+    let err = call(
+        &webview,
+        "list_workspace_files",
+        json!({ "args": { "profile": "personal", "subpath": "../work" } }),
+    )
+    .expect_err("traversal must be refused");
+    let msg = err.as_str().unwrap_or_default();
+    assert!(
+        msg.contains("invalid subpath"),
+        "expected the traversal refusal, got: {msg}"
+    );
+}
+
 // ── classifier settings (PLAN §11) ─────────────────────────────────────
 
 #[test]
@@ -1018,6 +1087,7 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "list_cron_jobs",
         "set_cron_job_enabled",
         "delete_cron_job",
+        "list_workspace_files",
         "explain_classification",
         "list_memory",
         "save_memory",

@@ -518,6 +518,7 @@ pub fn run() {
             ipc::list_cron_jobs,
             ipc::set_cron_job_enabled,
             ipc::delete_cron_job,
+            ipc::list_workspace_files,
             ipc::get_classifier_settings,
             ipc::set_classifier_settings,
             ipc::set_redaction_enabled,

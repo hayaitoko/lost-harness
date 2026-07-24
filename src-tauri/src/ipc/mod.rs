@@ -2412,6 +2412,96 @@ pub fn delete_cron_job(
     db.delete_cron_job(&args.id).map_err(|e| e.to_string())
 }
 
+// ── workspace files (the Files screen's read-only browser) ─────────────────
+//
+// READ-ONLY listing of the profile's Tier-P workspace subtree — the same tree
+// the agent's fs tools write into (`<base>/workspace/<profile>`). No content
+// read, no mutation: the write path stays exclusively behind the gated fs
+// tools. Confinement mirrors the fs tools: the validated profile name maps
+// through `profile_workspace_path`, and the optional subpath is rejected on
+// any traversal/absolute component, then canonicalize-checked to stay inside
+// the workspace (a symlinked dir can't walk the listing out of the tree).
+
+/// One workspace entry, for the Files screen.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size_bytes: i64,
+    /// Seconds since epoch; None when the metadata read failed.
+    pub modified_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListWorkspaceFilesArgs {
+    pub profile: String,
+    /// Relative directory within the workspace ("" = the root).
+    #[serde(default)]
+    pub subpath: String,
+}
+
+/// List one directory of this profile's workspace (read-only).
+#[tauri::command]
+pub fn list_workspace_files(
+    state: State<'_, AppState>,
+    args: ListWorkspaceFilesArgs,
+) -> Result<Vec<WorkspaceEntry>, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let ws_root = state.storage.base_path().join("workspace");
+    let ws = crate::tools::fs::profile_workspace_path(&ws_root, &args.profile);
+    if ws == ws_root {
+        // The resolver only falls back to the shared root on a hostile
+        // profile string; validate_profile_name should have caught it.
+        return Err("invalid profile for workspace listing".into());
+    }
+    std::fs::create_dir_all(&ws).map_err(|e| e.to_string())?;
+
+    // Reject traversal in the subpath BEFORE touching the filesystem.
+    let sub = args.subpath.trim_matches('/');
+    if sub.split('/').any(|c| c == ".." || c.starts_with('\\')) || sub.starts_with('/') {
+        return Err("invalid subpath".into());
+    }
+    let dir = if sub.is_empty() { ws.clone() } else { ws.join(sub) };
+
+    // Canonicalize-confine: the listed dir must still live under the
+    // workspace after symlink resolution.
+    let canon_ws = ws.canonicalize().map_err(|e| e.to_string())?;
+    let canon_dir = dir
+        .canonicalize()
+        .map_err(|_| "no such folder in this profile's workspace".to_string())?;
+    if !canon_dir.starts_with(&canon_ws) {
+        return Err("path escapes the profile workspace".into());
+    }
+
+    let mut entries: Vec<WorkspaceEntry> = Vec::new();
+    for entry in std::fs::read_dir(&canon_dir).map_err(|e| e.to_string())? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The Tier-P migration marker is plumbing, not user data.
+        if name == crate::tools::fs::LEGACY_MIGRATION_MARKER {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        entries.push(WorkspaceEntry {
+            name,
+            is_dir: meta.is_dir(),
+            size_bytes: if meta.is_dir() { 0 } else { meta.len() as i64 },
+            modified_at: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64),
+        });
+    }
+    // Dirs first, then case-insensitive by name — stable browsing order.
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

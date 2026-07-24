@@ -36,9 +36,9 @@
 
   let { active, onnewsession, engineState = "idle" }: Props = $props();
 
+  // Nav honesty: only LIVE sections. Email/Whiteboard return here when their
+  // backends exist (see design/types.ts ScreenId note).
   const SECTIONS: { id: ScreenId; label: string }[] = [
-    { id: "email", label: "Email" },
-    { id: "whiteboard", label: "Whiteboard" },
     { id: "files", label: "Files" },
     { id: "scheduled-jobs", label: "Scheduled jobs" },
   ];
@@ -103,33 +103,7 @@
 </script>
 
 {#snippet sectionIcon(id: ScreenId)}
-  {#if id === "email"}
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="1.8"
-      class="shrink-0"
-    >
-      <rect x="3" y="5" width="18" height="14" rx="2" />
-      <path d="M3 7l9 6 9-6" />
-    </svg>
-  {:else if id === "whiteboard"}
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="1.8"
-      class="shrink-0"
-    >
-      <rect x="3" y="4" width="18" height="13" rx="2" />
-      <path d="M8 20l4-3 4 3" />
-    </svg>
-  {:else if id === "files"}
+  {#if id === "files"}
     <svg
       width="14"
       height="14"

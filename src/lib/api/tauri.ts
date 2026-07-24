@@ -957,6 +957,29 @@ export async function deleteCronJob(profile: string, id: string): Promise<boolea
   return false;
 }
 
+// ── workspace files (the Files screen's read-only browser) ─────────────────
+
+/** One workspace entry. Mirrors `WorkspaceEntry` in `ipc/mod.rs`. */
+export interface WorkspaceEntry {
+  name: string;
+  is_dir: boolean;
+  size_bytes: number;
+  modified_at: number | null;
+}
+
+/** Read-only listing of one directory in this profile's Tier-P workspace
+ *  ("" = the root). Traversal is refused backend-side. */
+export async function listWorkspaceFiles(
+  profile: string,
+  subpath: string,
+): Promise<WorkspaceEntry[]> {
+  if (isTauri())
+    return tauriInvoke<WorkspaceEntry[]>("list_workspace_files", {
+      args: { profile, subpath },
+    });
+  return [];
+}
+
 // ── MCP servers (C3 — stdio wire transport) ────────────────────────────────
 
 /** One registered MCP server + its live status. Mirrors `McpServerInfo`. */

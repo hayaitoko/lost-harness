@@ -19,28 +19,21 @@
   import { pushToast } from "$lib/stores/toasts";
 
   import MainScreen from "$lib/design/screens/MainScreen.svelte";
-  import EmptyState from "$lib/design/screens/EmptyState.svelte";
-  import Email from "$lib/design/screens/Email.svelte";
-  import Whiteboard from "$lib/design/screens/Whiteboard.svelte";
   import Files from "$lib/design/screens/Files.svelte";
   import ScheduledJobs from "$lib/design/screens/ScheduledJobs.svelte";
-  import Editor from "$lib/design/screens/Editor.svelte";
   import Settings from "$lib/design/screens/Settings.svelte";
-  import Onboarding from "$lib/design/screens/Onboarding.svelte";
   import ApprovalDialog from "$lib/components/ApprovalDialog.svelte";
   import AskHumanDialog from "$lib/components/AskHumanDialog.svelte";
   import Toasts from "$lib/components/Toasts.svelte";
 
+  // Only LIVE screens (see the ScreenId note in design/types.ts — the
+  // Email/Whiteboard/Editor/Onboarding/EmptyState mockups were removed from
+  // the app until their backends exist).
   const SCREENS = {
     main: MainScreen,
-    empty: EmptyState,
-    email: Email,
-    whiteboard: Whiteboard,
     files: Files,
     "scheduled-jobs": ScheduledJobs,
-    editor: Editor,
     settings: Settings,
-    onboarding: Onboarding,
   } as const;
 
   const Current = $derived(SCREENS[nav.current]);

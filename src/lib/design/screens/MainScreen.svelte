@@ -32,11 +32,15 @@
   import {
     explainClassification,
     onMemoryEvent,
+    listWorkspaceFiles,
     type ClassificationExplanation,
     type ClassificationSpan,
+    type WorkspaceEntry,
   } from "$lib/api/tauri";
 
-  type PanelTab = "routing" | "files" | "tasks" | "agents" | "terminal";
+  // Nav honesty: only tabs with real backing data. The mock tasks/agents/
+  // terminal tabs were removed with the other fiction surfaces (2026-07-24).
+  type PanelTab = "routing" | "files";
   type ModelOption = { name: string; kind: "local" | "cloud"; group: string; key: string };
 
   const BINDING_LABEL: Record<Binding, string> = {
@@ -77,10 +81,7 @@
 
   const TABS: { id: PanelTab; label: string }[] = [
     { id: "routing", label: "Routing" },
-    { id: "files", label: "Files in this chat" },
-    { id: "tasks", label: "Background tasks" },
-    { id: "agents", label: "Sub-agents" },
-    { id: "terminal", label: "Terminal" },
+    { id: "files", label: "Workspace files" },
   ];
 
   // This screen's per-send binding override (Auto/Public/Private) — feeds
@@ -128,6 +129,18 @@
       un.then((f) => f());
       if (memoryNoteTimer) clearTimeout(memoryNoteTimer);
     };
+  });
+
+  // ── Workspace files tab: the profile workspace's top level (read-only).
+  let wsEntries = $state<WorkspaceEntry[]>([]);
+  let wsError: string | null = $state(null);
+  $effect(() => {
+    if (!whyOpen || panelTab !== "files") return;
+    const profile = $activeProfileId;
+    wsError = null;
+    listWorkspaceFiles(profile, "")
+      .then((rows) => (wsEntries = rows))
+      .catch((err) => (wsError = String(err)));
   });
 
   // ── "Why this was routed" — real classifier explanation of the last user
@@ -670,139 +683,39 @@
             <div
               class="px-0.5 pb-2 pt-1 text-[10.5px] font-semibold uppercase tracking-[0.06em] text-text-3"
             >
-              Touched in this chat
+              This profile's workspace
             </div>
-            <div class="flex flex-col gap-1">
-              <a
-                href="#/editor"
-                onclick={(e) => {
-                  e.preventDefault();
-                  nav.go("editor");
-                }}
-                class="flex items-center gap-2.5 rounded-[var(--r)] px-2.5 py-[9px] no-underline hover:bg-surface-hover"
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--text-3)" stroke-width="1.7" class="shrink-0">
-                  <path d="M6 2h9l5 5v15H6z" />
-                  <path d="M15 2v5h5" />
-                </svg>
-                <span class="min-w-0 flex-1">
-                  <span class="block text-[12.5px] text-text">heater-reply.md</span>
-                  <span class="block text-[11px] text-text-3">Created just now</span>
-                </span>
-                {@render dot("bg-local")}
-              </a>
-              <a
-                href="#/editor"
-                onclick={(e) => {
-                  e.preventDefault();
-                  nav.go("editor");
-                }}
-                class="flex items-center gap-2.5 rounded-[var(--r)] px-2.5 py-[9px] no-underline hover:bg-surface-hover"
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--text-3)" stroke-width="1.7" class="shrink-0">
-                  <path d="M6 2h9l5 5v15H6z" />
-                  <path d="M15 2v5h5" />
-                </svg>
-                <span class="min-w-0 flex-1">
-                  <span class="block text-[12.5px] text-text">lease.pdf</span>
-                  <span class="block text-[11px] text-text-3">Read for context</span>
-                </span>
-                {@render dot("bg-local")}
-              </a>
-            </div>
-            <div class="px-0.5 pt-3 text-[11px] text-text-3">
-              Only files the assistant opened or wrote in this conversation
-              appear here.
-            </div>
-          </div>
-        {:else if panelTab === "tasks"}
-          <div class="flex flex-col gap-2 p-3">
-            <div class={card}>
-              <div class="flex items-center gap-2">
-                <span class="flex-1 text-[12.5px] font-[550]">Indexing workspace</span>
-                <span class="text-[11px] text-text-2">62%</span>
+            {#if wsError}
+              <div class="px-0.5 py-1 text-[12px] text-red-400">{wsError}</div>
+            {:else if wsEntries.length === 0}
+              <p class="px-0.5 py-1 text-[12px] text-text-3">
+                Nothing here yet — files the assistant reads or writes for this
+                profile land in its workspace.
+              </p>
+            {:else}
+              <div class="flex flex-col gap-1">
+                {#each wsEntries.slice(0, 8) as f (f.name)}
+                  <div class="flex items-center gap-2.5 rounded-[var(--r)] px-2.5 py-[7px]">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--text-3)" stroke-width="1.7" class="shrink-0">
+                      {#if f.is_dir}
+                        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                      {:else}
+                        <path d="M6 2h9l5 5v15H6z" />
+                        <path d="M15 2v5h5" />
+                      {/if}
+                    </svg>
+                    <span class="min-w-0 flex-1 truncate text-[12.5px] text-text">{f.name}</span>
+                  </div>
+                {/each}
               </div>
-              <div
-                class="mt-2 h-[5px] overflow-hidden rounded-[3px] bg-surface-2"
-              >
-                <div class="h-full w-[62%] bg-accent"></div>
-              </div>
-            </div>
-            <div class="{card} flex items-center gap-[9px]">
-              {@render dot("bg-local")}
-              <span class="flex-1 text-[12.5px] font-[550]">Inbox triage</span>
-              <span class="text-[11px] text-text-3">next in 38m</span>
-            </div>
-            <div class="{card} flex items-center gap-[9px]">
-              {@render dot("bg-blocked")}
-              <span class="flex-1 text-[12.5px] font-[550]">Weekly expense rollup</span>
-              <span class="text-[11px] text-blocked">held</span>
-            </div>
-          </div>
-        {:else if panelTab === "agents"}
-          <div class="flex flex-col gap-2 p-3">
-            <div class={card}>
-              <div class="flex items-center gap-[9px]">
-                {@render dot("bg-local")}
-                <span class="flex-1 text-[12.5px] font-semibold">research</span>
-                <span class="text-[11px] text-local">running</span>
-              </div>
-              <div class="mt-[5px] pl-4 text-[11px] text-text-3">
-                3 tools · 12k tokens · local
-              </div>
-            </div>
-            <div class={card}>
-              <div class="flex items-center gap-[9px]">
-                {@render dot("bg-cloud")}
-                <span class="flex-1 text-[12.5px] font-semibold">summarizer</span>
-                <span class="text-[11px] text-cloud">cloud · Opus</span>
-              </div>
-              <div class="mt-[5px] pl-4 text-[11px] text-text-3">
-                waiting on research
-              </div>
-            </div>
-            <div class={card}>
-              <div class="flex items-center gap-[9px]">
-                {@render dot("bg-text-3")}
-                <span class="flex-1 text-[12.5px] font-semibold">code-reviewer</span>
-                <span class="text-[11px] text-text-3">done</span>
-              </div>
-              <div class="mt-[5px] pl-4 text-[11px] text-text-3">
-                finished in 4.1s
-              </div>
-            </div>
-          </div>
-        {:else if panelTab === "terminal"}
-          <div class="p-3">
-            <div
-              class="rounded-[var(--r-lg)] border border-border bg-[#0d0d0f] px-[13px] py-3 font-mono text-[11.5px] leading-[1.7] text-[#c8c8cf]"
+            {/if}
+            <button
+              type="button"
+              onclick={() => nav.go("files")}
+              class="mt-2 border-0 bg-transparent p-0 px-0.5 text-[12px] font-semibold text-text underline"
             >
-              <div>
-                <span class="text-[#6fa8dc]">tadashi</span>
-                <span class="text-[#8f8f99]">~/workspace</span> $ lh run --local
-                summarize
-              </div>
-              <div class="text-[#8f8f99]">▸ loaded Qwen3-14B on tadashi (mps)</div>
-              <div class="text-[#3fa87d]">▸ guard: 2 spans kept local</div>
-              <div class="text-[#8f8f99]">▸ wrote heater-reply.md</div>
-              <div class="text-[#c8c8cf]">done in 1.24s</div>
-              <div class="mt-[3px]">
-                <span class="text-[#6fa8dc]">tadashi</span>
-                <span class="text-[#8f8f99]">~/workspace</span> $
-                <span
-                  class="lh-cursor inline-block h-[14px] w-[7px] align-[-2px] bg-[#c8c8cf]"
-                ></span>
-              </div>
-            </div>
-            <div
-              class="mt-2 flex items-center gap-1.5 rounded-[var(--r)] border border-border-strong bg-surface px-[11px] py-[7px] font-mono text-[11.5px] text-text-3"
-            >
-              <span class="text-text-2">$</span>
-              <input
-                placeholder="run a command…"
-                class="min-w-0 flex-1 border-0 bg-transparent font-mono text-text outline-none"
-              />
-            </div>
+              Open the Files browser
+            </button>
           </div>
         {/if}
       </div>

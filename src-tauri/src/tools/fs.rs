@@ -108,7 +108,7 @@ pub fn profile_workspace_path(base: &std::path::Path, profile: &str) -> PathBuf 
 }
 
 /// The filename that records the legacy-workspace migration already ran.
-const LEGACY_MIGRATION_MARKER: &str = ".tierp-migrated";
+pub const LEGACY_MIGRATION_MARKER: &str = ".tierp-migrated";
 /// The marker's CONTENT sentinel. Presence-only checks are unsafe (a legacy
 /// file that happens to be named `.tierp-migrated` would spoof "already done"
 /// and strand real data); we treat migration as done only when the marker holds
