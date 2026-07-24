@@ -65,6 +65,15 @@
     listLocalModels,
     removeLocalModel,
     type LocalModel,
+    searchModels,
+    getModelDetail,
+    calculateModelFit,
+    type HfModelSummary,
+    type ModelDetailResponse,
+    type ModelSpec,
+    type CalcOutput,
+    type KvCacheQuant,
+    type Fit,
     getBudgetSettings,
     setBudgetSettings,
     resetBudgetSettings,
@@ -198,6 +207,104 @@
   let packOpen = $state(false);
   let skillReflectEnabled = $state(false);
   let skillReflectSaving = $state(false);
+  // M8 S5 — the interactive HuggingFace model search + hardware calculator.
+  // Search is live (empty query = the trusted Staff picks); expanding a result
+  // reads its GGUF geometry and runs the pure fit/speed calculator per quant
+  // for THIS machine as the context/KV-quant knobs move. Downloading a
+  // searched model is deliberately NOT wired (F7: needs the provenance-
+  // attestation consent gate first) — external endpoints are the run path.
+  let mSearchQuery = $state("");
+  let mSearchResults = $state<HfModelSummary[]>([]);
+  let mSearchLoading = $state(false);
+  let mSearchError: string | null = $state(null);
+  let mExpandedId: string | null = $state(null);
+  let mDetail = $state<ModelDetailResponse | null>(null);
+  let mDetailLoading = $state(false);
+  let mDetailError: string | null = $state(null);
+  let mCalcCtx = $state(8192);
+  let mCalcKv = $state<KvCacheQuant>("q8_0");
+  let mQuantCalcs = $state<Record<string, CalcOutput>>({});
+
+  async function runModelSearch() {
+    mSearchLoading = true;
+    mSearchError = null;
+    mExpandedId = null;
+    mDetail = null;
+    try {
+      mSearchResults = await searchModels(mSearchQuery.trim(), "downloads", 20);
+    } catch (err) {
+      mSearchError = String(err);
+      mSearchResults = [];
+    } finally {
+      mSearchLoading = false;
+    }
+  }
+
+  async function expandModel(id: string) {
+    if (mExpandedId === id) {
+      mExpandedId = null;
+      mDetail = null;
+      return;
+    }
+    mExpandedId = id;
+    mDetail = null;
+    mDetailError = null;
+    mDetailLoading = true;
+    try {
+      const d = await getModelDetail(id);
+      // The user may have clicked another row while this one loaded.
+      if (mExpandedId !== id) return;
+      mDetail = d;
+      if (d?.spec) {
+        // Clamp the context knob to what the model supports.
+        mCalcCtx = Math.min(mCalcCtx, d.spec.native_context_len || 8192);
+        await recalcQuants();
+      }
+    } catch (err) {
+      if (mExpandedId === id) mDetailError = String(err);
+    } finally {
+      if (mExpandedId === id) mDetailLoading = false;
+    }
+  }
+
+  async function recalcQuants() {
+    const d = mDetail;
+    if (!d?.spec) return;
+    const results: Record<string, CalcOutput> = {};
+    for (const q of d.quants) {
+      if (!q.complete) continue;
+      try {
+        const out = await calculateModelFit(d.spec, {
+          weight_file_bytes: q.total_size_bytes,
+          kv_quant: mCalcKv,
+          context_len: mCalcCtx,
+        });
+        if (out) results[q.quant ?? "?"] = out;
+      } catch {
+        // Per-quant calc failure: leave that row without a chip.
+      }
+    }
+    mQuantCalcs = results;
+  }
+
+  const CTX_CHOICES = [2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  function ctxChoicesFor(spec: ModelSpec | null): number[] {
+    const native = spec?.native_context_len ?? 8192;
+    const within = CTX_CHOICES.filter((c) => c <= native);
+    return within.length > 0 ? within : [Math.min(2048, native)];
+  }
+
+  function fitChip(fit: Fit): { label: string; cls: string } {
+    if (fit === "fits") return { label: "fits", cls: "bg-local-soft text-local" };
+    if (fit === "tight") return { label: "tight", cls: "bg-warn-soft text-warn" };
+    return { label: "too large", cls: "bg-blocked-soft text-blocked" };
+  }
+
+  function speedLabel(out: CalcOutput): string {
+    if (out.predicted_tokens_per_sec == null) return "speed unknown";
+    return `~${out.predicted_tokens_per_sec.toFixed(0)} tok/s`;
+  }
+
   // model catalog — downloadable local models sized to this machine (Wave 5.3 / M8)
   let catalogModels = $state<CatalogModel[]>([]);
   let hardware = $state<HardwareProfile | null>(null);
@@ -496,6 +603,8 @@
     probeHardware().then((h) => (hardware = h)).catch(() => {});
     listModelCatalog().then((m) => (catalogModels = m)).catch(() => {});
     listLocalModels().then((m) => (localModels = m)).catch(() => {});
+    // M8 S5: seed the search pane with the trusted Staff picks.
+    if (mSearchResults.length === 0) void runModelSearch();
   });
 
   async function startModelDownload(m: CatalogModel) {
@@ -1397,6 +1506,142 @@
                 </span>
               </button>
             {/if}
+
+            <!-- M8 S5: interactive HF model search + hardware calculator -->
+            <div class="mb-2 mt-6 flex items-center gap-2.5">
+              <span class="text-[12px] font-[550] text-text">Find a model</span>
+              {#if hardware}
+                <span class="text-[11.5px] text-text-3">
+                  fit &amp; speed computed for your {fmtGB(hardware.total_ram_bytes)} machine
+                </span>
+              {/if}
+            </div>
+            <div class="mb-1.5 flex items-center gap-1.5">
+              <input
+                bind:value={mSearchQuery}
+                placeholder="Search HuggingFace (empty = staff picks)…"
+                onkeydown={(e) => e.key === "Enter" && void runModelSearch()}
+                class="min-w-0 flex-1 rounded-[var(--r)] border border-border bg-surface px-2.5 py-1.5 text-[12.5px] text-text outline-none placeholder:text-text-3 focus:border-border-strong"
+              />
+              <Button onclick={() => void runModelSearch()} disabled={mSearchLoading}>
+                {mSearchLoading ? "Searching…" : "Search"}
+              </Button>
+            </div>
+            {#if mSearchError}
+              <div class="px-1 py-1.5 text-[12px] text-red-400">{mSearchError}</div>
+            {/if}
+            <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border">
+              {#if mSearchResults.length === 0 && !mSearchLoading}
+                <div class="px-3 py-5 text-center text-[12px] text-text-3">
+                  No results{mSearchQuery.trim() ? ` for “${mSearchQuery.trim()}”` : ""}.
+                  Searches run against huggingface.co.
+                </div>
+              {:else}
+                {#each mSearchResults as r (r.id)}
+                  <div class="border-b border-border last:border-b-0">
+                    <button
+                      type="button"
+                      onclick={() => void expandModel(r.id)}
+                      class="flex w-full items-center gap-2 py-[9px] pl-3 pr-2.5 text-left hover:bg-surface-hover"
+                    >
+                      <span class="min-w-0 flex-1">
+                        <span class="block truncate text-[12.5px] font-[550] text-text">{r.id}</span>
+                        <span class="block truncate text-[11.5px] text-text-3">
+                          {r.publisher}{r.downloads != null ? ` · ${r.downloads.toLocaleString()} downloads` : ""}{r.likes != null ? ` · ${r.likes.toLocaleString()} likes` : ""}
+                        </span>
+                      </span>
+                      {#if r.provenance === "trusted"}
+                        <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">trusted</span>
+                      {:else}
+                        <span class="flex-shrink-0 rounded-[8px] bg-warn-soft px-[7px] py-px text-[10px] text-warn">community</span>
+                      {/if}
+                      <svg
+                        class="flex-shrink-0 text-text-3 transition-transform {mExpandedId === r.id ? 'rotate-90' : ''}"
+                        width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                      >
+                        <path d="m9 6 6 6-6 6" />
+                      </svg>
+                    </button>
+                    {#if mExpandedId === r.id}
+                      <div class="border-t border-border bg-surface-2 px-3 py-2.5">
+                        {#if mDetailLoading}
+                          <div class="py-2 text-[12px] text-text-3">Reading model geometry…</div>
+                        {:else if mDetailError}
+                          <div class="py-2 text-[12px] text-red-400">{mDetailError}</div>
+                        {:else if mDetail}
+                          {#if mDetail.spec}
+                            {@const spec = mDetail.spec}
+                            <div class="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-text-2">
+                              <span>{spec.architecture}</span>
+                              <span>{spec.total_params_b.toFixed(1)}B params{spec.active_params_b < spec.total_params_b ? ` (${spec.active_params_b.toFixed(1)}B active)` : ""}</span>
+                              <span>native ctx {spec.native_context_len.toLocaleString()}</span>
+                              {#if !spec.kv_exact}
+                                <span class="text-warn">KV size approximate</span>
+                              {/if}
+                            </div>
+                            <div class="mb-2 flex flex-wrap items-center gap-2 text-[11.5px] text-text-2">
+                              <label class="flex items-center gap-1.5">
+                                <span>Context</span>
+                                <select
+                                  bind:value={mCalcCtx}
+                                  onchange={() => void recalcQuants()}
+                                  class="rounded-[var(--r)] border border-border bg-surface px-1.5 py-0.5 text-[11.5px] text-text outline-none"
+                                >
+                                  {#each ctxChoicesFor(spec) as c (c)}
+                                    <option value={c}>{c.toLocaleString()}</option>
+                                  {/each}
+                                </select>
+                              </label>
+                              <label class="flex items-center gap-1.5">
+                                <span>KV cache</span>
+                                <select
+                                  bind:value={mCalcKv}
+                                  onchange={() => void recalcQuants()}
+                                  class="rounded-[var(--r)] border border-border bg-surface px-1.5 py-0.5 text-[11.5px] text-text outline-none"
+                                >
+                                  <option value="f16">f16</option>
+                                  <option value="q8_0">q8_0</option>
+                                  <option value="q4_0">q4_0</option>
+                                </select>
+                              </label>
+                            </div>
+                            <div class="flex flex-col gap-1">
+                              {#each mDetail.quants.filter((q) => q.complete) as q (q.quant ?? q.files[0]?.filename)}
+                                {@const out = mQuantCalcs[q.quant ?? "?"]}
+                                <div class="flex items-center gap-2 rounded-[var(--r)] bg-surface px-2.5 py-1.5">
+                                  <span class="min-w-0 flex-1 truncate text-[12px] text-text">
+                                    {q.quant ?? "unknown quant"}
+                                    <span class="text-text-3"> · {fmtGB(q.total_size_bytes)}</span>
+                                  </span>
+                                  {#if out}
+                                    {@const chip = fitChip(out.fit)}
+                                    <span class="flex-shrink-0 text-[11px] text-text-3">{speedLabel(out)}</span>
+                                    <span class="flex-shrink-0 rounded-[8px] px-[7px] py-px text-[10px] {chip.cls}">{chip.label}</span>
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                            {#if mDetail.spec_notes.length > 0}
+                              <div class="mt-1.5 text-[11px] text-text-3">{mDetail.spec_notes.join(" · ")}</div>
+                            {/if}
+                          {:else}
+                            <div class="py-2 text-[12px] text-text-3">
+                              Couldn't read this model's architecture — the fit calculator
+                              can't run on it. {mDetail.spec_notes.join(" · ")}
+                            </div>
+                          {/if}
+                          <div class="mt-2 border-t border-border pt-2 text-[11px] text-text-3">
+                            Downloading searched models isn't enabled yet — install from the
+                            curated list below, or point a provider at your own endpoint
+                            (Settings → Models → Add an endpoint).
+                          </div>
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              {/if}
+            </div>
 
             <!-- Downloadable local models (Wave 5.3 / M8), sized to this machine -->
             <div class="mb-2 mt-6 flex items-center gap-2.5">
