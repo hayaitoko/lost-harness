@@ -15,8 +15,10 @@
   import type { Binding, Route } from "$lib/design/types";
   import {
     activeConversation,
+    activeConversationId,
     streamingMessage,
     sendMessage as sendChatMessage,
+    cancelActiveStream,
     type Message,
   } from "$lib/stores/chat";
   import {
@@ -530,16 +532,32 @@
               <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
             </svg>
           </button>
-          <button
-            type="button"
-            aria-label="Send"
-            onclick={handleSend}
-            class="grid h-[30px] w-[30px] flex-shrink-0 place-items-center self-end rounded-[var(--r)] border-0 bg-accent text-on-accent transition duration-100 hover:brightness-[1.06]"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 19V5M5 12l7-7 7 7" />
-            </svg>
-          </button>
+          {#if $streamingMessage && $streamingMessage.conversationId === $activeConversationId}
+            <!-- C7 cooperative cancel: while THIS conversation streams, the
+                 send slot becomes a Stop button (backend persists the partial
+                 with aborted:true and ends the stream). -->
+            <button
+              type="button"
+              aria-label="Stop generating"
+              onclick={() => void cancelActiveStream()}
+              class="grid h-[30px] w-[30px] flex-shrink-0 place-items-center self-end rounded-[var(--r)] border border-border-strong bg-surface-2 text-text transition duration-100 hover:bg-surface-hover"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="1.5" />
+              </svg>
+            </button>
+          {:else}
+            <button
+              type="button"
+              aria-label="Send"
+              onclick={handleSend}
+              class="grid h-[30px] w-[30px] flex-shrink-0 place-items-center self-end rounded-[var(--r)] border-0 bg-accent text-on-accent transition duration-100 hover:brightness-[1.06]"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 19V5M5 12l7-7 7 7" />
+              </svg>
+            </button>
+          {/if}
         </div>
       </div>
     </div>

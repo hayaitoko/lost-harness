@@ -10,7 +10,13 @@
   import { hydrate as hydrateProfiles } from "$lib/stores/profiles";
   import { hydrateProviders } from "$lib/stores/providers.svelte";
   import { hydrateConversations } from "$lib/stores/chat";
-  import { onStreamError, type StreamErrorPayload } from "$lib/api/tauri";
+  import {
+    onStreamError,
+    onLocalReroute,
+    onBudgetWarning,
+    type StreamErrorPayload,
+  } from "$lib/api/tauri";
+  import { pushToast } from "$lib/stores/toasts";
 
   import MainScreen from "$lib/design/screens/MainScreen.svelte";
   import EmptyState from "$lib/design/screens/EmptyState.svelte";
@@ -23,6 +29,7 @@
   import Onboarding from "$lib/design/screens/Onboarding.svelte";
   import ApprovalDialog from "$lib/components/ApprovalDialog.svelte";
   import AskHumanDialog from "$lib/components/AskHumanDialog.svelte";
+  import Toasts from "$lib/components/Toasts.svelte";
 
   const SCREENS = {
     main: MainScreen,
@@ -50,6 +57,23 @@
         `[stream:error] source=${payload.source} conv=${payload.conversation_id}: ${payload.error}`,
       );
     });
+    // Non-silent routing signal (C5): a turn was force-moved to a local
+    // provider. Green "stayed local" tone — this is the privacy system
+    // working, not an error.
+    await onLocalReroute((e) => {
+      pushToast(
+        "local",
+        e.to_is_bundled_runner
+          ? "Started your local model"
+          : `Switched to ${e.to_provider}`,
+        e.reason,
+      );
+    });
+    // Non-blocking budget signal (C1): the turn proceeded, but it's over the
+    // profile's spend cap. Amber caution tone.
+    await onBudgetWarning((e) => {
+      pushToast("warn", "Over budget", e.message);
+    });
   });
 </script>
 
@@ -60,3 +84,6 @@
 
 <!-- Backend-driven; renders only when the agent calls the `ask_human` tool. -->
 <AskHumanDialog />
+
+<!-- App-level transient signals: local reroute (C5) + budget warning (C1). -->
+<Toasts />

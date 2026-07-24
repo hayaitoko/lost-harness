@@ -182,6 +182,35 @@ export const STREAM_TOKEN_EVENT = "stream:token";
 export const STREAM_ERROR_EVENT = "stream:error";
 export const TOOL_APPROVAL_REQUEST_EVENT = "tool:approval_request";
 export const MEMORY_EVENT = "memory:event";
+export const LOCAL_REROUTE_EVENT = "stream:local_reroute";
+export const BUDGET_WARNING_EVENT = "stream:budget_warning";
+
+/**
+ * Payload of `stream:local_reroute` (C5). Mirrors `LocalReroutePayload` in
+ * `loop_mod.rs` — emitted once when a turn is force-rerouted to a local
+ * provider (privacy gate / LocalRequired tool), so the UI can show a
+ * non-silent "switched to local" toast.
+ */
+export interface LocalReroutePayload {
+  conversation_id: string;
+  reason: string;
+  from_provider: string;
+  to_provider: string;
+  /** True when `to_provider` is the app's bundled sidecar rather than a
+   * user-added local endpoint — lets the toast read "started your local
+   * model" vs "switched to <name>". */
+  to_is_bundled_runner: boolean;
+}
+
+/**
+ * Payload of `stream:budget_warning` (C1). Mirrors `BudgetWarningPayload` in
+ * `loop_mod.rs` — a NON-BLOCKING banner when an attended turn is over its
+ * spend cap; the turn still proceeds.
+ */
+export interface BudgetWarningPayload {
+  conversation_id: string;
+  message: string;
+}
 
 /** Payload of `memory:event`. Mirrors `MemoryEventPayload` in `loop_mod.rs`. */
 export interface MemoryEvent {
@@ -455,6 +484,38 @@ export async function onMemoryEvent(
 ): Promise<UnlistenFn> {
   if (isTauri()) {
     return tauriListen<MemoryEvent>(MEMORY_EVENT, (event) => {
+      callback(event.payload);
+    });
+  }
+  return () => {};
+}
+
+/**
+ * Subscribes to `stream:local_reroute` — fired once when a turn is
+ * force-rerouted to a local provider (privacy gate / LocalRequired). Returns
+ * an unlisten function. Browser mode: no-op (the mock never reroutes).
+ */
+export async function onLocalReroute(
+  callback: (e: LocalReroutePayload) => void,
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<LocalReroutePayload>(LOCAL_REROUTE_EVENT, (event) => {
+      callback(event.payload);
+    });
+  }
+  return () => {};
+}
+
+/**
+ * Subscribes to `stream:budget_warning` — the non-blocking over-spend-cap
+ * banner for attended turns. Returns an unlisten function. Browser mode:
+ * no-op (the mock has no budget).
+ */
+export async function onBudgetWarning(
+  callback: (e: BudgetWarningPayload) => void,
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<BudgetWarningPayload>(BUDGET_WARNING_EVENT, (event) => {
       callback(event.payload);
     });
   }

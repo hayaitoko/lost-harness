@@ -421,6 +421,24 @@ export async function sendMessage(
   }
 }
 
+/**
+ * Cancels the in-flight stream (C7 cooperative cancel). Asks the backend to
+ * stop the active turn for the streaming conversation; the backend persists
+ * the partial with `aborted:true` and the stream ends, which resolves the
+ * pending `sendMessage` via its normal completion path. Safe no-op when
+ * nothing is streaming.
+ */
+export async function cancelActiveStream(): Promise<void> {
+  const current = get(streamingMessage);
+  if (!current) return;
+  try {
+    await api.cancelMessage(current.conversationId);
+  } catch (err) {
+    // Cancel is best-effort — a failure just means the stream runs on.
+    console.warn("cancel_message failed:", err);
+  }
+}
+
 // ── Internal helpers ────────────────────────────────────────────────────────
 
 function convFromInfo(info: ConversationInfo): Conversation {
