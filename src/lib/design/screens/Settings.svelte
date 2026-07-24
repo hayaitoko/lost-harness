@@ -65,9 +65,20 @@
     listLocalModels,
     removeLocalModel,
     type LocalModel,
+    getBudgetSettings,
+    setBudgetSettings,
+    resetBudgetSettings,
+    getSandboxConfig,
+    setSandboxConfig,
+    type SandboxConfig,
+    listMcpServers,
+    registerMcpServer,
+    removeMcpServer,
+    type McpServer,
+    getAppVersion,
   } from "$lib/api/tauri";
 
-  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "agents" | "usage" | "appearance";
+  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "agents" | "mcp" | "usage" | "appearance";
   const SECTIONS: [Section, string][] = [
     ["routing", "Routing"],
     ["privacy", "Privacy guard"],
@@ -76,6 +87,7 @@
     ["memory", "Memory"],
     ["skills", "Skills"],
     ["agents", "Agent types"],
+    ["mcp", "MCP servers"],
     ["usage", "Usage"],
     ["appearance", "Appearance"],
   ];
@@ -262,6 +274,170 @@
       .finally(() => {
         usageLoading = false;
       });
+  });
+
+  // budget — the profile's spend cap (C1 governor). Loaded with the Usage pane
+  // since the cap and the ledger read together.
+  let budgetCap: number | null = $state(null);
+  let budgetDraft = $state("");
+  let budgetError: string | null = $state(null);
+  let budgetSaved = $state(false);
+  $effect(() => {
+    if (section !== "usage") return;
+    const profile = $activeProfileId;
+    budgetError = null;
+    getBudgetSettings(profile)
+      .then((b) => {
+        budgetCap = b?.cap_usd ?? null;
+        budgetDraft = b?.cap_usd != null ? String(b.cap_usd) : "";
+      })
+      .catch((err) => {
+        budgetError = String(err);
+      });
+  });
+
+  async function saveBudgetCap() {
+    budgetError = null;
+    budgetSaved = false;
+    const raw = budgetDraft.trim();
+    const parsed = raw === "" ? null : Number(raw);
+    if (parsed !== null && (!Number.isFinite(parsed) || parsed < 0)) {
+      budgetError = "Enter a positive dollar amount (or leave blank for no cap).";
+      return;
+    }
+    try {
+      const b =
+        parsed === null
+          ? await resetBudgetSettings($activeProfileId)
+          : await setBudgetSettings($activeProfileId, parsed);
+      budgetCap = b?.cap_usd ?? null;
+      budgetSaved = true;
+      setTimeout(() => (budgetSaved = false), 2000);
+    } catch (err) {
+      budgetError = String(err);
+    }
+  }
+
+  // sandbox — the profile's shell-network ceiling (M7 Tier-K, B2 writer
+  // surface). The enforcement is deliberately coarse (Seatbelt network is
+  // all-or-nothing), so the UI is one honest switch: blocked vs allowed-when-
+  // requested. "Unconfigured" behaves like allowed-when-requested.
+  let shellNetBlocked = $state(false);
+  let shellNetConfigured = $state(false);
+  let shellNetError: string | null = $state(null);
+  $effect(() => {
+    if (section !== "permissions") return;
+    const profile = $activeProfileId;
+    shellNetError = null;
+    getSandboxConfig(profile)
+      .then((cfg) => {
+        shellNetConfigured = cfg !== null;
+        shellNetBlocked =
+          cfg !== null &&
+          !cfg.network.allow_localhost &&
+          cfg.network.allowed_domains.length === 0;
+      })
+      .catch((err) => {
+        // A corrupt row fails closed backend-side; surface it here.
+        shellNetError = String(err);
+      });
+  });
+
+  async function setShellNetBlocked(blocked: boolean) {
+    shellNetError = null;
+    const cfg: SandboxConfig = {
+      enabled: true,
+      auto_allow_if_sandboxed: false,
+      excluded_commands: [],
+      network: {
+        allowed_domains: [],
+        allow_localhost: !blocked,
+        allow_unix_sockets: [],
+      },
+    };
+    try {
+      await setSandboxConfig($activeProfileId, cfg);
+      shellNetBlocked = blocked;
+      shellNetConfigured = true;
+    } catch (err) {
+      shellNetError = String(err);
+    }
+  }
+
+  // mcp — registered MCP servers (C3). Registration is the trust boundary:
+  // the pane carries the mandated "unsandboxed software install" warning (F1).
+  let mcpServers: McpServer[] = $state([]);
+  let mcpLoading = $state(false);
+  let mcpError: string | null = $state(null);
+  let mcpForm = $state({ name: "", command: "", argsText: "", tier: "remote" as "local" | "remote" });
+  let mcpRegistering = $state(false);
+  let confirmRemoveMcpId: string | null = $state(null);
+  $effect(() => {
+    if (section !== "mcp") return;
+    void $activeProfileId;
+    mcpLoading = true;
+    mcpError = null;
+    listMcpServers()
+      .then((rows) => {
+        mcpServers = rows;
+      })
+      .catch((err) => {
+        mcpError = String(err);
+      })
+      .finally(() => {
+        mcpLoading = false;
+      });
+  });
+
+  async function handleRegisterMcp() {
+    const name = mcpForm.name.trim();
+    const command = mcpForm.command.trim();
+    if (!name || !command) {
+      mcpError = "Name and command are required.";
+      return;
+    }
+    mcpRegistering = true;
+    mcpError = null;
+    try {
+      const server = await registerMcpServer({
+        name,
+        command,
+        args: mcpForm.argsText.trim() === "" ? [] : mcpForm.argsText.trim().split(/\s+/),
+        tier: mcpForm.tier,
+      });
+      if (server) mcpServers = [...mcpServers, server];
+      mcpForm = { name: "", command: "", argsText: "", tier: "remote" };
+    } catch (err) {
+      mcpError = String(err);
+    } finally {
+      mcpRegistering = false;
+    }
+  }
+
+  async function handleRemoveMcp(id: string) {
+    if (confirmRemoveMcpId !== id) {
+      confirmRemoveMcpId = id;
+      setTimeout(() => {
+        if (confirmRemoveMcpId === id) confirmRemoveMcpId = null;
+      }, 3000);
+      return;
+    }
+    confirmRemoveMcpId = null;
+    mcpError = null;
+    try {
+      await removeMcpServer(id);
+      mcpServers = mcpServers.filter((s) => s.id !== id);
+    } catch (err) {
+      mcpError = String(err);
+    }
+  }
+
+  // App version for the nav-rail footer (real value, not a hardcoded string).
+  let appVersion = $state("");
+  $effect(() => {
+    getAppVersion()
+      .then((v) => (appVersion = v))
+      .catch(() => {});
   });
 
   // Load every saved skill when the Skills pane opens. Skills are global (not
@@ -821,6 +997,11 @@
             {text}
           </button>
         {/each}
+        {#if appVersion}
+          <div class="mt-auto px-2.5 pb-2 pt-4 text-[10.5px] text-text-3">
+            Lost Harness {appVersion}
+          </div>
+        {/if}
       </div>
 
       <!-- Content pane -->
@@ -1009,6 +1190,32 @@
                 request, it appears here so you can take it back.
               </p>
             {/if}
+
+            <!-- M7 Tier-K: the per-profile shell-network ceiling (B2 writer
+                 surface). Coarse by design — Seatbelt network is all-or-
+                 nothing, so this is one honest switch. -->
+            <div class="mt-6">
+              <div class="{label} pb-1.5">Shell network — this profile</div>
+              {#if shellNetError}
+                <div class="px-3 py-2 text-sm text-red-400">{shellNetError}</div>
+              {/if}
+              <SettingRow
+                title="Block shell network"
+                desc={shellNetBlocked
+                  ? "Locked: shell commands on this profile are denied network access even when they ask for it."
+                  : shellNetConfigured
+                    ? "Open: a shell command that requests network (and passes approval) gets it."
+                    : "Default: a shell command that requests network (and passes approval) gets it. Flip on to lock this profile down."}
+              >
+                {#snippet control()}
+                  <Toggle checked={shellNetBlocked} onchange={(v) => void setShellNetBlocked(v)} />
+                {/snippet}
+              </SettingRow>
+              <p class="px-0.5 pt-2 text-[11px] text-text-3">
+                The sandbox itself is always on — shell commands run confined to this
+                profile's workspace regardless. This switch is only the network ceiling.
+              </p>
+            </div>
           {:else if section === "models"}
             {#if providersStore.loading && providersStore.providers.length === 0}
               <p
@@ -1022,11 +1229,17 @@
                 {@const isActive = p.id === providersStore.activeProviderId}
                 <SettingRow
                   title={p.name}
-                  desc={`${p.kind === "local" ? "Local" : p.kind === "cloud" ? "Cloud" : "Custom"} · ${p.baseUrl}`}
+                  desc={`${p.kind === "local" ? "Local" : p.kind === "cloud" ? "Cloud" : "Custom"} · ${p.baseUrl}${
+                    p.trustedByName
+                      ? " · trusted by name — only use on a network you control"
+                      : ""
+                  }`}
                   dotColor={providerDotColor(p.kind)}
                   tag={isActive
                     ? { label: "active", bg: "var(--accent-soft)", color: "var(--accent)" }
-                    : undefined}
+                    : p.trustedByName
+                      ? { label: "by name", bg: "var(--warn-soft)", color: "var(--warn)" }
+                      : undefined}
                 >
                   {#snippet control()}
                     <div class="flex flex-shrink-0 items-center gap-1.5">
@@ -1662,7 +1875,123 @@
                 seat's model — inheriting the conversation's privacy binding.
               </div>
             </div>
+          {:else if section === "mcp"}
+            <!-- F1 (mandated): registering an MCP server is a SOFTWARE INSTALL.
+                 The warning is the contract recorded on register_mcp_server. -->
+            <div
+              class="mb-4 rounded-r-[var(--r)] border-l-2 border-l-warn bg-warn-soft px-[13px] py-[10px] text-[12px] text-text-2"
+            >
+              <span class="font-medium text-warn">Installing software.</span> An MCP
+              server runs on your machine as a normal, unsandboxed program with your
+              full user privileges, and starts again every time the app launches. Only
+              add servers you trust — a malicious one can do anything you can. Its
+              individual <em>tools</em> still pass Lost Harness's approval gate, but
+              the server process itself is outside the sandbox.
+            </div>
+
+            {#if mcpError}
+              <div class="px-3 py-2 text-sm text-red-400">{mcpError}</div>
+            {/if}
+            {#if mcpLoading}
+              <div class="px-3 py-4 text-sm text-text-3">Loading servers…</div>
+            {:else if mcpServers.length > 0}
+              {#each mcpServers as s (s.id)}
+                <SettingRow
+                  title={s.name}
+                  desc={`${s.command}${s.args.length ? " " + s.args.join(" ") : ""} · ${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}`}
+                  dotColor={s.running ? "var(--local)" : "var(--text-3)"}
+                  tag={s.tier === "remote"
+                    ? { label: "remote", bg: "var(--cloud-soft)", color: "var(--cloud)" }
+                    : { label: "local", bg: "var(--local-soft)", color: "var(--local)" }}
+                >
+                  {#snippet control()}
+                    <div class="flex flex-shrink-0 items-center gap-1.5">
+                      <span class="text-[11px] text-text-3">{s.running ? "running" : "stopped"}</span>
+                      <Button variant="ghost" onclick={() => handleRemoveMcp(s.id)}>
+                        {confirmRemoveMcpId === s.id ? "Confirm?" : "Remove"}
+                      </Button>
+                    </div>
+                  {/snippet}
+                </SettingRow>
+              {/each}
+            {:else}
+              <p
+                class="rounded-[var(--r-lg)] border border-dashed border-border-strong px-3 py-6 text-center text-[12.5px] text-text-3"
+              >
+                No MCP servers registered.
+              </p>
+            {/if}
+
+            <div class="mt-4">
+              <div class="{label} pb-1.5">Add a server</div>
+              <div class="flex flex-col gap-2">
+                <input
+                  bind:value={mcpForm.name}
+                  placeholder="Name (e.g. github)"
+                  class="rounded-[var(--r)] border border-border bg-surface px-2.5 py-1.5 text-[12.5px] text-text outline-none placeholder:text-text-3 focus:border-border-strong"
+                />
+                <input
+                  bind:value={mcpForm.command}
+                  placeholder="Command (e.g. /usr/local/bin/my-mcp-server)"
+                  class="rounded-[var(--r)] border border-border bg-surface px-2.5 py-1.5 text-[12.5px] text-text outline-none placeholder:text-text-3 focus:border-border-strong"
+                />
+                <input
+                  bind:value={mcpForm.argsText}
+                  placeholder="Arguments (space-separated, optional)"
+                  class="rounded-[var(--r)] border border-border bg-surface px-2.5 py-1.5 text-[12.5px] text-text outline-none placeholder:text-text-3 focus:border-border-strong"
+                />
+                <div class="flex items-center justify-between">
+                  <label class="flex items-center gap-2 text-[12px] text-text-2">
+                    <span>Trust tier</span>
+                    <select
+                      bind:value={mcpForm.tier}
+                      class="rounded-[var(--r)] border border-border bg-surface px-2 py-1 text-[12px] text-text outline-none"
+                    >
+                      <option value="remote">Remote (stricter — tools ask before use)</option>
+                      <option value="local">Local (on-box only)</option>
+                    </select>
+                  </label>
+                  <Button onclick={() => void handleRegisterMcp()} disabled={mcpRegistering}>
+                    {mcpRegistering ? "Starting…" : "Register"}
+                  </Button>
+                </div>
+                <p class="text-[11px] text-text-3">
+                  The server is started and health-checked before it's saved — one that
+                  can't come up is never persisted. “Remote” means the server reaches
+                  off this machine; its tools always require approval.
+                </p>
+              </div>
+            </div>
           {:else if section === "usage"}
+            <!-- C1 budget governor: the profile's spend cap. Unattended work
+                 halts at the cap; attended chat warns (toast) and proceeds. -->
+            <div class="mb-4">
+              <div class="{label} pb-1.5">Spend cap — this profile</div>
+              {#if budgetError}
+                <div class="px-3 py-2 text-sm text-red-400">{budgetError}</div>
+              {/if}
+              <SettingRow
+                title="Monthly cap (USD)"
+                desc={budgetCap != null
+                  ? `Background/scheduled work halts at $${budgetCap}; chat warns and proceeds.`
+                  : "No cap — spend is tracked but never limited."}
+              >
+                {#snippet control()}
+                  <div class="flex flex-shrink-0 items-center gap-1.5">
+                    <input
+                      bind:value={budgetDraft}
+                      inputmode="decimal"
+                      placeholder="none"
+                      class="w-[90px] rounded-[var(--r)] border border-border bg-surface px-2 py-1 text-right text-[12.5px] tabular-nums text-text outline-none placeholder:text-text-3 focus:border-border-strong"
+                    />
+                    <Button variant="ghost" onclick={() => void saveBudgetCap()}>
+                      {budgetSaved ? "Saved" : "Set"}
+                    </Button>
+                  </div>
+                {/snippet}
+              </SettingRow>
+            </div>
+
             {#if usageLoading}
               <div class="px-3 py-4 text-sm text-text-3">Loading usage…</div>
             {:else if usageError}

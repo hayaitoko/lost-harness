@@ -25,6 +25,11 @@ export interface Provider {
   isPrivate: boolean;
   /** Q1: whether the endpoint supports OpenAI-style native structured tool calls. */
   supportsNativeTools: boolean;
+  /** F5: the endpoint is trusted as "private" by its DNS/mDNS NAME
+   * (.local/.lan/.internal/.ts.net) rather than a loopback/RFC1918 IP
+   * literal — surfaced so the UI can show the "only on a network you
+   * control" notice. */
+  trustedByName: boolean;
 }
 
 const STORAGE_KEY = "lh.providers.v1";
@@ -126,6 +131,7 @@ export async function hydrateProviders(): Promise<void> {
       kind: (p.kind as ProviderKind) ?? "custom",
       isPrivate: p.is_private,
       supportsNativeTools: p.supports_native_tools,
+      trustedByName: p.trusted_by_name,
     }));
 
     // Merge: if a local provider has the same id, keep the local apiKey
@@ -182,7 +188,7 @@ export async function fetchModels(providerId: string): Promise<string[]> {
 
 /** Add a new provider via the backend IPC. Falls back to localStorage in browser mode. */
 export async function addProvider(
-  p: Omit<Provider, "id" | "isPrivate"> & { id?: string },
+  p: Omit<Provider, "id" | "isPrivate" | "trustedByName"> & { id?: string },
 ): Promise<Provider> {
   const existingIdx = providersStore.providers.findIndex((x) => x.id === p.id);
 
@@ -211,6 +217,7 @@ export async function addProvider(
         kind: (info.kind as ProviderKind) ?? p.kind,
         isPrivate: info.is_private,
         supportsNativeTools: info.supports_native_tools,
+        trustedByName: info.trusted_by_name,
       };
     } catch (err) {
       // IPC error — update locally so the UI reflects the edit for this
@@ -224,6 +231,7 @@ export async function addProvider(
         kind: p.kind,
         isPrivate: existing.isPrivate,
         supportsNativeTools: p.supportsNativeTools,
+        trustedByName: existing.trustedByName,
       };
     }
     // Base URL or kind may have changed — drop the cached model list.
@@ -249,6 +257,7 @@ export async function addProvider(
       kind: (info.kind as ProviderKind) ?? p.kind,
       isPrivate: info.is_private,
       supportsNativeTools: info.supports_native_tools,
+      trustedByName: info.trusted_by_name,
     };
     providersStore.providers.push(provider);
     // First provider added → make it active by default.
@@ -270,6 +279,7 @@ export async function addProvider(
       kind: p.kind,
       isPrivate: p.kind === "local",
       supportsNativeTools: p.supportsNativeTools,
+      trustedByName: false,
     };
     providersStore.providers.push(next);
     if (providersStore.activeProviderId === null) {
