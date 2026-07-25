@@ -1,7 +1,7 @@
 <script lang="ts">
   // The left rail — brand, section nav (Email / Whiteboard / Files / Scheduled
-  // jobs), search, conversation list (Pinned + Sessions), the local-engine card
-  // with the Knot, and the profile switcher. Shared by every full-app screen.
+  // jobs), conversation list (Sessions), and the profile switcher. The Knot is
+  // part of the brand mark so the current route is visible without a status card.
   // Maps to `.sidebar` + the DC prototype's `.lh-nav-link` chrome.
   import { nav } from "../nav.svelte";
   import type { ScreenId, Route } from "../types";
@@ -20,16 +20,6 @@
     activeProfile,
     switchProfile,
   } from "$lib/stores/profiles";
-  import { providersStore } from "$lib/stores/providers.svelte";
-
-  // The engine card shows the REAL active model/provider (honesty: the old
-  // hardcoded "Qwen3-14B" label predated provider wiring). Falls back to an
-  // honest "No model selected" when nothing is configured.
-  const engineModel = $derived(providersStore.activeModel ?? "No model selected");
-  const engineHost = $derived(
-    providersStore.providers.find((p) => p.id === providersStore.activeProviderId)
-      ?.name ?? null,
-  );
 
   interface Props {
     active?: ScreenId;
@@ -40,7 +30,7 @@
      */
     activeConv?: string;
     onnewsession?: () => void;
-    /** Agent status shown by the Knot in the local-engine card. */
+    /** Current send route, expressed through the Knot beside the brand. */
     engineState?: KnotState;
   }
 
@@ -103,13 +93,6 @@
     const match = $profiles.find((p) => p.name === name);
     if (match) void switchProfile(match.id);
   }
-
-  const ENGINE_LABEL: Record<KnotState, string> = {
-    idle: "local engine · idle",
-    local: "answering locally",
-    cloud: "routing to cloud",
-    held: "held by the guard",
-  };
 
   const navLink =
     "flex w-full items-center gap-[9px] rounded-[var(--r)] border-0 px-2 py-[6px] text-left text-[12.5px] font-medium transition-colors duration-100 cursor-pointer";
@@ -176,9 +159,8 @@
   <div
     class="flex h-12 flex-shrink-0 items-center gap-[9px] border-b border-border px-[14px]"
   >
-    <span class="text-[13.5px] font-semibold tracking-[-0.005em]"
-      >Lost Harness</span
-    >
+    <Knot size={25} state={engineState} seed={-7} title="Current send route" />
+    <span class="text-[13.5px] font-semibold tracking-[-0.005em]">Lost Harness</span>
   </div>
 
   <div class="flex flex-col gap-px px-2 pt-2">
@@ -235,18 +217,6 @@
   </div>
 
   <div class="relative flex-shrink-0 border-t border-border px-2.5 pb-2.5 pt-2">
-    <div
-      title="Local engine"
-      class="mb-1.5 flex cursor-pointer items-center gap-[9px] rounded-[var(--r)] border border-border bg-surface px-2.5 py-2 transition-colors duration-100 hover:bg-surface-hover"
-    >
-      <Knot size={22} state={engineState} seed={-7} />
-      <div class="min-w-0">
-        <div class="truncate text-[12px] font-[550]">{engineModel}</div>
-        <div class="flex items-center gap-[5px] text-[10.5px] text-text-3">
-          {ENGINE_LABEL[engineState]}{engineHost ? ` · ${engineHost}` : ""}
-        </div>
-      </div>
-    </div>
     <ProfileSwitcher
       profiles={switcherProfiles}
       active={$activeProfile?.name ?? ""}

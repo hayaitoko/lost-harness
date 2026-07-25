@@ -1,7 +1,6 @@
 <script lang="ts">
-  // The composer's model selector — a button showing the active model that
-  // opens an upward-facing popover with a search box and grouped options.
-  // Maps to `.model-picker` / `.model-btn` / `.model-pop`.
+  // The composer's model control — a compact robot icon that opens an
+  // upward-facing popover with model selection and thinking-strength choices.
 
   /** A single selectable model, grouped by provider/source. */
   interface ModelOption {
@@ -24,12 +23,15 @@
     /** Shown on the button when nothing is selected. */
     placeholder?: string;
     onchange?: (key: string) => void;
+    /** Lets the surrounding composer close any competing popover before opening this one. */
+    onopen?: () => void;
   }
 
-  let { models, value, placeholder = "Select model", onchange }: Props = $props();
+  let { models, value, placeholder = "Select model", onchange, onopen }: Props = $props();
 
   let open = $state(false);
   let query = $state("");
+  let thinkingStrength = $state<"light" | "balanced" | "deep">("balanced");
   let rootEl: HTMLDivElement;
 
   const keyOf = (m: ModelOption) => m.key ?? m.name;
@@ -77,41 +79,66 @@
     local: "bg-local-soft text-local",
     cloud: "bg-cloud-soft text-cloud",
   };
+
+  const THINKING_STRENGTHS: { id: typeof thinkingStrength; label: string; description: string }[] = [
+    { id: "light", label: "Light", description: "Quicker" },
+    { id: "balanced", label: "Balanced", description: "Default" },
+    { id: "deep", label: "Deep", description: "More deliberate" },
+  ];
 </script>
 
 <div bind:this={rootEl} class="relative flex items-center">
-  <div class="overflow-hidden max-w-[220px] opacity-100">
-    <button
-      type="button"
-      aria-haspopup="listbox"
-      aria-expanded={open}
-      onclick={() => (open = !open)}
-      class="inline-flex items-center gap-[7px] rounded-[var(--r)] border border-border bg-transparent px-[9px] py-[5px] text-[12px] font-medium text-text-2 transition-[0.1s]
-        hover:bg-surface-hover hover:text-text hover:border-border-strong"
-    >
-      <span class="h-1.5 w-1.5 rounded-full {dotClass[selected?.kind ?? 'local']}"></span>
-      <span>{selected?.name ?? placeholder}</span>
-      <svg
-        width="11"
-        height="11"
-        viewBox="0 0 12 12"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="1.6"
-        class="text-text-3 transition-transform duration-[0.12s] {open ? 'rotate-180' : ''}"
-      >
-        <path d="M2 4.5 6 8l4-3.5" />
-      </svg>
-    </button>
-  </div>
+  <button
+    type="button"
+    aria-haspopup="listbox"
+    aria-expanded={open}
+    onclick={() => {
+      onopen?.();
+      open = !open;
+    }}
+    title="Choose model and thinking strength"
+    class="relative grid h-[36px] w-[36px] place-items-center rounded-full border border-transparent text-text-3 transition-[background-color,color,border-color] duration-150 focus-visible:border-accent focus-visible:outline-none
+      {open ? 'border-border-strong bg-surface-hover text-text' : 'hover:bg-surface-hover hover:text-text-2'}"
+  >
+    <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+      <rect x="5.5" y="7" width="13" height="11" rx="3" />
+      <path d="M12 4v3M8.7 12h.1M15.2 12h.1M9.2 15h5.6" stroke-linecap="round" />
+      <path d="M4 11v3M20 11v3" stroke-linecap="round" opacity=".7" />
+    </svg>
+    {#if selected}
+      <span class="absolute bottom-[7px] right-[7px] h-1.5 w-1.5 rounded-full ring-2 ring-surface {dotClass[selected.kind]}"></span>
+    {/if}
+    <span class="sr-only">{selected?.name ?? placeholder}; thinking strength {thinkingStrength}</span>
+  </button>
 
   <div
     role="listbox"
-    class="absolute bottom-[calc(100%+6px)] right-0 z-40 w-[280px] overflow-hidden rounded-[var(--r)] border border-border-strong bg-surface shadow-[var(--shadow-pop)] transition-[0.12s]
+    class="absolute bottom-[calc(100%+8px)] right-0 z-40 w-[292px] overflow-hidden rounded-[var(--r-lg)] border border-border-strong bg-surface shadow-[var(--shadow-pop)] transition-[0.12s]
       {open
       ? 'opacity-100 translate-y-0 pointer-events-auto'
       : 'opacity-0 translate-y-[4px] pointer-events-none'}"
   >
+    <div class="border-b border-border px-3 py-2.5">
+      <div class="mb-2 flex items-baseline justify-between">
+        <span class="text-[10px] font-semibold uppercase tracking-[0.07em] text-text-3">Thinking strength</span>
+        <span class="text-[10px] text-text-3">Applies when supported</span>
+      </div>
+      <div class="grid grid-cols-3 gap-1" role="group" aria-label="Thinking strength">
+        {#each THINKING_STRENGTHS as strength (strength.id)}
+          <button
+            type="button"
+            aria-pressed={thinkingStrength === strength.id}
+            onclick={() => (thinkingStrength = strength.id)}
+            class="rounded-[var(--r-sm)] px-1.5 py-1.5 text-left transition-[0.1s] {thinkingStrength === strength.id
+              ? 'bg-accent-soft text-text'
+              : 'text-text-3 hover:bg-surface-hover hover:text-text-2'}"
+          >
+            <span class="block text-[11px] font-semibold">{strength.label}</span>
+            <span class="block text-[9.5px] leading-[1.2] opacity-75">{strength.description}</span>
+          </button>
+        {/each}
+      </div>
+    </div>
     <div class="border-b border-border p-2">
       <input
         placeholder="Search models…"

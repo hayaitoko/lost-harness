@@ -17,7 +17,7 @@
   import { FULL, OVER0, OVER1, OVER2 } from "./knot-geometry";
 
   /** Agent status conveyed by the idle mark. */
-  export type KnotState = "idle" | "local" | "cloud" | "held";
+  export type KnotState = "idle" | "local" | "cloud" | "filter" | "held";
 
   interface Props {
     /**
@@ -69,6 +69,7 @@
   class="knot"
   class:st-local={state === "local"}
   class:st-cloud={state === "cloud"}
+  class:st-filter={state === "filter"}
   class:st-held={state === "held"}
   viewBox="0 0 100 100"
   width={size}
@@ -204,16 +205,34 @@
     --lap-b: 5.2s;
     --head-op: 0.95;
   }
+  .knot.st-filter {
+    --pulse: var(--warn);
+    --lap-a: 2.4s;
+    --lap-b: 5.2s;
+    --head-op: 0.95;
+  }
+  .knot.st-local .base,
+  .knot.st-local .over,
+  .knot.st-cloud .base,
+  .knot.st-cloud .over,
+  .knot.st-filter .base,
+  .knot.st-filter .over {
+    stroke: var(--pulse);
+    opacity: 0.8;
+  }
   .knot.st-local .p1,
-  .knot.st-cloud .p1 {
+  .knot.st-cloud .p1,
+  .knot.st-filter .p1 {
     opacity: 0.16;
   }
   .knot.st-local .p2,
-  .knot.st-cloud .p2 {
+  .knot.st-cloud .p2,
+  .knot.st-filter .p2 {
     opacity: 0.34;
   }
   .knot.st-local .pb,
-  .knot.st-cloud .pb {
+  .knot.st-cloud .pb,
+  .knot.st-filter .pb {
     opacity: 0.2;
   }
   .knot.st-held .pulse {

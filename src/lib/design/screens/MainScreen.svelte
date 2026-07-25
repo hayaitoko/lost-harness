@@ -11,6 +11,7 @@
   import RoutingBadge from "../components/RoutingBadge.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import AppStatusBar from "../components/AppStatusBar.svelte";
+  import type { KnotState } from "../components/Knot.svelte";
   import { nav } from "$lib/design/nav.svelte";
   import type { Binding, Route } from "$lib/design/types";
   import {
@@ -65,20 +66,20 @@
   // local edits (never off-box / dangerous actions). Feeds sendMessage().
   type SessionMode = "normal" | "plan" | "accept_edits";
   const MODE_LABEL: Record<SessionMode, string> = {
-    normal: "Normal",
+    normal: "Ask",
     plan: "Plan",
-    accept_edits: "Accept edits",
+    accept_edits: "Bypass local edits",
   };
   const MODE_DESC: Record<SessionMode, string> = {
     normal: "Tool actions ask for approval as usual",
     plan: "Read-only — the agent can look and plan but makes no changes",
     accept_edits: "Auto-approve local edits (never off-box or dangerous actions)",
   };
-  const NEXT_MODE: Record<SessionMode, SessionMode> = {
-    normal: "plan",
-    plan: "accept_edits",
-    accept_edits: "normal",
-  };
+  const MODE_OPTIONS: { id: SessionMode; label: string; description: string }[] = [
+    { id: "normal", label: MODE_LABEL.normal, description: MODE_DESC.normal },
+    { id: "plan", label: MODE_LABEL.plan, description: MODE_DESC.plan },
+    { id: "accept_edits", label: MODE_LABEL.accept_edits, description: MODE_DESC.accept_edits },
+  ];
 
   const TABS: { id: PanelTab; label: string }[] = [
     { id: "routing", label: "Routing" },
@@ -91,6 +92,8 @@
   let bindingSaving = $state(false);
   let bindingError = $state<string | null>(null);
   let mode = $state<SessionMode>("normal");
+  let permissionOpen = $state(false);
+  let permissionEl: HTMLDivElement | null = $state(null);
   let whyOpen = $state(false);
   let panelTab = $state<PanelTab>("routing");
 
@@ -98,6 +101,12 @@
   let draft = $state("");
   let isSending = $state(false);
   let textareaEl: HTMLTextAreaElement | null = $state(null);
+  type ComposerPopover = "attachments" | "context" | null;
+  let composerPopover = $state<ComposerPopover>(null);
+  let attachmentEl: HTMLDivElement | null = $state(null);
+  let contextEl: HTMLDivElement | null = $state(null);
+  let listening = $state(false);
+  let voiceNotice = $state<string | null>(null);
 
   $effect(() => {
     if ($activeConversation) binding = $activeConversation.binding;
@@ -122,12 +131,33 @@
       bindingSaving = false;
     }
   }
-  const cycleMode = () => (mode = NEXT_MODE[mode]);
+  const selectMode = (next: SessionMode) => {
+    mode = next;
+    permissionOpen = false;
+  };
   const toggleWhy = () => (whyOpen = !whyOpen);
   const openTab = (t: PanelTab) => {
     whyOpen = true;
     panelTab = t;
   };
+
+  $effect(() => {
+    if (!permissionOpen && !composerPopover) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (
+        permissionEl?.contains(target) ||
+        attachmentEl?.contains(target) ||
+        contextEl?.contains(target)
+      ) {
+        return;
+      }
+      permissionOpen = false;
+      composerPopover = null;
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  });
 
   // ── Non-silent memory signal (PLAN §9): a transient "recalled N notes" (or
   // "remembered N notes") line when the agent injects or saves memory for the
@@ -295,6 +325,125 @@
       : "",
   );
 
+  // The send color reflects the actual route commitment we can make before a
+  // turn starts: explicit local/cloud models get their own colors, while Auto
+  // (or an unset model) stays amber because the privacy filter decides.
+  type SendRoute = "local" | "public" | "filter";
+  const activeProvider = $derived(
+    providersStore.providers.find((provider) => provider.id === providersStore.activeProviderId),
+  );
+  const sendRoute = $derived.by((): SendRoute => {
+    if (binding === "auto" || !activeProvider) return "filter";
+    if (binding === "private" || activeProvider.kind !== "cloud") return "local";
+    return "public";
+  });
+  const SEND_ROUTE_LABEL: Record<SendRoute, string> = {
+    local: "local model",
+    public: "public model",
+    filter: "privacy filter",
+  };
+  const SEND_ROUTE_CLASS: Record<SendRoute, string> = {
+    local: "bg-local text-white hover:brightness-110",
+    public: "bg-cloud text-white hover:brightness-110",
+    filter: "bg-warn text-[#231f16] hover:brightness-110",
+  };
+  const knotState = $derived.by((): KnotState => {
+    if (sendRoute === "local") return "local";
+    if (sendRoute === "public") return "cloud";
+    return "filter";
+  });
+
+  // The backend does not expose full token accounting yet. The context panel
+  // therefore reports only a clearly-labelled estimate for text already in the
+  // visible conversation, and marks every unmetered source as such.
+  const contextUsage = $derived.by(() => {
+    const messages = $activeConversation?.messages ?? [];
+    const estimate = (text: string) => Math.ceil(Array.from(text).length / 4);
+    const input = messages
+      .filter((message) => message.role === "user")
+      .reduce((total, message) => total + estimate(message.content), 0);
+    const output = messages
+      .filter((message) => message.role === "assistant")
+      .reduce((total, message) => total + estimate(message.content), 0);
+    return { input, output, total: input + output };
+  });
+  // The frontend has no model-specific window metadata yet. Use the same
+  // conservative 8k presentation baseline as the model-fit UI, and make the
+  // number explicit in the detail popover rather than implying it is exact.
+  const CONTEXT_METER_WINDOW = 8192;
+  const CONTEXT_RING_RADIUS = 8.25;
+  const CONTEXT_RING_CIRCUMFERENCE = 2 * Math.PI * CONTEXT_RING_RADIUS;
+  const contextRing = $derived.by(() => {
+    const filled = Math.min(contextUsage.total / CONTEXT_METER_WINDOW, 1);
+    return { dashOffset: CONTEXT_RING_CIRCUMFERENCE * (1 - filled) };
+  });
+
+  type DictationAlternative = { transcript: string };
+  type DictationResult = { isFinal: boolean; [index: number]: DictationAlternative };
+  type DictationEvent = { resultIndex: number; results: ArrayLike<DictationResult> };
+  type DictationRecognition = {
+    continuous: boolean;
+    interimResults: boolean;
+    lang: string;
+    onresult: ((event: DictationEvent) => void) | null;
+    onerror: (() => void) | null;
+    onend: (() => void) | null;
+    start: () => void;
+    stop: () => void;
+  };
+  type DictationConstructor = new () => DictationRecognition;
+  let recognition: DictationRecognition | null = null;
+  let voiceNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function showVoiceNotice(message: string) {
+    voiceNotice = message;
+    if (voiceNoticeTimer) clearTimeout(voiceNoticeTimer);
+    voiceNoticeTimer = setTimeout(() => (voiceNotice = null), 3500);
+  }
+
+  function toggleVoiceInput() {
+    composerPopover = null;
+    permissionOpen = false;
+    if (listening) {
+      recognition?.stop();
+      return;
+    }
+    const voiceWindow = window as typeof window & {
+      SpeechRecognition?: DictationConstructor;
+      webkitSpeechRecognition?: DictationConstructor;
+    };
+    const Recognition = voiceWindow.SpeechRecognition ?? voiceWindow.webkitSpeechRecognition;
+    if (!Recognition) {
+      showVoiceNotice("Voice dictation is not available in this preview.");
+      return;
+    }
+
+    const nextRecognition = new Recognition();
+    nextRecognition.continuous = false;
+    nextRecognition.interimResults = false;
+    nextRecognition.lang = navigator.language || "en-US";
+    nextRecognition.onresult = (event) => {
+      let transcript = "";
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        if (result?.isFinal) transcript += result[0]?.transcript ?? "";
+      }
+      if (!transcript.trim()) return;
+      draft = draft.trimEnd() ? `${draft.trimEnd()} ${transcript.trim()}` : transcript.trim();
+      autoresize();
+    };
+    nextRecognition.onerror = () => showVoiceNotice("Voice dictation could not start.");
+    nextRecognition.onend = () => (listening = false);
+    recognition = nextRecognition;
+    listening = true;
+    try {
+      nextRecognition.start();
+    } catch {
+      listening = false;
+      showVoiceNotice("Voice dictation could not start.");
+    }
+  }
+
   // ── Routing: map a real message's gate outcome to the design's Route.
   // "allow" means the gate let the request go to whichever endpoint was
   // targeted — local or cloud depends on that provider's kind, so allow
@@ -411,7 +560,7 @@
     ? 'grid-cols-[260px_1fr_350px]'
     : 'grid-cols-[260px_1fr_0px]'}"
 >
-  <Sidebar activeConv={$activeConversation?.name ?? "New chat"} engineState="local" />
+  <Sidebar activeConv={$activeConversation?.name ?? "New chat"} engineState={knotState} />
 
   <main class="flex min-h-0 min-w-0 flex-col">
     <div
@@ -435,18 +584,6 @@
       {#if bindingError}
         <span class="max-w-56 truncate text-[11px] text-blocked" title={bindingError}>{bindingError}</span>
       {/if}
-
-      <button
-        type="button"
-        onclick={cycleMode}
-        title={MODE_DESC[mode]}
-        aria-label="Permission mode — click to switch"
-        class="inline-flex h-7 cursor-pointer items-center gap-[7px] rounded-[14px] border px-3 text-[12px] font-semibold tracking-[0.02em] {mode === 'normal'
-          ? 'border-border-strong bg-surface text-text'
-          : 'border-warn bg-warn-soft text-warn'}"
-      >
-        {MODE_LABEL[mode]}
-      </button>
 
       <div class="flex-1"></div>
 
@@ -546,53 +683,212 @@
       </div>
     {/if}
 
-    <div class="flex-shrink-0 px-5 pb-4 pt-1">
+    <div class="flex-shrink-0 px-5 pb-4 pt-2">
       <div
-        class="mx-auto max-w-[700px] rounded-[var(--r-lg)] border border-border-strong bg-surface shadow-[var(--shadow)] transition-colors duration-100 focus-within:border-[color-mix(in_srgb,var(--accent)_45%,var(--border-strong))]"
+        class="mx-auto flex max-w-[700px] flex-col rounded-[24px] border border-border-strong bg-surface px-[15px] py-1.5 shadow-[var(--shadow)] transition-colors duration-100 focus-within:border-[color-mix(in_srgb,var(--accent)_55%,var(--border-strong))]"
       >
-        <div class="flex items-center gap-2 py-[7px] pl-3 pr-[7px]">
-          <textarea
-            bind:this={textareaEl}
-            bind:value={draft}
-            rows="1"
-            placeholder="Message Lost Harness…"
-            onkeydown={handleKeydown}
-            oninput={autoresize}
-            class="max-h-[150px] min-w-0 flex-1 resize-none border-0 bg-transparent py-[5px] text-[14px] leading-[1.55] text-text outline-none placeholder:text-text-3"
-          ></textarea>
-          <span class="flex-shrink-0 whitespace-nowrap">
+        <textarea
+          bind:this={textareaEl}
+          bind:value={draft}
+          rows="1"
+          placeholder="Message Lost Harness…"
+          onkeydown={handleKeydown}
+          oninput={autoresize}
+          class="min-h-[25px] max-h-[150px] w-full min-w-0 flex-1 resize-none border-0 bg-transparent px-[2px] py-0 text-[15px] leading-[1.55] text-text outline-none placeholder:text-text-3"
+        ></textarea>
+
+        <div class="mt-1 flex items-center justify-between gap-3">
+          <div class="flex items-center gap-1">
+            <div bind:this={attachmentEl} class="relative flex items-center">
+            <button
+              type="button"
+              aria-label="Attachments"
+              aria-expanded={composerPopover === "attachments"}
+              title="Attachments"
+              onclick={() => {
+                composerPopover = composerPopover === "attachments" ? null : "attachments";
+                permissionOpen = false;
+              }}
+              class="grid h-[36px] w-[36px] place-items-center rounded-full border border-transparent text-text-2 transition-[background-color,color] hover:bg-surface-hover hover:text-text focus-visible:border-accent focus-visible:outline-none"
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" stroke-linecap="round" />
+              </svg>
+            </button>
+            {#if composerPopover === "attachments"}
+              <div class="absolute bottom-[calc(100%+10px)] left-0 z-40 w-[240px] rounded-[var(--r-lg)] border border-border-strong bg-surface px-3 py-2.5 shadow-[var(--shadow-pop)]">
+                <div class="text-[12px] font-semibold text-text">Attachments</div>
+                <p class="mt-1 text-[11px] leading-[1.4] text-text-3">
+                  File and photo attachment sending has not been connected to this build yet.
+                </p>
+              </div>
+            {/if}
+          </div>
+
+            <div bind:this={permissionEl} class="relative flex items-center">
+              <button
+                type="button"
+                onclick={() => {
+                  permissionOpen = !permissionOpen;
+                  composerPopover = null;
+                }}
+                title={`Permissions: ${MODE_LABEL[mode]}`}
+                aria-label="Permission controls"
+                aria-expanded={permissionOpen}
+                class="relative grid h-[36px] w-[36px] cursor-pointer place-items-center rounded-full transition-[background-color,color] {mode === 'plan'
+                  ? 'bg-warn-soft text-warn'
+                  : mode === 'accept_edits'
+                    ? 'bg-local-soft text-local'
+                    : 'bg-transparent text-text-3 hover:bg-surface-hover hover:text-text'}"
+              >
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" aria-hidden="true">
+                  <path d="M12 3 19 6v5c0 4.8-2.9 8.2-7 10-4.1-1.8-7-5.2-7-10V6l7-3Z" />
+                  {#if mode === "plan"}
+                    <path d="M9 12h6" stroke-linecap="round" />
+                  {:else if mode === "accept_edits"}
+                    <path d="m9 12 2 2 4-4" stroke-linecap="round" stroke-linejoin="round" />
+                  {:else}
+                    <path d="M12 8.5v3.2M12 15.3v.1" stroke-linecap="round" />
+                  {/if}
+                </svg>
+              </button>
+              {#if permissionOpen}
+                <div class="absolute bottom-[calc(100%+10px)] left-0 z-50 w-[248px] overflow-hidden rounded-[var(--r-lg)] border border-border-strong bg-surface p-1.5 shadow-[var(--shadow-pop)]">
+                  <div class="px-2.5 pb-1.5 pt-1 text-[10px] font-semibold uppercase tracking-[0.07em] text-text-3">Permissions</div>
+                  {#each MODE_OPTIONS as option (option.id)}
+                    <button
+                      type="button"
+                      aria-pressed={mode === option.id}
+                      onclick={() => selectMode(option.id)}
+                      class="flex w-full items-start gap-2.5 rounded-[var(--r)] px-2.5 py-2 text-left transition-[0.1s] {mode === option.id
+                        ? 'bg-surface-2 text-text'
+                        : 'text-text-2 hover:bg-surface-hover hover:text-text'}"
+                    >
+                      <span class="mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full {option.id === 'plan' ? 'bg-warn' : option.id === 'accept_edits' ? 'bg-local' : 'bg-text-3'}"></span>
+                      <span>
+                        <span class="block text-[12px] font-semibold">{option.label}</span>
+                        <span class="mt-0.5 block text-[10.5px] leading-[1.35] text-text-3">{option.description}</span>
+                      </span>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          </div>
+
+          <div class="flex items-center gap-1.5">
+            <div bind:this={contextEl} class="relative flex items-center">
+              <button
+                type="button"
+                aria-label="Conversation context usage"
+                aria-expanded={composerPopover === "context"}
+                title="Conversation context"
+                onclick={() => {
+                  composerPopover = composerPopover === "context" ? null : "context";
+                  permissionOpen = false;
+                }}
+                class="grid h-[36px] w-[36px] place-items-center rounded-full border border-transparent text-text-3 transition-[background-color,color] hover:bg-surface-hover hover:text-text-2 focus-visible:border-accent focus-visible:outline-none"
+              >
+                <svg width="21" height="21" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <circle cx="12" cy="12" r={CONTEXT_RING_RADIUS} stroke="currentColor" stroke-width="2" opacity=".25" />
+                  <circle
+                    cx="12"
+                    cy="12"
+                    r={CONTEXT_RING_RADIUS}
+                    stroke="var(--accent)"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-dasharray={CONTEXT_RING_CIRCUMFERENCE}
+                    stroke-dashoffset={contextRing.dashOffset}
+                    transform="rotate(-90 12 12)"
+                    class="[transition:stroke-dashoffset_300ms_ease]"
+                  />
+                </svg>
+              </button>
+              {#if composerPopover === "context"}
+                <div class="absolute bottom-[calc(100%+10px)] right-0 z-40 w-[310px] rounded-[var(--r-lg)] border border-border-strong bg-surface p-3 shadow-[var(--shadow-pop)]">
+                  <div class="flex items-baseline justify-between gap-3">
+                    <span class="text-[12px] font-semibold text-text">Conversation context</span>
+                    <span class="whitespace-nowrap text-[10px] text-text-3">~{contextUsage.total} / 8k text tokens</span>
+                  </div>
+                  <p class="mt-1 text-[10.5px] leading-[1.35] text-text-3">
+                    Text is estimated from the visible conversation. The rest is shown only when it is metered.
+                  </p>
+                  <div class="mt-3 grid grid-cols-[1fr_auto] gap-x-3 gap-y-1.5 text-[11px]">
+                    <span class="text-text-2">System prompt</span><span class="text-text-3">Not metered</span>
+                    <span class="text-text-2">Tools</span><span class="text-text-3">Not metered</span>
+                    <span class="text-text-2">Skills</span><span class="text-text-3">Not metered</span>
+                    <span class="text-text-2">MCP</span><span class="text-text-3">Not metered</span>
+                    <span class="text-text-2">Files</span><span class="text-text-3">Not metered</span>
+                    <span class="text-text-2">Photos</span><span class="text-text-3">Not metered</span>
+                    <span class="text-text-2">Input</span><span class="text-text">~{contextUsage.input}</span>
+                    <span class="text-text-2">Output</span><span class="text-text">~{contextUsage.output}</span>
+                  </div>
+                </div>
+              {/if}
+            </div>
+
             <ModelPicker
               models={modelOptions}
               value={activeModelKey}
               onchange={handleModelChange}
+              onopen={() => {
+                composerPopover = null;
+                permissionOpen = false;
+              }}
             />
-          </span>
-          {#if $streamingMessage && $streamingMessage.conversationId === $activeConversationId}
-            <!-- C7 cooperative cancel: while THIS conversation streams, the
-                 send slot becomes a Stop button (backend persists the partial
-                 with aborted:true and ends the stream). -->
-            <button
-              type="button"
-              aria-label="Stop generating"
-              onclick={() => void cancelActiveStream()}
-              class="grid h-[30px] w-[30px] flex-shrink-0 place-items-center self-end rounded-[var(--r)] border border-border-strong bg-surface-2 text-text transition duration-100 hover:bg-surface-hover"
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                <rect x="6" y="6" width="12" height="12" rx="1.5" />
-              </svg>
-            </button>
-          {:else}
-            <button
-              type="button"
-              aria-label="Send"
-              onclick={handleSend}
-              class="grid h-[30px] w-[30px] flex-shrink-0 place-items-center self-end rounded-[var(--r)] border-0 bg-accent text-on-accent transition duration-100 hover:brightness-[1.06]"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 19V5M5 12l7-7 7 7" />
-              </svg>
-            </button>
-          {/if}
+
+            <div class="relative flex items-center">
+              <button
+                type="button"
+                aria-label={listening ? "Stop voice input" : "Start voice input"}
+                aria-pressed={listening}
+                title={listening ? "Listening… click to stop" : "Voice input"}
+                onclick={toggleVoiceInput}
+                class="grid h-[36px] w-[36px] place-items-center rounded-full border border-transparent transition-[background-color,color] focus-visible:border-accent focus-visible:outline-none {listening
+                  ? 'bg-accent-soft text-accent'
+                  : 'text-text-3 hover:bg-surface-hover hover:text-text-2'}"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                  <rect x="9" y="3" width="6" height="11" rx="3" />
+                  <path d="M6.5 11.5a5.5 5.5 0 0 0 11 0M12 17v4M8.5 21h7" stroke-linecap="round" />
+                </svg>
+              </button>
+              {#if voiceNotice}
+                <div class="absolute bottom-[calc(100%+10px)] right-0 z-40 w-[230px] rounded-[var(--r-lg)] border border-border-strong bg-surface px-3 py-2 text-[11px] text-text-2 shadow-[var(--shadow-pop)]">
+                  {voiceNotice}
+                </div>
+              {/if}
+            </div>
+
+            {#if $streamingMessage && $streamingMessage.conversationId === $activeConversationId}
+              <!-- C7 cooperative cancel: while THIS conversation streams, the
+                   send slot becomes a Stop button (backend persists the partial
+                   with aborted:true and ends the stream). -->
+              <button
+                type="button"
+                aria-label="Stop generating"
+                onclick={() => void cancelActiveStream()}
+                class="grid h-[36px] w-[36px] place-items-center rounded-full bg-surface-2 text-text transition-[transform,filter] hover:scale-[1.03] hover:bg-surface-hover"
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="6" y="6" width="12" height="12" rx="1.5" />
+                </svg>
+              </button>
+            {:else}
+              <button
+                type="button"
+                aria-label={`Send via ${SEND_ROUTE_LABEL[sendRoute]}`}
+                title={`Send via ${SEND_ROUTE_LABEL[sendRoute]}`}
+                onclick={handleSend}
+                class="grid h-[36px] w-[36px] place-items-center rounded-full transition-[transform,filter] hover:scale-[1.03] {SEND_ROUTE_CLASS[sendRoute]}"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 19V5M5 12l7-7 7 7" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+            {/if}
+          </div>
         </div>
       </div>
     </div>
