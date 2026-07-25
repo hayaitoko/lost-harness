@@ -32,6 +32,7 @@ pub mod computer_use;
 pub mod cron;
 pub mod delegate;
 pub mod dispatch;
+pub mod email;
 pub mod exec;
 pub mod fetch;
 pub mod fs;
@@ -140,6 +141,9 @@ impl BodyEnv {
             Capability::Audio,
             Capability::ComputerUse,
             Capability::WebResearch,
+            // The email round (2026-07-24): the desktop body can reach the
+            // user's connected Gmail (tools gate per-call; External/Dangerous).
+            Capability::Email,
         ])
     }
 

@@ -256,6 +256,7 @@ pub fn run() {
                 Some(app.handle().clone()),
                 Some(Arc::clone(&human_prompter)),
                 Arc::clone(&model_manager),
+                Arc::clone(&provider_secrets),
             ));
 
             // C4: register every ALREADY-APPROVED skill as a callable Tool at
@@ -393,6 +394,7 @@ pub fn run() {
             let hardware = Arc::new(crate::models::hardware::probe());
             let state = AppState {
                 agent_loop,
+                email: Arc::new(crate::ipc::EmailRuntime::new()),
                 model_manager,
                 storage,
                 provider_secrets,
@@ -520,6 +522,14 @@ pub fn run() {
             ipc::set_cron_job_enabled,
             ipc::delete_cron_job,
             ipc::list_workspace_files,
+            ipc::gmail_setup_status,
+            ipc::set_gmail_client,
+            ipc::gmail_begin_connect,
+            ipc::gmail_finish_connect,
+            ipc::gmail_disconnect,
+            ipc::list_email,
+            ipc::read_email,
+            ipc::send_email,
             ipc::get_classifier_settings,
             ipc::set_classifier_settings,
             ipc::set_redaction_enabled,
@@ -788,6 +798,7 @@ fn build_tool_dispatcher(
     app_handle: Option<tauri::AppHandle>,
     human_prompter: Option<Arc<dyn crate::tools::ask_human::HumanPrompter>>,
     model_manager: Arc<ModelManager>,
+    provider_secrets: Arc<dyn crate::secrets::ProviderSecretStore>,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -880,6 +891,25 @@ fn build_tool_dispatcher(
     // destination; every hop re-validated (scheme + private-host + DNS/IP
     // block-list) so it can never reach localhost/RFC-1918/metadata.
     registry.register(Box::new(crate::tools::fetch::FetchUrlTool::new()));
+    // The email round (2026-07-24, M7-Q2): Gmail tools over the user's OWN
+    // OAuth client (per-user; per-profile connection). search/read are
+    // External (off-box egress with a surfaced destination — the F2 gate
+    // means a Private turn can't reach them even on a local model); send is
+    // Dangerous (irreversible; Once-only Ask + the C2 journal). If the
+    // production token endpoint can't construct (a TLS-stack failure — never
+    // observed), email tools are simply absent rather than half-wired.
+    match crate::email::oauth::HttpTokenEndpoint::new() {
+        Ok(endpoint) => {
+            let deps = crate::tools::email::EmailToolDeps {
+                secrets: provider_secrets,
+                endpoint: Arc::new(endpoint),
+            };
+            registry.register(Box::new(crate::tools::email::EmailSearchTool::new(deps.clone())));
+            registry.register(Box::new(crate::tools::email::EmailReadTool::new(deps.clone())));
+            registry.register(Box::new(crate::tools::email::EmailSendTool::new(deps)));
+        }
+        Err(e) => tracing::warn!(error = %e, "email tools unavailable (token endpoint failed to build)"),
+    }
     // Wave 2.1: the single blocking "ask the user" tool. Safe → pre-trusted
     // (asking a question has no side effect); it blocks the loop until the user
     // answers via `resolve_ask_human`. `None` prompter (no UI) ⇒ it reports

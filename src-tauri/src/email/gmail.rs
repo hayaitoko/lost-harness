@@ -121,6 +121,11 @@ pub trait GmailApi: Send + Sync {
     /// (build it with [`build_rfc822`]). Returns the sent message's id.
     /// IRREVERSIBLE — the tool wrapping this is `Dangerous` (see module docs).
     fn send<'a>(&'a self, raw_rfc822: &'a str) -> BoxFuture<'a, anyhow::Result<String>>;
+
+    /// `GET /gmail/v1/users/me/profile` — the connected account's email
+    /// address, captured once at connect time so the UI can show
+    /// "connected as x@gmail.com" without further network calls.
+    fn get_profile<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<String>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +271,19 @@ impl GmailApi for GmailClient {
             let sent: SentResponse = serde_json::from_str(&resp)
                 .map_err(|e| anyhow::anyhow!("send response didn't parse: {e}"))?;
             Ok(sent.id)
+        })
+    }
+
+    fn get_profile<'a>(&'a self) -> BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async move {
+            let url = format!("{}/gmail/v1/users/me/profile", self.base_url);
+            let body = self.execute(HttpMethod::Get, &url, None).await?;
+            let v: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("profile response didn't parse: {e}"))?;
+            v.get("emailAddress")
+                .and_then(|e| e.as_str())
+                .map(String::from)
+                .ok_or_else(|| anyhow::anyhow!("profile response had no emailAddress"))
         })
     }
 }

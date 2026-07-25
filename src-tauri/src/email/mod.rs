@@ -44,14 +44,10 @@
 //!   trait; transport behind [`gmail::GmailHttp`], authorization behind
 //!   [`gmail::TokenProvider`] (stage 2 implements it over the keychain +
 //!   [`oauth::refresh`]); pure fixture-tested parsers for everything else.
-//
-// The module-level `allow(dead_code)` stays only because stage 2 (tools/IPC)
-// hasn't wired callers yet — nothing outside `email/` calls in today. Remove
-// it when the first tool/IPC registration lands.
-#![allow(dead_code)]
 
 pub mod gmail;
 pub mod oauth;
+pub mod token_provider;
 
 use std::future::Future;
 use std::pin::Pin;

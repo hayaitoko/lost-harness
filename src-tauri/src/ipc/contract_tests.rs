@@ -77,6 +77,7 @@ fn test_app() -> App<MockRuntime> {
 
     let state = AppState {
         agent_loop,
+        email: Arc::new(crate::ipc::EmailRuntime::new()),
         model_manager,
         storage,
         provider_secrets: Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
@@ -160,6 +161,14 @@ fn test_app() -> App<MockRuntime> {
             ipc::set_cron_job_enabled,
             ipc::delete_cron_job,
             ipc::list_workspace_files,
+            ipc::gmail_setup_status,
+            ipc::set_gmail_client,
+            ipc::gmail_begin_connect,
+            ipc::gmail_finish_connect,
+            ipc::gmail_disconnect,
+            ipc::list_email,
+            ipc::read_email,
+            ipc::send_email,
             ipc::explain_classification,
             ipc::list_memory,
             ipc::save_memory,
@@ -776,6 +785,84 @@ fn list_workspace_files_lists_and_confines_to_the_profile_tree() {
     );
 }
 
+// ── Gmail (the email round) ────────────────────────────────────────────
+
+#[test]
+fn gmail_setup_status_and_client_paste_round_trip_through_real_ipc() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // Fresh install: nothing configured, nothing connected.
+    let got = call(&webview, "gmail_setup_status", json!({ "args": { "profile": "personal" } }))
+        .expect("gmail_setup_status must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got["client_configured"], false);
+    assert_eq!(got["connected"], false);
+    assert_eq!(got["account_email"], Value::Null);
+    assert_eq!(got["needs_reconnect"], false);
+
+    // A mispasted client id is a DOMAIN error pointing at the console page.
+    let err = call(
+        &webview,
+        "set_gmail_client",
+        json!({ "args": { "client_id": "not-a-client-id", "client_secret": "s" } }),
+    )
+    .expect_err("a mispasted id must be rejected");
+    let msg = err.as_str().unwrap_or_default();
+    assert!(msg.contains("apps.googleusercontent.com"), "got: {msg}");
+
+    // A plausible client persists; status flips.
+    call(
+        &webview,
+        "set_gmail_client",
+        json!({ "args": {
+            "client_id": "1234567890-abcdef.apps.googleusercontent.com",
+            "client_secret": "GOCSPX-something"
+        } }),
+    )
+    .expect("a plausible client must persist");
+    let got = call(&webview, "gmail_setup_status", json!({ "args": { "profile": "personal" } }))
+        .expect("gmail_setup_status must dispatch");
+    let got: Value = got.deserialize().expect("valid JSON");
+    assert_eq!(got["client_configured"], true);
+    assert_eq!(got["connected"], false, "a pasted client alone is not a connection");
+}
+
+#[test]
+fn gmail_flows_fail_closed_with_setup_pointing_errors() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // finish without begin: a clear domain error.
+    let err = call(
+        &webview,
+        "gmail_finish_connect",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect_err("finish without begin must be refused");
+    assert!(
+        err.as_str().unwrap_or_default().contains("Connect"),
+        "got: {err:?}"
+    );
+
+    // Reading mail without any client/connection: a setup-pointing error,
+    // and no network is touched (the failure happens at the keychain).
+    let err = call(
+        &webview,
+        "list_email",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect_err("list_email without setup must be refused");
+    assert!(
+        err.as_str().unwrap_or_default().contains("Settings → Email"),
+        "got: {err:?}"
+    );
+
+    // Disconnect is idempotent — never an error on an unconnected profile.
+    call(&webview, "gmail_disconnect", json!({ "args": { "profile": "personal" } }))
+        .expect("disconnect must be idempotent");
+}
+
 // ── classifier settings (PLAN §11) ─────────────────────────────────────
 
 #[test]
@@ -1088,6 +1175,14 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "set_cron_job_enabled",
         "delete_cron_job",
         "list_workspace_files",
+        "gmail_setup_status",
+        "set_gmail_client",
+        "gmail_begin_connect",
+        "gmail_finish_connect",
+        "gmail_disconnect",
+        "list_email",
+        "read_email",
+        "send_email",
         "explain_classification",
         "list_memory",
         "save_memory",

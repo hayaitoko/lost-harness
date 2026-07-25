@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
+use crate::email::gmail::GmailApi as _; // trait methods on GmailClient (email round)
 use crate::agent::result_sink::{ResultSink, TauriResultSink};
 use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget, PermissionMode, ToolRule};
 use crate::ipc::approval::ApprovalRegistry;
@@ -63,6 +64,8 @@ pub struct AppState {
     /// In-flight tool-approval prompts (§3.5). The dispatcher parks a request
     /// here and awaits it; `resolve_tool_approval` answers by id.
     pub approvals: Arc<ApprovalRegistry>,
+    /// Email round: pending OAuth dances + the needs-reconnect flags.
+    pub email: Arc<EmailRuntime>,
     /// In-flight `ask_human` prompts. The tool parks a question here and awaits
     /// it; `resolve_ask_human` delivers the user's answer by id.
     pub ask_human: Arc<AskHumanRegistry>,
@@ -2410,6 +2413,399 @@ pub fn delete_cron_job(
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
     db.delete_cron_job(&args.id).map_err(|e| e.to_string())
+}
+
+// ── Gmail (the email round — per-USER OAuth client, per-PROFILE connection) ──
+//
+// M7-Q2 (Lukas, 2026-07-24): every user creates their OWN Google OAuth client
+// through the in-app guided setup (stage 3's wizard) — no vendor client, no
+// Lost Harness server in the loop. The pasted client id/secret are install-
+// global; the Gmail connection (refresh token) is per-profile. All secrets
+// live in the OS keychain via `AppState.provider_secrets`; SQLite never sees
+// them. `NeedsReconnect` is a NORMAL state (Testing-status Google clients
+// expire refresh tokens after ~7 days) — the UI renders a calm reconnect
+// button, driven by `needs_reconnect` below.
+
+/// In-flight OAuth dances + soft state for the email round.
+pub struct EmailRuntime {
+    /// profile → the pending loopback-listener auth (consumed by finish).
+    pending: parking_lot::Mutex<std::collections::HashMap<String, crate::email::oauth::PendingAuth>>,
+    /// Profiles whose last Gmail call failed with a dead grant.
+    needs_reconnect: parking_lot::Mutex<std::collections::HashSet<String>>,
+}
+
+impl EmailRuntime {
+    pub fn new() -> Self {
+        Self {
+            pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            needs_reconnect: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+}
+
+impl Default for EmailRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The production token endpoint, per call (cheap: one reqwest client).
+fn email_endpoint() -> Result<std::sync::Arc<dyn crate::email::oauth::TokenEndpoint>, String> {
+    crate::email::oauth::HttpTokenEndpoint::new()
+        .map(|e| std::sync::Arc::new(e) as std::sync::Arc<dyn crate::email::oauth::TokenEndpoint>)
+        .map_err(|e| e.to_string())
+}
+
+/// A per-profile Gmail client over the keychain token provider.
+fn email_client(state: &AppState, profile: &str) -> Result<crate::email::gmail::GmailClient, String> {
+    let endpoint = email_endpoint()?;
+    let http = crate::email::gmail::ReqwestGmailHttp::new().map_err(|e| e.to_string())?;
+    Ok(crate::email::gmail::GmailClient::new(
+        Box::new(http),
+        Box::new(crate::email::token_provider::KeychainTokenProvider::new(
+            profile,
+            std::sync::Arc::clone(&state.provider_secrets),
+            endpoint,
+        )),
+    ))
+}
+
+/// Notes a NeedsReconnect failure for `profile` when `err` carries the marker,
+/// so `gmail_setup_status` can drive the calm reconnect UI.
+fn note_reconnect_if_needed(state: &AppState, profile: &str, err: &str) {
+    if err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER) {
+        state.email.needs_reconnect.lock().insert(profile.to_string());
+    }
+}
+
+/// The Gmail setup/connection state for one profile — everything the setup
+/// wizard + Email screen need to render.
+#[derive(Debug, Clone, Serialize)]
+pub struct GmailSetupStatus {
+    /// A GCP OAuth client id+secret are pasted (install-global).
+    pub client_configured: bool,
+    /// This profile holds a refresh token (is connected).
+    pub connected: bool,
+    /// The address this profile connected as, when known.
+    pub account_email: Option<String>,
+    /// The stored authorization died (expired/revoked) — show "Reconnect".
+    pub needs_reconnect: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GmailProfileArgs {
+    pub profile: String,
+}
+
+#[tauri::command]
+pub fn gmail_setup_status(
+    state: State<'_, AppState>,
+    args: GmailProfileArgs,
+) -> Result<GmailSetupStatus, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let s = &state.provider_secrets;
+    let client_configured = s
+        .get(crate::email::SECRET_GMAIL_CLIENT_ID)
+        .map_err(|e| e.to_string())?
+        .is_some()
+        && s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET)
+            .map_err(|e| e.to_string())?
+            .is_some();
+    let connected = s
+        .get(&crate::email::secret_gmail_refresh_token(&args.profile))
+        .map_err(|e| e.to_string())?
+        .is_some();
+    let account_email = s
+        .get(&crate::email::secret_gmail_account_email(&args.profile))
+        .map_err(|e| e.to_string())?;
+    let needs_reconnect = state.email.needs_reconnect.lock().contains(&args.profile);
+    Ok(GmailSetupStatus {
+        client_configured,
+        connected,
+        account_email,
+        needs_reconnect,
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetGmailClientArgs {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+/// Store the user's own GCP OAuth client (install-global). Minimal format
+/// validation so an obviously mispasted value fails HERE with a pointer,
+/// not later as an opaque Google error.
+#[tauri::command]
+pub fn set_gmail_client(
+    state: State<'_, AppState>,
+    args: SetGmailClientArgs,
+) -> Result<(), String> {
+    let id = args.client_id.trim();
+    let secret = args.client_secret.trim();
+    if !id.ends_with(".apps.googleusercontent.com") || id.len() < 30 {
+        return Err(
+            "that doesn't look like a Google OAuth client ID (it should end with \
+             .apps.googleusercontent.com) — copy it from Credentials in the Google Cloud console"
+                .to_string(),
+        );
+    }
+    if secret.is_empty() {
+        return Err("the client secret is empty — copy it from the same Credentials page".into());
+    }
+    state
+        .provider_secrets
+        .set(crate::email::SECRET_GMAIL_CLIENT_ID, id)
+        .map_err(|e| e.to_string())?;
+    state
+        .provider_secrets
+        .set(crate::email::SECRET_GMAIL_CLIENT_SECRET, secret)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GmailBeginConnect {
+    pub auth_url: String,
+}
+
+/// Start the OAuth dance for a profile: bind the loopback listener, open the
+/// consent URL in the system browser (macOS), and stash the pending auth for
+/// `gmail_finish_connect`. Re-calling replaces any prior pending dance.
+#[tauri::command]
+pub async fn gmail_begin_connect(
+    state: State<'_, AppState>,
+    args: GmailProfileArgs,
+) -> Result<GmailBeginConnect, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let s = &state.provider_secrets;
+    let (Some(client_id), Some(client_secret)) = (
+        s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET).map_err(|e| e.to_string())?,
+    ) else {
+        return Err("paste your Google OAuth client first (Settings → Email setup)".into());
+    };
+    let gcp = crate::email::oauth::GcpClient { client_id, client_secret };
+    let pending = crate::email::oauth::begin_auth(&gcp).await.map_err(|e| e.to_string())?;
+    let auth_url = pending.auth_url.clone();
+    state.email.pending.lock().insert(args.profile.clone(), pending);
+
+    // Best-effort browser launch; the UI also shows the URL for copy/paste
+    // (the honest fallback on other OSes or if `open` fails).
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/open").arg(&auth_url).spawn();
+    }
+
+    Ok(GmailBeginConnect { auth_url })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GmailConnected {
+    pub account_email: String,
+}
+
+/// Await the browser redirect, exchange the code, persist the credential, and
+/// capture the connected address. Blocks until the user finishes consent in
+/// the browser (bounded by the flow's 5-minute timeout).
+#[tauri::command]
+pub async fn gmail_finish_connect(
+    state: State<'_, AppState>,
+    args: GmailProfileArgs,
+) -> Result<GmailConnected, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let pending = state
+        .email
+        .pending
+        .lock()
+        .remove(&args.profile)
+        .ok_or_else(|| "no connection attempt in progress — click Connect first".to_string())?;
+    let s = &state.provider_secrets;
+    let (Some(client_id), Some(client_secret)) = (
+        s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET).map_err(|e| e.to_string())?,
+    ) else {
+        return Err("the Google OAuth client was removed mid-connect — start over".into());
+    };
+    let gcp = crate::email::oauth::GcpClient { client_id, client_secret };
+    let endpoint = email_endpoint()?;
+    let tokens = pending
+        .finish(endpoint.as_ref(), &gcp)
+        .await
+        .map_err(|e| e.to_string())?;
+    let refresh = tokens
+        .refresh_token
+        .clone()
+        .ok_or_else(|| {
+            "Google didn't return a refresh token — remove the app's access at \
+             myaccount.google.com/permissions and connect again"
+                .to_string()
+        })?;
+    s.set(&crate::email::secret_gmail_refresh_token(&args.profile), &refresh)
+        .map_err(|e| e.to_string())?;
+
+    // One profile call with the fresh access token to capture the address.
+    struct OneShot(String);
+    impl crate::email::gmail::TokenProvider for OneShot {
+        fn access_token(
+            &self,
+            _force: bool,
+        ) -> crate::email::BoxFuture<'_, anyhow::Result<String>> {
+            let t = self.0.clone();
+            Box::pin(async move { Ok(t) })
+        }
+    }
+    let http = crate::email::gmail::ReqwestGmailHttp::new().map_err(|e| e.to_string())?;
+    let client = crate::email::gmail::GmailClient::new(
+        Box::new(http),
+        Box::new(OneShot(tokens.access_token.clone())),
+    );
+    let account_email = client
+        .get_profile()
+        .await
+        .unwrap_or_else(|_| "connected".to_string());
+    let _ = s.set(
+        &crate::email::secret_gmail_account_email(&args.profile),
+        &account_email,
+    );
+    state.email.needs_reconnect.lock().remove(&args.profile);
+    Ok(GmailConnected { account_email })
+}
+
+/// Disconnect a profile's Gmail: delete its keychain credentials. The
+/// install-global client id/secret stay (other profiles may use them).
+#[tauri::command]
+pub fn gmail_disconnect(state: State<'_, AppState>, args: GmailProfileArgs) -> Result<(), String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let s = &state.provider_secrets;
+    let _ = s.delete(&crate::email::secret_gmail_refresh_token(&args.profile));
+    let _ = s.delete(&crate::email::secret_gmail_account_email(&args.profile));
+    state.email.needs_reconnect.lock().remove(&args.profile);
+    state.email.pending.lock().remove(&args.profile);
+    Ok(())
+}
+
+/// One inbox row for the Email screen.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailSummary {
+    pub id: String,
+    pub from: String,
+    pub subject: String,
+    pub date: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListEmailArgs {
+    pub profile: String,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub max: Option<u32>,
+}
+
+/// The Email screen's inbox read (human-initiated; the agent path is the
+/// gated `email_search` tool).
+#[tauri::command]
+pub async fn list_email(
+    state: State<'_, AppState>,
+    args: ListEmailArgs,
+) -> Result<Vec<EmailSummary>, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let max = args.max.unwrap_or(15).clamp(1, 15);
+    let client = email_client(&state, &args.profile)?;
+    let metas = client
+        .list_messages(args.query.as_deref(), max)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            note_reconnect_if_needed(&state, &args.profile, &msg);
+            msg
+        })?;
+    let mut rows = Vec::new();
+    for meta in metas.iter().take(max as usize) {
+        if let Ok(m) = client.get_message(&meta.id).await {
+            rows.push(EmailSummary {
+                id: m.id,
+                from: m.from,
+                subject: m.subject,
+                date: m.date,
+                snippet: m.snippet,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// One full message for the Email screen's reading pane.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailDetail {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+    pub date: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReadEmailArgs {
+    pub profile: String,
+    pub id: String,
+}
+
+#[tauri::command]
+pub async fn read_email(
+    state: State<'_, AppState>,
+    args: ReadEmailArgs,
+) -> Result<EmailDetail, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let client = email_client(&state, &args.profile)?;
+    let m = client.get_message(&args.id).await.map_err(|e| {
+        let msg = e.to_string();
+        note_reconnect_if_needed(&state, &args.profile, &msg);
+        msg
+    })?;
+    Ok(EmailDetail {
+        id: m.id,
+        from: m.from,
+        to: m.to,
+        subject: m.subject,
+        date: m.date,
+        body: m.body_text,
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SendEmailArgs {
+    pub profile: String,
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailSent {
+    pub id: String,
+}
+
+/// The compose pane's send (human clicked Send — that click IS the consent;
+/// the agent path is the Dangerous `email_send` tool with its own Ask).
+#[tauri::command]
+pub async fn send_email(
+    state: State<'_, AppState>,
+    args: SendEmailArgs,
+) -> Result<EmailSent, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let raw = crate::email::gmail::build_rfc822(&args.to, &args.subject, &args.body)
+        .map_err(|e| e.to_string())?;
+    let client = email_client(&state, &args.profile)?;
+    let id = client.send(&raw).await.map_err(|e| {
+        let msg = e.to_string();
+        note_reconnect_if_needed(&state, &args.profile, &msg);
+        msg
+    })?;
+    Ok(EmailSent { id })
 }
 
 // ── workspace files (the Files screen's read-only browser) ─────────────────
