@@ -16,6 +16,7 @@ mod agent; // M1: agent loop, §7 gate, tool dispatch
 mod classifier; // M1: privacy classifier (heuristic + trained model)
 mod embedder; // PLAN §9: on-device text embedder (memory's meaning-search lane)
 mod audio; // M6: Audio engine, VAD, TTS pipeline
+mod email; // Email round (stage 1): Gmail OAuth (PKCE) + REST client — toolized in stage 2
 mod hooks; // M3: Hook chain — privacy filter + permission + sandbox + first-use
 mod ipc; // M1: Tauri command handlers
 mod models; // M4: Model manager (local + cloud)

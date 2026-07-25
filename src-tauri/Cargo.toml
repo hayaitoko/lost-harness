@@ -45,6 +45,9 @@ regex = "1"
 url = "2"
 # sha256 for the TRM message-hash audit log (spec §3: never log plaintext).
 sha2 = "0.10"
+# Email round (stage 1): PKCE S256 code-challenge encoding (RFC 7636) + Gmail
+# base64url message bodies / raw RFC 822 sends. sha2 above supplies the digest.
+base64 = "0.22"
 
 # M8 (Wave 5.3): hardware detection for the model-lifecycle onboarding — total
 # RAM + CPU cores, to size the curated model catalog to the machine. Minimal
