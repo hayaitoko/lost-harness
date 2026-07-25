@@ -66,6 +66,7 @@
       detail = null;
       detailError = null;
       listError = null;
+      listLoading = false; // clear loading flag on profile switch
       actionError = null;
       reconnecting = false;
       confirmDisconnect = false;
@@ -94,6 +95,7 @@
     const s = status;
     if (!s?.connected || s.needs_reconnect) return;
     const token = ++listSeq;
+    const statusToken = statusSeq; // capture status token to gate secondary status writes
     listLoading = true;
     listError = null;
     listEmail(profile)
@@ -108,7 +110,7 @@
         // changed; the effect then exits early on rerun (no retry loop).
         try {
           const fresh = await gmailSetupStatus(profile);
-          if (token === listSeq && status && fresh.needs_reconnect !== status.needs_reconnect) {
+          if (token === listSeq && statusToken === statusSeq && status && fresh.needs_reconnect !== status.needs_reconnect) {
             status = fresh;
           }
         } catch {
@@ -413,7 +415,16 @@
 
 <!-- compose modal -->
 {#if composeOpen}
-  <div class="fixed inset-0 z-[80] grid place-items-center bg-black/45">
+  <div
+    class="fixed inset-0 z-[80] grid place-items-center bg-black/45"
+    role="presentation"
+    onclick={(e) => {
+      if (!sending && e.target === e.currentTarget) composeOpen = false;
+    }}
+    onkeydown={(e) => {
+      if (!sending && e.key === "Escape") composeOpen = false;
+    }}
+  >
     <div
       class="w-[min(560px,94vw)] overflow-hidden rounded-[var(--r-lg)] border border-border-strong bg-surface shadow-[var(--shadow-pop)]"
       role="dialog"
@@ -426,7 +437,7 @@
           from {status?.account_email ?? "your Gmail account"}
         </span>
         <div class="flex-1"></div>
-        <IconButton label="Close" onclick={() => (composeOpen = false)}>
+        <IconButton label="Close" disabled={sending} onclick={() => (composeOpen = false)}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M6 6l12 12M18 6 6 18" />
           </svg>

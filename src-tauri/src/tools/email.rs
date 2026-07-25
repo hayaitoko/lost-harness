@@ -19,11 +19,14 @@
 //! Per-profile: every call builds its client from `ctx.profile` at dispatch
 //! time, so a `work` chat can never read the `personal` mailbox.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::email::gmail::{build_rfc822, GmailApi, GmailClient, ReqwestGmailHttp};
 use crate::email::oauth::TokenEndpoint;
-use crate::email::token_provider::KeychainTokenProvider;
+use crate::email::token_provider::{KeychainTokenProvider, NEEDS_RECONNECT_MARKER};
 use crate::secrets::ProviderSecretStore;
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
@@ -39,6 +42,12 @@ const READ_BODY_CAP: usize = 40_000;
 pub struct EmailToolDeps {
     pub secrets: Arc<dyn ProviderSecretStore>,
     pub endpoint: Arc<dyn TokenEndpoint>,
+    /// Profiles whose last Gmail call failed with a dead grant — the SAME
+    /// `Arc` as `ipc::EmailRuntime`'s set (see that type's doc comment).
+    /// Without this being shared, an agent-only dead-token failure would
+    /// never light the screen's reconnect banner, since only the screen IPC
+    /// path (`ipc::mod::note_reconnect_if_needed`) used to touch it.
+    pub needs_reconnect: Arc<Mutex<HashSet<String>>>,
 }
 
 impl EmailToolDeps {
@@ -53,6 +62,15 @@ impl EmailToolDeps {
                 Arc::clone(&self.endpoint),
             )),
         ))
+    }
+}
+
+/// If `err` carries [`NEEDS_RECONNECT_MARKER`], flip the shared reconnect
+/// flag for `profile` — mirrors `ipc::mod::note_reconnect_if_needed` so the
+/// agent tool path lights the same banner the screen IPC path does.
+fn note_reconnect_if_needed(deps: &EmailToolDeps, profile: &str, err: &str) {
+    if err.contains(NEEDS_RECONNECT_MARKER) {
+        deps.needs_reconnect.lock().insert(profile.to_string());
     }
 }
 
@@ -117,11 +135,19 @@ impl Tool for EmailSearchTool {
 
             let client = match self.deps.client(&ctx.profile) {
                 Ok(c) => c,
-                Err(e) => return ToolResult::Err(e.to_string()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
+                    return ToolResult::Err(msg);
+                }
             };
             let metas = match client.list_messages(query.as_deref(), max).await {
                 Ok(m) => m,
-                Err(e) => return ToolResult::Err(e.to_string()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
+                    return ToolResult::Err(msg);
+                }
             };
             // Fetch each hit for headers + snippet. Bounded by SEARCH_MAX_CAP.
             let mut rows = Vec::new();
@@ -200,7 +226,11 @@ impl Tool for EmailReadTool {
             };
             let client = match self.deps.client(&ctx.profile) {
                 Ok(c) => c,
-                Err(e) => return ToolResult::Err(e.to_string()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
+                    return ToolResult::Err(msg);
+                }
             };
             match client.get_message(id).await {
                 Ok(m) => {
@@ -218,7 +248,11 @@ impl Tool for EmailReadTool {
                         "body": body,
                     }))
                 }
-                Err(e) => ToolResult::Err(e.to_string()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
+                    ToolResult::Err(msg)
+                }
             }
         })
     }
@@ -315,7 +349,11 @@ impl Tool for EmailSendTool {
             };
             let client = match self.deps.client(&ctx.profile) {
                 Ok(c) => c,
-                Err(e) => return ToolResult::Err(e.to_string()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
+                    return ToolResult::Err(msg);
+                }
             };
             match client.send(&raw).await {
                 Ok(id) => ToolResult::Ok(serde_json::json!({
@@ -323,7 +361,11 @@ impl Tool for EmailSendTool {
                     "message_id": id,
                     "to": to,
                 })),
-                Err(e) => ToolResult::Err(format!("send failed: {e}")),
+                Err(e) => {
+                    let msg = format!("send failed: {e}");
+                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
+                    ToolResult::Err(msg)
+                }
             }
         })
     }
@@ -343,11 +385,16 @@ mod tests {
         }
     }
 
+    fn empty_reconnect_set() -> Arc<Mutex<HashSet<String>>> {
+        Arc::new(Mutex::new(HashSet::new()))
+    }
+
     #[test]
     fn risk_classes_match_the_trust_posture() {
         let deps = EmailToolDeps {
             secrets: Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
             endpoint: Arc::new(NoopEndpoint),
+            needs_reconnect: empty_reconnect_set(),
         };
         assert_eq!(EmailSearchTool::new(deps.clone()).risk(), RiskClass::External);
         assert_eq!(EmailReadTool::new(deps.clone()).risk(), RiskClass::External);
@@ -376,6 +423,7 @@ mod tests {
         let deps = EmailToolDeps {
             secrets: Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
             endpoint: Arc::new(NoopEndpoint),
+            needs_reconnect: empty_reconnect_set(),
         };
         let ctx = ExecCtx {
             profile: "personal".into(),
@@ -388,5 +436,62 @@ mod tests {
             ToolResult::Err(e) => assert!(e.contains("Settings → Email"), "got: {e}"),
             other => panic!("expected a setup-pointing error, got {other:?}"),
         }
+    }
+
+    /// A token endpoint that always answers with a dead grant (Google's
+    /// `invalid_grant`), so `KeychainTokenProvider::refresh_now` bails with
+    /// `NEEDS_RECONNECT_MARKER` — the exact shape a revoked/expired
+    /// Testing-mode refresh token produces in production.
+    struct DeadGrantEndpoint;
+    impl TokenEndpoint for DeadGrantEndpoint {
+        fn post_form(
+            &self,
+            _form: Vec<(String, String)>,
+        ) -> crate::email::BoxFuture<'_, anyhow::Result<(u16, String)>> {
+            Box::pin(async {
+                Ok((
+                    400,
+                    r#"{"error":"invalid_grant","error_description":"revoked"}"#.to_string(),
+                ))
+            })
+        }
+    }
+
+    /// The finding this pins: only the screen IPC path used to flip
+    /// `needs_reconnect`, so an agent-only dead-token failure never lit the
+    /// reconnect banner. Now the tool path inserts into the SAME shared set.
+    #[tokio::test]
+    async fn needs_reconnect_marker_flips_the_shared_flag() {
+        let secrets = crate::secrets::MemoryProviderSecretStore::default();
+        secrets
+            .set(crate::email::SECRET_GMAIL_CLIENT_ID, "id-1.apps.googleusercontent.com")
+            .unwrap();
+        secrets.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh").unwrap();
+        secrets
+            .set(&crate::email::secret_gmail_refresh_token("personal"), "rt-dead")
+            .unwrap();
+
+        let shared = empty_reconnect_set();
+        let deps = EmailToolDeps {
+            secrets: Arc::new(secrets),
+            endpoint: Arc::new(DeadGrantEndpoint),
+            needs_reconnect: Arc::clone(&shared),
+        };
+        let ctx = ExecCtx {
+            profile: "personal".into(),
+            ..Default::default()
+        };
+
+        let out = EmailSearchTool::new(deps)
+            .run(ToolInput::new(serde_json::json!({})), &ctx)
+            .await;
+        match out {
+            ToolResult::Err(e) => assert!(e.contains(NEEDS_RECONNECT_MARKER), "got: {e}"),
+            other => panic!("expected a NeedsReconnect error, got {other:?}"),
+        }
+        assert!(
+            shared.lock().contains("personal"),
+            "the agent tool path must flip the shared reconnect flag, not a private one"
+        );
     }
 }

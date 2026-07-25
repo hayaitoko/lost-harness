@@ -8,18 +8,21 @@
     /** Accessible label — also drives the hover tooltip. */
     label: string;
     active?: boolean;
+    disabled?: boolean;
     onclick?: () => void;
     children: Snippet;
   }
 
-  let { label, active = false, onclick, children }: Props = $props();
+  let { label, active = false, disabled = false, onclick, children }: Props = $props();
 
   const base =
     "relative grid h-[30px] w-[30px] place-items-center rounded-[var(--r)] border border-transparent transition-[background-color,color] duration-100";
   const state = $derived(
-    active
-      ? "bg-surface-2 text-text"
-      : "bg-transparent text-text-3 hover:bg-surface-hover hover:text-text-2",
+    disabled
+      ? "cursor-not-allowed text-text-3 opacity-50"
+      : active
+        ? "bg-surface-2 text-text"
+        : "bg-transparent text-text-3 hover:bg-surface-hover hover:text-text-2",
   );
 </script>
 
@@ -28,6 +31,7 @@
   class="{base} {state}"
   aria-label={label}
   data-tip={label}
+  {disabled}
   {onclick}
 >
   {@render children()}

@@ -497,6 +497,22 @@ manifest and loader, server-flavored default permission seeding (prep work
 for the server track), and OS-level sandbox enforcement replacing the v1
 no-op passthrough.
 
+> **M7-Q2 DECIDED (Lukas, 2026-07-24) — how email/calendar connect: per-USER
+> OAuth client, guided in-app setup, no vendor infrastructure.** Each user
+> creates and owns their OWN Google Cloud OAuth client through an in-app
+> walkthrough; Lost Harness never runs a server, holds no shared credential,
+> and never appears in the OAuth grant. The pasted client id/secret are
+> install-global; the connection (refresh token) is per-profile; all secrets
+> live in the OS keychain (F6). This maximizes the privacy story and needs no
+> Google verification/user-cap, at the cost of a one-time ~5–10-min guided
+> setup — so the wizard is a first-class surface, not a form. A Testing-status
+> Google client expires refresh tokens every ~7 days, so `NeedsReconnect` is a
+> NORMAL state rendered as a calm reconnect button. **Deferred alternative (no
+> rework needed):** a vendor-owned OAuth client giving one-click connect —
+> addable later as the default path, since the core treats client credentials
+> as data. Gmail shipped first (the round, 2026-07-24); calendar/tasks follow
+> the same pattern. Full design: `docs/plans/2026-07-24-email-round.md`.
+
 **M8 — Settings, onboarding, hardware detection.** This is where the
 local-model-lifecycle gap (§6) becomes real: hardware probing, a curated
 downloadable model catalog, and seat assignment as part of first-run setup.

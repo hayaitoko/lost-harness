@@ -2430,15 +2430,35 @@ pub fn delete_cron_job(
 pub struct EmailRuntime {
     /// profile → the pending loopback-listener auth (consumed by finish).
     pending: parking_lot::Mutex<std::collections::HashMap<String, crate::email::oauth::PendingAuth>>,
-    /// Profiles whose last Gmail call failed with a dead grant.
-    needs_reconnect: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Profiles whose last Gmail call failed with a dead grant. An
+    /// `Arc<Mutex<_>>` rather than a bare `Mutex` so this same set can be
+    /// handed to `tools::email::EmailToolDeps` (see
+    /// [`EmailRuntime::with_shared_reconnect`]) — the agent tool path and
+    /// this screen IPC path must flip the SAME flag, or an agent-only
+    /// dead-token failure never lights the reconnect banner.
+    needs_reconnect: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl EmailRuntime {
     pub fn new() -> Self {
         Self {
             pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            needs_reconnect: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            needs_reconnect: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+        }
+    }
+
+    /// Build with a needs-reconnect set that's already shared with the
+    /// agent tool path — pass the SAME `Arc` used to build
+    /// `tools::email::EmailToolDeps` so a dead-token failure on either path
+    /// flips one flag both paths observe.
+    pub fn with_shared_reconnect(
+        needs_reconnect: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        Self {
+            pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            needs_reconnect,
         }
     }
 }
@@ -2536,6 +2556,15 @@ pub struct SetGmailClientArgs {
 /// Store the user's own GCP OAuth client (install-global). Minimal format
 /// validation so an obviously mispasted value fails HERE with a pointer,
 /// not later as an opaque Google error.
+///
+/// A refresh token is minted BY a specific client — swapping in a DIFFERENT
+/// client orphans every profile's stored refresh token (it belongs to the
+/// old client and can never be exchanged with the new one), while
+/// `gmail_setup_status` would keep reporting `connected: true` on a
+/// credential nothing can actually use. So a client CHANGE wipes every
+/// profile's Gmail connection up front, honestly resetting status to
+/// disconnected. Re-pasting the SAME client is a no-op here (nothing to
+/// wipe).
 #[tauri::command]
 pub fn set_gmail_client(
     state: State<'_, AppState>,
@@ -2553,14 +2582,21 @@ pub fn set_gmail_client(
     if secret.is_empty() {
         return Err("the client secret is empty — copy it from the same Credentials page".into());
     }
-    state
-        .provider_secrets
-        .set(crate::email::SECRET_GMAIL_CLIENT_ID, id)
-        .map_err(|e| e.to_string())?;
-    state
-        .provider_secrets
-        .set(crate::email::SECRET_GMAIL_CLIENT_SECRET, secret)
-        .map_err(|e| e.to_string())?;
+    let s = &state.provider_secrets;
+    let previous_id = s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?;
+    let client_changed = previous_id.as_deref().is_some_and(|prev| prev != id);
+    if client_changed {
+        if let Ok(names) = state.storage.list_profile_names() {
+            for name in names {
+                let _ = s.delete(&crate::email::secret_gmail_refresh_token(&name));
+                let _ = s.delete(&crate::email::secret_gmail_account_email(&name));
+                state.email.needs_reconnect.lock().remove(&name);
+                state.email.pending.lock().remove(&name);
+            }
+        }
+    }
+    s.set(crate::email::SECRET_GMAIL_CLIENT_ID, id).map_err(|e| e.to_string())?;
+    s.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, secret).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2602,7 +2638,10 @@ pub async fn gmail_begin_connect(
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GmailConnected {
-    pub account_email: String,
+    /// `None` when the post-connect profile lookup failed — never a
+    /// fabricated placeholder address. The UI falls back to a generic
+    /// "your Gmail account" label when this is absent.
+    pub account_email: Option<String>,
 }
 
 /// Await the browser redirect, exchange the code, persist the credential, and
@@ -2660,14 +2699,13 @@ pub async fn gmail_finish_connect(
         Box::new(http),
         Box::new(OneShot(tokens.access_token.clone())),
     );
-    let account_email = client
-        .get_profile()
-        .await
-        .unwrap_or_else(|_| "connected".to_string());
-    let _ = s.set(
-        &crate::email::secret_gmail_account_email(&args.profile),
-        &account_email,
-    );
+    // Best-effort address capture. On failure, store NOTHING — a fabricated
+    // "connected" placeholder would be a fake identity persisted as if it
+    // were real. A missing address is an honest, UI-tolerated state.
+    let account_email = client.get_profile().await.ok();
+    if let Some(email) = &account_email {
+        let _ = s.set(&crate::email::secret_gmail_account_email(&args.profile), email);
+    }
     state.email.needs_reconnect.lock().remove(&args.profile);
     Ok(GmailConnected { account_email })
 }
@@ -2723,16 +2761,26 @@ pub async fn list_email(
             msg
         })?;
     let mut rows = Vec::new();
+    let mut last_err: Option<String> = None;
     for meta in metas.iter().take(max as usize) {
-        if let Ok(m) = client.get_message(&meta.id).await {
-            rows.push(EmailSummary {
+        match client.get_message(&meta.id).await {
+            Ok(m) => rows.push(EmailSummary {
                 id: m.id,
                 from: m.from,
                 subject: m.subject,
                 date: m.date,
                 snippet: m.snippet,
-            });
+            }),
+            // One bad message shouldn't sink the whole list — but if EVERY
+            // one fails (below), that's not "an empty inbox", it's a dead
+            // token mid-loop, and reporting it that way would be a lie.
+            Err(e) => last_err = Some(e.to_string()),
         }
+    }
+    if rows.is_empty() && !metas.is_empty() {
+        let msg = last_err.unwrap_or_else(|| "every message fetch failed".to_string());
+        note_reconnect_if_needed(&state, &args.profile, &msg);
+        return Err(msg);
     }
     Ok(rows)
 }

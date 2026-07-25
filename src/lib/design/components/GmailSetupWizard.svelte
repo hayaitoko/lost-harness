@@ -79,6 +79,19 @@
     clientIdValid && clientSecret.trim().length > 0 && !clientSaving,
   );
 
+  // Format client configuration errors for clarity
+  function formatClientError(err: unknown): string {
+    const msg = String(err);
+    // Backend validation errors typically mention format or invalid credentials
+    if (msg.toLowerCase().includes("invalid") || msg.toLowerCase().includes("malformed")) {
+      return "Check your Google client credentials. Make sure the client ID and secret are correct and match your Google Cloud project.";
+    }
+    if (msg.toLowerCase().includes("credential") || msg.toLowerCase().includes("secret")) {
+      return "The client secret appears invalid. Double-check it was copied completely from the Google Cloud console.";
+    }
+    return msg;
+  }
+
   async function saveClient() {
     if (!clientSaveEnabled) return;
     clientSaving = true;
@@ -88,7 +101,7 @@
       await setGmailClient(clientId.trim(), clientSecret.trim());
       advance();
     } catch (err) {
-      clientError = String(err);
+      clientError = formatClientError(err);
     } finally {
       clientSaving = false;
     }
@@ -99,6 +112,20 @@
   let authUrl: string | null = $state(null);
   let connectError: string | null = $state(null);
   let connectedAs: string | null = $state(null);
+
+  // Distinguish reconnect (stale token) from misconfiguration (bad client setup)
+  function formatConnectError(err: unknown): string {
+    const msg = String(err);
+    // Backend error messages distinguish these cases; surface the right guidance
+    if (msg.toLowerCase().includes("reconnect") || msg.toLowerCase().includes("token")) {
+      return "Gmail needs a quick reconnect — your access token expired. Click Connect again to re-authenticate.";
+    }
+    if (msg.toLowerCase().includes("client") || msg.toLowerCase().includes("credential")) {
+      return "Check your Google client credentials. Make sure the client ID and secret are correct and match your Google Cloud project.";
+    }
+    // Generic fallback for other errors
+    return msg;
+  }
 
   async function connect() {
     connectPhase = "waiting";
@@ -113,7 +140,7 @@
       saveFurthest(CONNECT_STEP);
       onconnected?.();
     } catch (err) {
-      connectError = String(err);
+      connectError = formatConnectError(err);
       connectPhase = "idle";
     }
   }

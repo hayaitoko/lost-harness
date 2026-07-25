@@ -1419,9 +1419,11 @@ export interface GmailBeginConnect {
   auth_url: string;
 }
 
-/** Result of `gmail_finish_connect`. Mirrors `GmailConnected`. */
+/** Result of `gmail_finish_connect`. Mirrors `GmailConnected`.
+ *  `account_email` is null when the connect succeeded but the profile
+ *  address couldn't be read (never a fabricated address). */
 export interface GmailConnected {
-  account_email: string;
+  account_email: string | null;
 }
 
 /** One inbox row for the Email screen. Mirrors `EmailSummary`. */

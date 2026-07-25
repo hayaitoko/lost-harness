@@ -50,7 +50,17 @@ pub const AUTH_TIMEOUT_SECS: u64 = 300;
 
 /// Per-connection read budget: a stray speculative connection (browsers
 /// pre-connect without sending) must not wedge the real redirect behind it.
-const CONN_READ_TIMEOUT_SECS: u64 = 10;
+/// Kept short — connections are handled serially (one `accept` at a time),
+/// so this IS the worst-case delay a single silent/garbage connection can
+/// add in front of the real browser redirect landing. That residual bound
+/// is accepted rather than spawning per-connection tasks over an mpsc: the
+/// listener only lives for the few seconds of a human clicking through
+/// consent, so a multi-second stall from a pathological local process is a
+/// tolerable ceiling, not a real DoS (see [`wait_and_exchange`] for the
+/// actual DoS fix: a forged/mismatched-state request can no longer end the
+/// flow at all, so this timeout is now only about a silent connection, not
+/// a malicious one).
+const CONN_READ_TIMEOUT_SECS: u64 = 3;
 
 /// Cap on the request head we will buffer from the loopback redirect.
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
@@ -123,14 +133,19 @@ impl std::fmt::Debug for TokenSet {
 }
 
 /// Everything that can go wrong between "open the browser" and "we hold
-/// tokens". Typed so the caller can distinguish user-denial from CSRF from
-/// plumbing without string-matching.
+/// tokens". Typed so the caller can distinguish user-denial from plumbing
+/// without string-matching. NOTE: a `state` mismatch/absence is NOT a
+/// variant here — it's not a distinguishable failure of THIS attempt, it's
+/// how a forged or unrelated request is told apart from the real redirect,
+/// so it's silently absorbed by the accept loop (404 + keep waiting) rather
+/// than surfaced as an error. See [`wait_and_exchange`] for why: a request
+/// without the correct state is never authoritative, so it must never be
+/// able to END the flow — surfacing it as a terminal error was exactly the
+/// CSRF/DoS this design closes.
 #[derive(Debug, thiserror::Error)]
 pub enum OauthError {
     #[error("authorization timed out (no browser redirect within 5 minutes)")]
     Timeout,
-    #[error("redirect state token did not match — rejecting a possible CSRF/forged redirect")]
-    StateMismatch,
     #[error("Google reported an authorization error: {0}")]
     Provider(String),
     #[error("malformed authorization redirect: {0}")]
@@ -403,8 +418,19 @@ impl PendingAuth {
     /// - Stray requests (favicon fetches, speculative pre-connects) get a 404
     ///   and the wait continues; only ONE plausible OAuth redirect is ever
     ///   processed.
-    /// - A `state` mismatch is rejected as CSRF — the code in a forged
-    ///   redirect is never sent anywhere.
+    /// - `state` is validated BEFORE anything else. A request with no state
+    ///   or a MISMATCHED state is NOT treated as the real redirect — it is
+    ///   NOT authoritative for this attempt, so it gets a 404 and the wait
+    ///   continues, exactly like stray noise. This is deliberate: any local
+    ///   process can connect to this loopback port, so a forged
+    ///   `GET /?error=...` or a stolen-looking `GET /?code=...` with the
+    ///   wrong (or no) state must never be able to END the flow — doing so
+    ///   would drop the single-use listener out from under the REAL browser
+    ///   redirect, which then hits a closed port and silently fails
+    ///   (a local CSRF/DoS). The code in a forged redirect is therefore
+    ///   never sent anywhere. Only once `state` matches do we look at
+    ///   `error`/`code` — a genuine Google denial redirect carries the
+    ///   correct state too, so denial handling still works.
     /// - The browser page is answered BEFORE the exchange (per the flow
     ///   design), so a failed exchange surfaces in the app, not the tab.
     pub async fn finish(
@@ -451,14 +477,24 @@ async fn wait_and_exchange(
             write_response(&mut stream, 404, "Not Found", "").await;
             continue;
         };
-        // From here this IS the redirect — vet it, answer it, stop listening.
+        // `state` FIRST, before looking at `error`/`code`: a request that
+        // doesn't carry OUR state token is not authoritative for this
+        // attempt — forged, stale, or simply a different in-flight
+        // attempt's redirect. Treat it exactly like stray noise (404, keep
+        // waiting) rather than terminating the loop, so it can never end
+        // the flow out from under the real browser redirect still on its
+        // way (see `finish`'s doc comment for why that matters).
+        if params.state.as_deref() != Some(expected_state) {
+            write_response(&mut stream, 404, "Not Found", "").await;
+            continue;
+        }
+        // From here `state` matches: this IS the redirect for OUR attempt —
+        // vet it, answer it, stop listening. A genuine Google denial
+        // redirect carries the correct state too, so this still fires for
+        // real user-denial.
         if let Some(err) = params.error {
             write_response(&mut stream, 200, "OK", REJECT_HTML).await;
             return Err(OauthError::Provider(err));
-        }
-        if params.state.as_deref() != Some(expected_state) {
-            write_response(&mut stream, 400, "Bad Request", REJECT_HTML).await;
-            return Err(OauthError::StateMismatch);
         }
         let Some(code) = params.code else {
             write_response(&mut stream, 400, "Bad Request", REJECT_HTML).await;
@@ -731,27 +767,84 @@ mod tests {
         );
     }
 
-    /// CSRF: a redirect with the wrong state is rejected and its code is
-    /// NEVER sent to the token endpoint.
+    /// CSRF/DoS: a redirect with the wrong state is NOT authoritative — its
+    /// code is never sent to the token endpoint, AND (the bug this test now
+    /// pins) it must NOT be able to end the flow either. A forged request
+    /// used to terminate the whole `finish` call before the state check was
+    /// reordered, which meant a local process racing the real browser
+    /// redirect could kill the single-use listener out from under it. Now
+    /// the forged request is 404'd and silently ignored, and the real,
+    /// correctly-stated redirect still completes the flow.
     #[tokio::test]
-    async fn state_mismatch_is_rejected_and_code_never_exchanged() {
+    async fn forged_state_is_ignored_and_the_real_redirect_still_completes() {
         let pending = begin_auth(&gcp()).await.unwrap();
         let port = pending.port;
+        let state = pending.state.clone();
         let browser = tokio::spawn(async move {
-            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-            s.write_all(b"GET /?state=FORGED&code=stolen HTTP/1.1\r\nHost: x\r\n\r\n")
+            // A local process racing the real browser: wrong state, a
+            // real-looking stolen code.
+            let mut s1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s1.write_all(b"GET /?state=FORGED&code=stolen HTTP/1.1\r\nHost: x\r\n\r\n")
                 .await
                 .unwrap();
-            let mut resp = String::new();
-            s.read_to_string(&mut resp).await.unwrap();
-            resp
+            let mut r1 = String::new();
+            s1.read_to_string(&mut r1).await.unwrap();
+            assert!(r1.starts_with("HTTP/1.1 404"), "forged state → 404, got {r1}");
+
+            // The flow must still be alive to receive this.
+            let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let req = format!("GET /?state={state}&code=real HTTP/1.1\r\nHost: x\r\n\r\n");
+            s2.write_all(req.as_bytes()).await.unwrap();
+            let mut r2 = String::new();
+            s2.read_to_string(&mut r2).await.unwrap();
+            assert!(r2.starts_with("HTTP/1.1 200"), "got {r2}");
         });
 
         let endpoint = FakeEndpoint::respond(200, TOKEN_OK);
-        let err = pending.finish(&endpoint, &gcp()).await.unwrap_err();
-        assert!(matches!(err, OauthError::StateMismatch), "got {err:?}");
-        assert_eq!(endpoint.calls(), 0, "forged code must never reach the endpoint");
-        assert!(browser.await.unwrap().starts_with("HTTP/1.1 400"));
+        let tokens = pending.finish(&endpoint, &gcp()).await.unwrap();
+        assert_eq!(tokens.access_token, "at-1");
+        assert_eq!(endpoint.calls(), 1, "only the correctly-stated redirect is ever exchanged");
+        assert_eq!(
+            endpoint.form_value(0, "code").as_deref(),
+            Some("real"),
+            "the forged/stolen code must never reach the endpoint"
+        );
+        browser.await.unwrap();
+    }
+
+    /// The exact bug in the finding: an `error=` redirect with NO state at
+    /// all used to be checked (and could terminate the flow) BEFORE the
+    /// `state` check ran. Now `state` is validated first, so a stateless
+    /// forged error probe is silently ignored and the real redirect still
+    /// lands.
+    #[tokio::test]
+    async fn forged_error_with_no_state_does_not_end_the_flow() {
+        let pending = begin_auth(&gcp()).await.unwrap();
+        let port = pending.port;
+        let state = pending.state.clone();
+        let browser = tokio::spawn(async move {
+            let mut s1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s1.write_all(b"GET /?error=access_denied HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let mut r1 = String::new();
+            s1.read_to_string(&mut r1).await.unwrap();
+            assert!(r1.starts_with("HTTP/1.1 404"), "stateless error → 404, got {r1}");
+
+            let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let req = format!("GET /?state={state}&code=real HTTP/1.1\r\nHost: x\r\n\r\n");
+            s2.write_all(req.as_bytes()).await.unwrap();
+            let mut r2 = String::new();
+            s2.read_to_string(&mut r2).await.unwrap();
+            assert!(r2.starts_with("HTTP/1.1 200"), "got {r2}");
+        });
+
+        let endpoint = FakeEndpoint::respond(200, TOKEN_OK);
+        let tokens = pending.finish(&endpoint, &gcp()).await.unwrap();
+        assert_eq!(tokens.access_token, "at-1");
+        assert_eq!(endpoint.calls(), 1);
+        assert_eq!(endpoint.form_value(0, "code").as_deref(), Some("real"));
+        browser.await.unwrap();
     }
 
     /// A stray request (favicon) before the real redirect gets a 404 and the

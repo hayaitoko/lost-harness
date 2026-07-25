@@ -240,6 +240,16 @@ pub fn run() {
                     std::time::Duration::from_secs(600),
                 ));
 
+            // The email round's needs-reconnect set, created ONCE here and
+            // shared between the agent tool path (threaded into
+            // `build_tool_dispatcher` → `EmailToolDeps`, below) and the
+            // screen IPC path (`ipc::EmailRuntime`, at `AppState`
+            // construction) — a dead Gmail grant hit from EITHER path must
+            // flip the SAME flag, or the reconnect banner only ever lights
+            // from the screen.
+            let email_needs_reconnect =
+                Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+
             // §3 tool spine: workspace-confined read-only tools behind the
             // unified pretooluse hook chain, filtered by this body's caps.
             // State-changing tools (a later round) route through the approval
@@ -257,6 +267,7 @@ pub fn run() {
                 Some(Arc::clone(&human_prompter)),
                 Arc::clone(&model_manager),
                 Arc::clone(&provider_secrets),
+                Arc::clone(&email_needs_reconnect),
             ));
 
             // C4: register every ALREADY-APPROVED skill as a callable Tool at
@@ -394,7 +405,9 @@ pub fn run() {
             let hardware = Arc::new(crate::models::hardware::probe());
             let state = AppState {
                 agent_loop,
-                email: Arc::new(crate::ipc::EmailRuntime::new()),
+                email: Arc::new(crate::ipc::EmailRuntime::with_shared_reconnect(Arc::clone(
+                    &email_needs_reconnect,
+                ))),
                 model_manager,
                 storage,
                 provider_secrets,
@@ -799,6 +812,8 @@ fn build_tool_dispatcher(
     human_prompter: Option<Arc<dyn crate::tools::ask_human::HumanPrompter>>,
     model_manager: Arc<ModelManager>,
     provider_secrets: Arc<dyn crate::secrets::ProviderSecretStore>,
+    // Shared with `ipc::EmailRuntime` — see the call site's comment in `run()`.
+    email_needs_reconnect: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -903,6 +918,7 @@ fn build_tool_dispatcher(
             let deps = crate::tools::email::EmailToolDeps {
                 secrets: provider_secrets,
                 endpoint: Arc::new(endpoint),
+                needs_reconnect: email_needs_reconnect,
             };
             registry.register(Box::new(crate::tools::email::EmailSearchTool::new(deps.clone())));
             registry.register(Box::new(crate::tools::email::EmailReadTool::new(deps.clone())));
