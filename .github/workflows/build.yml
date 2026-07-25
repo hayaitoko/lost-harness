@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: ${{ matrix.os }}
@@ -68,7 +71,7 @@ jobs:
           cache: 'npm'
 
       - name: Install npm dependencies
-        run: npm ci || npm install
+        run: npm ci
 
       # ── Rust checks ─────────────────────────────────────────────────────
       - name: cargo build

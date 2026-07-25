@@ -2,8 +2,10 @@
 src-tauri/target/
 # Cargo.lock IS committed — this is a shipped application, not a library, so the
 # exact dependency graph must be reproducible across the dev box and CI.
+src-tauri/.tauri/
 **/*.rs.bk
 *.pdb
+*.dSYM/
 
 # Node / Vite
 node_modules/
@@ -13,6 +15,9 @@ dist/
 *.local
 .npm/
 .eslintcache
+coverage/
+test-results/
+playwright-report/
 
 # Tauri
 src-tauri/gen/
@@ -34,5 +39,21 @@ yarn-error.log*
 
 # Environment
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.*.example
+.envrc.local
+
+# Credentials and signing material — credentials belong in the OS keychain or
+# the CI secret store, never in the repository.
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+credentials*.json
+oauth-client*.json
+
+# Local model/runtime artifacts
+models/
+*.gguf
