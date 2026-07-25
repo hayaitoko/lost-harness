@@ -1391,6 +1391,157 @@ export async function setMemorySettings(
   });
 }
 
+// ── Gmail (the email round — per-USER OAuth client, per-PROFILE connection) ─
+//
+// M7-Q2: every user creates their OWN Google Cloud OAuth client through the
+// in-app guided wizard — no vendor client, no Lost Harness server in the
+// loop. The pasted client id/secret are install-global; the connection
+// (refresh token) is per-profile. `needs_reconnect` is a NORMAL state
+// (Testing-status Google clients expire refresh tokens after ~7 days) —
+// the UI renders a calm Reconnect, not an error.
+
+/** The Gmail setup/connection state for one profile. Mirrors `GmailSetupStatus`
+ *  in `ipc/mod.rs` — everything the setup wizard + Email screen need. */
+export interface GmailSetupStatus {
+  /** A Google Cloud OAuth client id+secret are pasted (install-global). */
+  client_configured: boolean;
+  /** This profile holds a refresh token (is connected). */
+  connected: boolean;
+  /** The address this profile connected as, when known. */
+  account_email: string | null;
+  /** The stored authorization died (expired/revoked) — show a calm Reconnect. */
+  needs_reconnect: boolean;
+}
+
+/** Result of `gmail_begin_connect`. Mirrors `GmailBeginConnect`. */
+export interface GmailBeginConnect {
+  /** The Google consent URL (also opened in the system browser, best-effort). */
+  auth_url: string;
+}
+
+/** Result of `gmail_finish_connect`. Mirrors `GmailConnected`. */
+export interface GmailConnected {
+  account_email: string;
+}
+
+/** One inbox row for the Email screen. Mirrors `EmailSummary`. */
+export interface EmailSummary {
+  id: string;
+  from: string;
+  subject: string;
+  date: string;
+  snippet: string;
+}
+
+/** One full message (plain text only) for the reading pane. Mirrors `EmailDetail`. */
+export interface EmailDetail {
+  id: string;
+  from: string;
+  to: string;
+  subject: string;
+  date: string;
+  body: string;
+}
+
+/** Result of `send_email`. Mirrors `EmailSent`. */
+export interface EmailSent {
+  id: string;
+}
+
+const BROWSER_EMAIL_ERROR = "not available in browser mode — run the desktop app";
+
+/** The Gmail setup/connection state driving the wizard + Email screen. */
+export async function gmailSetupStatus(profile: string): Promise<GmailSetupStatus> {
+  if (isTauri()) {
+    return tauriInvoke<GmailSetupStatus>("gmail_setup_status", { args: { profile } });
+  }
+  return {
+    client_configured: false,
+    connected: false,
+    account_email: null,
+    needs_reconnect: false,
+  };
+}
+
+/** Store the user's own Google Cloud OAuth client (install-global; lands in
+ *  the OS keychain). The backend re-validates the id format. */
+export async function setGmailClient(clientId: string, clientSecret: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("set_gmail_client", {
+      args: { client_id: clientId, client_secret: clientSecret },
+    });
+    return;
+  }
+  throw new Error(`Gmail setup is ${BROWSER_EMAIL_ERROR}`);
+}
+
+/** Start the OAuth dance for a profile: the backend binds a loopback listener
+ *  and opens the consent URL in the system browser (best-effort — the UI must
+ *  also show `auth_url` for manual copy/paste). */
+export async function gmailBeginConnect(profile: string): Promise<GmailBeginConnect> {
+  if (isTauri()) {
+    return tauriInvoke<GmailBeginConnect>("gmail_begin_connect", { args: { profile } });
+  }
+  throw new Error(`Gmail connect is ${BROWSER_EMAIL_ERROR}`);
+}
+
+/** Await the browser redirect + code exchange. Blocks until the user finishes
+ *  consent (bounded by the flow's 5-minute timeout); resolves with the
+ *  connected address. */
+export async function gmailFinishConnect(profile: string): Promise<GmailConnected> {
+  if (isTauri()) {
+    return tauriInvoke<GmailConnected>("gmail_finish_connect", { args: { profile } });
+  }
+  throw new Error(`Gmail connect is ${BROWSER_EMAIL_ERROR}`);
+}
+
+/** Disconnect this profile's Gmail (deletes its keychain credentials; the
+ *  install-global client id/secret stay for other profiles). */
+export async function gmailDisconnect(profile: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("gmail_disconnect", { args: { profile } });
+    return;
+  }
+  throw new Error(`Gmail disconnect is ${BROWSER_EMAIL_ERROR}`);
+}
+
+/** The Email screen's inbox read (human-initiated; the agent path is the
+ *  gated `email_search` tool). `max` clamps to 15 backend-side. */
+export async function listEmail(
+  profile: string,
+  query?: string,
+  max?: number,
+): Promise<EmailSummary[]> {
+  if (isTauri()) {
+    return tauriInvoke<EmailSummary[]>("list_email", {
+      args: { profile, query: query ?? null, max: max ?? null },
+    });
+  }
+  return [];
+}
+
+/** One full message for the reading pane (plain text — render escaped only). */
+export async function readEmail(profile: string, id: string): Promise<EmailDetail> {
+  if (isTauri()) {
+    return tauriInvoke<EmailDetail>("read_email", { args: { profile, id } });
+  }
+  throw new Error(`Email reading is ${BROWSER_EMAIL_ERROR}`);
+}
+
+/** The compose pane's send — the human's Send click IS the consent (the agent
+ *  path is the Dangerous `email_send` tool with its own Ask). */
+export async function sendEmail(
+  profile: string,
+  to: string,
+  subject: string,
+  body: string,
+): Promise<EmailSent> {
+  if (isTauri()) {
+    return tauriInvoke<EmailSent>("send_email", { args: { profile, to, subject, body } });
+  }
+  throw new Error(`Email sending is ${BROWSER_EMAIL_ERROR}`);
+}
+
 // ── Browser fallback (used when running outside Tauri) ──────────────────────
 
 const browserStreamListeners: StreamTokenCallback[] = [];

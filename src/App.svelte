@@ -19,6 +19,7 @@
   import { pushToast } from "$lib/stores/toasts";
 
   import MainScreen from "$lib/design/screens/MainScreen.svelte";
+  import Email from "$lib/design/screens/Email.svelte";
   import Files from "$lib/design/screens/Files.svelte";
   import ScheduledJobs from "$lib/design/screens/ScheduledJobs.svelte";
   import Settings from "$lib/design/screens/Settings.svelte";
@@ -26,11 +27,12 @@
   import AskHumanDialog from "$lib/components/AskHumanDialog.svelte";
   import Toasts from "$lib/components/Toasts.svelte";
 
-  // Only LIVE screens (see the ScreenId note in design/types.ts — the
-  // Email/Whiteboard/Editor/Onboarding/EmptyState mockups were removed from
-  // the app until their backends exist).
+  // Only LIVE screens (see the ScreenId note in design/types.ts — Email is
+  // live as of the 2026-07-24 email round; the Whiteboard/Editor/Onboarding/
+  // EmptyState mockups stay out until their backends exist).
   const SCREENS = {
     main: MainScreen,
+    email: Email,
     files: Files,
     "scheduled-jobs": ScheduledJobs,
     settings: Settings,
