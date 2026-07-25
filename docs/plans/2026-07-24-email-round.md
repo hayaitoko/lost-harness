@@ -1,8 +1,7 @@
-# Email round — Gmail, natively integrated (2026-07-24)
+# Google productivity round — Gmail, Calendar, and Tasks (2026-07-24/25)
 
-The deferred M7 email/calendar round, Gmail-first. Built in four
-subagent-orchestrated stages; this doc is the design record + the handoff for
-calendar/tasks (which follow the same pattern) and for finishing this round.
+The deferred M7 email/calendar round, built Gmail-first and completed with
+Calendar and Tasks on the same per-profile Google connection.
 
 ## The decision (M7-Q2)
 
@@ -53,13 +52,18 @@ works either way with no code change.
   off-box egress, surfaced destination, the F2 `egresses_offbox` gate applies)
   and `email_send` (**Dangerous** — irreversible, Once-only Ask, C2-journaled,
   recipient in the approval dialog). Per-call client keyed off `ctx.profile`.
+- `src-tauri/src/email/google.rs`, `calendar.rs`, and `tasks.rs` — shared
+  authenticated Google JSON transport (bounded 401 refresh retry), Calendar
+  v3 events, and Google Tasks v1 default-list operations. `tools/productivity.rs`
+  exposes list operations as **External** and mutations as **Dangerous**; the
+  Planner screen is the direct human-control path.
 - `src-tauri/src/ipc/mod.rs` — `EmailRuntime` (pending OAuth dances + shared
-  needs-reconnect flags) + 8 commands: `gmail_setup_status`, `set_gmail_client`,
-  `gmail_begin_connect`, `gmail_finish_connect`, `gmail_disconnect`,
-  `list_email`, `read_email`, `send_email`.
+  needs-reconnect flags), Gmail commands, plus live Calendar/Tasks list,
+  create/update/delete commands.
 - Frontend — `GmailSetupWizard.svelte` (the 6-step per-user walkthrough with
-  console deep links + localStorage step-resume + a reconnect variant) and
-  `Email.svelte` (live inbox/read/compose; escaped text only). Nav re-added.
+  console deep links for Gmail, Calendar, and Tasks APIs + localStorage
+  step-resume + a reconnect variant), `Email.svelte` (live inbox/read/compose;
+  escaped text only), and `Planner.svelte` (live events/tasks). Nav re-added.
 
 ## Trust posture
 
@@ -75,16 +79,17 @@ works either way with no code change.
   per-call gate + approval, not scope narrowing. If narrower is ever needed,
   `gmail.metadata` (headers only, no bodies) is the only lever.
 
-## What's left in / after this round
+## Completion and manual verification
 
-- **Finish S4:** the confirmed review fixes (loopback state-first check;
-  `list_email` total-failure error; agent-tool reconnect flag; client-change
-  token cleanup; the two compose/loading frontend guards) — landing with the
-  round's final commit.
+- **S4 is complete** in `4150d75`: the state-first loopback check,
+  total-failure inbox error, agent-tool reconnect flag, client-change token
+  cleanup, and compose/loading guards are all landed and covered by the final
+  review pass.
 - **A live end-to-end connect test** — needs a real GCP client + a browser
   consent, so it can't run in headless CI. Manual: create a Testing client,
   run the wizard, connect, list/read/send, let the token expire → reconnect.
-- **Calendar + tasks** — same per-user-OAuth + keychain + gated-tools pattern,
-  next. Add the Google Calendar API scope to a SEPARATE client config section
-  (or reuse the same client with additional scopes — decide at build time).
+- **Calendar + Tasks are complete.** The existing OAuth client is reused with
+  `calendar.events` and `tasks` scopes. Existing Gmail-only grants must reconnect
+  once to grant the newly requested scopes; the wizard explicitly asks users to
+  enable all three Google APIs.
 - **Vendor-client path** (optional, later) — see the deferred alternative above.

@@ -255,9 +255,38 @@ impl McpTransport for StdioMcpTransport {
 
 // ── the runtime registry + server lifecycle (registration/list/remove) ──────
 
+/// One live server's concrete transport. Stdio owns a child to tear down;
+/// Streamable HTTP is connection/session state only and needs no process kill.
+pub enum McpRuntimeTransport {
+    Stdio(std::sync::Arc<StdioMcpTransport>),
+    Http(std::sync::Arc<super::mcp_http::HttpMcpTransport>),
+}
+
+impl McpRuntimeTransport {
+    fn as_transport(&self) -> std::sync::Arc<dyn super::mcp::McpTransport> {
+        match self {
+            Self::Stdio(transport) => transport.clone(),
+            Self::Http(transport) => transport.clone(),
+        }
+    }
+
+    async fn list_tools(&self) -> Result<Vec<McpToolDescriptor>, String> {
+        match self {
+            Self::Stdio(transport) => transport.list_tools().await,
+            Self::Http(transport) => transport.list_tools().await,
+        }
+    }
+
+    pub async fn shutdown(self) {
+        if let Self::Stdio(transport) = self {
+            transport.shutdown().await;
+        }
+    }
+}
+
 /// One live server: its transport + the tool names it registered.
 pub struct McpRuntimeEntry {
-    pub transport: std::sync::Arc<StdioMcpTransport>,
+    pub transport: McpRuntimeTransport,
     pub tool_names: Vec<String>,
 }
 
@@ -275,10 +304,11 @@ impl McpRuntime {
     }
 }
 
-/// Bring one persisted server UP: spawn + handshake → `tools/list` → wrap every
-/// descriptor through the UNTOUCHED trust spine (`McpTool::new` namespaces,
-/// sanitizes, derives risk) → hot-register into the live dispatcher → record in
-/// the runtime. Fail-closed: any error tears the child down and registers
+/// Bring one persisted server UP: either spawn stdio or connect Streamable HTTP,
+/// then handshake → `tools/list` → wrap every descriptor through the untouched
+/// trust spine. A URL beginning with `https://` (or loopback `http://`) is a
+/// remote Streamable HTTP endpoint; all other commands are local stdio spawns.
+/// Fail-closed: a connection/handshake/list failure registers and persists
 /// nothing. Returns the registered (namespaced) tool names.
 pub async fn bring_up_server(
     row: &crate::storage::McpServerRow,
@@ -287,7 +317,17 @@ pub async fn bring_up_server(
 ) -> Result<Vec<String>, String> {
     use super::mcp::{McpServerConfig, McpTool, McpTrustTier};
     use crate::tools::Tool as _; // for McpTool::name()
-    let transport = std::sync::Arc::new(StdioMcpTransport::spawn(&row.command, &row.args).await?);
+    let is_http = row.command.trim_start().starts_with("https://")
+        || row.command.trim_start().starts_with("http://");
+    let transport = if is_http {
+        McpRuntimeTransport::Http(std::sync::Arc::new(
+            super::mcp_http::HttpMcpTransport::connect(&row.command).await?,
+        ))
+    } else {
+        McpRuntimeTransport::Stdio(std::sync::Arc::new(
+            StdioMcpTransport::spawn(&row.command, &row.args).await?,
+        ))
+    };
     let descriptors = match transport.list_tools().await {
         Ok(d) => d,
         Err(e) => {
@@ -308,7 +348,7 @@ pub async fn bring_up_server(
     };
     let mut names = Vec::new();
     for d in &descriptors {
-        let tool = McpTool::new(&cfg, d, transport.clone() as std::sync::Arc<dyn super::mcp::McpTransport>);
+        let tool = McpTool::new(&cfg, d, transport.as_transport());
         let name = tool.name().to_string();
         // hot_register refuses shadowing — a foreign server can never displace
         // a native tool or another server's tool. Refusals are logged loudly

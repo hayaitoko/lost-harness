@@ -575,7 +575,14 @@ impl ToolDispatcher {
                     "function": {
                         "name": neutralize_untrusted(t.name()),
                         "description": neutralize_untrusted(t.description()),
-                        "parameters": t.schema(),
+                        // LM Studio's OpenAI-compatible validator requires
+                        // `parameters.properties` to be an object, including
+                        // for tools with no named arguments. A few internal
+                        // tools intentionally use the concise JSON-schema
+                        // form `{ "additionalProperties": true }`; normalize
+                        // only the transport copy so those tools remain
+                        // compatible with strict native-tool endpoints.
+                        "parameters": native_parameters_schema(t.schema()),
                     }
                 })
             })
@@ -1242,6 +1249,35 @@ impl ToolDispatcher {
     }
 }
 
+/// Produce the object-shaped function-parameter schema expected by strict
+/// OpenAI-compatible providers. JSON Schema permits omitting `properties`, but
+/// LM Studio currently validates it as required for native tool definitions.
+fn native_parameters_schema(schema: serde_json::Value) -> serde_json::Value {
+    let mut object = schema.as_object().cloned().unwrap_or_default();
+
+    // Tool calls always carry a JSON object for arguments. Do not let a
+    // malformed or overly-permissive tool schema advertise another shape.
+    object.insert(
+        "type".to_string(),
+        serde_json::Value::String("object".to_string()),
+    );
+
+    if !matches!(object.get("properties"), Some(serde_json::Value::Object(_))) {
+        object.insert("properties".to_string(), serde_json::json!({}));
+    }
+
+    // `required`, when supplied, must be a list of property names. Drop an
+    // invalid value rather than sending a schema a provider will reject.
+    if !object
+        .get("required")
+        .is_none_or(|value| matches!(value, serde_json::Value::Array(items) if items.iter().all(serde_json::Value::is_string)))
+    {
+        object.remove("required");
+    }
+
+    serde_json::Value::Object(object)
+}
+
 /// Turn a dispatch outcome into the text fed back to the model.
 ///
 /// The tool's *returned data* is untrusted and gets `guard_wrap`ped. But the
@@ -1326,6 +1362,30 @@ mod tests {
             name: name.to_string(),
             args,
         }
+    }
+
+    #[test]
+    fn native_parameter_schema_supplies_properties_for_argumentless_tools() {
+        let schema = native_parameters_schema(serde_json::json!({
+            "additionalProperties": true
+        }));
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"], serde_json::json!({}));
+        assert_eq!(schema["additionalProperties"], true);
+    }
+
+    #[test]
+    fn native_parameter_schema_drops_invalid_required_field() {
+        let schema = native_parameters_schema(serde_json::json!({
+            "type": "array",
+            "properties": { "path": { "type": "string" } },
+            "required": "path"
+        }));
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert!(schema.get("required").is_none());
     }
 
     /// A tool that records whether it was actually executed — lets a test

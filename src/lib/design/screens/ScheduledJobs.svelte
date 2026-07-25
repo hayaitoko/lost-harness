@@ -25,20 +25,32 @@
   let loading = $state(true);
   let error: string | null = $state(null);
   let confirmDeleteId: string | null = $state(null);
+  // Drop stale profile responses: an old profile's list must never become
+  // actionable after the user has switched to another profile.
+  let jobsSeq = 0;
 
   $effect(() => {
     const profile = $activeProfileId;
+    const token = ++jobsSeq;
     loading = true;
     error = null;
     listCronJobs(profile)
-      .then((rows) => (jobs = rows))
-      .catch((err) => (error = String(err)))
-      .finally(() => (loading = false));
+      .then((rows) => {
+        if (token === jobsSeq) jobs = rows;
+      })
+      .catch((err) => {
+        if (token === jobsSeq) error = String(err);
+      })
+      .finally(() => {
+        if (token === jobsSeq) loading = false;
+      });
   });
 
   const activeCount = $derived(jobs.filter((j) => j.enabled).length);
 
   async function toggleJob(job: CronJobInfo, enabled: boolean) {
+    const profile = $activeProfileId;
+    const token = jobsSeq;
     error = null;
     // Optimistic; on failure restore the snapshotted pre-request value
     // (reverting to `!enabled` can land opposite reality when two failed
@@ -46,13 +58,16 @@
     const prev = job.enabled;
     jobs = jobs.map((j) => (j.id === job.id ? { ...j, enabled } : j));
     try {
-      const ok = await setCronJobEnabled($activeProfileId, job.id, enabled);
+      const ok = await setCronJobEnabled(profile, job.id, enabled);
+      if (token !== jobsSeq || profile !== $activeProfileId) return;
       if (!ok) jobs = jobs.filter((j) => j.id !== job.id); // vanished backend-side
     } catch (err) {
+      if (token !== jobsSeq || profile !== $activeProfileId) return;
       error = String(err);
       jobs = jobs.map((j) => (j.id === job.id ? { ...j, enabled: prev } : j));
       try {
-        jobs = await listCronJobs($activeProfileId);
+        const rows = await listCronJobs(profile);
+        if (token === jobsSeq && profile === $activeProfileId) jobs = rows;
       } catch {
         // Keep the reverted snapshot if even the reconcile fetch fails.
       }
@@ -67,12 +82,16 @@
       }, 3000);
       return;
     }
+    const profile = $activeProfileId;
+    const token = jobsSeq;
     confirmDeleteId = null;
     error = null;
     try {
-      await deleteCronJob($activeProfileId, id);
+      await deleteCronJob(profile, id);
+      if (token !== jobsSeq || profile !== $activeProfileId) return;
       jobs = jobs.filter((j) => j.id !== id);
     } catch (err) {
+      if (token !== jobsSeq || profile !== $activeProfileId) return;
       error = String(err);
     }
   }

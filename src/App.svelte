@@ -20,6 +20,7 @@
 
   import MainScreen from "$lib/design/screens/MainScreen.svelte";
   import Email from "$lib/design/screens/Email.svelte";
+  import Planner from "$lib/design/screens/Planner.svelte";
   import Files from "$lib/design/screens/Files.svelte";
   import ScheduledJobs from "$lib/design/screens/ScheduledJobs.svelte";
   import Settings from "$lib/design/screens/Settings.svelte";
@@ -33,6 +34,7 @@
   const SCREENS = {
     main: MainScreen,
     email: Email,
+    planner: Planner,
     files: Files,
     "scheduled-jobs": ScheduledJobs,
     settings: Settings,

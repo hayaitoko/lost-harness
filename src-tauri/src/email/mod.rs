@@ -46,7 +46,10 @@
 //!   [`oauth::refresh`]); pure fixture-tested parsers for everything else.
 
 pub mod gmail;
+pub mod google;
+pub mod calendar;
 pub mod oauth;
+pub mod tasks;
 pub mod token_provider;
 
 use std::future::Future;

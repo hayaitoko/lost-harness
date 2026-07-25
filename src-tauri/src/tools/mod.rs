@@ -37,8 +37,10 @@ pub mod exec;
 pub mod fetch;
 pub mod fs;
 pub mod mcp;
+pub mod mcp_http;
 pub mod mcp_stdio;
 pub mod memory;
+pub mod productivity;
 pub mod session_search;
 pub mod skills;
 pub mod system_status;
@@ -142,8 +144,10 @@ impl BodyEnv {
             Capability::ComputerUse,
             Capability::WebResearch,
             // The email round (2026-07-24): the desktop body can reach the
-            // user's connected Gmail (tools gate per-call; External/Dangerous).
+            // user's connected Google services (tools gate per-call;
+            // External/Dangerous).
             Capability::Email,
+            Capability::Calendar,
         ])
     }
 

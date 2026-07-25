@@ -110,17 +110,4 @@
       </span>
     </button>
   {/each}
-  <div class="my-0.5 h-px bg-border"></div>
-  <button
-    type="button"
-    onclick={() => (open = false)}
-    class="flex w-full items-center gap-[9px] px-[11px] py-2 text-left text-[12.5px] text-text transition hover:bg-surface-hover"
-  >
-    <span
-      class="grid h-[22px] w-[22px] place-items-center rounded-[var(--r-sm)] border border-border-strong bg-surface-2 text-[10px] font-[650] text-text-2"
-    >
-      ⋯
-    </span>
-    <span>Manage profiles…</span>
-  </button>
 </div>

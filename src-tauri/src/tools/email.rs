@@ -25,6 +25,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::email::gmail::{build_rfc822, GmailApi, GmailClient, ReqwestGmailHttp};
+use crate::email::google::GoogleClient;
 use crate::email::oauth::TokenEndpoint;
 use crate::email::token_provider::{KeychainTokenProvider, NEEDS_RECONNECT_MARKER};
 use crate::secrets::ProviderSecretStore;
@@ -53,22 +54,33 @@ pub struct EmailToolDeps {
 impl EmailToolDeps {
     /// A per-call Gmail client for `profile`. Cheap: two small structs; the
     /// keychain reads happen lazily inside the token provider.
+    fn token_provider(&self, profile: &str) -> Box<KeychainTokenProvider> {
+        Box::new(KeychainTokenProvider::new(
+            profile,
+            Arc::clone(&self.secrets),
+            Arc::clone(&self.endpoint),
+        ))
+    }
+
     fn client(&self, profile: &str) -> anyhow::Result<GmailClient> {
         Ok(GmailClient::new(
             Box::new(ReqwestGmailHttp::new()?),
-            Box::new(KeychainTokenProvider::new(
-                profile,
-                Arc::clone(&self.secrets),
-                Arc::clone(&self.endpoint),
-            )),
+            self.token_provider(profile),
         ))
+    }
+
+    /// Build the same per-profile authenticated Google client used by the
+    /// Calendar and Tasks tools. It shares Gmail's keychain token/reconnect
+    /// contract; it does not create a second credential store.
+    pub(crate) fn google_client(&self, profile: &str) -> anyhow::Result<GoogleClient> {
+        GoogleClient::new(self.token_provider(profile))
     }
 }
 
 /// If `err` carries [`NEEDS_RECONNECT_MARKER`], flip the shared reconnect
 /// flag for `profile` — mirrors `ipc::mod::note_reconnect_if_needed` so the
 /// agent tool path lights the same banner the screen IPC path does.
-fn note_reconnect_if_needed(deps: &EmailToolDeps, profile: &str, err: &str) {
+pub(crate) fn note_reconnect_if_needed(deps: &EmailToolDeps, profile: &str, err: &str) {
     if err.contains(NEEDS_RECONNECT_MARKER) {
         deps.needs_reconnect.lock().insert(profile.to_string());
     }

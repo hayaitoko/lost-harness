@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Serializes lowercase (`"local"`/`"cloud"`/`"custom"`) to match the
 /// frontend, which sends `kind` lowercase and compares `p.kind === "local"`
-/// (provider-catalog.ts, providers.svelte.ts, ProviderSettings.svelte,
+/// (providers.svelte.ts and the Settings provider UI,
 /// ModelPicker.svelte). Without this the IPC returns PascalCase `"Cloud"` and
 /// the frontend's kind checks silently fail in the real Tauri shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

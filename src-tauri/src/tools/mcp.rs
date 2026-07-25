@@ -13,13 +13,11 @@
 //! construct these types: `mcp_stdio::bring_up_server` builds each foreign
 //! tool through `McpTool::new`, registration lands via the `register_mcp_server`
 //! IPC command, and enabled servers are re-spawned at boot (`lib.rs`).
-//! [`UnwiredTransport`] remains as the inert, fail-loud fallback/test
-//! placeholder for a server that has no live transport. The SSE/HTTP transports
-//! are still future work. NOTE: the trust spine gates every MCP *tool call*,
-//! but the spawned server *process itself* is currently un-sandboxed (see the
+//! Streamable HTTP is also live in [`super::mcp_http`], including JSON and SSE
+//! response framing. [`UnwiredTransport`] remains an inert fail-loud test seam,
+//! never a registration path. NOTE: the trust spine gates every MCP *tool
+//! call*, but a spawned stdio server process is currently un-sandboxed (see the
 //! external-review ledger, F1) — unlike `ShellExecTool`'s Seatbelt jail.
-//! The module-level `allow(dead_code)` stays only because the not-yet-wired
-//! transports/types remain.
 #![allow(dead_code)]
 
 use std::future::Future;
@@ -214,8 +212,7 @@ impl McpTransport for UnwiredTransport {
         let name = tool_name.to_string();
         Box::pin(async move {
             Err(format!(
-                "no MCP transport wired for tool '{name}' — a stdio/SSE/HTTP client is separate \
-                 follow-up work"
+                "no MCP transport wired for tool '{name}'"
             ))
         })
     }

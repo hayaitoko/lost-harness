@@ -5,7 +5,7 @@
 // All submodules are currently empty. Implementations land in M5.
 
 // Include the active platform's module via cfg.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "computer-use"))]
 pub mod macos;
 
 #[cfg(target_os = "windows")]

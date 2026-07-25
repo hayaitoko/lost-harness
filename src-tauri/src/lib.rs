@@ -490,6 +490,7 @@ pub fn run() {
             ipc::list_profiles,
             ipc::list_conversations,
             ipc::create_conversation,
+            ipc::set_conversation_binding,
             ipc::get_messages,
             ipc::list_providers,
             ipc::add_provider,
@@ -513,7 +514,6 @@ pub fn run() {
             ipc::delete_agent_type,
             ipc::install_pack,
             ipc::probe_hardware,
-            ipc::list_model_catalog,
             ipc::search_models,
             ipc::get_model_detail,
             ipc::calculate_model_fit,
@@ -543,6 +543,13 @@ pub fn run() {
             ipc::list_email,
             ipc::read_email,
             ipc::send_email,
+            ipc::list_calendar_events,
+            ipc::create_calendar_event,
+            ipc::delete_calendar_event,
+            ipc::list_google_tasks,
+            ipc::create_google_task,
+            ipc::set_google_task_completed,
+            ipc::delete_google_task,
             ipc::get_classifier_settings,
             ipc::set_classifier_settings,
             ipc::set_redaction_enabled,
@@ -922,7 +929,29 @@ fn build_tool_dispatcher(
             };
             registry.register(Box::new(crate::tools::email::EmailSearchTool::new(deps.clone())));
             registry.register(Box::new(crate::tools::email::EmailReadTool::new(deps.clone())));
-            registry.register(Box::new(crate::tools::email::EmailSendTool::new(deps)));
+            registry.register(Box::new(crate::tools::email::EmailSendTool::new(deps.clone())));
+            let productivity = crate::tools::productivity::ProductivityToolDeps::new(deps);
+            registry.register(Box::new(
+                crate::tools::productivity::CalendarListTool::new(productivity.clone()),
+            ));
+            registry.register(Box::new(
+                crate::tools::productivity::CalendarCreateTool::new(productivity.clone()),
+            ));
+            registry.register(Box::new(
+                crate::tools::productivity::CalendarDeleteTool::new(productivity.clone()),
+            ));
+            registry.register(Box::new(
+                crate::tools::productivity::TaskListTool::new(productivity.clone()),
+            ));
+            registry.register(Box::new(
+                crate::tools::productivity::TaskCreateTool::new(productivity.clone()),
+            ));
+            registry.register(Box::new(
+                crate::tools::productivity::TaskCompleteTool::new(productivity.clone()),
+            ));
+            registry.register(Box::new(
+                crate::tools::productivity::TaskDeleteTool::new(productivity),
+            ));
         }
         Err(e) => tracing::warn!(error = %e, "email tools unavailable (token endpoint failed to build)"),
     }
@@ -1038,20 +1067,23 @@ fn build_tool_dispatcher(
         &audit_writer,
     ))));
 
-    // C6 / M5 logic half: the `ui_*` act-tool skeletons + the OnScreenActionHook,
-    // over the refuse-loudly UnavailableBackend (no native backend this slice —
-    // the tools are registered + fully gated, and every actuation honestly
-    // errors "no native backend in this build"). The hook appends AFTER the
-    // generic gates: correct because an irreversible target's `covers_once`
-    // floor is checked before the Once grant is consumed at the execution arm,
-    // and a Session grant passing PermissionHook still can't cover it.
+    // C6 / M5: the `ui_*` act tools + the OnScreenActionHook. macOS receives
+    // the concrete Accessibility/Quartz backend; other platforms keep the
+    // explicit unavailable fallback until an equivalent native backend lands.
+    // The hook appends AFTER generic gates so an irreversible target's
+    // `covers_once` floor is checked before its Once grant is consumed.
     #[cfg(feature = "computer-use")]
     {
-        use crate::tools::computer_backend::{ComputerBackend, UnavailableBackend};
+        use crate::tools::computer_backend::ComputerBackend;
         use crate::tools::computer_tools::{
             UiClickTool, UiDragTool, UiKeyTool, UiScrollTool, UiTypeTool,
         };
-        let backend: Arc<dyn ComputerBackend> = Arc::new(UnavailableBackend);
+        #[cfg(target_os = "macos")]
+        let backend: Arc<dyn ComputerBackend> =
+            Arc::new(crate::platform::macos::MacOsComputerBackend::new());
+        #[cfg(not(target_os = "macos"))]
+        let backend: Arc<dyn ComputerBackend> =
+            Arc::new(crate::tools::computer_backend::UnavailableBackend);
         registry.register(Box::new(UiScrollTool::new(Arc::clone(&backend))));
         registry.register(Box::new(UiClickTool::new(Arc::clone(&backend))));
         registry.register(Box::new(UiTypeTool::new(Arc::clone(&backend))));

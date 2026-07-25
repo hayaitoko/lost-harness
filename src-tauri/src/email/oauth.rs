@@ -39,10 +39,13 @@ pub const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth"
 /// Google's token endpoint (code exchange + refresh).
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-/// The scopes this product asks for: read mail + send mail, nothing broader
-/// (no modify/delete — the narrowest pair that covers the email tools).
-pub const GMAIL_SCOPES: &str =
-    "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send";
+/// The Google productivity scopes this product asks for: Gmail read/send plus
+/// the narrow Calendar event and Google Tasks surfaces. They are requested in
+/// one per-profile consent flow so Calendar and Tasks never need a second
+/// credential store. Calendar is limited to events, not calendar settings or
+/// ACLs; Gmail still omits modify/delete.
+pub const GOOGLE_PRODUCTIVITY_SCOPES: &str =
+    "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/tasks";
 
 /// The whole begin→redirect→exchange dance must finish inside this window;
 /// after it the listener is dropped and the attempt is void.
@@ -300,7 +303,7 @@ pub async fn begin_auth(gcp: &GcpClient) -> Result<PendingAuth, OauthError> {
         .append_pair("client_id", &gcp.client_id)
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_type", "code")
-        .append_pair("scope", GMAIL_SCOPES)
+        .append_pair("scope", GOOGLE_PRODUCTIVITY_SCOPES)
         .append_pair("code_challenge", &pkce.challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &state)
@@ -697,7 +700,7 @@ mod tests {
         assert_eq!(q["client_id"], gcp().client_id);
         assert_eq!(q["redirect_uri"], format!("http://127.0.0.1:{}", pending.port));
         assert_eq!(q["response_type"], "code");
-        assert_eq!(q["scope"], GMAIL_SCOPES);
+        assert_eq!(q["scope"], GOOGLE_PRODUCTIVITY_SCOPES);
         assert_eq!(q["code_challenge_method"], "S256");
         assert_eq!(q["code_challenge"], pending.pkce.challenge);
         assert_eq!(q["state"], pending.state);

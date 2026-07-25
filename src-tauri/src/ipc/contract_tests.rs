@@ -111,6 +111,7 @@ fn test_app() -> App<MockRuntime> {
             ipc::list_profiles,
             ipc::list_conversations,
             ipc::create_conversation,
+            ipc::set_conversation_binding,
             ipc::get_messages,
             ipc::list_providers,
             ipc::add_provider,
@@ -152,7 +153,6 @@ fn test_app() -> App<MockRuntime> {
             ipc::delete_agent_type,
             ipc::install_pack,
             ipc::probe_hardware,
-            ipc::list_model_catalog,
             ipc::list_local_models,
             ipc::remove_local_model,
             ipc::list_tool_rules,
@@ -169,6 +169,13 @@ fn test_app() -> App<MockRuntime> {
             ipc::list_email,
             ipc::read_email,
             ipc::send_email,
+            ipc::list_calendar_events,
+            ipc::create_calendar_event,
+            ipc::delete_calendar_event,
+            ipc::list_google_tasks,
+            ipc::create_google_task,
+            ipc::set_google_task_completed,
+            ipc::delete_google_task,
             ipc::explain_classification,
             ipc::list_memory,
             ipc::save_memory,
@@ -278,6 +285,57 @@ fn create_conversation_old_broken_shape_is_rejected() {
         is_ipc_arg_rejection(msg),
         "expected an IPC-level arg-deserialization rejection, got: {msg}"
     );
+}
+
+#[test]
+fn conversation_binding_update_is_profile_scoped_and_persisted() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let created: Value = call(
+        &webview,
+        "create_conversation",
+        json!({"args": {"name": "Bound", "binding": "auto", "profile": "personal"}}),
+    )
+    .expect("seed conversation")
+    .deserialize()
+    .expect("valid create JSON");
+    let id = created["id"].as_str().expect("conversation id");
+
+    let updated: Value = call(
+        &webview,
+        "set_conversation_binding",
+        json!({"args": {"conversation_id": id, "binding": "private", "profile": "personal"}}),
+    )
+    .expect("binding update")
+    .deserialize()
+    .expect("valid binding JSON");
+    assert_eq!(updated["binding"], "private");
+
+    let listed: Value = call(
+        &webview,
+        "list_conversations",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("re-list")
+    .deserialize()
+    .expect("valid list JSON");
+    assert_eq!(listed.as_array().unwrap()[0]["binding"], "private");
+
+    let bad = call(
+        &webview,
+        "set_conversation_binding",
+        json!({"args": {"conversation_id": id, "binding": "cloud", "profile": "personal"}}),
+    )
+    .expect_err("invalid binding must be rejected");
+    assert!(bad.as_str().unwrap_or_default().contains("binding must be"));
+
+    let foreign = call(
+        &webview,
+        "set_conversation_binding",
+        json!({"args": {"conversation_id": id, "binding": "public", "profile": "work"}}),
+    )
+    .expect_err("another profile must not mutate this conversation");
+    assert!(foreign.as_str().unwrap_or_default().contains("not found"));
 }
 
 // ── list_conversations ─────────────────────────────────────────────────
@@ -401,7 +459,7 @@ fn add_provider_correct_shape_dispatches_and_succeeds() {
     // `ProviderKind` serializes lowercase (`#[serde(rename_all = "lowercase")]`)
     // so it matches what the frontend sends and compares against
     // (`p.kind === "local"` in ProviderSettings.svelte, ModelPicker.svelte,
-    // provider-catalog.ts). Guards against a regression to PascalCase "Cloud".
+    // provider UI). Guards against a regression to PascalCase "Cloud".
     assert_eq!(value["kind"], "cloud");
     assert!(value["id"].is_string());
 }
@@ -1183,6 +1241,13 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "list_email",
         "read_email",
         "send_email",
+        "list_calendar_events",
+        "create_calendar_event",
+        "delete_calendar_event",
+        "list_google_tasks",
+        "create_google_task",
+        "set_google_task_completed",
+        "delete_google_task",
         "explain_classification",
         "list_memory",
         "save_memory",
@@ -1220,7 +1285,6 @@ fn every_no_arg_command_dispatches() {
         "get_skill_reflect_enabled",
         "list_agent_types",
         "probe_hardware",
-        "list_model_catalog",
         "list_local_models",
     ];
     for cmd in no_arg_cmds {

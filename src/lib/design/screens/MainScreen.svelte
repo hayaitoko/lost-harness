@@ -19,6 +19,7 @@
     streamingMessage,
     sendMessage as sendChatMessage,
     cancelActiveStream,
+    setConversationBinding as persistConversationBinding,
     type Message,
   } from "$lib/stores/chat";
   import {
@@ -84,10 +85,11 @@
     { id: "files", label: "Workspace files" },
   ];
 
-  // This screen's per-send binding override (Auto/Public/Private) — feeds
-  // sendMessage() directly (see chat.ts's bindingOverride param) rather than
-  // mutating the conversation's stored default.
+  // This is the conversation's persisted routing intent. Before the first
+  // send it is held locally and becomes the new conversation's binding.
   let binding = $state<Binding>("auto");
+  let bindingSaving = $state(false);
+  let bindingError = $state<string | null>(null);
   let mode = $state<SessionMode>("normal");
   let whyOpen = $state(false);
   let panelTab = $state<PanelTab>("routing");
@@ -97,7 +99,29 @@
   let isSending = $state(false);
   let textareaEl: HTMLTextAreaElement | null = $state(null);
 
-  const cycleBinding = () => (binding = NEXT_BINDING[binding]);
+  $effect(() => {
+    if ($activeConversation) binding = $activeConversation.binding;
+  });
+
+  async function cycleBinding() {
+    if (bindingSaving) return;
+    const next = NEXT_BINDING[binding];
+    const conversation = $activeConversation;
+    if (!conversation) {
+      binding = next;
+      return;
+    }
+    bindingSaving = true;
+    bindingError = null;
+    try {
+      await persistConversationBinding(conversation.id, next);
+      binding = next;
+    } catch (err) {
+      bindingError = `Couldn't save routing preference: ${String(err)}`;
+    } finally {
+      bindingSaving = false;
+    }
+  }
   const cycleMode = () => (mode = NEXT_MODE[mode]);
   const toggleWhy = () => (whyOpen = !whyOpen);
   const openTab = (t: PanelTab) => {
@@ -326,7 +350,7 @@
         content,
         providersStore.activeProviderId,
         providersStore.activeModel,
-        binding,
+        $activeConversation ? undefined : binding,
         mode,
       );
     } finally {
@@ -399,14 +423,18 @@
 
       <button
         type="button"
-        onclick={cycleBinding}
+        onclick={() => void cycleBinding()}
         title={BINDING_DESC[binding]}
         aria-label="Conversation binding — click to switch"
-        class="inline-flex h-7 cursor-pointer items-center gap-[7px] rounded-[14px] border border-border-strong bg-surface px-3 text-[12px] font-semibold tracking-[0.02em] text-text"
+        disabled={bindingSaving}
+        class="inline-flex h-7 cursor-pointer items-center gap-[7px] rounded-[14px] border border-border-strong bg-surface px-3 text-[12px] font-semibold tracking-[0.02em] text-text disabled:cursor-wait disabled:opacity-60"
       >
         {@render dot(binding === "public" ? "bg-cloud" : "bg-local")}
         {BINDING_LABEL[binding]}
       </button>
+      {#if bindingError}
+        <span class="max-w-56 truncate text-[11px] text-blocked" title={bindingError}>{bindingError}</span>
+      {/if}
 
       <button
         type="button"
@@ -523,15 +551,6 @@
         class="mx-auto max-w-[700px] rounded-[var(--r-lg)] border border-border-strong bg-surface shadow-[var(--shadow)] transition-colors duration-100 focus-within:border-[color-mix(in_srgb,var(--accent)_45%,var(--border-strong))]"
       >
         <div class="flex items-center gap-2 py-[7px] pl-3 pr-[7px]">
-          <button
-            type="button"
-            aria-label="Attach"
-            class="grid h-[30px] w-[30px] flex-shrink-0 place-items-center self-end rounded-[var(--r)] border-0 bg-transparent text-text-3 hover:bg-surface-hover hover:text-text-2"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-          </button>
           <textarea
             bind:this={textareaEl}
             bind:value={draft}
@@ -548,16 +567,6 @@
               onchange={handleModelChange}
             />
           </span>
-          <button
-            type="button"
-            aria-label="Voice input"
-            class="grid h-[30px] w-[30px] flex-shrink-0 place-items-center self-end rounded-[var(--r)] border-0 bg-transparent text-text-3 hover:bg-surface-hover hover:text-text-2"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="9" y="3" width="6" height="11" rx="3" />
-              <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
-            </svg>
-          </button>
           {#if $streamingMessage && $streamingMessage.conversationId === $activeConversationId}
             <!-- C7 cooperative cancel: while THIS conversation streams, the
                  send slot becomes a Stop button (backend persists the partial

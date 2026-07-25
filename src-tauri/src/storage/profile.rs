@@ -357,6 +357,18 @@ impl ProfileDb {
         Ok(n > 0)
     }
 
+    /// Changes only a conversation's routing intent. Keeping this as a narrow
+    /// update avoids a read-modify-write race with future title/pin/folder
+    /// edits from another surface.
+    pub fn set_conversation_binding(&self, id: &str, binding: &str) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let n = self.conn.lock().execute(
+            "UPDATE conversations SET binding = ?1, updated_at = ?2 WHERE id = ?3",
+            params![binding, now, id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn delete_conversation(&self, id: &str) -> Result<bool> {
         let n = self
             .conn

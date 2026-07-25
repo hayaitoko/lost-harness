@@ -1,11 +1,9 @@
 //! C6 / M5 (logic half) — the **ComputerBackend seam**: the trait the `ui_*`
 //! act tools and the [`crate::hooks::OnScreenActionHook`] drive, plus the mock
-//! that makes the whole slice `cargo test --lib`-provable. The NATIVE backends
-//! (macOS AX/CGEvent, Windows UIA/SendInput, Linux AT-SPI/XTest) are the
-//! on-target build and deliberately DO NOT exist here — production registers
-//! the tools over [`UnavailableBackend`], which refuses loudly (honest
-//! degradation), so the skeletons are wired and gate-tested without any GUI
-//! dependency.
+//! that makes the whole slice `cargo test --lib`-provable. macOS supplies a
+//! production Accessibility-backed implementation in
+//! [`crate::platform::macos`]. Other platforms deliberately use
+//! [`UnavailableBackend`] until they have an equivalent native implementation.
 //!
 //! Locators are SEMANTIC (`app`/`role`/`label` — see
 //! [`crate::tools::computer_use::ActionTarget`]), never pixels and never an
@@ -26,11 +24,22 @@ pub struct UiNode {
 
 /// A locator re-resolved against a FRESH snapshot — what synthesis acts on.
 /// No geometry here: bounds/HiDPI math is the native backend's private concern.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedElement {
     pub app: String,
     pub role: String,
     pub label: String,
+    /// Geometry is discovered privately by the native backend, never accepted
+    /// from tool arguments or exposed as an action fingerprint.
+    pub center: Option<UiPoint>,
+}
+
+/// A native screen-space point. It exists only after Accessibility has freshly
+/// resolved a semantic target; callers can never provide one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
 /// Why a backend call failed.
@@ -40,8 +49,10 @@ pub enum CuError {
     NotFound,
     /// The OS denied the accessibility/input permission.
     PermissionDenied(String),
-    /// No native backend is built into this binary (the logic-half state).
+    /// No native backend is available for this platform/build.
     Unavailable,
+    /// The accessibility service rejected an otherwise well-formed action.
+    Failed(String),
 }
 
 impl std::fmt::Display for CuError {
@@ -51,8 +62,9 @@ impl std::fmt::Display for CuError {
             CuError::PermissionDenied(why) => write!(f, "OS permission denied: {why}"),
             CuError::Unavailable => write!(
                 f,
-                "no native computer-use backend in this build — on-screen actions are unavailable"
+                "no native computer-use backend is available on this platform"
             ),
+            CuError::Failed(why) => write!(f, "computer-use action failed: {why}"),
         }
     }
 }
@@ -64,9 +76,10 @@ pub trait ComputerBackend: Send + Sync {
     /// A fresh accessibility-tree snapshot (foreground app scoped).
     fn ui_tree(&self) -> Result<UiNode, CuError>;
     /// Re-find `locator` by its semantic tuple (app, role, label) against a
-    /// fresh snapshot. `None` = moved/vanished — the caller refuses, never
-    /// mis-clicks a stale position.
-    fn resolve(&self, locator: &ActionTarget) -> Option<ResolvedElement>;
+    /// fresh snapshot. `Ok(None)` = moved/vanished — the caller refuses, never
+    /// mis-clicks a stale position. An `Err` preserves permission/backend
+    /// failures instead of misreporting them as a vanished target.
+    fn resolve(&self, locator: &ActionTarget) -> Result<Option<ResolvedElement>, CuError>;
     /// Actuate: click/type/key/drag/scroll on a JUST-resolved element.
     fn synthesize(
         &self,
@@ -75,18 +88,15 @@ pub trait ComputerBackend: Send + Sync {
     ) -> Result<(), CuError>;
 }
 
-/// The production placeholder while no native backend is built: every call
-/// refuses loudly with [`CuError::Unavailable`]. Registered so the tool
-/// skeletons + their gating are LIVE and testable, without pretending an
-/// actuation could succeed.
+/// The honest fallback on platforms without a native backend.
 pub struct UnavailableBackend;
 
 impl ComputerBackend for UnavailableBackend {
     fn ui_tree(&self) -> Result<UiNode, CuError> {
         Err(CuError::Unavailable)
     }
-    fn resolve(&self, _locator: &ActionTarget) -> Option<ResolvedElement> {
-        None
+    fn resolve(&self, _locator: &ActionTarget) -> Result<Option<ResolvedElement>, CuError> {
+        Err(CuError::Unavailable)
     }
     fn synthesize(
         &self,
@@ -119,6 +129,7 @@ impl MockComputerBackend {
                         app: app.into(),
                         role: role.into(),
                         label: label.into(),
+                        center: None,
                     })
                     .collect(),
             ),
@@ -142,15 +153,16 @@ impl ComputerBackend for MockComputerBackend {
             children: Vec::new(),
         })
     }
-    fn resolve(&self, locator: &ActionTarget) -> Option<ResolvedElement> {
+    fn resolve(&self, locator: &ActionTarget) -> Result<Option<ResolvedElement>, CuError> {
         if self.vanished.load(std::sync::atomic::Ordering::SeqCst) {
-            return None;
+            return Ok(None);
         }
-        self.elements
+        Ok(self
+            .elements
             .lock()
             .iter()
             .find(|e| e.app == locator.app && e.role == locator.role && e.label == locator.label)
-            .cloned()
+            .cloned())
     }
     fn synthesize(
         &self,
@@ -172,12 +184,12 @@ mod tests {
     fn mock_resolves_by_semantic_tuple_and_vanish_makes_targets_disappear() {
         let mock = MockComputerBackend::with_elements(vec![("Mail", "button", "Reply")]);
         let target = ActionTarget { app: "Mail".into(), role: "button".into(), label: "Reply".into() };
-        assert!(mock.resolve(&target).is_some(), "present target resolves");
+        assert!(mock.resolve(&target).unwrap().is_some(), "present target resolves");
         let missing =
             ActionTarget { app: "Mail".into(), role: "button".into(), label: "Nope".into() };
-        assert!(mock.resolve(&missing).is_none(), "absent target doesn't");
+        assert!(mock.resolve(&missing).unwrap().is_none(), "absent target doesn't");
         mock.vanish_all();
-        assert!(mock.resolve(&target).is_none(), "a vanished target stops resolving");
+        assert!(mock.resolve(&target).unwrap().is_none(), "a vanished target stops resolving");
     }
 
     #[test]
@@ -185,6 +197,6 @@ mod tests {
         let b = UnavailableBackend;
         assert_eq!(b.ui_tree().unwrap_err(), CuError::Unavailable);
         let t = ActionTarget { app: "X".into(), role: "button".into(), label: "Y".into() };
-        assert!(b.resolve(&t).is_none());
+        assert_eq!(b.resolve(&t).unwrap_err(), CuError::Unavailable);
     }
 }

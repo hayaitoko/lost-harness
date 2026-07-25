@@ -2333,6 +2333,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "core-graphics",
  "keyring",
  "libc",
  "ndarray",

@@ -35,13 +35,6 @@ export interface Provider {
 const STORAGE_KEY = "lh.providers.v1";
 const ACTIVE_KEY = "lh.providers.active.v1";
 
-function newId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return "p-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-
 function loadFromStorage(): {
   providers: Provider[];
   activeProviderId: string | null;
@@ -83,8 +76,7 @@ export const providersStore = $state({
 });
 
 // Cache of fetched models per provider id — avoids re-fetching on every
-// picker open. The catalog store still provides baked-in presets as a
-// fallback.
+// picker open. The installed app never substitutes a baked-in model list.
 const modelCache = new Map<string, string[]>();
 
 function persistProviders(): void {
@@ -141,10 +133,13 @@ export async function hydrateProviders(): Promise<void> {
       const local = localById.get(p.id);
       return local ? { ...p, apiKey: local.apiKey } : p;
     });
-    // Add any local providers not known to the backend (browser fallback
-    // might have created them).
-    for (const [id, p] of localById) {
-      if (!merged.some((m) => m.id === id)) merged.push(p);
+    // Browser fallback owns its local store. In the installed app, treating
+    // an unknown cache entry as real would resurrect a failed/deleted
+    // provider after restart and falsely imply it was saved.
+    if (!api.isTauriRuntime()) {
+      for (const [id, p] of localById) {
+        if (!merged.some((m) => m.id === id)) merged.push(p);
+      }
     }
 
     providersStore.providers = merged;
@@ -186,7 +181,7 @@ export async function fetchModels(providerId: string): Promise<string[]> {
   }
 }
 
-/** Add a new provider via the backend IPC. Falls back to localStorage in browser mode. */
+/** Add a provider through the backend (or the bridge's browser-mode mock). */
 export async function addProvider(
   p: Omit<Provider, "id" | "isPrivate" | "trustedByName"> & { id?: string },
 ): Promise<Provider> {
@@ -220,19 +215,10 @@ export async function addProvider(
         trustedByName: info.trusted_by_name,
       };
     } catch (err) {
-      // IPC error — update locally so the UI reflects the edit for this
-      // session; it may revert on next launch if the backend never saw it.
-      console.error("updateProvider IPC failed, using local fallback", err);
-      providersStore.providers[existingIdx] = {
-        id,
-        name: p.name.trim(),
-        baseUrl: p.baseUrl.trim(),
-        apiKey,
-        kind: p.kind,
-        isPrivate: existing.isPrivate,
-        supportsNativeTools: p.supportsNativeTools,
-        trustedByName: existing.trustedByName,
-      };
+      // The bridge already supplies a browser-only mock. A real Tauri
+      // failure must stay visible rather than pretending a durable edit won.
+      console.error("updateProvider failed", err);
+      throw err;
     }
     // Base URL or kind may have changed — drop the cached model list.
     modelCache.delete(id);
@@ -268,37 +254,19 @@ export async function addProvider(
     persistActive();
     return provider;
   } catch (err) {
-    // Browser fallback or IPC error — create locally with a generated id.
-    console.error("addProvider IPC failed, using local fallback", err);
-    const id = p.id ?? newId();
-    const next: Provider = {
-      id,
-      name: p.name.trim(),
-      baseUrl: p.baseUrl.trim(),
-      apiKey: p.apiKey ?? "",
-      kind: p.kind,
-      isPrivate: p.kind === "local",
-      supportsNativeTools: p.supportsNativeTools,
-      trustedByName: false,
-    };
-    providersStore.providers.push(next);
-    if (providersStore.activeProviderId === null) {
-      providersStore.activeProviderId = id;
-    }
-    persistProviders();
-    persistActive();
-    return next;
+    console.error("addProvider failed", err);
+    throw err;
   }
 }
 
-/** Remove a provider by id via the backend IPC. Falls back to localStorage. */
+/** Remove a provider only after the backend (or browser mock) confirms it. */
 export async function removeProvider(id: string): Promise<void> {
   try {
     await api.removeProvider(id);
   } catch (err) {
-    console.error("removeProvider IPC failed, using local fallback", err);
+    console.error("removeProvider failed", err);
+    throw err;
   }
-  // Always update local state regardless of IPC result.
   const idx = providersStore.providers.findIndex((p) => p.id === id);
   if (idx < 0) return;
   providersStore.providers.splice(idx, 1);

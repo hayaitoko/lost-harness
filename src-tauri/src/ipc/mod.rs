@@ -87,7 +87,7 @@ pub struct AppState {
     pub mcp: Arc<crate::tools::mcp_stdio::McpRuntime>,
     /// A4: the machine's hardware profile, probed ONCE at boot and cached here.
     /// `hardware::probe()` shells out to `system_profiler` (hundreds of ms per
-    /// call), so `probe_hardware` / `list_model_catalog` / `calculate_model_fit`
+    /// call), so `probe_hardware` / `calculate_model_fit`
     /// read this snapshot instead of re-probing.
     pub hardware: Arc<crate::models::hardware::HardwareProfile>,
     /// M8 S4: the bundled-sidecar context (supervisor + resolved binary).
@@ -274,6 +274,14 @@ pub struct CreateConversationArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SetConversationBindingArgs {
+    pub profile: String,
+    pub conversation_id: String,
+    /// The per-conversation privacy intent: "auto" | "public" | "private".
+    pub binding: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProfileScopedArgs {
     pub profile: String,
 }
@@ -392,6 +400,46 @@ pub fn create_conversation(
         .agent_loop
         .consolidate_on_new_chat(&args.profile, &conv.id);
     Ok(conv.into())
+}
+
+/// Persists a chat's routing intent in its own profile database.  This is
+/// deliberately narrower than the older storage `update_conversation` helper:
+/// the UI must not be able to accidentally mutate a title, pin, or folder when
+/// all the user asked to change was where the conversation may run.
+#[tauri::command]
+pub fn set_conversation_binding(
+    state: State<'_, AppState>,
+    args: SetConversationBindingArgs,
+) -> Result<ConversationInfo, String> {
+    if !matches!(args.binding.as_str(), "auto" | "public" | "private") {
+        return Err("binding must be auto, public, or private".to_string());
+    }
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    let existing = db
+        .list_conversations()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|row| row.id == args.conversation_id)
+        .ok_or_else(|| "conversation not found in this profile".to_string())?;
+    if !db
+        .set_conversation_binding(&existing.id, &args.binding)
+        .map_err(|e| e.to_string())?
+    {
+        return Err("conversation not found in this profile".to_string());
+    }
+    Ok(ConversationInfo {
+        id: existing.id,
+        name: existing.name,
+        pinned: existing.pinned,
+        binding: args.binding,
+        folder_id: existing.folder_id,
+        color: existing.color,
+        created_at: existing.created_at,
+        updated_at: chrono::Utc::now().timestamp(),
+    })
 }
 
 #[tauri::command]
@@ -625,7 +673,11 @@ pub async fn send_message(
             &sink,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        // Preserve the provider's nested HTTP error in the UI. `to_string()`
+        // kept only the outer context (for example, a provider UUID), making
+        // a recoverable configuration/compatibility failure impossible to
+        // diagnose from the chat surface.
+        .map_err(|e| format!("{e:#}"))?;
 
     // Look up the assistant message we just persisted. We re-query the
     // profile db (read-only) and pick the most recent assistant row —
@@ -879,15 +931,6 @@ pub fn probe_hardware(state: State<'_, AppState>) -> crate::models::hardware::Ha
     (*state.hardware).clone()
 }
 
-/// The curated model catalog, each entry annotated with its fit against the
-/// cached hardware profile (Wave 5.3 / M8). Works offline (bundled catalog).
-#[tauri::command]
-pub fn list_model_catalog(
-    state: State<'_, AppState>,
-) -> Vec<crate::models::catalog::CatalogEntryView> {
-    crate::models::catalog::catalog_for(&state.hardware)
-}
-
 // ── M8 S2′/S3′ — HF search + interactive calculator IPC (A3) ──────────────
 
 /// Args for [`search_models`]. `sort` ∈ {downloads,likes,trending,last_modified}
@@ -1116,7 +1159,8 @@ pub struct RegisterMcpServerArgs {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// "local" | "remote" (anything else fails closed to remote).
+    /// "local" | "remote" (anything else fails closed to remote). Streamable
+    /// HTTP endpoints are always remote, regardless of this field.
     #[serde(default)]
     pub tier: Option<String>,
     #[serde(default)]
@@ -1158,6 +1202,11 @@ pub async fn register_mcp_server(
     if args.name.trim().is_empty() || args.command.trim().is_empty() {
         return Err("an MCP server needs a non-empty name and command".to_string());
     }
+    let is_http = args.command.trim_start().starts_with("https://")
+        || args.command.trim_start().starts_with("http://");
+    if is_http && !args.args.is_empty() {
+        return Err("a Streamable HTTP MCP endpoint does not take process arguments".to_string());
+    }
     // Review fix (#2): reject a sanitized-NAMESPACE collision with an existing
     // server. The `mcp__{server}__{tool}` separator is collision-free per
     // (server, tool) — so the only cross-server collision domain is the server
@@ -1189,9 +1238,13 @@ pub async fn register_mcp_server(
         name: args.name.trim().to_string(),
         command: args.command.trim().to_string(),
         args: args.args,
-        tier: match args.tier.as_deref() {
+        tier: if is_http {
+            "remote".to_string()
+        } else {
+            match args.tier.as_deref() {
             Some("local") => "local".to_string(),
             _ => "remote".to_string(), // ambiguous ⇒ remote (the stricter tier)
+            }
         },
         trusted_read_only: args.trusted_read_only,
         capabilities: args.capabilities,
@@ -1341,8 +1394,17 @@ pub async fn remove_local_model(
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownloadModelArgs {
-    /// The catalog entry id to download.
-    pub id: String,
+    /// The exact Hugging Face repository selected in the live discovery UI.
+    pub model_id: String,
+    /// The first file of the selected logical quant. The backend re-fetches the
+    /// repository manifest and resolves this filename itself; URL/hash values
+    /// from the renderer are never trusted.
+    pub first_filename: String,
+    /// Community repositories are deliberately a two-step UI action. The
+    /// backend re-derives provenance from the live manifest before accepting
+    /// this acknowledgement.
+    #[serde(default)]
+    pub acknowledge_community: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1360,38 +1422,71 @@ struct DownloadProgress {
     total: u64,
 }
 
-/// Download + verify a curated catalog model (Wave 5.3 / M8). Streams progress
-/// via the `model:download-progress` event; on success the VERIFIED file is
-/// registered in `model_catalog` (status `ready`). A digest mismatch or an
-/// off-allowlist / uncurated entry installs NOTHING and errors (the
-/// verified-before-runnable invariant). The model becomes a runnable provider
-/// once a runner points at it (external runner today; the bundled sidecar is S4).
+/// Download one single-file GGUF selected from the live Hugging Face discovery
+/// result. The artifact URL and LFS hash are fetched again from the repository
+/// tree on the backend, so the webview can neither redirect a download nor
+/// substitute a checksum. Community repositories require an explicit UI
+/// acknowledgement; trusted-publisher status is re-derived here, never taken
+/// from the webview. A digest mismatch installs nothing.
+///
+/// Multi-file GGUFs are shown in discovery but intentionally refused here: the
+/// current local-model database records one independently boot-verified file
+/// per runnable model. Treating just the first part as verified would be a
+/// security bug, so the app asks the user to choose a single-file quant instead
+/// of pretending split artifacts are safe to run.
 #[tauri::command]
 pub async fn download_model(
     state: State<'_, AppState>,
     app: AppHandle,
     args: DownloadModelArgs,
 ) -> Result<DownloadedModelInfo, String> {
-    let entry = crate::models::catalog::bundled_catalog()
+    use crate::models::hf_search::Provenance;
+
+    let detail = crate::models::hf_search::model_detail(args.model_id.trim())
+        .await
+        .map_err(|e| e.to_string())?;
+    let quant = detail
+        .quants
         .into_iter()
-        .find(|e| e.id == args.id)
-        .ok_or_else(|| format!("no catalog model \"{}\"", args.id))?;
-    if !entry.is_curated() {
+        .find(|q| q.complete && q.files.first().is_some_and(|f| f.filename == args.first_filename))
+        .ok_or_else(|| "the selected GGUF is no longer present or is incomplete; refresh the model details".to_string())?;
+    if quant.files.len() != 1 {
         return Err(
-            "this model isn't release-curated yet (no verified hash) — can't download safely"
+            "split GGUF files are not yet supported by the verified local runner; choose a single-file quant"
                 .to_string(),
         );
     }
+    if detail.provenance == Provenance::Community && !args.acknowledge_community {
+        return Err(
+            "this is a community model; review its publisher and explicitly acknowledge its provenance before downloading"
+                .to_string(),
+        );
+    }
+    let file = quant.files.into_iter().next().expect("len checked above");
 
     let dir = state.storage.base_path().join("models").join("downloaded");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let final_path = dir.join(format!("{}.gguf", entry.id));
-    let partial = dir.join(format!("{}.gguf.partial", entry.id));
+    // The LFS digest is a stable, filesystem-safe artifact id. Repository and
+    // filename text never becomes a local path.
+    let id = format!("hf-{}", &file.sha256[..16]);
+    let final_path = dir.join(format!("{id}.gguf"));
+    let partial = dir.join(format!("{id}.gguf.partial"));
+
+    if let Some(existing) = state.storage.global().get_model(&id).map_err(|e| e.to_string())? {
+        if existing.status == "ready" && std::path::Path::new(&existing.path).is_file() {
+            return Ok(DownloadedModelInfo {
+                id: existing.id,
+                name: existing.name,
+                path: existing.path,
+                sha256: existing.sha256,
+            });
+        }
+    }
 
     // Stream, emitting progress (throttling is the frontend's job).
-    let id_for_progress = entry.id.clone();
+    let id_for_progress = id.clone();
     let app_for_progress = app.clone();
-    crate::models::download::download_to_partial(&entry.url, &partial, move |downloaded, total| {
+    crate::models::download::download_to_partial(&file.url, &partial, move |downloaded, total| {
         let _ = app_for_progress.emit(
             "model:download-progress",
             DownloadProgress { id: id_for_progress.clone(), downloaded, total },
@@ -1401,17 +1496,17 @@ pub async fn download_model(
     .map_err(|e| e.to_string())?;
 
     // Verify-or-nothing: a mismatch removes the partial + registers nothing.
-    crate::models::download::verify_and_install(&partial, &final_path, &entry.sha256)
+    crate::models::download::verify_and_install(&partial, &final_path, &file.sha256)
         .map_err(|e| e.to_string())?;
 
     let model = crate::storage::ModelEntry {
-        id: entry.id.clone(),
-        name: entry.name.clone(),
+        id,
+        name: format!("{} · {}", detail.id, quant.quant.as_deref().unwrap_or("GGUF")),
         path: final_path.to_string_lossy().to_string(),
-        size_bytes: entry.size_bytes as i64,
-        quantization: Some(entry.quantization.clone()),
+        size_bytes: file.size_bytes as i64,
+        quantization: quant.quant,
         added_at: chrono::Utc::now().timestamp(),
-        sha256: entry.sha256.clone(),
+        sha256: file.sha256,
         status: "ready".to_string(),
     };
     state.storage.global().insert_model(&model).map_err(|e| e.to_string())?;
@@ -2490,6 +2585,29 @@ fn email_client(state: &AppState, profile: &str) -> Result<crate::email::gmail::
     ))
 }
 
+/// A per-profile authenticated Google JSON client. Calendar and Tasks share
+/// Gmail's keychain-backed OAuth session, but have their own narrow REST
+/// clients and IPC surfaces.
+fn google_client(state: &AppState, profile: &str) -> Result<crate::email::google::GoogleClient, String> {
+    let endpoint = email_endpoint()?;
+    crate::email::google::GoogleClient::new(Box::new(
+        crate::email::token_provider::KeychainTokenProvider::new(
+            profile,
+            std::sync::Arc::clone(&state.provider_secrets),
+            endpoint,
+        ),
+    ))
+    .map_err(|e| e.to_string())
+}
+
+fn calendar_client(state: &AppState, profile: &str) -> Result<crate::email::calendar::CalendarClient, String> {
+    Ok(crate::email::calendar::CalendarClient::new(google_client(state, profile)?))
+}
+
+fn tasks_client(state: &AppState, profile: &str) -> Result<crate::email::tasks::TasksClient, String> {
+    Ok(crate::email::tasks::TasksClient::new(google_client(state, profile)?))
+}
+
 /// Notes a NeedsReconnect failure for `profile` when `err` carries the marker,
 /// so `gmail_setup_status` can drive the calm reconnect UI.
 fn note_reconnect_if_needed(state: &AppState, profile: &str, err: &str) {
@@ -2854,6 +2972,248 @@ pub async fn send_email(
         msg
     })?;
     Ok(EmailSent { id })
+}
+
+// ── Google Calendar + Tasks (same per-profile OAuth connection as Gmail) ───
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CalendarEventInfo {
+    pub id: String,
+    pub summary: String,
+    pub description: String,
+    pub start: String,
+    pub end: String,
+    pub all_day: bool,
+}
+
+impl From<crate::email::calendar::CalendarEvent> for CalendarEventInfo {
+    fn from(event: crate::email::calendar::CalendarEvent) -> Self {
+        Self {
+            id: event.id,
+            summary: event.summary,
+            description: event.description,
+            start: event.start,
+            end: event.end,
+            all_day: event.all_day,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListCalendarEventsArgs {
+    pub profile: String,
+    /// RFC 3339 range start. Omitted means now.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// RFC 3339 range end. Omitted means seven days after `from`.
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub max: Option<u32>,
+}
+
+fn parse_calendar_range(
+    args: &ListCalendarEventsArgs,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), String> {
+    let from = args
+        .from
+        .as_deref()
+        .map(|v| chrono::DateTime::parse_from_rfc3339(v).map(|d| d.with_timezone(&chrono::Utc)))
+        .transpose()
+        .map_err(|_| "calendar range start must be an RFC 3339 timestamp".to_string())?
+        .unwrap_or_else(chrono::Utc::now);
+    let to = args
+        .to
+        .as_deref()
+        .map(|v| chrono::DateTime::parse_from_rfc3339(v).map(|d| d.with_timezone(&chrono::Utc)))
+        .transpose()
+        .map_err(|_| "calendar range end must be an RFC 3339 timestamp".to_string())?
+        .unwrap_or_else(|| from + chrono::Duration::days(7));
+    if to <= from {
+        return Err("calendar range end must be after its start".to_string());
+    }
+    Ok((from, to))
+}
+
+#[tauri::command]
+pub async fn list_calendar_events(
+    state: State<'_, AppState>,
+    args: ListCalendarEventsArgs,
+) -> Result<Vec<CalendarEventInfo>, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let (from, to) = parse_calendar_range(&args)?;
+    let client = calendar_client(&state, &args.profile)?;
+    client
+        .list_upcoming(from, to, args.max.unwrap_or(30))
+        .await
+        .map(|events| events.into_iter().map(Into::into).collect())
+        .map_err(|e| {
+            let msg = e.to_string();
+            note_reconnect_if_needed(&state, &args.profile, &msg);
+            msg
+        })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateCalendarEventArgs {
+    pub profile: String,
+    pub summary: String,
+    #[serde(default)]
+    pub description: String,
+    pub start: String,
+    pub end: String,
+}
+
+#[tauri::command]
+pub async fn create_calendar_event(
+    state: State<'_, AppState>,
+    args: CreateCalendarEventArgs,
+) -> Result<CalendarEventInfo, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    let client = calendar_client(&state, &args.profile)?;
+    client
+        .create(&args.summary, &args.description, &args.start, &args.end)
+        .await
+        .map(Into::into)
+        .map_err(|e| {
+            let msg = e.to_string();
+            note_reconnect_if_needed(&state, &args.profile, &msg);
+            msg
+        })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteCalendarEventArgs {
+    pub profile: String,
+    pub id: String,
+}
+
+#[tauri::command]
+pub async fn delete_calendar_event(
+    state: State<'_, AppState>,
+    args: DeleteCalendarEventArgs,
+) -> Result<(), String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    calendar_client(&state, &args.profile)?
+        .delete(&args.id)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            note_reconnect_if_needed(&state, &args.profile, &msg);
+            msg
+        })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GoogleTaskInfo {
+    pub id: String,
+    pub title: String,
+    pub notes: String,
+    pub due: Option<String>,
+    pub completed: bool,
+}
+
+impl From<crate::email::tasks::Task> for GoogleTaskInfo {
+    fn from(task: crate::email::tasks::Task) -> Self {
+        Self { id: task.id, title: task.title, notes: task.notes, due: task.due, completed: task.completed }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListGoogleTasksArgs {
+    pub profile: String,
+    #[serde(default)]
+    pub max: Option<u32>,
+}
+
+#[tauri::command]
+pub async fn list_google_tasks(
+    state: State<'_, AppState>,
+    args: ListGoogleTasksArgs,
+) -> Result<Vec<GoogleTaskInfo>, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    tasks_client(&state, &args.profile)?
+        .list(args.max.unwrap_or(50))
+        .await
+        .map(|tasks| tasks.into_iter().map(Into::into).collect())
+        .map_err(|e| {
+            let msg = e.to_string();
+            note_reconnect_if_needed(&state, &args.profile, &msg);
+            msg
+        })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateGoogleTaskArgs {
+    pub profile: String,
+    pub title: String,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub due: Option<String>,
+}
+
+#[tauri::command]
+pub async fn create_google_task(
+    state: State<'_, AppState>,
+    args: CreateGoogleTaskArgs,
+) -> Result<GoogleTaskInfo, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    tasks_client(&state, &args.profile)?
+        .create(&args.title, &args.notes, args.due.as_deref())
+        .await
+        .map(Into::into)
+        .map_err(|e| {
+            let msg = e.to_string();
+            note_reconnect_if_needed(&state, &args.profile, &msg);
+            msg
+        })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetGoogleTaskCompletedArgs {
+    pub profile: String,
+    pub id: String,
+    pub completed: bool,
+}
+
+#[tauri::command]
+pub async fn set_google_task_completed(
+    state: State<'_, AppState>,
+    args: SetGoogleTaskCompletedArgs,
+) -> Result<GoogleTaskInfo, String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    tasks_client(&state, &args.profile)?
+        .set_completed(&args.id, args.completed)
+        .await
+        .map(Into::into)
+        .map_err(|e| {
+            let msg = e.to_string();
+            note_reconnect_if_needed(&state, &args.profile, &msg);
+            msg
+        })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteGoogleTaskArgs {
+    pub profile: String,
+    pub id: String,
+}
+
+#[tauri::command]
+pub async fn delete_google_task(
+    state: State<'_, AppState>,
+    args: DeleteGoogleTaskArgs,
+) -> Result<(), String> {
+    crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    tasks_client(&state, &args.profile)?
+        .delete(&args.id)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            note_reconnect_if_needed(&state, &args.profile, &msg);
+            msg
+        })
 }
 
 // ── workspace files (the Files screen's read-only browser) ─────────────────

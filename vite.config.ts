@@ -12,7 +12,10 @@ const host = process.env.TAURI_DEV_HOST;
 const LIB_ALIAS = { $lib: resolve(__dirname, "src/lib") };
 
 export default defineConfig(async () => ({
-  plugins: [tailwindcss(), svelte()],
+  // `root` is `src/`, while the one canonical Svelte config lives at the
+  // repository root. Point the plugin at it explicitly so both Vite and
+  // svelte-check share the same config without a duplicate source file.
+  plugins: [tailwindcss(), svelte({ configFile: "../svelte.config.js" })],
 
   // Prevent Vite from obscuring Rust errors
   clearScreen: false,

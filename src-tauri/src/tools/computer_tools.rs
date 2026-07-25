@@ -90,13 +90,14 @@ async fn act(
     let mut resolved = None;
     for t in &targets {
         match backend.resolve(t) {
-            Some(r) => resolved = Some(r),
-            None => {
+            Ok(Some(r)) => resolved = Some(r),
+            Ok(None) => {
                 return ToolResult::Err(format!(
                     "target moved or vanished (\"{}\" {} in {}) — refusing to act on a stale position; re-read the screen first",
                     t.label, t.role, t.app
                 ))
             }
+            Err(e) => return ToolResult::Err(e.to_string()),
         }
     }
     let Some(elem) = resolved else {

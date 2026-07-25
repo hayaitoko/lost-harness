@@ -15,11 +15,12 @@ export type Binding = "auto" | "public" | "private";
  *  EmptyState mockups stay out of the map — their backends don't exist yet,
  *  and a nav entry that opens dead UI misleads. Re-add each id here when its
  *  backend lands. */
-export type ScreenId = "main" | "email" | "files" | "scheduled-jobs" | "settings";
+export type ScreenId = "main" | "email" | "planner" | "files" | "scheduled-jobs" | "settings";
 
 export const SCREEN_IDS: ScreenId[] = [
   "main",
   "email",
+  "planner",
   "files",
   "scheduled-jobs",
   "settings",

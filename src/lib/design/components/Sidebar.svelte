@@ -11,7 +11,7 @@
   import {
     conversations,
     activeConversationId,
-    createConversation,
+    createConversationViaBackend,
     hydrateMessages,
     type Conversation,
   } from "$lib/stores/chat";
@@ -51,6 +51,7 @@
   // design/types.ts ScreenId note).
   const SECTIONS: { id: ScreenId; label: string }[] = [
     { id: "email", label: "Email" },
+    { id: "planner", label: "Planner" },
     { id: "files", label: "Files" },
     { id: "scheduled-jobs", label: "Scheduled jobs" },
   ];
@@ -81,12 +82,12 @@
     nav.go("main");
   }
 
-  function handleNewSession() {
+  async function handleNewSession() {
     if (onnewsession) {
       onnewsession();
       return;
     }
-    createConversation();
+    await createConversationViaBackend();
     nav.go("main");
   }
 
@@ -142,6 +143,19 @@
         d="M3 8a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"
       />
     </svg>
+  {:else if id === "planner"}
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.8"
+      class="shrink-0"
+    >
+      <rect x="4" y="5" width="16" height="15" rx="2" />
+      <path d="M8 3v4M16 3v4M7 11h10M8 15h3" />
+    </svg>
   {:else}
     <svg
       width="14"
@@ -180,33 +194,6 @@
         {s.label}
       </button>
     {/each}
-  </div>
-
-  <div class="px-2.5 pb-1 pt-2.5">
-    <div
-      class="flex cursor-text items-center gap-2 rounded-[var(--r)] border border-border bg-surface px-2.5 py-[6px] text-text-3"
-    >
-      <svg
-        width="12"
-        height="12"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        class="shrink-0"
-      >
-        <circle cx="11" cy="11" r="7" />
-        <path d="M20 20l-4-4" />
-      </svg>
-      <input
-        placeholder="Search"
-        class="w-full border-0 bg-transparent text-[12.5px] text-text outline-none placeholder:text-text-3"
-      />
-      <span
-        class="rounded-[4px] border border-border px-[5px] py-px text-[10px] text-text-3"
-        >⌘K</span
-      >
-    </div>
   </div>
 
   <div class="lh-conv-list flex-1 overflow-y-auto px-1.5 pb-2 pt-1">

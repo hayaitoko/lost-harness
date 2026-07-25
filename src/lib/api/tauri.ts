@@ -19,6 +19,7 @@
 //   - `list_models(args: { provider_id }) -> Vec<String>`
 //   - `list_conversations(args: { profile }) -> Vec<ConversationInfo>`
 //   - `create_conversation(args: { name, binding, profile }) -> ConversationInfo`
+//   - `set_conversation_binding(args: { conversation_id, binding, profile }) -> ConversationInfo`
 //   - `get_messages(args: { profile, conversation_id }) -> Vec<MessageInfo>`
 //
 // IMPORTANT — Tauri v2 argument shape:
@@ -175,6 +176,11 @@ declare global {
 
 const isTauri = (): boolean =>
   typeof window !== "undefined" && typeof window.__TAURI_INTERNALS__ !== "undefined";
+
+/** Whether calls are running against the installed Tauri app rather than the
+ * browser-only development fallback. Stores use this to avoid disguising a
+ * failed durable write as a successful local-only edit. */
+export const isTauriRuntime = isTauri;
 
 // ── Event channel names (must match Rust `app.emit(...)`) ───────────────────
 
@@ -374,6 +380,24 @@ export async function createConversation(
     });
   }
   return browserCreateConversation(name, binding);
+}
+
+/** Persists the routing intent for one conversation in the active profile. */
+export async function setConversationBinding(
+  conversationId: string,
+  profile: string,
+  binding: "auto" | "public" | "private",
+): Promise<ConversationInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ConversationInfo>("set_conversation_binding", {
+      args: {
+        conversation_id: conversationId,
+        profile,
+        binding,
+      },
+    });
+  }
+  return browserSetConversationBinding(conversationId, binding);
 }
 
 /** Lists messages in a conversation for the given profile. */
@@ -661,23 +685,6 @@ export async function deleteSkill(id: string): Promise<boolean> {
   return false;
 }
 
-/** A catalog model annotated with its fit against the machine (Wave 5.3 / M8). */
-export interface CatalogModel {
-  id: string;
-  name: string;
-  description: string;
-  family: string;
-  quantization: string;
-  params_billions: number;
-  url: string;
-  sha256: string;
-  size_bytes: number;
-  /** "fits" | "tight" | "too_large" */
-  fit: string;
-  /** false when the entry's sha256 is still a release-curation placeholder. */
-  installable: boolean;
-}
-
 /** One enumerated GPU (best-effort; `null` fields = the OS didn't report them). */
 export interface GpuInfo {
   name: string;
@@ -829,17 +836,25 @@ export async function calculateModelFit(
   return null;
 }
 
-/** The curated model catalog, sized to this machine. Works offline. */
-export async function listModelCatalog(): Promise<CatalogModel[]> {
-  if (isTauri()) return tauriInvoke<CatalogModel[]>("list_model_catalog", {});
-  return [];
-}
-
-/** Download + verify a curated catalog model. Progress arrives on the
- *  `model:download-progress` event; throws on a digest mismatch / uncurated entry. */
-export async function downloadModel(id: string): Promise<{ id: string; name: string; path: string }> {
-  if (isTauri()) return tauriInvoke("download_model", { args: { id } });
-  return { id, name: "", path: "" };
+/** Download a selected live Hugging Face GGUF. The backend re-fetches the
+ * repository tree and its LFS hash before downloading; it never trusts a URL
+ * or checksum supplied by the renderer. Community models need an explicit
+ * provenance acknowledgement. */
+export async function downloadModel(
+  modelId: string,
+  firstFilename: string,
+  acknowledgeCommunity = false,
+): Promise<{ id: string; name: string; path: string }> {
+  if (isTauri()) {
+    return tauriInvoke("download_model", {
+      args: {
+        model_id: modelId,
+        first_filename: firstFilename,
+        acknowledge_community: acknowledgeCommunity,
+      },
+    });
+  }
+  throw new Error("Model downloads require the installed Lost Harness app.");
 }
 
 // ── sandbox_config (B2 — per-profile shell network ceiling) ────────────────
@@ -1544,6 +1559,104 @@ export async function sendEmail(
   throw new Error(`Email sending is ${BROWSER_EMAIL_ERROR}`);
 }
 
+// ── Google Calendar + Tasks (the Planner screen) ──────────────────────────
+
+export interface CalendarEventInfo {
+  id: string;
+  summary: string;
+  description: string;
+  /** RFC 3339 for timed events; ISO date for all-day events. */
+  start: string;
+  end: string;
+  all_day: boolean;
+}
+
+export interface GoogleTaskInfo {
+  id: string;
+  title: string;
+  notes: string;
+  due: string | null;
+  completed: boolean;
+}
+
+export async function listCalendarEvents(
+  profile: string,
+  from?: string,
+  to?: string,
+): Promise<CalendarEventInfo[]> {
+  if (isTauri()) {
+    return tauriInvoke<CalendarEventInfo[]>("list_calendar_events", {
+      args: { profile, from: from ?? null, to: to ?? null, max: 30 },
+    });
+  }
+  throw new Error("Calendar requires the installed Lost Harness app and a connected Google account.");
+}
+
+export async function createCalendarEvent(
+  profile: string,
+  summary: string,
+  start: string,
+  end: string,
+  description = "",
+): Promise<CalendarEventInfo> {
+  if (isTauri()) {
+    return tauriInvoke<CalendarEventInfo>("create_calendar_event", {
+      args: { profile, summary, start, end, description },
+    });
+  }
+  throw new Error("Calendar requires the installed Lost Harness app and a connected Google account.");
+}
+
+export async function deleteCalendarEvent(profile: string, id: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("delete_calendar_event", { args: { profile, id } });
+    return;
+  }
+  throw new Error("Calendar requires the installed Lost Harness app and a connected Google account.");
+}
+
+export async function listGoogleTasks(profile: string): Promise<GoogleTaskInfo[]> {
+  if (isTauri()) {
+    return tauriInvoke<GoogleTaskInfo[]>("list_google_tasks", { args: { profile, max: 50 } });
+  }
+  throw new Error("Tasks require the installed Lost Harness app and a connected Google account.");
+}
+
+export async function createGoogleTask(
+  profile: string,
+  title: string,
+  notes = "",
+  due?: string,
+): Promise<GoogleTaskInfo> {
+  if (isTauri()) {
+    return tauriInvoke<GoogleTaskInfo>("create_google_task", {
+      args: { profile, title, notes, due: due ?? null },
+    });
+  }
+  throw new Error("Tasks require the installed Lost Harness app and a connected Google account.");
+}
+
+export async function setGoogleTaskCompleted(
+  profile: string,
+  id: string,
+  completed: boolean,
+): Promise<GoogleTaskInfo> {
+  if (isTauri()) {
+    return tauriInvoke<GoogleTaskInfo>("set_google_task_completed", {
+      args: { profile, id, completed },
+    });
+  }
+  throw new Error("Tasks require the installed Lost Harness app and a connected Google account.");
+}
+
+export async function deleteGoogleTask(profile: string, id: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("delete_google_task", { args: { profile, id } });
+    return;
+  }
+  throw new Error("Tasks require the installed Lost Harness app and a connected Google account.");
+}
+
 // ── Browser fallback (used when running outside Tauri) ──────────────────────
 
 const browserStreamListeners: StreamTokenCallback[] = [];
@@ -1696,6 +1809,23 @@ function browserCreateConversation(name: string, binding: string): ConversationI
   list.unshift(conv);
   browserPersistConversations(list);
   return conv;
+}
+
+function browserSetConversationBinding(
+  id: string,
+  binding: "auto" | "public" | "private",
+): ConversationInfo {
+  const list = browserListConversations();
+  const index = list.findIndex((conversation) => conversation.id === id);
+  if (index < 0) throw new Error("conversation not found");
+  const updated = {
+    ...list[index],
+    binding,
+    updated_at: Math.floor(Date.now() / 1000),
+  };
+  list[index] = updated;
+  browserPersistConversations(list);
+  return updated;
 }
 
 function browserGetMessages(_conversationId: string): MessageInfo[] {

@@ -75,6 +75,10 @@ libc = "0.2"
 # Rust 1.77 floor; keyring 4.x currently requires Rust 1.88.
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
+# Native pointer/scroll synthesis for the Accessibility-backed computer-use
+# backend.  The crate is already transitive through Tauri; declaring it here
+# makes the production backend's direct use explicit.
+core-graphics = { version = "0.25", features = ["highsierra"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }

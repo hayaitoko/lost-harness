@@ -1,18 +1,15 @@
 <script lang="ts">
-  // Settings — a 2/3 modal over a blurred app: submenu nav (Routing, Privacy
-  // guard, Models, Memory, Appearance), a per-profile editable memory viewer, and
-  // live accent/theme/appearance controls. Closing returns to the main screen.
+  // Settings — a focused modal: submenu nav (Routing, Privacy guard, Models,
+  // Memory, Appearance), a per-profile editable memory viewer, and live
+  // accent/theme/appearance controls. Closing returns to the main screen.
   // Ported from the React Settings screen (templates/settings/Settings.dc.html).
   import { nav } from "../nav.svelte";
   import Button from "../components/Button.svelte";
-  import ChatMessage from "../components/ChatMessage.svelte";
   import IconButton from "../components/IconButton.svelte";
   import SegmentedControl from "../components/SegmentedControl.svelte";
   import Select from "../components/Select.svelte";
   import SettingRow from "../components/SettingRow.svelte";
   import Toggle from "../components/Toggle.svelte";
-  import Sidebar from "../components/Sidebar.svelte";
-  import AppStatusBar from "../components/AppStatusBar.svelte";
   import {
     providersStore,
     addProvider,
@@ -22,7 +19,6 @@
     type Provider,
     type ProviderKind,
   } from "$lib/stores/providers.svelte";
-  import { modelsForProvider } from "$lib/stores/provider-catalog";
   import { theme, applyTheme, type Theme } from "$lib/stores/settings";
   import { activeProfileId } from "$lib/stores/profiles";
   import {
@@ -57,10 +53,8 @@
     deleteAgentType,
     type AgentType,
     installPack,
-    listModelCatalog,
     downloadModel,
     probeHardware,
-    type CatalogModel,
     type HardwareProfile,
     listLocalModels,
     removeLocalModel,
@@ -70,6 +64,7 @@
     calculateModelFit,
     type HfModelSummary,
     type ModelDetailResponse,
+    type QuantGroup,
     type ModelSpec,
     type CalcOutput,
     type KvCacheQuant,
@@ -144,9 +139,6 @@
   const goMain = () => nav.go("main");
   let section = $state<Section>("routing");
 
-  // routing
-  let defaultBinding = $state("auto");
-  let uncertainty = $state(true);
   // privacy — real per-profile classifier thresholds (PLAN §11), loaded live
   let guard = $state(true);
   let classifierStrictness = $state(50);
@@ -160,6 +152,7 @@
   let showProviderKey = $state(false);
   let confirmRemoveProviderId = $state<string | null>(null);
   let savingProvider = $state(false);
+  let providerError = $state<string | null>(null);
   // Fetched model lists per provider id (populated lazily below).
   let modelsByProvider = $state<Record<string, string[]>>({});
   // memory — real facts for the active profile (PLAN §9)
@@ -213,9 +206,9 @@
   // huggingface.co egress before it can happen. An empty query fetches the
   // trusted Staff picks; expanding a result
   // reads its GGUF geometry and runs the pure fit/speed calculator per quant
-  // for THIS machine as the context/KV-quant knobs move. Downloading a
-  // searched model is deliberately NOT wired (F7: needs the provenance-
-  // attestation consent gate first) — external endpoints are the run path.
+  // for THIS machine as the context/KV-quant knobs move. Downloads use the
+  // selected live artifact; the backend re-fetches its manifest and LFS hash
+  // before it writes anything locally.
   let mSearchQuery = $state("");
   let mSearchResults = $state<HfModelSummary[]>([]);
   let mSearchLoading = $state(false);
@@ -325,10 +318,9 @@
     return `~${out.predicted_tokens_per_sec.toFixed(0)} tok/s`;
   }
 
-  // model catalog — downloadable local models sized to this machine (Wave 5.3 / M8)
-  let catalogModels = $state<CatalogModel[]>([]);
   let hardware = $state<HardwareProfile | null>(null);
   let modelDownloadStatus = $state<Record<string, string>>({});
+  let confirmCommunityDownload = $state<string | null>(null);
   let localModels = $state<LocalModel[]>([]);
   let confirmRemoveModelId = $state<string | null>(null);
   // seats — per-profile model-seat bindings (Wave 3.1)
@@ -352,10 +344,8 @@
     return true;
   });
 
-  // Lazily fetch each provider's model list once. Falls back to the baked-in
-  // catalog (provider-catalog.ts) if the IPC call comes back empty — e.g. no
-  // Tauri shell in browser dev mode, or a provider the catalog doesn't know
-  // about yet whose /models call hasn't resolved.
+  // Lazily fetch each provider's model list once. The backend asks the
+  // configured endpoint; browser mode never fabricates a stale provider list.
   $effect(() => {
     for (const p of providersStore.providers) {
       if (p.id in modelsByProvider) continue;
@@ -520,16 +510,21 @@
     }
   }
 
-  // mcp — registered MCP servers (C3). Registration is the trust boundary:
-  // the pane carries the mandated "unsandboxed software install" warning (F1).
+  // MCP servers (C3). Stdio registration installs local software; Streamable
+  // HTTP connects to a remote endpoint. Both are external trust boundaries.
   let mcpServers: McpServer[] = $state([]);
   let mcpLoading = $state(false);
   let mcpError: string | null = $state(null);
-  let mcpForm = $state({ name: "", command: "", argsText: "", tier: "remote" as "local" | "remote" });
+  let mcpForm = $state({
+    name: "",
+    command: "",
+    argsText: "",
+    transport: "stdio" as "stdio" | "http",
+    tier: "remote" as "local" | "remote",
+  });
   let mcpRegistering = $state(false);
-  // register_mcp_server's UI contract (ipc/mod.rs) demands explicit
-  // confirmation before the spawn — this arms the Register button for one
-  // confirming click, mirroring confirmRemoveMcpId below.
+  // Registration always needs an explicit confirmation: it either spawns a
+  // local executable or grants a remote server a live tool connection.
   let confirmRegisterMcp = $state(false);
   let confirmRemoveMcpId: string | null = $state(null);
   $effect(() => {
@@ -561,11 +556,8 @@
       mcpError = "Name and command are required.";
       return;
     }
-    // Two-click confirm, mirroring handleRemoveMcp: the first click arms the
-    // button into a "Run <command>? Confirm" state showing the exact command
-    // line that will be spawned; only the second click (within 4s) invokes
-    // register_mcp_server. This is the explicit-confirmation half of that
-    // command's software-install contract — the F1 banner is only disclosure.
+    // Two-click confirm, mirroring handleRemoveMcp. The first click arms the
+    // exact process command or endpoint; only the second invokes the backend.
     if (!confirmRegisterMcp) {
       confirmRegisterMcp = true;
       mcpError = null;
@@ -581,11 +573,11 @@
       const server = await registerMcpServer({
         name,
         command,
-        args: mcpForm.argsText.trim() === "" ? [] : mcpForm.argsText.trim().split(/\s+/),
-        tier: mcpForm.tier,
+        args: mcpForm.transport === "http" || mcpForm.argsText.trim() === "" ? [] : mcpForm.argsText.trim().split(/\s+/),
+        tier: mcpForm.transport === "http" ? "remote" : mcpForm.tier,
       });
       if (server) mcpServers = [...mcpServers, server];
-      mcpForm = { name: "", command: "", argsText: "", tier: "remote" };
+      mcpForm = { name: "", command: "", argsText: "", transport: "stdio", tier: "remote" };
     } catch (err) {
       mcpError = String(err);
     } finally {
@@ -661,7 +653,7 @@
       });
   });
 
-  // Load this profile's seat bindings + the model catalog when the Models pane opens.
+  // Load this profile's seat bindings and downloaded models when the Models pane opens.
   $effect(() => {
     if (section !== "models") return;
     const profile = $activeProfileId;
@@ -673,7 +665,6 @@
         seatError = String(err);
       });
     probeHardware().then((h) => (hardware = h)).catch(() => {});
-    listModelCatalog().then((m) => (catalogModels = m)).catch(() => {});
     listLocalModels().then((m) => (localModels = m)).catch(() => {});
     // Deliberately NO auto-search here: seeding the pane would (a) fire a live
     // huggingface.co request on merely opening Settings→Models — silent egress
@@ -682,14 +673,31 @@
     // search. The Search button / Enter is the only trigger.
   });
 
-  async function startModelDownload(m: CatalogModel) {
-    modelDownloadStatus = { ...modelDownloadStatus, [m.id]: "Downloading…" };
+  function modelDownloadKey(modelId: string, q: QuantGroup): string {
+    return `${modelId}:${q.files[0]?.filename ?? q.quant ?? "unknown"}`;
+  }
+
+  async function startModelDownload(detail: ModelDetailResponse | null, q: QuantGroup) {
+    if (!detail) return;
+    const filename = q.files[0]?.filename;
+    if (!filename || q.files.length !== 1) return;
+    const key = modelDownloadKey(detail.id, q);
+    const needsCommunityAck = detail.provenance === "community";
+    if (needsCommunityAck && confirmCommunityDownload !== key) {
+      confirmCommunityDownload = key;
+      setTimeout(() => {
+        if (confirmCommunityDownload === key) confirmCommunityDownload = null;
+      }, 5000);
+      return;
+    }
+    confirmCommunityDownload = null;
+    modelDownloadStatus = { ...modelDownloadStatus, [key]: "Downloading…" };
     try {
-      await downloadModel(m.id);
-      modelDownloadStatus = { ...modelDownloadStatus, [m.id]: "Downloaded ✓" };
+      await downloadModel(detail.id, filename, needsCommunityAck);
+      modelDownloadStatus = { ...modelDownloadStatus, [key]: "Downloaded ✓" };
       localModels = await listLocalModels();
     } catch (err) {
-      modelDownloadStatus = { ...modelDownloadStatus, [m.id]: `Failed: ${String(err)}` };
+      modelDownloadStatus = { ...modelDownloadStatus, [key]: `Failed: ${String(err)}` };
     }
   }
 
@@ -806,9 +814,7 @@
   }
 
   function modelsFor(p: Provider): string[] {
-    const fetched = modelsByProvider[p.id];
-    if (fetched && fetched.length > 0) return fetched;
-    return modelsForProvider(p).map((m) => m.name);
+    return modelsByProvider[p.id] ?? [];
   }
 
   function providerDotColor(kind: ProviderKind): string {
@@ -818,10 +824,12 @@
   }
 
   function startAddProvider() {
+    providerError = null;
     providerForm = { ...EMPTY_PROVIDER_FORM };
     showProviderKey = false;
   }
   function startAddProviderFromPreset(preset: (typeof QUICK_PROVIDER_PRESETS)[number]) {
+    providerError = null;
     providerForm = {
       id: null,
       name: preset.name,
@@ -833,6 +841,7 @@
     showProviderKey = false;
   }
   function startEditProvider(p: Provider) {
+    providerError = null;
     if (providerForm?.id === p.id) {
       providerForm = null;
       return;
@@ -848,10 +857,12 @@
     showProviderKey = false;
   }
   function cancelProviderForm() {
+    providerError = null;
     providerForm = null;
   }
   async function saveProvider() {
     if (!providerForm || !canSaveProvider || savingProvider) return;
+    providerError = null;
     savingProvider = true;
     try {
       await addProvider({
@@ -865,6 +876,7 @@
       providerForm = null;
     } catch (err) {
       console.error("save provider failed", err);
+      providerError = `Couldn't save provider: ${String(err)}`;
     } finally {
       savingProvider = false;
     }
@@ -879,7 +891,13 @@
       return;
     }
     confirmRemoveProviderId = null;
-    await removeProvider(id);
+    providerError = null;
+    try {
+      await removeProvider(id);
+    } catch (err) {
+      console.error("remove provider failed", err);
+      providerError = `Couldn't remove provider: ${String(err)}`;
+    }
   }
 
   function setTheme(v: string) {
@@ -1126,33 +1144,6 @@
     "flex items-center justify-between gap-[14px] border-b border-border py-3";
 </script>
 
-<!-- Blurred app backdrop -->
-<div class="grid h-screen grid-cols-[260px_1fr_0]">
-  <Sidebar activeConv="Reply to landlord" />
-  <main class="flex min-h-0 min-w-0 flex-col">
-    <div class="flex h-12 flex-shrink-0 items-center gap-3 border-b border-border py-0 pl-[18px] pr-[14px]">
-      <div class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[13.5px] font-semibold">
-        Reply to landlord
-      </div>
-      <div class="flex-1"></div>
-    </div>
-    <div class="flex-1 overflow-y-auto px-5 py-[26px]">
-      <div class="mx-auto flex max-w-[700px] flex-col gap-5">
-        <ChatMessage role="user">
-          Help me write a firm but polite reply to my landlord about the broken heater.
-        </ChatMessage>
-        <ChatMessage role="assistant">
-          <p>
-            Here's a draft that's firm on the timeline without burning the
-            relationship. Want it warmer, or a firm deadline added?
-          </p>
-        </ChatMessage>
-      </div>
-    </div>
-    <AppStatusBar />
-  </main>
-</div>
-
 <!-- Modal overlay -->
 <div class="fixed inset-0 z-40">
   <button
@@ -1203,32 +1194,14 @@
         <div class="flex-1 overflow-y-auto px-[18px] pb-7 pt-4">
           {#if section === "routing"}
             <SettingRow
-              title="New chats start as"
-              desc="Where new conversations run until you change them"
-            >
-              {#snippet control()}
-                <SegmentedControl
-                  options={[
-                    { value: "auto", label: "Auto" },
-                    { value: "public", label: "Public" },
-                    { value: "private", label: "Private" },
-                  ]}
-                  value={defaultBinding}
-                  onchange={(v) => (defaultBinding = v)}
-                />
-              {/snippet}
-            </SettingRow>
+              title="Routing is set per conversation"
+              desc="Use the Auto, Public, or Private control in a chat header. The choice is saved with that chat."
+            />
             <SettingRow
-              title="When unsure, keep it local"
-              desc="If it's not clear whether something is private, stay on this Mac"
-            >
-              {#snippet control()}
-                <Toggle checked={uncertainty} onchange={(v) => (uncertainty = v)} />
-              {/snippet}
-            </SettingRow>
-            <!-- The real, per-profile "Send only the safe parts" toggle lives in
-                 the Privacy guard tab (wired to setRedactionEnabled). No duplicate
-                 mock here. -->
+              title="Uncertain content stays local"
+              desc="Under Auto, ambiguous content is kept on this Mac rather than sent to a cloud model."
+              dotColor="var(--local)"
+            />
           {:else if section === "privacy"}
             <SettingRow
               title="Egress guard"
@@ -1323,9 +1296,6 @@
             <SettingRow title="SSN">
               {#snippet control()}<Toggle checked locked />{/snippet}
             </SettingRow>
-            <div class="mt-3">
-              <Button variant="ghost">Add category…</Button>
-            </div>
           {:else if section === "permissions"}
             <div class="{label} pb-2">
               Standing tool permissions — the "Always allow" grants you've made in this profile
@@ -1450,6 +1420,10 @@
               >
                 No providers configured yet. Add one below.
               </p>
+            {/if}
+
+            {#if providerError}
+              <p class="mt-2 text-[11.5px] text-blocked">{providerError}</p>
             {/if}
 
             <div class="mt-4">
@@ -1692,6 +1666,7 @@
                             <div class="flex flex-col gap-1">
                               {#each mDetail.quants.filter((q) => q.complete) as q (q.quant ?? q.files[0]?.filename)}
                                 {@const out = mQuantCalcs[q.quant ?? "?"]}
+                                {@const downloadKey = modelDownloadKey(mDetail.id, q)}
                                 <div class="flex items-center gap-2 rounded-[var(--r)] bg-surface px-2.5 py-1.5">
                                   <span class="min-w-0 flex-1 truncate text-[12px] text-text">
                                     {q.quant ?? "unknown quant"}
@@ -1701,6 +1676,21 @@
                                     {@const chip = fitChip(out.fit)}
                                     <span class="flex-shrink-0 text-[11px] text-text-3">{speedLabel(out)}</span>
                                     <span class="flex-shrink-0 rounded-[8px] px-[7px] py-px text-[10px] {chip.cls}">{chip.label}</span>
+                                  {/if}
+                                  {#if q.files.length !== 1}
+                                    <span class="flex-shrink-0 text-[10.5px] text-text-3">split files unsupported</span>
+                                  {:else if modelDownloadStatus[downloadKey]}
+                                    <span class="flex-shrink-0 text-[10.5px] text-text-2">{modelDownloadStatus[downloadKey]}</span>
+                                  {:else}
+                                    <Button
+                                      variant="ghost"
+                                      disabled={out?.fit === "too_large"}
+                                      onclick={() => void startModelDownload(mDetail, q)}
+                                    >
+                                      {mDetail.provenance === "community" && confirmCommunityDownload === downloadKey
+                                        ? "Confirm publisher"
+                                        : "Download"}
+                                    </Button>
                                   {/if}
                                 </div>
                               {/each}
@@ -1715,9 +1705,8 @@
                             </div>
                           {/if}
                           <div class="mt-2 border-t border-border pt-2 text-[11px] text-text-3">
-                            Downloading searched models isn't enabled yet — install from the
-                            curated list below, or point a provider at your own endpoint
-                            (Settings → Models → Add an endpoint).
+                            Downloads use the live repository manifest and its LFS checksum; a mismatch
+                            installs nothing. Community publishers require a second confirmation.
                           </div>
                         {/if}
                       </div>
@@ -1725,55 +1714,6 @@
                   </div>
                 {/each}
               {/if}
-            </div>
-
-            <!-- Downloadable local models (Wave 5.3 / M8), sized to this machine -->
-            <div class="mb-2 mt-6 flex items-center gap-2.5">
-              <span class="text-[12px] font-[550] text-text">Download a local model</span>
-              {#if hardware}
-                <span class="text-[11.5px] text-text-3">
-                  {fmtGB(hardware.total_ram_bytes)} RAM · {hardware.cpu_cores} cores · sized to your machine
-                </span>
-              {/if}
-            </div>
-            <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border" data-testid="model-catalog">
-              {#if catalogModels.length === 0}
-                <div class="px-3 py-6 text-center text-[12px] text-text-3">
-                  No catalog models available.
-                </div>
-              {:else}
-                {#each catalogModels as m (m.id)}
-                  <div class="flex items-center gap-2 border-b border-border py-[9px] pl-3 pr-2.5" data-testid="catalog-row">
-                    <span class="min-w-0 flex-1">
-                      <span class="block truncate text-[12.5px] font-[550] text-text">{m.name}</span>
-                      <span class="block truncate text-[11.5px] text-text-3">{m.description} · {fmtGB(m.size_bytes)}</span>
-                    </span>
-                    {#if m.fit === "fits"}
-                      <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">fits</span>
-                    {:else if m.fit === "tight"}
-                      <span class="flex-shrink-0 rounded-[8px] bg-warn-soft px-[7px] py-px text-[10px] text-warn">tight</span>
-                    {:else}
-                      <span class="flex-shrink-0 rounded-[8px] bg-surface-2 px-[7px] py-px text-[10px] text-text-3">too large</span>
-                    {/if}
-                    {#if modelDownloadStatus[m.id]}
-                      <span class="flex-shrink-0 text-[11px] text-text-2">{modelDownloadStatus[m.id]}</span>
-                    {:else}
-                      <Button
-                        variant="ghost"
-                        disabled={!m.installable || m.fit === "too_large"}
-                        onclick={() => startModelDownload(m)}
-                      >
-                        {m.installable ? "Download" : "Soon"}
-                      </Button>
-                    {/if}
-                  </div>
-                {/each}
-              {/if}
-              <div class="px-3 py-2 text-[11px] text-text-3">
-                Models download from Hugging Face and are verified by checksum before use — a
-                mismatch installs nothing. (Entries marked “Soon” await release curation of their
-                verified hash.)
-              </div>
             </div>
 
             {#if localModels.length > 0}
@@ -2205,21 +2145,17 @@
               </div>
             </div>
           {:else if section === "mcp"}
-            <!-- F1 (mandated): registering an MCP server is a SOFTWARE INSTALL.
-                 This banner is only the DISCLOSURE half of the contract recorded
-                 on register_mcp_server (ipc/mod.rs) — the explicit-confirmation
-                 half is the Register button's two-click arm in
-                 handleRegisterMcp, which shows the exact command before it
-                 spawns. -->
+            <!-- Stdio MCP registration installs local software; remote MCP
+                 registration connects an external tool endpoint. The form's
+                 two-click arm always shows the exact target before use. -->
             <div
               class="mb-4 rounded-r-[var(--r)] border-l-2 border-l-warn bg-warn-soft px-[13px] py-[10px] text-[12px] text-text-2"
             >
-              <span class="font-medium text-warn">Installing software.</span> An MCP
-              server runs on your machine as a normal, unsandboxed program with your
-              full user privileges, and starts again every time the app launches. Only
-              add servers you trust — a malicious one can do anything you can. Its
-              individual <em>tools</em> still pass Lost Harness's approval gate, but
-              the server process itself is outside the sandbox.
+              <span class="font-medium text-warn">MCP is a trust boundary.</span> A local
+              stdio server runs as an unsandboxed program with your user privileges and
+              restarts at launch. A Streamable HTTP server receives off-box tool calls.
+              Only add targets you trust; every individual tool still passes Lost
+              Harness's approval gate.
             </div>
 
             {#if mcpError}
@@ -2258,6 +2194,20 @@
             <div class="mt-4">
               <div class="{label} pb-1.5">Add a server</div>
               <div class="flex flex-col gap-2">
+                <label class="flex items-center gap-2 text-[12px] text-text-2">
+                  <span>Transport</span>
+                  <select
+                    bind:value={mcpForm.transport}
+                    onchange={() => {
+                      if (mcpForm.transport === "http") mcpForm.tier = "remote";
+                      confirmRegisterMcp = false;
+                    }}
+                    class="rounded-[var(--r)] border border-border bg-surface px-2 py-1 text-[12px] text-text outline-none"
+                  >
+                    <option value="stdio">Stdio (local executable)</option>
+                    <option value="http">Streamable HTTP (remote endpoint)</option>
+                  </select>
+                </label>
                 <input
                   bind:value={mcpForm.name}
                   placeholder="Name (e.g. github)"
@@ -2265,37 +2215,44 @@
                 />
                 <input
                   bind:value={mcpForm.command}
-                  placeholder="Command (e.g. /usr/local/bin/my-mcp-server)"
+                  placeholder={mcpForm.transport === "http" ? "Endpoint (e.g. https://example.com/mcp)" : "Command (e.g. /usr/local/bin/my-mcp-server)"}
                   class="rounded-[var(--r)] border border-border bg-surface px-2.5 py-1.5 text-[12.5px] text-text outline-none placeholder:text-text-3 focus:border-border-strong"
                 />
-                <input
-                  bind:value={mcpForm.argsText}
-                  placeholder="Arguments (space-separated, optional)"
-                  class="rounded-[var(--r)] border border-border bg-surface px-2.5 py-1.5 text-[12.5px] text-text outline-none placeholder:text-text-3 focus:border-border-strong"
-                />
+                {#if mcpForm.transport === "stdio"}
+                  <input
+                    bind:value={mcpForm.argsText}
+                    placeholder="Arguments (space-separated, optional)"
+                    class="rounded-[var(--r)] border border-border bg-surface px-2.5 py-1.5 text-[12.5px] text-text outline-none placeholder:text-text-3 focus:border-border-strong"
+                  />
+                {/if}
                 <div class="flex items-center justify-between">
-                  <label class="flex items-center gap-2 text-[12px] text-text-2">
-                    <span>Trust tier</span>
-                    <select
-                      bind:value={mcpForm.tier}
-                      class="rounded-[var(--r)] border border-border bg-surface px-2 py-1 text-[12px] text-text outline-none"
-                    >
-                      <option value="remote">Remote (stricter — tools ask before use)</option>
-                      <option value="local">Local (on-box only)</option>
-                    </select>
-                  </label>
+                  {#if mcpForm.transport === "stdio"}
+                    <label class="flex items-center gap-2 text-[12px] text-text-2">
+                      <span>Trust tier</span>
+                      <select
+                        bind:value={mcpForm.tier}
+                        class="rounded-[var(--r)] border border-border bg-surface px-2 py-1 text-[12px] text-text outline-none"
+                      >
+                        <option value="remote">Remote (stricter — tools ask before use)</option>
+                        <option value="local">Local (on-box only)</option>
+                      </select>
+                    </label>
+                  {:else}
+                    <span class="text-[12px] text-text-3">Remote tools always require approval.</span>
+                  {/if}
                   <Button onclick={() => void handleRegisterMcp()} disabled={mcpRegistering}>
                     {mcpRegistering
                       ? "Starting…"
                       : confirmRegisterMcp
-                        ? `Run ${mcpForm.command.trim()}${mcpForm.argsText.trim() ? ` ${mcpForm.argsText.trim()}` : ""}? Confirm`
+                        ? `${mcpForm.transport === "http" ? "Connect" : "Run"} ${mcpForm.command.trim()}${mcpForm.transport === "stdio" && mcpForm.argsText.trim() ? ` ${mcpForm.argsText.trim()}` : ""}? Confirm`
                         : "Register"}
                   </Button>
                 </div>
                 <p class="text-[11px] text-text-3">
-                  The server is started and health-checked before it's saved — one that
-                  can't come up is never persisted. “Remote” means the server reaches
-                  off this machine; its tools always require approval.
+                  The server is initialized and lists its tools before it is saved — a
+                  target that cannot come up is never persisted. Streamable HTTP must
+                  use HTTPS (except localhost development endpoints) and may return
+                  JSON or SSE responses.
                 </p>
               </div>
             </div>

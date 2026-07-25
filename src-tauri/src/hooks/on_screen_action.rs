@@ -79,13 +79,14 @@ impl GatingHook for OnScreenActionHook {
         let mut resolved_label = None;
         for t in targets {
             match self.backend.resolve(t) {
-                Some(r) => resolved_label = Some(r),
-                None => {
+                Ok(Some(r)) => resolved_label = Some(r),
+                Ok(None) => {
                     return HookResult::Deny(format!(
                         "on-screen target not found on a fresh snapshot (\"{}\" {} in {}) — it moved or vanished",
                         t.label, t.role, t.app
                     ))
                 }
+                Err(e) => return HookResult::Deny(e.to_string()),
             }
         }
         match reversibility(&action) {

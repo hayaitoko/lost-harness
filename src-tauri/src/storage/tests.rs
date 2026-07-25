@@ -280,6 +280,12 @@ fn create_conversation_add_messages_query_back() {
     })
     .unwrap();
 
+    assert!(db.set_conversation_binding(&conv_id, "private").unwrap());
+    let updated = db.get_conversation(&conv_id).unwrap().unwrap();
+    assert_eq!(updated.binding, "private");
+    assert_eq!(updated.name, "Test chat");
+    assert!(!updated.pinned);
+
     // Add 3 messages: user, assistant (with thinking), user.
     let messages = vec![
         Message {

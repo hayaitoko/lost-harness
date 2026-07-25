@@ -28,7 +28,7 @@
 
   let { profile, status, variant = "full", onconnected }: Props = $props();
 
-  const STEPS = ["Why", "Project", "Gmail API", "Consent", "Client", "Connect"] as const;
+  const STEPS = ["Why", "Project", "Google APIs", "Consent", "Client", "Connect"] as const;
   const CONNECT_STEP = STEPS.length - 1;
 
   // The furthest-reached step persists per install (the client steps are
@@ -267,7 +267,7 @@
         <p class={body}>
           Sign in with your Google account and create a project — the name
           doesn't matter (something like "Lost Harness" works). This is free;
-          the Gmail API needs no billing setup.
+          the Google APIs this app uses need no billing setup.
         </p>
         <a
           class={linkBtn}
@@ -281,20 +281,42 @@
       </div>
     {:else if step === 2}
       <div class={card}>
-        <div class={heading}>Enable the Gmail API</div>
+        <div class={heading}>Enable the Google APIs</div>
         <p class={body}>
           With your new project selected (the picker in the console's top bar),
-          open the Gmail API page and click <b>Enable</b>.
+          enable <b>Gmail API</b>, <b>Google Calendar API</b>, and
+          <b>Google Tasks API</b>. This one private connection powers Mail and
+          Planner for the profile you connect below.
         </p>
-        <a
-          class={linkBtn}
-          href="https://console.cloud.google.com/apis/library/gmail.googleapis.com"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Open the Gmail API page
-          {@render externalIcon()}
-        </a>
+        <div class="flex flex-wrap gap-2">
+          <a
+            class={linkBtn}
+            href="https://console.cloud.google.com/apis/library/gmail.googleapis.com"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Gmail API
+            {@render externalIcon()}
+          </a>
+          <a
+            class={linkBtn}
+            href="https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Calendar API
+            {@render externalIcon()}
+          </a>
+          <a
+            class={linkBtn}
+            href="https://console.cloud.google.com/apis/library/tasks.googleapis.com"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Tasks API
+            {@render externalIcon()}
+          </a>
+        </div>
       </div>
     {:else if step === 3}
       <div class={card}>
@@ -366,6 +388,7 @@
             </label>
             <input
               id="gmail-client-secret"
+              type="password"
               bind:value={clientSecret}
               placeholder="GOCSPX-…"
               spellcheck="false"

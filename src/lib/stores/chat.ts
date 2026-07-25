@@ -133,11 +133,12 @@ export async function hydrateConversations(): Promise<void> {
       }
       return base;
     });
-    // Preserve any locally-created conversations the backend doesn't know
-    // about yet (e.g. browser fallback where lists diverge).
-    const localOnly = existing.filter(
-      (c) => !remote.some((m) => m.id === c.id),
-    );
+    // Only the browser fallback owns local-only conversations. Keeping an
+    // unknown local row in the installed app would resurrect a failed create
+    // as though it had been durably saved.
+    const localOnly = api.isTauriRuntime()
+      ? []
+      : existing.filter((c) => !remote.some((m) => m.id === c.id));
     const next = [...localOnly, ...mapped];
     conversations.set(next);
 
@@ -176,6 +177,27 @@ export async function hydrateMessages(conversationId: string): Promise<void> {
   }
 }
 
+/** Update the active chat's routing intent only after the profile-scoped
+ * backend write succeeds. This prevents a restarted app from silently
+ * reverting a choice the UI had presented as saved. */
+export async function setConversationBinding(
+  conversationId: string,
+  binding: Binding,
+): Promise<void> {
+  const info = await api.setConversationBinding(
+    conversationId,
+    getActiveProfileId(),
+    binding,
+  );
+  conversations.update((list) =>
+    list.map((conversation) =>
+      conversation.id === conversationId
+        ? { ...conversation, binding: info.binding as Binding }
+        : conversation,
+    ),
+  );
+}
+
 /**
  * Creates a conversation via the backend IPC and inserts it into the store.
  * Returns the new conversation's id. Falls back to the local-only path in
@@ -183,19 +205,20 @@ export async function hydrateMessages(conversationId: string): Promise<void> {
  */
 export async function createConversationViaBackend(
   name?: string,
+  binding: Binding = "auto",
 ): Promise<string> {
   const profile = getActiveProfileId();
   const displayName = name ?? defaultName();
   try {
-    const info = await api.createConversation(displayName, profile, "auto");
+    const info = await api.createConversation(displayName, profile, binding);
     const conv: Conversation = convFromInfo(info);
     conversations.update((list) => [conv, ...list]);
     activeConversationId.set(conv.id);
     return conv.id;
   } catch (err) {
-    // Fall back to local-only creation.
-    console.error("createConversationViaBackend failed, using local fallback", err);
-    return createConversation(displayName);
+    console.error("createConversationViaBackend failed", err);
+    if (api.isTauriRuntime()) throw err;
+    return createConversation(displayName, binding);
   }
 }
 
@@ -205,13 +228,13 @@ export async function createConversationViaBackend(
  * Creates a new empty conversation locally (no backend round-trip), inserts
  * it at the top of the list, and marks it active. Returns the new id.
  */
-export function createConversation(name?: string): string {
+export function createConversation(name?: string, binding: Binding = "auto"): string {
   const id = newId();
   const conv: Conversation = {
     id,
     name: name ?? defaultName(),
     pinned: false,
-    binding: "auto",
+    binding,
     messages: [],
     hydrated: true, // locally created — nothing to fetch from backend
     created_at: Date.now(),
@@ -253,7 +276,7 @@ export async function sendMessage(
   // Ensure we have an active conversation.
   let activeId = get(activeConversationId);
   if (!activeId) {
-    activeId = await createConversationViaBackend();
+    activeId = await createConversationViaBackend(undefined, bindingOverride ?? "auto");
   }
   const conversationId = activeId;
 
