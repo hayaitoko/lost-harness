@@ -250,7 +250,9 @@ pub fn generate_state() -> String {
 /// Open `auth_url` in the system browser, then call [`PendingAuth::finish`].
 pub struct PendingAuth {
     listener: TcpListener,
-    /// The ephemeral loopback port the OS assigned.
+    /// The ephemeral loopback port the OS assigned. (Diagnostic metadata —
+    /// the consent URL already embeds it; kept for logging/tests.)
+    #[allow(dead_code)]
     pub port: u16,
     /// The fully-assembled consent URL to open in the system browser.
     pub auth_url: String,
@@ -388,6 +390,7 @@ async fn read_head(stream: &mut TcpStream) -> std::io::Result<String> {
 impl PendingAuth {
     /// The state token bound to this attempt (stage 2 has no need for it —
     /// exposed for tests and diagnostics).
+    #[allow(dead_code)] // test/diagnostic accessor; the flow reads the field directly
     pub fn state(&self) -> &str {
         &self.state
     }
