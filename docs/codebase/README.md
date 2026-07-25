@@ -21,12 +21,15 @@ distilbert) when its models are installed under `<storage>/models/classifier/`,
 falling back to rules-only otherwise (`lib.rs:100-119`) — it is not a stub. The
 frontend was reskinned onto the ported `src/lib/design/` design system (Svelte
 port of the React design source); most of it is now wired to the real backend —
-chat, routing + the "why" explainability sidebar, and 7 of Settings' 9 tabs
-(privacy guard, permissions, models, memory, skills, agent types, usage — plus
-theme within Appearance). The Routing tab and several full screens (Email,
-Files, Whiteboard, Scheduled-jobs, Editor, Onboarding, EmptyState) are still
-visual-only with sample data. See
-`frontend-svelte.md` for the exact breakdown and HANDOFF for the precise line.
+chat, routing + the "why" explainability sidebar, and all of Settings' 10 tabs.
+**As of the 2026-07-24 UI bridge campaign the app is functionally complete:**
+every reachable screen (Main, Files, Scheduled jobs, Settings) is wired to the
+real backend — the old Email/Whiteboard/Editor/Onboarding/EmptyState mockups
+were DELETED (their backends don't exist yet; design reference lives in the
+mockup repo), Files browses the real Tier-P workspace read-only, ScheduledJobs
+manages the real per-profile cron store, and Settings→Models carries the M8 S5
+interactive HF search + hardware calculator. See `frontend-svelte.md` for the
+per-component map and HANDOFF's 2026-07-24 entry for the campaign detail.
 
 ## The request flow (the spine)
 
@@ -54,7 +57,7 @@ user message
 | [tools.md](tools.md) | `Tool` trait/registry/`RiskClass`, the fenced tool-call dialect + injection defense, dispatch, the fs tools, plus the rest of the registry: `tools/ask_human.rs`, `tools/computer_use.rs` (dormant M5 slice), `tools/cron.rs`, `tools/delegate.rs`, `tools/exec.rs` (the shell tool), `tools/fetch.rs`, `tools/mcp.rs`, `tools/memory.rs`, `tools/session_search.rs`, `tools/skills.rs`, `tools/system_status.rs` |
 | [models.md](models.md) | `ModelManager`, providers, the OpenAI-compatible HTTP client + SSE (text-only, no native tool_use yet), plus `models/content.rs` (multimodal wire format, dormant), `models/pricing.rs` (usage-ledger cost), `models/catalog.rs` (the curated download catalog), `models/download.rs` (verified-before-runnable installer), `models/hardware.rs` (hardware probe for onboarding), `models/seat.rs` (model seats) |
 | [storage.md](storage.md) | Two-DB SQLite (global + per-profile), schema/migrations, sqlite-vec + FTS5, `trm_logs` audit, plus `embedder.rs` (the on-device text embedder feeding memory's sqlite-vec meaning lane) |
-| [ipc-and-app-wiring.md](ipc-and-app-wiring.md) | Tauri command surface + `AppState` (44 commands, 7 `AppState` fields), the approval IPC round-trip, `lib.rs::run` wiring, plus `ipc/ask_human.rs` (the ask-human IPC round-trip) and `packs/mod.rs` (Capability Packs, installed via the `install_pack` command) |
+| [ipc-and-app-wiring.md](ipc-and-app-wiring.md) | Tauri command surface + `AppState` (62 commands as of 2026-07-24, 8+ `AppState` fields), the approval IPC round-trip, `lib.rs::run` wiring, plus `ipc/ask_human.rs` (the ask-human IPC round-trip) and `packs/mod.rs` (Capability Packs, installed via the `install_pack` command) |
 | [frontend-svelte.md](frontend-svelte.md) | The Svelte 5 shell, `tauri.ts` (the only IPC bridge), stores, components — the ported `src/lib/design/` design system (components/screens reskinned from the React source at lost-harness-ui), now mostly wired to real backend stores (see that doc for exactly which screens/tabs still aren't) |
 
 ## Load-bearing invariants (do NOT break these)
@@ -104,7 +107,7 @@ its own are enforced; the cross-cutting ones:
 
 ```bash
 # from the repo root
-cd src-tauri && cargo test --lib      # Rust unit/contract tests (683 as of 2026-07-23)
+cd src-tauri && cargo test --lib      # Rust unit/contract tests (685 as of 2026-07-24)
 cd src-tauri && cargo build           # Rust core
 npm run tauri dev                     # full app (native window) — see gotcha below
 npm run build && npm run check        # frontend build + svelte-check
@@ -210,5 +213,7 @@ against the code as of this pass:
   before release.
 
 *Regenerated 2026-07-21 against 542 tests / HEAD `ca54251`; test count refreshed
-2026-07-23 to 683 (external-review fix batch included). If you change a
-subsystem materially, update its doc — a wrong doc is worse than none.*
+2026-07-24 to 685 (external-review fix batch + the UI bridge campaign — new
+cron + workspace-listing IPC, M8 S5 search/calculator UI, mock screens
+deleted). If you change a subsystem materially, update its doc — a wrong doc
+is worse than none.*

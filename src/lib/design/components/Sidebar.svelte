@@ -20,6 +20,16 @@
     activeProfile,
     switchProfile,
   } from "$lib/stores/profiles";
+  import { providersStore } from "$lib/stores/providers.svelte";
+
+  // The engine card shows the REAL active model/provider (honesty: the old
+  // hardcoded "Qwen3-14B" label predated provider wiring). Falls back to an
+  // honest "No model selected" when nothing is configured.
+  const engineModel = $derived(providersStore.activeModel ?? "No model selected");
+  const engineHost = $derived(
+    providersStore.providers.find((p) => p.id === providersStore.activeProviderId)
+      ?.name ?? null,
+  );
 
   interface Props {
     active?: ScreenId;
@@ -229,9 +239,9 @@
     >
       <Knot size={22} state={engineState} seed={-7} />
       <div class="min-w-0">
-        <div class="text-[12px] font-[550]">Qwen3-14B</div>
+        <div class="truncate text-[12px] font-[550]">{engineModel}</div>
         <div class="flex items-center gap-[5px] text-[10.5px] text-text-3">
-          {ENGINE_LABEL[engineState]}
+          {ENGINE_LABEL[engineState]}{engineHost ? ` · ${engineHost}` : ""}
         </div>
       </div>
     </div>

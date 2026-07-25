@@ -208,7 +208,10 @@
   let skillReflectEnabled = $state(false);
   let skillReflectSaving = $state(false);
   // M8 S5 — the interactive HuggingFace model search + hardware calculator.
-  // Search is live (empty query = the trusted Staff picks); expanding a result
+  // Search runs ONLY on explicit user action (the Search button / Enter) —
+  // opening the pane sends nothing, and the hint under the input discloses the
+  // huggingface.co egress before it can happen. An empty query fetches the
+  // trusted Staff picks; expanding a result
   // reads its GGUF geometry and runs the pure fit/speed calculator per quant
   // for THIS machine as the context/KV-quant knobs move. Downloading a
   // searched model is deliberately NOT wired (F7: needs the provenance-
@@ -256,8 +259,15 @@
       if (mExpandedId !== id) return;
       mDetail = d;
       if (d?.spec) {
-        // Clamp the context knob to what the model supports.
-        mCalcCtx = Math.min(mCalcCtx, d.spec.native_context_len || 8192);
+        // Snap the context knob into the model's choice list. A raw min()
+        // clamp could land on a value the <select> doesn't offer (e.g. 65536
+        // clamped to a 40960 native), desyncing the control from the calc
+        // input — so snap to the largest choice <= the current value instead.
+        const choices = ctxChoicesFor(d.spec);
+        if (!choices.includes(mCalcCtx)) {
+          const within = choices.filter((c) => c <= mCalcCtx);
+          mCalcCtx = within.length > 0 ? within[within.length - 1] : choices[0];
+        }
         await recalcQuants();
       }
     } catch (err) {
@@ -270,6 +280,9 @@
   async function recalcQuants() {
     const d = mDetail;
     if (!d?.spec) return;
+    // The user may click another row while the per-quant calcs run — bail at
+    // the end rather than painting stale numbers under the new expansion.
+    const forId = mExpandedId;
     const results: Record<string, CalcOutput> = {};
     for (const q of d.quants) {
       if (!q.complete) continue;
@@ -284,12 +297,19 @@
         // Per-quant calc failure: leave that row without a chip.
       }
     }
+    if (mExpandedId !== forId) return;
     mQuantCalcs = results;
   }
 
   const CTX_CHOICES = [2048, 4096, 8192, 16384, 32768, 65536, 131072];
   function ctxChoicesFor(spec: ModelSpec | null): number[] {
-    const native = spec?.native_context_len ?? 8192;
+    // native_context_len == 0 is the backend's honest-unknown sentinel
+    // (gguf_meta::build_model_spec falls back to 0 when neither the header
+    // nor the repo summary carries a context length). The old `?? 8192`
+    // didn't catch 0 and produced a bogus [0] choice list — treat unknown as
+    // the historical 8192 default instead; the spec line marks it "assumed".
+    const native =
+      spec != null && spec.native_context_len > 0 ? spec.native_context_len : 8192;
     const within = CTX_CHOICES.filter((c) => c <= native);
     return within.length > 0 ? within : [Math.min(2048, native)];
   }
@@ -395,10 +415,13 @@
     budgetError = null;
     getBudgetSettings(profile)
       .then((b) => {
+        // Bail if the profile switched mid-fetch (staleness guard).
+        if (profile !== $activeProfileId) return;
         budgetCap = b?.cap_usd ?? null;
         budgetDraft = b?.cap_usd != null ? String(b.cap_usd) : "";
       })
       .catch((err) => {
+        if (profile !== $activeProfileId) return;
         budgetError = String(err);
       });
   });
@@ -438,6 +461,9 @@
     shellNetError = null;
     getSandboxConfig(profile)
       .then((cfg) => {
+        // The profile may have switched while this read was in flight
+        // (mirrors the expandModel mExpandedId staleness pattern).
+        if (profile !== $activeProfileId) return;
         shellNetConfigured = cfg !== null;
         shellNetBlocked =
           cfg !== null &&
@@ -445,6 +471,7 @@
           cfg.network.allowed_domains.length === 0;
       })
       .catch((err) => {
+        if (profile !== $activeProfileId) return;
         // A corrupt row fails closed backend-side; surface it here.
         shellNetError = String(err);
       });
@@ -452,20 +479,42 @@
 
   async function setShellNetBlocked(blocked: boolean) {
     shellNetError = null;
-    const cfg: SandboxConfig = {
-      enabled: true,
-      auto_allow_if_sandboxed: false,
-      excluded_commands: [],
-      network: {
-        allowed_domains: [],
-        allow_localhost: !blocked,
-        allow_unix_sockets: [],
-      },
-    };
+    const profile = $activeProfileId;
     try {
-      await setSandboxConfig($activeProfileId, cfg);
+      // Read-modify-write: a blind fixed-shape write here destroyed richer
+      // stored configs (excluded commands, unix sockets, domain grants) and
+      // silently WIDENED them on an on→off round-trip. Spread the stored
+      // config and change only the network ceiling.
+      const stored = await getSandboxConfig(profile);
+      const base: SandboxConfig = stored ?? {
+        // Unconfigured behaves like allowed-when-requested (see above).
+        enabled: true,
+        auto_allow_if_sandboxed: false,
+        excluded_commands: [],
+        network: { allowed_domains: [], allow_localhost: true, allow_unix_sockets: [] },
+      };
+      const dropped = blocked ? base.network.allowed_domains.length : 0;
+      const cfg: SandboxConfig = {
+        ...base,
+        network: {
+          ...base.network,
+          allow_localhost: !blocked,
+          // Blocking must ALSO clear domain grants: the backend permits shell
+          // network when localhost is allowed OR any domain is granted, so
+          // preserving domains would leave this switch showing "blocked"
+          // while network still flows. The clear is surfaced below — never
+          // silent. Unblocking preserves whatever domains remain.
+          allowed_domains: blocked ? [] : base.network.allowed_domains,
+        },
+      };
+      await setSandboxConfig(profile, cfg);
       shellNetBlocked = blocked;
       shellNetConfigured = true;
+      if (dropped > 0) {
+        shellNetError = `Also removed ${dropped} per-domain network grant${
+          dropped === 1 ? "" : "s"
+        } this profile had — blocking denies all shell network, including those domains.`;
+      }
     } catch (err) {
       shellNetError = String(err);
     }
@@ -478,20 +527,29 @@
   let mcpError: string | null = $state(null);
   let mcpForm = $state({ name: "", command: "", argsText: "", tier: "remote" as "local" | "remote" });
   let mcpRegistering = $state(false);
+  // register_mcp_server's UI contract (ipc/mod.rs) demands explicit
+  // confirmation before the spawn — this arms the Register button for one
+  // confirming click, mirroring confirmRemoveMcpId below.
+  let confirmRegisterMcp = $state(false);
   let confirmRemoveMcpId: string | null = $state(null);
   $effect(() => {
     if (section !== "mcp") return;
-    void $activeProfileId;
+    const profile = $activeProfileId;
     mcpLoading = true;
     mcpError = null;
     listMcpServers()
       .then((rows) => {
+        // The list is global, but bail on a mid-fetch profile switch anyway so
+        // a slow response can't clobber the re-run's state (staleness guard).
+        if (profile !== $activeProfileId) return;
         mcpServers = rows;
       })
       .catch((err) => {
+        if (profile !== $activeProfileId) return;
         mcpError = String(err);
       })
       .finally(() => {
+        if (profile !== $activeProfileId) return;
         mcpLoading = false;
       });
   });
@@ -503,6 +561,20 @@
       mcpError = "Name and command are required.";
       return;
     }
+    // Two-click confirm, mirroring handleRemoveMcp: the first click arms the
+    // button into a "Run <command>? Confirm" state showing the exact command
+    // line that will be spawned; only the second click (within 4s) invokes
+    // register_mcp_server. This is the explicit-confirmation half of that
+    // command's software-install contract — the F1 banner is only disclosure.
+    if (!confirmRegisterMcp) {
+      confirmRegisterMcp = true;
+      mcpError = null;
+      setTimeout(() => {
+        confirmRegisterMcp = false;
+      }, 4000);
+      return;
+    }
+    confirmRegisterMcp = false;
     mcpRegistering = true;
     mcpError = null;
     try {
@@ -603,8 +675,11 @@
     probeHardware().then((h) => (hardware = h)).catch(() => {});
     listModelCatalog().then((m) => (catalogModels = m)).catch(() => {});
     listLocalModels().then((m) => (localModels = m)).catch(() => {});
-    // M8 S5: seed the search pane with the trusted Staff picks.
-    if (mSearchResults.length === 0) void runModelSearch();
+    // Deliberately NO auto-search here: seeding the pane would (a) fire a live
+    // huggingface.co request on merely opening Settings→Models — silent egress
+    // in a privacy-first app — and (b) track mSearchResults in this effect,
+    // which runModelSearch reassigns, looping forever on an empty/failed
+    // search. The Search button / Enter is the only trigger.
   });
 
   async function startModelDownload(m: CatalogModel) {
@@ -1074,7 +1149,7 @@
         </ChatMessage>
       </div>
     </div>
-    <AppStatusBar session="0:12" />
+    <AppStatusBar />
   </main>
 </div>
 
@@ -1527,14 +1602,21 @@
                 {mSearchLoading ? "Searching…" : "Search"}
               </Button>
             </div>
+            <!-- Egress disclosure BEFORE any egress can happen: search never
+                 runs on its own, only from the button/Enter above. -->
+            <p class="mb-1.5 px-1 text-[11px] text-text-3">
+              Search and staff picks query huggingface.co — nothing is sent until
+              you search.
+            </p>
             {#if mSearchError}
               <div class="px-1 py-1.5 text-[12px] text-red-400">{mSearchError}</div>
             {/if}
             <div class="flex flex-col overflow-hidden rounded-[var(--r-lg)] border border-border">
               {#if mSearchResults.length === 0 && !mSearchLoading}
                 <div class="px-3 py-5 text-center text-[12px] text-text-3">
-                  No results{mSearchQuery.trim() ? ` for “${mSearchQuery.trim()}”` : ""}.
-                  Searches run against huggingface.co.
+                  {mSearchQuery.trim()
+                    ? `No results for “${mSearchQuery.trim()}”.`
+                    : "Nothing loaded yet — press Search with an empty query for the trusted staff picks."}
                 </div>
               {:else}
                 {#each mSearchResults as r (r.id)}
@@ -1571,10 +1653,12 @@
                         {:else if mDetail}
                           {#if mDetail.spec}
                             {@const spec = mDetail.spec}
+                            <!-- 0 params / 0 ctx are the backend's honest-unknown
+                                 sentinels (gguf_meta) — say "unknown", never "0.0B". -->
                             <div class="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-text-2">
                               <span>{spec.architecture}</span>
-                              <span>{spec.total_params_b.toFixed(1)}B params{spec.active_params_b < spec.total_params_b ? ` (${spec.active_params_b.toFixed(1)}B active)` : ""}</span>
-                              <span>native ctx {spec.native_context_len.toLocaleString()}</span>
+                              <span>{spec.total_params_b > 0 ? `${spec.total_params_b.toFixed(1)}B params${spec.active_params_b < spec.total_params_b ? ` (${spec.active_params_b.toFixed(1)}B active)` : ""}` : "params unknown"}</span>
+                              <span>{spec.native_context_len > 0 ? `native ctx ${spec.native_context_len.toLocaleString()}` : "native ctx unknown — context choices assumed"}</span>
                               {#if !spec.kv_exact}
                                 <span class="text-warn">KV size approximate</span>
                               {/if}
@@ -2122,7 +2206,11 @@
             </div>
           {:else if section === "mcp"}
             <!-- F1 (mandated): registering an MCP server is a SOFTWARE INSTALL.
-                 The warning is the contract recorded on register_mcp_server. -->
+                 This banner is only the DISCLOSURE half of the contract recorded
+                 on register_mcp_server (ipc/mod.rs) — the explicit-confirmation
+                 half is the Register button's two-click arm in
+                 handleRegisterMcp, which shows the exact command before it
+                 spawns. -->
             <div
               class="mb-4 rounded-r-[var(--r)] border-l-2 border-l-warn bg-warn-soft px-[13px] py-[10px] text-[12px] text-text-2"
             >
@@ -2197,7 +2285,11 @@
                     </select>
                   </label>
                   <Button onclick={() => void handleRegisterMcp()} disabled={mcpRegistering}>
-                    {mcpRegistering ? "Starting…" : "Register"}
+                    {mcpRegistering
+                      ? "Starting…"
+                      : confirmRegisterMcp
+                        ? `Run ${mcpForm.command.trim()}${mcpForm.argsText.trim() ? ` ${mcpForm.argsText.trim()}` : ""}? Confirm`
+                        : "Register"}
                   </Button>
                 </div>
                 <p class="text-[11px] text-text-3">

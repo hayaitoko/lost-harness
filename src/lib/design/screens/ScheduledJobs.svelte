@@ -40,14 +40,22 @@
 
   async function toggleJob(job: CronJobInfo, enabled: boolean) {
     error = null;
-    // Optimistic; revert on failure.
+    // Optimistic; on failure restore the snapshotted pre-request value
+    // (reverting to `!enabled` can land opposite reality when two failed
+    // toggles overlap), then re-list — cheap and authoritative.
+    const prev = job.enabled;
     jobs = jobs.map((j) => (j.id === job.id ? { ...j, enabled } : j));
     try {
       const ok = await setCronJobEnabled($activeProfileId, job.id, enabled);
       if (!ok) jobs = jobs.filter((j) => j.id !== job.id); // vanished backend-side
     } catch (err) {
       error = String(err);
-      jobs = jobs.map((j) => (j.id === job.id ? { ...j, enabled: !enabled } : j));
+      jobs = jobs.map((j) => (j.id === job.id ? { ...j, enabled: prev } : j));
+      try {
+        jobs = await listCronJobs($activeProfileId);
+      } catch {
+        // Keep the reverted snapshot if even the reconcile fetch fails.
+      }
     }
   }
 
@@ -198,6 +206,6 @@
       </div>
     </div>
 
-    <AppStatusBar session="0:12" />
+    <AppStatusBar />
   </main>
 </div>

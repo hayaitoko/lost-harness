@@ -132,15 +132,28 @@
   });
 
   // ── Workspace files tab: the profile workspace's top level (read-only).
+  // `wsSeq` drops stale responses (e.g. a slow listing landing after a
+  // profile switch) so only the latest request may write state.
   let wsEntries = $state<WorkspaceEntry[]>([]);
   let wsError: string | null = $state(null);
+  let wsLoading = $state(true);
+  let wsSeq = 0;
   $effect(() => {
     if (!whyOpen || panelTab !== "files") return;
     const profile = $activeProfileId;
+    const token = ++wsSeq;
+    wsLoading = true;
     wsError = null;
     listWorkspaceFiles(profile, "")
-      .then((rows) => (wsEntries = rows))
-      .catch((err) => (wsError = String(err)));
+      .then((rows) => {
+        if (token === wsSeq) wsEntries = rows;
+      })
+      .catch((err) => {
+        if (token === wsSeq) wsError = String(err);
+      })
+      .finally(() => {
+        if (token === wsSeq) wsLoading = false;
+      });
   });
 
   // ── "Why this was routed" — real classifier explanation of the last user
@@ -575,7 +588,7 @@
       </div>
     </div>
 
-    <AppStatusBar {binding} session="0:12" />
+    <AppStatusBar {binding} />
   </main>
 
   <div class="min-w-0 overflow-hidden">
@@ -687,6 +700,8 @@
             </div>
             {#if wsError}
               <div class="px-0.5 py-1 text-[12px] text-red-400">{wsError}</div>
+            {:else if wsLoading}
+              <p class="px-0.5 py-1 text-[12px] text-text-3">Loading…</p>
             {:else if wsEntries.length === 0}
               <p class="px-0.5 py-1 text-[12px] text-text-3">
                 Nothing here yet — files the assistant reads or writes for this

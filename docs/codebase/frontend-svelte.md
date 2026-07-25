@@ -1,5 +1,23 @@
 # Frontend (Svelte 5)
 
+> **⚠ 2026-07-24 UI bridge campaign — this doc's per-component tables predate it.**
+> What changed (trust HANDOFF's 2026-07-24 entry over any conflicting row below):
+> the app is now **functionally complete** — `ScreenId` is just
+> `main | files | scheduled-jobs | settings`, ALL live; the
+> **Email/Whiteboard/Editor/EmptyState/Onboarding mockup screens and
+> `shell-data.ts` were DELETED**, as were 16 never-imported components
+> (`BatonBanner`, `ClassifierControls`, `CommandPalette`, `ComposerRoutingNote`,
+> `ContextMenu`, `CostUsage`, `NotificationRollup`, `ProfilesSettings`,
+> `SeatAssignment`, `ServerPairing`, `SkillsSettings`, `SkillListItem`, `Tabs`,
+> `WhyPanel`, `FlyingBlindBanner`, `Slider`). New live surfaces: `Files.svelte`
+> (real read-only Tier-P workspace browser over `list_workspace_files`),
+> `ScheduledJobs.svelte` (real cron list/pause/delete over the new cron IPC),
+> `components/Toasts.svelte` + `stores/toasts.ts` (reroute + budget events),
+> the chat Stop button (`cancelActiveStream`), Settings' MCP/budget/shell-network
+> panes, and the M8 S5 model search + calculator in Settings→Models. MainScreen's
+> right panel is now `routing | files` only (mock tasks/agents/terminal tabs
+> deleted). Update the tables below on the next full doc regeneration.
+
 - **Purpose** — The Tauri webview UI. The real UI is the ported design system
   under `src/lib/design/` (chat shell, section screens, settings), rendered by
   `App.svelte` from a screen-router store. The old flat `src/lib/components/*`

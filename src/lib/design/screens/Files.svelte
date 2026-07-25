@@ -21,21 +21,39 @@
   let loading = $state(true);
   let error: string | null = $state(null);
 
+  // One effect owns both listing and the profile→root reset (a separate
+  // reset effect would run AFTER this one — sibling effects fire in creation
+  // order — and leak one request pairing the new profile with the old
+  // subpath). `seq` drops stale responses so a slow reply can't clobber a
+  // fresher listing.
+  let lastProfile: string | null = null;
+  let seq = 0;
   $effect(() => {
     const profile = $activeProfileId;
     const path = subpath;
+    if (profile !== lastProfile) {
+      lastProfile = profile;
+      if (path !== "") {
+        // The tree is per-profile: jump back to the root and let the re-run
+        // (subpath changed) issue the one clean request.
+        seq++; // invalidate anything in flight for the old tree
+        subpath = "";
+        return;
+      }
+    }
+    const token = ++seq;
     loading = true;
     error = null;
     listWorkspaceFiles(profile, path)
-      .then((rows) => (entries = rows))
-      .catch((err) => (error = String(err)))
-      .finally(() => (loading = false));
-  });
-
-  // Reset navigation when the profile changes (the tree is per-profile).
-  $effect(() => {
-    void $activeProfileId;
-    subpath = "";
+      .then((rows) => {
+        if (token === seq) entries = rows;
+      })
+      .catch((err) => {
+        if (token === seq) error = String(err);
+      })
+      .finally(() => {
+        if (token === seq) loading = false;
+      });
   });
 
   const crumbs = $derived(subpath === "" ? [] : subpath.split("/"));
@@ -195,6 +213,6 @@
       </div>
     </div>
 
-    <AppStatusBar session="0:12" />
+    <AppStatusBar />
   </main>
 </div>
