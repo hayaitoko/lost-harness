@@ -57,3 +57,6 @@ oauth-client*.json
 # Local model/runtime artifacts
 models/
 *.gguf
+
+# Claude Code — personal per-user overrides (the shared .claude/settings.json IS committed)
+.claude/settings.local.json

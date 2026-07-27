@@ -1,0 +1,25 @@
+{
+  "$comment": "Shared, committed Claude Code settings for collaborators. Only safe, read-only, and verification commands are pre-allowed so a collaborator's agent isn't prompted for the normal build/test loop. Anything that mutates history, the network, or the filesystem outside the workspace still prompts. Put personal overrides in .claude/settings.local.json (gitignored).",
+  "permissions": {
+    "allow": [
+      "Bash(cargo test:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(npm ci)",
+      "Bash(npm run check:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm run tauri:*)",
+      "Bash(npm test:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(rg:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)"
+    ]
+  }
+}
