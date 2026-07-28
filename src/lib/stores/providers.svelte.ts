@@ -12,6 +12,7 @@
 // later is a no-op for the UI.
 
 import * as api from "../api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 
 export type ProviderKind = "local" | "cloud" | "custom";
 
@@ -19,7 +20,9 @@ export interface Provider {
   id: string;
   name: string;
   baseUrl: string;
-  apiKey: string;
+  /** Whether a key has been stored for this provider. The key itself lives
+   *  in the OS keychain and NEVER enters the renderer process. */
+  hasApiKey: boolean;
   kind: ProviderKind;
   /** Whether the backend classified the endpoint as private/LAN. */
   isPrivate: boolean;
@@ -32,8 +35,33 @@ export interface Provider {
   trustedByName: boolean;
 }
 
+/** Input shape for addProvider — the caller (Settings UI) provides an
+ *  apiKey string, but the store never keeps it in the frontend model.
+ *  It is sent directly to the OS keychain via the one-shot IPC and
+ *  immediately discarded from renderer memory. */
+export interface ProviderInput {
+  id?: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  kind: ProviderKind;
+  supportsNativeTools: boolean;
+}
+
 const STORAGE_KEY = "lh.providers.v1";
 const ACTIVE_KEY = "lh.providers.active.v1";
+
+/** Migrate old stored data: strip `apiKey` from any stored Provider objects
+ *  (replaced with a `hasApiKey` boolean). Also strips apiKey from any
+ *  residual objects that slipped through before this fix. */
+function migrateProviders(raw: unknown): Provider[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((p: Record<string, unknown>) => {
+    const hadKey = typeof p.apiKey === "string" && (p.apiKey as string).length > 0;
+    const { apiKey: _, ...rest } = p;
+    return { ...rest, hasApiKey: hadKey } as unknown as Provider;
+  });
+}
 
 function loadFromStorage(): {
   providers: Provider[];
@@ -45,7 +73,7 @@ function loadFromStorage(): {
   try {
     const rawProv = localStorage.getItem(STORAGE_KEY);
     const rawActive = localStorage.getItem(ACTIVE_KEY);
-    const providers: Provider[] = rawProv ? JSON.parse(rawProv) : [];
+    const providers: Provider[] = rawProv ? migrateProviders(JSON.parse(rawProv)) : [];
     let activeProviderId: string | null = null;
     let activeModel: string | null = null;
     if (rawActive) {
@@ -82,7 +110,11 @@ const modelCache = new Map<string, string[]>();
 function persistProviders(): void {
   if (typeof localStorage === "undefined") return;
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(providersStore.providers));
+    // Strip any residual apiKey field before persisting (defense in depth).
+    const cleaned = providersStore.providers.map(
+      (p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl, hasApiKey: p.hasApiKey, kind: p.kind, isPrivate: p.isPrivate, supportsNativeTools: p.supportsNativeTools, trustedByName: p.trustedByName }),
+    );
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(cleaned));
   } catch {
     // localStorage may be unavailable; non-fatal.
   }
@@ -103,6 +135,30 @@ function persistActive(): void {
   }
 }
 
+// ── One-shot key injection IPC ────────────────────────────────────────────
+
+/**
+ * Sends an API key to the backend via the dedicated `set_provider_api_key`
+ * one-shot IPC. The backend stores it in the OS keychain. The frontend
+ * NEVER retains the key in memory or localStorage. In browser fallback
+ * mode this is a no-op (no keychain available).
+ */
+async function setProviderApiKey(
+  providerId: string,
+  apiKey: string,
+): Promise<void> {
+  if (typeof window !== "undefined" && typeof (window as any).__TAURI_INTERNALS__ !== "undefined") {
+    try {
+      await invoke("set_provider_api_key", {
+        args: { provider_id: providerId, api_key: apiKey },
+      });
+    } catch (err) {
+      console.error("setProviderApiKey failed", err);
+    }
+  }
+  // Browser fallback: no keychain — key is dropped.
+}
+
 // ── Hydration from backend ──────────────────────────────────────────────────
 
 /**
@@ -115,24 +171,27 @@ export async function hydrateProviders(): Promise<void> {
   try {
     const remote = await api.listProviders();
     // Map ProviderInfo → Provider (camelCase for the frontend).
-    const mapped: Provider[] = remote.map((p) => ({
-      id: p.id,
-      name: p.name,
-      baseUrl: p.base_url,
-      apiKey: "", // backend omits the key; user must re-enter to edit
-      kind: (p.kind as ProviderKind) ?? "custom",
-      isPrivate: p.is_private,
-      supportsNativeTools: p.supports_native_tools,
-      trustedByName: p.trusted_by_name,
-    }));
+        // The backend never returns the API key itself; it may or may not
+        // return has_api_key (P05 adds this). We default to false and rely
+        // on the local-merge below until the backend catches up.
+        const mapped: Provider[] = remote.map((p) => ({
+          id: p.id,
+          name: p.name,
+          baseUrl: p.base_url,
+          hasApiKey: (p as any).has_api_key ?? false,
+          kind: (p.kind as ProviderKind) ?? "custom",
+          isPrivate: p.is_private,
+          supportsNativeTools: p.supports_native_tools,
+          trustedByName: p.trusted_by_name,
+        }));
 
-    // Merge: if a local provider has the same id, keep the local apiKey
-    // (the backend never returns it). Otherwise add the remote one.
-    const localById = new Map(providersStore.providers.map((p) => [p.id, p]));
-    const merged: Provider[] = mapped.map((p) => {
-      const local = localById.get(p.id);
-      return local ? { ...p, apiKey: local.apiKey } : p;
-    });
+        // Merge: if a local provider has the same id, preserve the local
+        // hasApiKey (the backend doesn't return it yet; P05 adds it).
+        const localById = new Map(providersStore.providers.map((p) => [p.id, p]));
+        const merged: Provider[] = mapped.map((p) => {
+          const local = localById.get(p.id);
+          return local ? { ...p, hasApiKey: local.hasApiKey } : p;
+        });
     // Browser fallback owns its local store. In the installed app, treating
     // an unknown cache entry as real would resurrect a failed/deleted
     // provider after restart and falsely imply it was saved.
@@ -181,35 +240,44 @@ export async function fetchModels(providerId: string): Promise<string[]> {
   }
 }
 
-/** Add a provider through the backend (or the bridge's browser-mode mock). */
+/** Add a provider through the backend (or the bridge's browser-mode mock).
+ *  The caller provides an apiKey string; the store sends it to the backend
+ *  via the secure one-shot IPC (`set_provider_api_key`) and immediately
+ *  drops it — only `hasApiKey: boolean` is kept in the frontend model. */
 export async function addProvider(
-  p: Omit<Provider, "id" | "isPrivate" | "trustedByName"> & { id?: string },
+  input: ProviderInput,
 ): Promise<Provider> {
-  const existingIdx = providersStore.providers.findIndex((x) => x.id === p.id);
+  const existingIdx = providersStore.providers.findIndex((x) => x.id === input.id);
 
   if (existingIdx >= 0) {
     // Update existing — round-trip through the backend so the edit
     // survives a restart (hydrateProviders re-pulls from global.db).
-    const id = p.id!;
+    const id = input.id!;
     const existing = providersStore.providers[existingIdx];
-    // The edit form leaves the key field blank rather than echoing the
-    // stored secret; blank means "keep the stored key".
-    const apiKey = p.apiKey || existing.apiKey;
+    // If the form had a non-blank key, send it via one-shot IPC; blank
+    // means "keep the existing key" (already stored in the OS keychain).
+    const gotNewKey = !!input.apiKey;
+
     try {
       const info = await api.updateProvider(
         id,
-        p.name.trim(),
-        p.baseUrl.trim(),
-        p.apiKey || null,
-        p.kind,
-        p.supportsNativeTools,
+        input.name.trim(),
+        input.baseUrl.trim(),
+        null, // key never flows through the provider-update IPC
+        input.kind,
+        input.supportsNativeTools,
       );
+
+      if (gotNewKey) {
+        await setProviderApiKey(id, input.apiKey);
+      }
+
       providersStore.providers[existingIdx] = {
         id: info.id,
         name: info.name,
         baseUrl: info.base_url,
-        apiKey,
-        kind: (info.kind as ProviderKind) ?? p.kind,
+        hasApiKey: gotNewKey || existing.hasApiKey,
+        kind: (info.kind as ProviderKind) ?? input.kind,
         isPrivate: info.is_private,
         supportsNativeTools: info.supports_native_tools,
         trustedByName: info.trusted_by_name,
@@ -229,18 +297,23 @@ export async function addProvider(
   // New provider — round-trip through the backend.
   try {
     const info = await api.addProvider(
-      p.name.trim(),
-      p.baseUrl.trim(),
-      p.apiKey || null,
-      p.kind,
-      p.supportsNativeTools,
+      input.name.trim(),
+      input.baseUrl.trim(),
+      null, // key never flows through the provider-creation IPC
+      input.kind,
+      input.supportsNativeTools,
     );
+
+    if (input.apiKey) {
+      await setProviderApiKey(info.id, input.apiKey);
+    }
+
     const provider: Provider = {
       id: info.id,
       name: info.name,
       baseUrl: info.base_url,
-      apiKey: p.apiKey ?? "",
-      kind: (info.kind as ProviderKind) ?? p.kind,
+      hasApiKey: !!input.apiKey,
+      kind: (info.kind as ProviderKind) ?? input.kind,
       isPrivate: info.is_private,
       supportsNativeTools: info.supports_native_tools,
       trustedByName: info.trusted_by_name,
