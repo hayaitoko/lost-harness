@@ -29,7 +29,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: Cache cargo registry & target
         uses: actions/cache@v4
@@ -73,21 +73,21 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      # ── Rust checks ─────────────────────────────────────────────────────
-      - name: cargo build
+      # ── Rust checks (arm64-only — no x86_64 runtime files exist) ───────
+      - name: cargo build (aarch64)
         working-directory: src-tauri
-        run: cargo build --verbose
+        run: cargo build --target aarch64-apple-darwin --verbose
 
-      - name: cargo clippy (correctness gate)
+      - name: cargo clippy (correctness gate, aarch64)
         working-directory: src-tauri
         # The repository still carries non-correctness warning debt. Make
         # correctness findings release-blocking now; tighten to `-D warnings`
         # once the tracked warning backlog is cleared.
-        run: cargo clippy --all-targets -- -D clippy::correctness
+        run: cargo clippy --target aarch64-apple-darwin --all-targets -- -D clippy::correctness
 
-      - name: cargo test
+      - name: cargo test (aarch64)
         working-directory: src-tauri
-        run: cargo test --verbose
+        run: cargo test --target aarch64-apple-darwin --verbose
 
       - name: cargo audit (advisory)
         uses: rustsec/audit-check@v2.0.0

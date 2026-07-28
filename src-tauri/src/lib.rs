@@ -600,6 +600,15 @@ pub fn run() {
 /// resources (`bundle.resources` maps `vendor/llama-cpp` → `llama-cpp`) → the
 /// repo's vendor tree (debug/`tauri dev` fallback). `None` = no sidecar; local
 /// models then need an external runner (honest degradation, logged).
+///
+/// # Platform constraint
+/// This function is **arm64-only** (Apple Silicon). Every vendored runtime
+/// path is hardcoded to `macos-arm64/` and no x86_64 runtime files exist.
+/// Building for x86_64-apple-darwin with `feature = "local-runner"` is a
+/// compile-time error.
+#[cfg(feature = "local-runner")]
+#[cfg(not(target_arch = "aarch64"))]
+compile_error!("feature 'local-runner' is arm64-only: vendored llama-server binary only ships for macos-arm64; set --target aarch64-apple-darwin or remove the local-runner feature");
 #[cfg(feature = "local-runner")]
 fn resolve_sidecar_bin(app: &tauri::App) -> Option<PathBuf> {
     use tauri::Manager;

@@ -21,13 +21,22 @@ model providers, per-profile storage, gated tools, and local-first routing.
 See [HANDOFF.md](HANDOFF.md) for the current engineering state, and
 [docs/ROADMAP.md](docs/ROADMAP.md) for planned work.
 
+## Support matrix
+
+| Component | Constraint |
+|-----------|-----------|
+| **Architecture** | Apple Silicon (arm64) only. No x86_64 runtime files are shipped — the vendored `llama-server` binary and its dylibs are arm64 only. |
+| **Minimum OS** | macOS 15 (Sequoia) or later. The vendored llama-server binary (`LC_BUILD_VERSION minos 26.0`) requires at least this version; rebuilding it against an older SDK is a manual build task (see [Needs human decision](#needs-human-decision)). |
+| **Xcode** | Xcode Command Line Tools (macOS) or Xcode.app. |
+| **Node.js** | 20 or newer. |
+| **Rust** | 1.77 or newer via `rustup`. |
+
+> **Note:** The vendored llama.cpp runtime is a pre-built binary distributed in
+> `vendor/llama-cpp/macos-arm64/`. If you need to run on an older macOS version,
+> you must rebuild llama.cpp against the appropriate SDK and update the
+> vendored files.
+
 ## Development setup
-
-Requirements:
-
-- macOS with Xcode Command Line Tools (the primary supported platform).
-- Node.js 20 or newer.
-- Rust 1.77 or newer via `rustup`.
 
 ```sh
 git clone https://github.com/hayaitoko/lost-harness.git
