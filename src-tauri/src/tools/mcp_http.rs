@@ -2,6 +2,7 @@
 //! replaced the legacy HTTP+SSE transport with this single POST/GET endpoint;
 //! responses may still be JSON or SSE, so both are accepted here.
 
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use super::mcp::{McpToolAnnotations, McpToolDescriptor, McpTransport};
@@ -9,6 +10,7 @@ use super::mcp::{McpToolAnnotations, McpToolDescriptor, McpTransport};
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_REDIRECT_HOPS: usize = 5;
 
 /// A validated Streamable HTTP endpoint. HTTPS is mandatory except for a
 /// loopback HTTP endpoint used for local development; credentials/fragments in
@@ -19,8 +21,17 @@ pub fn validate_endpoint(raw: &str) -> Result<url::Url, String> {
     if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
         return Err("MCP endpoint URLs may not contain credentials or fragments".to_string());
     }
-    let host = url.host_str().unwrap_or_default();
-    let loopback = matches!(host, "127.0.0.1" | "::1" | "localhost");
+    // L-04: Parse the host as an IP address using url::Host so that all IPv6
+    // representations (::1, 0:0:0:0:0:0:0:1, etc.) are handled by the standard
+    // library's is_loopback() instead of naive string matching.
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        Some(url::Host::Domain(d)) => {
+            d.eq_ignore_ascii_case("localhost") || d.eq_ignore_ascii_case("localhost.")
+        }
+        None => false,
+    };
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
         return Err(
             "MCP endpoints must use HTTPS (HTTP is allowed only for localhost)".to_string(),
@@ -47,6 +58,10 @@ impl HttpMcpTransport {
         let client = reqwest::Client::builder()
             .timeout(RPC_TIMEOUT)
             .connect_timeout(std::time::Duration::from_secs(10))
+            // H-02: Disable automatic redirects — we follow manually with
+            // per-hop security checks so cross-origin session headers never
+            // leak and private destinations are rejected.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("couldn't build MCP HTTP client: {e}"))?;
         let transport = Self {
@@ -74,30 +89,90 @@ impl HttpMcpTransport {
         Ok(transport)
     }
 
+    /// Send a POST, manually following redirects with per-hop security checks.
+    ///
+    /// H-02: Redirects are not automatic. Every hop re-validates the endpoint,
+    /// rejects scheme downgrades, blocks private/loopback destinations, and
+    /// never forwards the session token across origins.
     async fn post(
         &self,
         payload: serde_json::Value,
         include_protocol: bool,
     ) -> Result<reqwest::Response, String> {
-        let mut request = self
-            .client
-            .post(self.endpoint.clone())
-            .header(
-                reqwest::header::ACCEPT,
-                "application/json, text/event-stream",
-            )
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&payload);
-        if include_protocol {
-            request = request.header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION);
+        let mut url = self.endpoint.clone();
+        let mut hop = 0usize;
+        // Snapshot the session token before following any redirects so we
+        // never forward it across a redirect boundary.
+        let session_token = self.session_id.lock().await.clone();
+
+        loop {
+            let mut request = self
+                .client
+                .post(url.clone())
+                .header(
+                    reqwest::header::ACCEPT,
+                    "application/json, text/event-stream",
+                )
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&payload);
+            if include_protocol {
+                request = request.header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION);
+            }
+            // H-02: Session header only on the original hop — never forwarded
+            // across a redirect boundary.
+            if hop == 0 {
+                if let Some(ref session) = session_token {
+                    request = request.header("Mcp-Session-Id", session.clone());
+                }
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("MCP HTTP POST failed: {e}"))?;
+
+            // Manual redirect following with per-hop security gates.
+            if response.status().is_redirection() {
+                if hop >= MAX_REDIRECT_HOPS {
+                    return Err(format!(
+                        "MCP HTTP redirect limit ({MAX_REDIRECT_HOPS}) exceeded"
+                    ));
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .ok_or("MCP redirect response missing Location header".to_string())?;
+                let location_str = location
+                    .to_str()
+                    .map_err(|_| "MCP redirect Location is not valid UTF-8".to_string())?;
+                let new_url = url::Url::parse(location_str)
+                    .or_else(|_| url.join(location_str))
+                    .map_err(|_| "MCP redirect Location could not be resolved".to_string())?;
+
+                // H-02: Re-run full endpoint validation every hop.
+                validate_endpoint(new_url.as_str()).map_err(|e| {
+                    format!("MCP redirect target rejected by endpoint validation: {e}")
+                })?;
+
+                // H-02: Reject scheme downgrade (HTTPS → HTTP).
+                if url.scheme() == "https" && new_url.scheme() != "https" {
+                    return Err("MCP redirect scheme downgrade from HTTPS is rejected".to_string());
+                }
+
+                // H-02: Reject private / loopback / unspecified destinations.
+                if is_private_destination(&new_url).await? {
+                    return Err(
+                        "MCP redirect to a private or loopback address is rejected".to_string()
+                    );
+                }
+
+                hop += 1;
+                url = new_url;
+                continue;
+            }
+
+            return Ok(response);
         }
-        if let Some(session) = self.session_id.lock().await.clone() {
-            request = request.header("Mcp-Session-Id", session);
-        }
-        request
-            .send()
-            .await
-            .map_err(|e| format!("MCP HTTP POST failed: {e}"))
     }
 
     async fn rpc(
@@ -107,13 +182,13 @@ impl HttpMcpTransport {
         include_protocol: bool,
     ) -> Result<serde_json::Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let response = self
+        let mut response = self
             .post(
                 serde_json::json!({"jsonrpc":"2.0", "id": id, "method": method, "params": params}),
                 include_protocol,
             )
             .await?;
-        self.capture_session(&response).await;
+        self.capture_session(&mut response).await;
         let status = response.status();
         let content_type = response
             .headers()
@@ -121,13 +196,26 @@ impl HttpMcpTransport {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| format!("MCP HTTP response read failed: {e}"))?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err("MCP HTTP response exceeds 4 MB limit".to_string());
+
+        // M-01: Stream response body through a byte counter instead of
+        // buffering everything into .bytes() before checking the limit.
+        let mut body = Vec::with_capacity(4096);
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .map_err(|e| format!("MCP HTTP response read failed: {e}"))?;
+            match chunk {
+                Some(bytes) => {
+                    if body.len().saturating_add(bytes.len()) > MAX_RESPONSE_BYTES {
+                        return Err("MCP HTTP response exceeds 4 MB limit".to_string());
+                    }
+                    body.extend_from_slice(&bytes);
+                }
+                None => break,
+            }
         }
+
         if !status.is_success() {
             return Err(format!(
                 "MCP HTTP {status}: {}",
@@ -241,6 +329,43 @@ impl McpTransport for HttpMcpTransport {
     }
 }
 
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+/// H-02: Check whether a resolved URL points to a private, loopback, or
+/// unspecified IP address. For domain names, DNS-resolve and inspect every
+/// returned address.
+async fn is_private_destination(url: &url::Url) -> Result<bool, String> {
+    match url.host() {
+        Some(url::Host::Ipv4(addr)) => {
+            Ok(addr.is_private() || addr.is_loopback() || addr.is_unspecified())
+        }
+        Some(url::Host::Ipv6(addr)) => {
+            Ok(addr.is_loopback() || addr.is_unspecified() || addr.is_unique_local())
+        }
+        Some(url::Host::Domain(host)) => {
+            let port = url.port_or_known_default().unwrap_or(443);
+            let mut addrs = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| format!("MCP redirect DNS resolution failed: {e}"))?;
+            let mut has_private = false;
+            for addr in addrs.by_ref() {
+                let is_private = match addr.ip() {
+                    IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_unspecified(),
+                    IpAddr::V6(v6) => {
+                        v6.is_loopback() || v6.is_unspecified() || v6.is_unique_local()
+                    }
+                };
+                if is_private {
+                    has_private = true;
+                    break;
+                }
+            }
+            Ok(has_private)
+        }
+        None => Ok(true), // No host → fail closed.
+    }
+}
+
 fn parse_jsonrpc(raw: &[u8], id: i64) -> Result<serde_json::Value, String> {
     let message: serde_json::Value =
         serde_json::from_slice(raw).map_err(|e| format!("MCP HTTP JSON decode failed: {e}"))?;
@@ -294,7 +419,16 @@ mod tests {
     fn endpoints_require_https_except_loopback() {
         assert!(validate_endpoint("https://example.com/mcp").is_ok());
         assert!(validate_endpoint("http://127.0.0.1:3000/mcp").is_ok());
+        // L-04: IPv6 loopback in canonical and expanded forms.
+        assert!(validate_endpoint("http://[::1]:3000/mcp").is_ok());
+        assert!(validate_endpoint("http://[0:0:0:0:0:0:0:1]:3000/mcp").is_ok());
+        // L-04: localhost variants — case-insensitive, trailing dot.
+        assert!(validate_endpoint("http://localhost:3000/mcp").is_ok());
+        assert!(validate_endpoint("http://LOCALHOST:3000/mcp").is_ok());
+        assert!(validate_endpoint("http://localhosT.:3000/mcp").is_ok());
+        // Non-loopback HTTP is rejected.
         assert!(validate_endpoint("http://example.com/mcp").is_err());
+        // Credentials and fragments are rejected.
         assert!(validate_endpoint("https://user:secret@example.com/mcp").is_err());
     }
 
