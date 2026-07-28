@@ -765,10 +765,10 @@ impl Tool for WriteFileTool {
         ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let Some(path) = arg_str(&input, "path") else {
+            let Some(path) = arg_str(&input, "path").map(String::from) else {
                 return ToolResult::Err("write_file requires a string \"path\" arg".to_string());
             };
-            let Some(content) = arg_str(&input, "content") else {
+            let Some(content) = arg_str(&input, "content").map(String::from) else {
                 return ToolResult::Err(
                     "write_file requires a string \"content\" arg".to_string(),
                 );
@@ -779,32 +779,22 @@ impl Tool for WriteFileTool {
                     content.len()
                 ));
             }
+            if let Err(e) = ensure_valid_profile(&ctx.profile) {
+                return ToolResult::Err(e);
+            }
             let ws = profile_workspace_path(&self.root, &ctx.profile);
-            let _ = std::fs::create_dir_all(&ws);
-            let resolved = match resolve_within_new(&ws, path) {
-                Ok(p) => p,
+            let _ = tokio::fs::create_dir_all(&ws).await;
+            let resolved = match resolve_within_new_async(ws.clone(), path.clone()).await {
+                Ok(v) => v,
                 Err(e) => return ToolResult::Err(e),
             };
-            // Refuse to clobber a directory with a file write.
-            if resolved.is_dir() {
+            if tokio::fs::metadata(&resolved).await.map(|m| m.is_dir()).unwrap_or(false) {
                 return ToolResult::Err(format!("'{path}' is a directory"));
             }
-            let existed = resolved.exists();
-            // Read-before-write: refuse to overwrite an EXISTING file the agent
-            // hasn't read this conversation, so it can't clobber blind (matches
-            // Claude Code). A brand-new file is exempt — nothing to lose. No-op
-            // unless the dispatcher wired a read-set into the context.
+            let existed = tokio::fs::try_exists(&resolved).await.unwrap_or(false);
             if existed {
                 if let Some(reads) = &ctx.reads {
-                    // Match read_file's recorded key: it records the FULLY
-                    // canonicalized path (leaf case/normalization corrected to
-                    // the on-disk form). `resolved` here keeps the RAW requested
-                    // leaf (resolve_within_new only canonicalizes the parent),
-                    // which differs on case-insensitive / Unicode-normalizing
-                    // filesystems (macOS/Windows) — so canonicalize the existing
-                    // target before the membership check, or a real read→write
-                    // is falsely refused.
-                    let key = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+                    let key = tokio::fs::canonicalize(&resolved).await.unwrap_or_else(|_| resolved.clone());
                     if !reads.contains(&ctx.conversation_id, &key) {
                         return ToolResult::Err(format!(
                             "refusing to write '{path}': read_file it first so you're not overwriting blind"
@@ -812,24 +802,18 @@ impl Tool for WriteFileTool {
                     }
                 }
             }
-            match atomic_write(&resolved, content) {
-                Ok(()) => {
-                    // The agent authored this content, so it isn't "blind" to
-                    // the file — record it (by canonical path, now that it
-                    // exists) so a later overwrite/edit this conversation isn't
-                    // refused. Covers the create-then-overwrite case.
+            let resolved2 = resolved.clone();
+            let content2 = content.clone();
+            match tokio::task::spawn_blocking(move || atomic_write(&resolved2, &content2)).await {
+                Ok(Ok(())) => {
                     if let Some(reads) = &ctx.reads {
-                        let key =
-                            std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+                        let key = tokio::fs::canonicalize(&resolved).await.unwrap_or_else(|_| resolved.clone());
                         reads.record(&ctx.conversation_id, key);
                     }
-                    ToolResult::Ok(json!({
-                        "path": path,
-                        "bytes_written": content.len(),
-                        "created": !existed,
-                    }))
+                    ToolResult::Ok(json!({"path": path, "bytes_written": content.len(), "created": !existed}))
                 }
-                Err(e) => ToolResult::Err(format!("write '{path}': {e}")),
+                Ok(Err(e)) => ToolResult::Err(format!("write '{path}': {e}")),
+                Err(e) => ToolResult::Err(format!("write task failed: {e}")),
             }
         })
     }
@@ -873,28 +857,31 @@ impl Tool for EditFileTool {
         ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let Some(path) = arg_str(&input, "path") else {
+            let Some(path) = arg_str(&input, "path").map(String::from) else {
                 return ToolResult::Err("edit_file requires a string \"path\" arg".to_string());
             };
-            let Some(old) = arg_str(&input, "old") else {
+            let Some(old) = arg_str(&input, "old").map(String::from) else {
                 return ToolResult::Err("edit_file requires a string \"old\" arg".to_string());
             };
-            let Some(new) = arg_str(&input, "new") else {
+            let Some(new) = arg_str(&input, "new").map(String::from) else {
                 return ToolResult::Err("edit_file requires a string \"new\" arg".to_string());
             };
             if old.is_empty() {
                 return ToolResult::Err("edit_file \"old\" must not be empty".to_string());
             }
-            // Must exist — use the strict resolver.
+            if let Err(e) = ensure_valid_profile(&ctx.profile) {
+                return ToolResult::Err(e);
+            }
             let ws = profile_workspace_path(&self.root, &ctx.profile);
-            let _ = std::fs::create_dir_all(&ws);
-            let resolved = match resolve_within(&ws, path) {
-                Ok(p) => p,
+            let _ = tokio::fs::create_dir_all(&ws).await;
+            let ws_canon = match tokio::fs::canonicalize(&ws).await {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(format!("workspace root unavailable: {e}")),
+            };
+            let resolved = match resolve_within_async(ws.clone(), path.clone()).await {
+                Ok(v) => v,
                 Err(e) => return ToolResult::Err(e),
             };
-            // Read-before-write: an edit rewrites the file, so require it was
-            // read this conversation first (a blind-edit guard). No-op unless
-            // the dispatcher wired a read-set into the context.
             if let Some(reads) = &ctx.reads {
                 if !reads.contains(&ctx.conversation_id, &resolved) {
                     return ToolResult::Err(format!(
@@ -902,11 +889,16 @@ impl Tool for EditFileTool {
                     ));
                 }
             }
-            let content = match std::fs::read_to_string(&resolved) {
-                Ok(c) => c,
-                Err(e) => return ToolResult::Err(format!("read '{path}': {e} (not UTF-8 text?)")),
+            let (mut file, _real_path) = match open_verified(&resolved, &ws_canon) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(format!("cannot access '{path}': {e}")),
             };
-            let count = content.matches(old).count();
+            use std::io::Read;
+            let mut content = String::new();
+            if let Err(e) = file.by_ref().take(MAX_WRITE_BYTES as u64 + 1).read_to_string(&mut content) {
+                return ToolResult::Err(format!("read '{path}': {e} (not UTF-8 text?)"));
+            }
+            let count = content.matches(&old).count();
             if count == 0 {
                 return ToolResult::Err(format!("edit_file: \"old\" not found in '{path}'"));
             }
@@ -915,20 +907,19 @@ impl Tool for EditFileTool {
                     "edit_file: \"old\" occurs {count} times in '{path}' — make it unique (add surrounding context)"
                 ));
             }
-            let updated = content.replacen(old, new, 1);
+            let updated = content.replacen(&old, &new, 1);
             if updated.len() > MAX_WRITE_BYTES {
                 return ToolResult::Err(format!(
                     "result is {} bytes, over the {MAX_WRITE_BYTES}-byte write limit",
                     updated.len()
                 ));
             }
-            match atomic_write(&resolved, &updated) {
-                Ok(()) => ToolResult::Ok(json!({
-                    "path": path,
-                    "replaced": 1,
-                    "bytes": updated.len(),
-                })),
-                Err(e) => ToolResult::Err(format!("write '{path}': {e}")),
+            let resolved2 = resolved.clone();
+            let updated2 = updated.clone();
+            match tokio::task::spawn_blocking(move || atomic_write(&resolved2, &updated2)).await {
+                Ok(Ok(())) => ToolResult::Ok(json!({"path": path, "replaced": 1, "bytes": updated.len()})),
+                Ok(Err(e)) => ToolResult::Err(format!("write '{path}': {e}")),
+                Err(e) => ToolResult::Err(format!("edit write task failed: {e}")),
             }
         })
     }
@@ -970,23 +961,46 @@ impl Tool for DeleteFileTool {
         ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let Some(path) = arg_str(&input, "path") else {
+            let Some(path) = arg_str(&input, "path").map(String::from) else {
                 return ToolResult::Err("delete_file requires a string \"path\" arg".to_string());
             };
+            if let Err(e) = ensure_valid_profile(&ctx.profile) {
+                return ToolResult::Err(e);
+            }
             let ws = profile_workspace_path(&self.root, &ctx.profile);
-            let _ = std::fs::create_dir_all(&ws);
-            let resolved = match resolve_within(&ws, path) {
-                Ok(p) => p,
+            let _ = tokio::fs::create_dir_all(&ws).await;
+            let ws_canon = match tokio::fs::canonicalize(&ws).await {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(format!("workspace root unavailable: {e}")),
+            };
+            let resolved = match resolve_within_async(ws.clone(), path.clone()).await {
+                Ok(v) => v,
                 Err(e) => return ToolResult::Err(e),
             };
+            let parent = resolved.parent().unwrap_or(&resolved);
+            let parent_file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(parent) {
+                Ok(f) => f,
+                Err(e) => return ToolResult::Err(format!("open parent directory: {e}")),
+            };
+            let parent_real = match fd_realpath(parent_file.as_raw_fd()) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::Err(format!("verify parent: {e}")),
+            };
+            if !parent_real.starts_with(&ws_canon) {
+                return ToolResult::Err(format!("'{path}' escaped the workspace"));
+            }
             if resolved.is_dir() {
                 return ToolResult::Err(format!(
                     "'{path}' is a directory — delete_file only removes files"
                 ));
             }
-            match std::fs::remove_file(&resolved) {
-                Ok(()) => ToolResult::Ok(json!({ "path": path, "deleted": true })),
-                Err(e) => ToolResult::Err(format!("delete '{path}': {e}")),
+            match tokio::task::spawn_blocking(move || std::fs::remove_file(&resolved)).await {
+                Ok(Ok(())) => ToolResult::Ok(json!({ "path": path, "deleted": true })),
+                Ok(Err(e)) => ToolResult::Err(format!("delete '{path}': {e}")),
+                Err(e) => ToolResult::Err(format!("delete task failed: {e}")),
             }
         })
     }
