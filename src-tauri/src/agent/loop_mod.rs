@@ -147,12 +147,12 @@ impl ModelStreamer for ModelClient {
 /// The §9 agent loop. Cheap to clone (`Arc` fields). `process_message` is
 /// the only entry point the IPC layer needs.
 ///
-/// Stream serialization: a `tokio::sync::Mutex<()>` guards the in-flight
-/// stream so two concurrent `process_message` calls (from different
-/// Tauri commands on the thread pool) don't both open connections and
-/// race on the shared storage. The lock is held for the duration of one
-/// message — fine for a chat UX where one in-flight stream per app is
-/// the natural shape.
+/// Stream serialization: locking is PER-CONVERSATION — a
+/// `HashMap<String, Arc<tokio::sync::Mutex<()>>>` guards the in-flight
+/// stream per `conversation_id`, so a stalled model/provider in one
+/// conversation does not block others. The lock is held for the duration
+/// of one message — fine for a chat UX where one in-flight stream per
+/// conversation is the natural shape.
 pub struct AgentLoop {
     gate: PrivacyGate,
     model_manager: Arc<ModelManager>,
@@ -172,7 +172,8 @@ pub struct AgentLoop {
     /// Keyed by conversation id; holds both buckets — the per-turn renderer
     /// applies the endpoint privacy filter, so a private fact never rides a
     /// cloud turn even though the frozen set includes it.
-    summary_cache: parking_lot::Mutex<std::collections::HashMap<String, Vec<(MemoryFact, MemoryBucket)>>>,
+    summary_cache:
+        parking_lot::Mutex<std::collections::HashMap<String, Vec<(MemoryFact, MemoryBucket)>>>,
     /// Per-conversation cloud-safety cache (privacy). Re-classifying every prior
     /// turn on each cloud send is expensive AND, capped, would wrongly force a
     /// long-but-benign cloud chat local. This caches `(is_safe, verified_count,
@@ -194,8 +195,9 @@ pub struct AgentLoop {
     /// for durable facts at most once. `Arc` so the new-chat nudge's detached
     /// task can share it with the on-stream flush. Same bounded-cache discipline
     /// as `summary_cache`/`cloud_safe_cache`.
-    flush_marks:
-        Arc<parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
+    flush_marks: Arc<
+        parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    >,
     /// Wave 4.2: the autonomous skill drafter (a LOCAL model in production; a fake
     /// in tests). `None` ⇒ reflection is disabled. Even when wired, it only runs
     /// if the global `skill_reflect_enabled` toggle is on, and its drafts are
@@ -210,7 +212,8 @@ pub struct AgentLoop {
     /// exactly the pre-S4 behavior. `lib.rs` sets it.
     #[cfg(feature = "local-runner")]
     local_runner: Option<Arc<crate::models::runner::LocalRunnerContext>>,
-    stream_lock: tokio::sync::Mutex<()>,
+    stream_locks:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// B7: a test-only injectable model streamer. `None` in production (one
     /// `Option` check on the per-round stream path, always None there); set by
     /// the `#[cfg(test)] with_model_streamer_override` builder so the REAL
@@ -222,8 +225,9 @@ pub struct AgentLoop {
     /// `cancel_message` flips the token; `stream_to_provider`'s SSE drain loop
     /// observes it cooperatively and breaks. Same `parking_lot::Mutex<HashMap>`
     /// idiom as `summary_cache`; touched only via the two tiny methods below,
-    /// never `stream_lock`, so a cancel can never deadlock the turn it interrupts.
-    cancellations: parking_lot::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// never `stream_locks`, so a cancel can never deadlock the turn it interrupts.
+    cancellations:
+        parking_lot::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
 }
 
 /// A borrowed lazy-runner reference for the free-fn reroute path
@@ -278,7 +282,7 @@ impl AgentLoop {
             reflect_marks: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             #[cfg(feature = "local-runner")]
             local_runner: None,
-            stream_lock: tokio::sync::Mutex::new(()),
+            stream_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             streamer_override: None,
             cancellations: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
@@ -349,7 +353,7 @@ impl AgentLoop {
 
     /// C7: cancel the in-flight streaming turn for `conversation_id`, if one
     /// exists. Returns whether there was something to cancel. Takes ONLY the
-    /// internal registry lock (never `stream_lock`), so it can't deadlock
+    /// internal registry lock (never `stream_locks`), so it can't deadlock
     /// against the `process_message` it interrupts.
     pub fn cancel_conversation(&self, conversation_id: &str) -> bool {
         match self.cancellations.lock().get(conversation_id) {
@@ -364,10 +368,7 @@ impl AgentLoop {
     /// Attach the memory embedder handle (meaning-lane hybrid search).
     /// Builder-style so existing constructions stay valid; `None` keeps
     /// keyword-only.
-    pub fn with_embedder(
-        mut self,
-        embedder: Option<Arc<crate::embedder::EmbedderHandle>>,
-    ) -> Self {
+    pub fn with_embedder(mut self, embedder: Option<Arc<crate::embedder::EmbedderHandle>>) -> Self {
         self.embedder = embedder;
         self
     }
@@ -396,10 +397,20 @@ impl AgentLoop {
         session_mode: crate::hooks::SessionMode,
         sink: &Arc<dyn ResultSink>,
     ) -> Result<String> {
-        // Serialize streams — one in-flight message per agent loop. Held for the
-        // whole turn so the storage / model_manager accesses below don't race
-        // with another concurrent process_message call.
-        let _stream_guard = self.stream_lock.lock().await;
+        // Serialize per-conversation — one in-flight message per
+        // conversation_id, so a stalled turn in one conversation does not
+        // block others. Held for the whole turn so the storage /
+        // model_manager accesses for THIS conversation don't race with
+        // another concurrent process_message call against the same
+        // conversation.
+        let conv_lock = {
+            let mut locks = self.stream_locks.lock();
+            locks
+                .entry(conversation_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _stream_guard = conv_lock.lock().await;
         // C7: register a cancellation token for this turn. The thin wrapper
         // removes the registry entry on every NORMAL exit path (Ok, Err, or any
         // early `return` inside the inner body) without a manual guard type. A
@@ -446,8 +457,14 @@ impl AgentLoop {
         // block the send path.
         if self.tools.is_attended() {
             let since = crate::hooks::budget::month_start_ts(chrono::Utc::now());
-            let cap = self.storage.open_profile(&profile).and_then(|db| db.budget_cap());
-            let sum = self.storage.open_profile(&profile).and_then(|db| db.usage_summary_since(since));
+            let cap = self
+                .storage
+                .open_profile(&profile)
+                .and_then(|db| db.budget_cap());
+            let sum = self
+                .storage
+                .open_profile(&profile)
+                .and_then(|db| db.usage_summary_since(since));
             if let (Ok(cap), Ok(sum)) = (cap, sum) {
                 if let crate::hooks::budget::BudgetVerdict::Warn(reason) =
                     crate::hooks::budget::evaluate(cap, &sum, true)
@@ -574,11 +591,7 @@ impl AgentLoop {
                 // closed if no local model is configured. (Mirrors the guard the
                 // redact-and-send path already applies.)
                 if is_cloud
-                    && !self.conversation_is_cloud_safe(
-                        &profile,
-                        &conversation_id,
-                        &classifier_cfg,
-                    )
+                    && !self.conversation_is_cloud_safe(&profile, &conversation_id, &classifier_cfg)
                 {
                     let Some(local) = self.find_or_start_local_provider().await else {
                         let reason = "This conversation can't be safely continued on a cloud \
@@ -877,7 +890,7 @@ impl AgentLoop {
         cfg: &crate::classifier::ClassifierConfig,
     ) -> bool {
         // A cold full scan re-classifies every prior turn (each a potential ONNX
-        // pass) under the app-wide `stream_lock`, so bound the FIRST (uncached)
+        // pass) while holding the per-conversation lock, so bound the FIRST (uncached)
         // scan of a very long conversation — beyond this, fail closed (stay
         // local) rather than stall the send. This only bites a cold scan of a
         // huge conversation (e.g. right after restart); once cached, growth is
@@ -920,7 +933,11 @@ impl AgentLoop {
                 let safe = messages[entry.verified_count..].iter().all(msg_safe);
                 cache.insert(
                     conversation_id.to_string(),
-                    CloudSafeEntry { safe, verified_count: n, cfg: *cfg },
+                    CloudSafeEntry {
+                        safe,
+                        verified_count: n,
+                        cfg: *cfg,
+                    },
                 );
                 return safe;
             }
@@ -934,7 +951,11 @@ impl AgentLoop {
         let safe = messages.iter().all(msg_safe);
         cache.insert(
             conversation_id.to_string(),
-            CloudSafeEntry { safe, verified_count: n, cfg: *cfg },
+            CloudSafeEntry {
+                safe,
+                verified_count: n,
+                cfg: *cfg,
+            },
         );
         safe
     }
@@ -971,7 +992,8 @@ impl AgentLoop {
         is_cloud: bool,
     ) -> Option<(String, usize)> {
         let summary = self.assemble_curated_summary(conversation_id, profile, is_cloud);
-        let snippets = self.assemble_relevance_snippets(conversation_id, profile, content, is_cloud);
+        let snippets =
+            self.assemble_relevance_snippets(conversation_id, profile, content, is_cloud);
         match (summary, snippets) {
             (None, None) => None,
             (Some(s), None) => Some((s, 0)),
@@ -1121,7 +1143,7 @@ impl AgentLoop {
     /// before a compacted send drops the `trimmed` older turns; sweeps them for
     /// durable facts and saves them BEFORE they leave the model-facing history.
     ///
-    /// Runs UNDER the stream lock, so it does ONLY cheap synchronous work here —
+    /// Runs UNDER the per-conversation lock, so it does ONLY cheap synchronous work here —
     /// pick the not-yet-swept turns, mark them, and `spawn` a detached task for
     /// the (local-model) extraction + saves. A failure or slow local model can
     /// never delay or fail the send. Disabled (no-op) until a flush classifier is
@@ -1174,7 +1196,9 @@ impl AgentLoop {
             {
                 Ok(n) if n > 0 => sink.memory_event(&conversation_id, "remembered", n),
                 Ok(_) => {}
-                Err(e) => tracing::debug!(target: "lhp::compaction", error = %e, "pre-compaction flush failed"),
+                Err(e) => {
+                    tracing::debug!(target: "lhp::compaction", error = %e, "pre-compaction flush failed")
+                }
             }
         });
     }
@@ -1437,9 +1461,7 @@ impl AgentLoop {
         // across the conversation's turns (deterministic wrap, frozen snapshot),
         // so the prompt prefix is reused turn-over-turn. Endpoint-aware
         // (private-local facts dropped on a cloud turn) + profile-scoped.
-        if let Some(summary) =
-            self.assemble_curated_summary(&conversation_id, &profile, is_cloud)
-        {
+        if let Some(summary) = self.assemble_curated_summary(&conversation_id, &profile, is_cloud) {
             history.push(ChatMessage::system(summary));
         }
         // The trimmable middle: prior turns — every persisted message EXCEPT the
@@ -1600,7 +1622,11 @@ impl AgentLoop {
                     .stream_chat_with_tools(
                         &model,
                         compaction.sent,
-                        if native_mode { native_spec.as_ref() } else { None },
+                        if native_mode {
+                            native_spec.as_ref()
+                        } else {
+                            None
+                        },
                     )
                     .await
                     .with_context(|| format!("stream_chat to provider {}", provider.id))?,
@@ -1736,9 +1762,8 @@ impl AgentLoop {
                 let cost_usd = if !is_cloud {
                     Some(0.0)
                 } else {
-                    round_usage.and_then(|(pt, ct)| {
-                        crate::models::pricing::cost_usd(&model, pt, ct)
-                    })
+                    round_usage
+                        .and_then(|(pt, ct)| crate::models::pricing::cost_usd(&model, pt, ct))
                 };
                 if let Err(e) = profile_db.record_usage(&crate::storage::UsageEvent {
                     id: Uuid::new_v4().to_string(),
@@ -1891,7 +1916,8 @@ impl AgentLoop {
         profile_db.insert_trm_log(&entry)?;
         // Also keep the tracing layer happy (for operators tailing logs
         // without a DB connection).
-        self.gate.log_decision(decision, message_hash, conversation_id);
+        self.gate
+            .log_decision(decision, message_hash, conversation_id);
         Ok(())
     }
 }
@@ -1918,7 +1944,12 @@ pub(crate) fn emit_memory_event(
     }
 }
 
-pub(crate) fn emit_error(app: &AppHandle, conversation_id: &str, error: String, source: &'static str) {
+pub(crate) fn emit_error(
+    app: &AppHandle,
+    conversation_id: &str,
+    error: String,
+    source: &'static str,
+) {
     let payload = StreamErrorPayload {
         error,
         conversation_id: conversation_id.to_string(),
@@ -1992,7 +2023,9 @@ async fn lazy_start_then_retry(
             Ok(_) => {
                 let candidates = model_manager.list_providers();
                 if let Ok(local) = enforce_local_routing(routing, &candidates) {
-                    return model_manager.get_client(&local.id).map(|c| (local.clone(), c));
+                    return model_manager
+                        .get_client(&local.id)
+                        .map(|c| (local.clone(), c));
                 }
             }
             Err(e) => {
@@ -2025,7 +2058,13 @@ pub(crate) async fn resolve_turn_outcome(
     // (if wired) lazily starts the bundled sidecar and the lookup retries
     // once. `None` (tests, feature-off) = the pre-S4 hard-deny behavior.
     local_runner: LocalRunnerRef<'_>,
-) -> Result<(Option<ChatMessage>, Provider, ModelClient, bool, &'static str)> {
+) -> Result<(
+    Option<ChatMessage>,
+    Provider,
+    ModelClient,
+    bool,
+    &'static str,
+)> {
     // Backstop, not a designed retry count — `remaining` strictly shrinks
     // each pass, so a reroute chain terminates naturally; hitting the cap
     // means a logic bug, and it fails closed. Same philosophy as
@@ -2072,7 +2111,12 @@ pub(crate) async fn resolve_turn_outcome(
                 };
                 match found {
                     Some((local, local_client)) => {
-                        on_reroute(&provider.name, &local.name, &reason, local.is_bundled_runner());
+                        on_reroute(
+                            &provider.name,
+                            &local.name,
+                            &reason,
+                            local.is_bundled_runner(),
+                        );
                         let resumed = tools
                             .resume_after_local_switch(
                                 call,
@@ -2131,4 +2175,161 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{:02x}", b);
     }
     out
+}
+
+// ── P14 concurrent-conversation test ─────────────────────────────────────
+
+#[cfg(test)]
+mod concurrent_tests {
+    use super::*;
+    use crate::agent::gate::Binding;
+    use crate::agent::result_sink::ResultSink;
+    use crate::models::sse::SseStream;
+    use crate::models::{ModelManager, Provider, ProviderKind};
+    use crate::storage::Storage;
+    use std::sync::Arc;
+
+    /// A `ModelStreamer` that returns a PENDING stream when the request
+    /// messages contain the marker "slow-conversation", and a fast canned
+    /// SSE response otherwise. This lets us test per-conversation locking:
+    /// a stalled turn in one conversation must not block another.
+    struct SelectorStreamer(Provider);
+
+    impl ModelStreamer for SelectorStreamer {
+        fn provider(&self) -> &Provider {
+            &self.0
+        }
+        fn stream<'a>(
+            &'a self,
+            _model: &'a str,
+            messages: Vec<ChatMessage>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SseStream>> + Send + 'a>>
+        {
+            let is_slow = messages
+                .iter()
+                .any(|m| m.content.contains("slow-conversation"));
+            Box::pin(async move {
+                if is_slow {
+                    // A stream that never produces events — the SSE drain loop
+                    // hangs forever on `sse.next_event().await`. This simulates
+                    // a stalled provider or long network timeout.
+                    Ok(SseStream::from_byte_stream(tokio_stream::pending::<
+                        Result<Vec<u8>, reqwest::Error>,
+                    >()))
+                } else {
+                    // A fast canned response that completes immediately.
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"fast reply\"}}]}\n\ndata: [DONE]\n";
+                    Ok(SseStream::from_byte_stream(tokio_stream::iter(vec![Ok::<
+                        _,
+                        reqwest::Error,
+                    >(
+                        body.as_bytes().to_vec(),
+                    )])))
+                }
+            })
+        }
+    }
+
+    /// P14: demonstrate that a stalled turn in one conversation does not
+    /// block another conversation from progressing. Uses a single
+    /// `AgentLoop` with a `SelectorStreamer` that returns a pending stream
+    /// for "slow-conversation" and a fast stream for any other conversation.
+    #[tokio::test]
+    async fn two_conversations_progress_independently() {
+        let dir = std::env::temp_dir().join(format!("lhp-ptest-{}", Uuid::new_v4()));
+        let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+
+        // Seed the profile and two conversations.
+        let _ = storage.open_profile("personal").expect("profile");
+        for conv_id in &["slow-conv", "fast-conv"] {
+            storage
+                .open_profile("personal")
+                .unwrap()
+                .create_conversation(&crate::storage::Conversation {
+                    id: (*conv_id).to_string(),
+                    name: "t".to_string(),
+                    pinned: false,
+                    binding: "public".to_string(),
+                    folder_id: None,
+                    color: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+        }
+
+        let mm = Arc::new(ModelManager::new());
+        let cloud = Provider::new(
+            "cloudco",
+            "CloudCo",
+            "https://api.openai.com/v1",
+            Some("sk-test".into()),
+            ProviderKind::Cloud,
+        );
+        mm.add_provider(cloud.clone());
+
+        let gate = PrivacyGate::new(Arc::new(crate::classifier::RulesClassifier::new()));
+        let agent = Arc::new(
+            AgentLoop::new(
+                gate,
+                mm,
+                Arc::clone(&storage),
+                Arc::new(ToolDispatcher::empty()),
+            )
+            .with_model_streamer_override(
+                Arc::new(SelectorStreamer(cloud.clone())) as Arc<dyn ModelStreamer>
+            ),
+        );
+
+        let sink: Arc<dyn ResultSink> = Arc::new(crate::agent::result_sink::HeadlessSink);
+
+        // Spawn conversation A — it uses a pending streamer and hangs
+        // indefinitely in the SSE drain loop.
+        let agent_a = Arc::clone(&agent);
+        let sink_a = Arc::clone(&sink);
+        let handle_a = tokio::spawn(async move {
+            agent_a
+                .process_message(
+                    "slow-conversation marker, hangs forever".into(),
+                    "slow-conv".into(),
+                    Binding::Public,
+                    "cloudco".into(),
+                    "m".into(),
+                    "personal".into(),
+                    crate::hooks::SessionMode::Normal,
+                    &sink_a,
+                )
+                .await
+        });
+
+        // Conversation B must complete within the timeout — it uses a fast
+        // streamer. With the OLD global stream_lock, conv B would block
+        // waiting for conv A's lock to release. With per-conversation
+        // locking, conv B acquires its OWN lock and proceeds immediately.
+        let fast_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.process_message(
+                "hello from the fast conversation".into(),
+                "fast-conv".into(),
+                Binding::Public,
+                "cloudco".into(),
+                "m".into(),
+                "personal".into(),
+                crate::hooks::SessionMode::Normal,
+                &sink,
+            ),
+        )
+        .await
+        .expect("timeout: fast conv B was blocked by slow conv A")
+        .expect("process_message should succeed for conv B");
+
+        assert!(
+            fast_result.contains("fast reply"),
+            "conv B should get the fast reply, got: {fast_result}"
+        );
+
+        // Clean up: abort conv A's handle (best-effort).
+        handle_a.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
