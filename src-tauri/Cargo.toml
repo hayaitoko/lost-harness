@@ -45,6 +45,13 @@ regex = "1"
 url = "2"
 # sha256 for the TRM message-hash audit log (spec §3: never log plaintext).
 sha2 = "0.10"
+# Ed25519 signature verification for the curated-model manifest (H-08 / P09).
+# We only use the verification half; signing is an out-of-band human step.
+# The `default` features include both `verify` and `std`; we also need `pkcs8`
+# for key import — though we load the key from a base64 constant, not a PEM file.
+ed25519-dalek = "2"
+# Hex encoding for the manifest public key and signature strings.
+hex = "0.4"
 # Email round (stage 1): PKCE S256 code-challenge encoding (RFC 7636) + Gmail
 # base64url message bodies / raw RFC 822 sends. sha2 above supplies the digest.
 base64 = "0.22"

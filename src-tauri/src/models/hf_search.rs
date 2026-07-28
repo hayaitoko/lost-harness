@@ -1,4 +1,4 @@
-//! Wave 5.3 / M8 (REVISION 2026-07-22b) — HuggingFace model **search** + the
+//! Wave 5.3 / M8 (REVISION 2026-07-28c) — HuggingFace model **search** + the
 //! per-model file/quant listing that feeds the interactive calculator.
 //!
 //! This is the discovery half of the product redirect: instead of a hardcoded
@@ -9,44 +9,59 @@
 //! EVERY redirect hop):
 //!   - **search** `GET /api/models?search=&filter=gguf&sort=&limit=` → the
 //!     result rows ([`HfModelSummary`]),
-//!   - **tree** `GET /api/models/{id}/tree/main` → the `*.gguf` files, each
-//!     carrying its `lfs.oid` (the real sha256, 64-hex) + `lfs.size`
-//!     ([`QuantOption`]). **This is where the verified-before-runnable sha256
-//!     comes from** — no pre-curation, but also (see the trust-root note below)
-//!     no longer an out-of-band trust root.
+//!   - **tree** `GET /api/models/{id}/tree/{revision}` → the `*.gguf` files,
+//!     each carrying its `lfs.oid` (the real sha256, 64-hex) + `lfs.size`
+//!     ([`QuantOption`]).
 //!
-//! ## Trust-root honesty (2026-07-22c review requirement — LOAD-BEARING)
+//! ## Provenance architecture (P09 / H-08 — supply-chain boundary)
 //!
-//! Post-redirect the expected sha256 is self-reported by the same host at the
-//! same moment as the bytes (`lfs.oid`). That still catches transport/CDN
-//! corruption and partial downloads; it can NOT catch a compromised HF repo.
-//! The compensating control lives HERE: [`Provenance`]. Staff-picks / default
-//! rows are limited to a **trusted-publisher allowlist**; any other result is
-//! labelled [`Provenance::Community`] in the returned data so the UI can render
-//! a visible "community model — provenance is the publisher's" warning before
-//! download. The repo-trust decision then sits with the user, per model, never
-//! silently.
+//! The expected SHA-256 for a curated model no longer comes from the live HF
+//! API (`lfs.oid`). Instead, a **signed manifest** (on disk at a well-known
+//! path) maps each curated model id to an immutable commit revision and the
+//! exact file hashes at that revision. The app verifies the manifest's
+//! Ed25519 signature against a baked-in public key, then uses the pinned
+//! revision for all download URLs and the manifest's hashes for integrity
+//! verification. This decouples the trust root from the content host:
+//!
+//! - **Curated** (in the manifest + signature valid): download uses the pinned
+//!   commit revision; the expected hash comes from the manifest, not the live
+//!   API. A compromised HF repo cannot forge a verified download.
+//! - **Curated (publisher-allowlisted, not in manifest)**: the publisher is on
+//!   the curated-name allowlist for the staff-picks view, but without a
+//!   manifest entry there is no revision pinning or manifest-hash override.
+//!   This is a degraded form — the label still says "Curated" but the trust
+//!   root is still the live API. See [`Provenance`].
+//! - **Community**: any other publisher. The UI shows a warning and requires
+//!   explicit consent before download.
 //!
 //! The network functions are thin; every parse/classify step is a **pure**
 //! helper unit-tested with fixtures (the live endpoints are exercised only by an
 //! env-gated, self-skipping integration test, mirroring
 //! `live_native_tool_call_roundtrip`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::models::download::{allowlisted_redirect_policy, host_allowed, is_real_sha256};
 
-/// Publishers whose GGUF repos we treat as trusted for the Staff-picks default
+/// Publishers whose GGUF repos we treat as curated for the Staff-picks default
 /// view and for suppressing the community-provenance warning. Two groups:
-/// well-known official model orgs, and the trusted community requantizers the
+/// well-known official model orgs, and the community requantizers the
 /// design names explicitly (`lmstudio-community`/`ggml-org`/`unsloth`/
 /// `bartowski`). Anything not on this list is [`Provenance::Community`] — the
 /// conservative default (more warnings, never fewer). Matched case-insensitively
 /// against the publisher (the segment before `/` in a repo id).
-const TRUSTED_PUBLISHERS: &[&str] = &[
+///
+/// ⚠ This is a **curation** allowlist, not a trust root. A publisher on this
+/// list still has their model hashes verified against the signed manifest
+/// (see [`ModelManifest`]) before a download is accepted. Models from these
+/// publishers that are NOT in the manifest still use the live API for hashes
+/// (degraded curation — the label says "Curated" but the trust root is the
+/// content host, not the manifest).
+const CURATED_PUBLISHERS: &[&str] = &[
     // Trusted community requantizers (design §22b + 22c note).
     "lmstudio-community",
     "ggml-org",
@@ -55,6 +70,8 @@ const TRUSTED_PUBLISHERS: &[&str] = &[
     // Well-known official model orgs that publish (or whose GGUFs are mirrored
     // under) these names. Not exhaustive by design — an unlisted publisher is
     // Community, which only ever ADDS a provenance warning.
+    // (This is a curation allowlist; manifest-hash verification is the
+    // real trust root — see [`ModelManifest`].)
     "qwen",
     "google",
     "meta-llama",
@@ -70,15 +87,28 @@ const TRUSTED_PUBLISHERS: &[&str] = &[
     "01-ai",
 ];
 
-/// How much we vouch for a model's bytes. This is the compensating control for
-/// the post-redirect trust-root shift (the sha256 now comes from the same host
-/// as the bytes) — see the module docs.
+/// How much we vouch for a model's bytes. This enum replaces the pre-P09
+/// "Trusted" label (which conflated namespace curation with cryptographic
+/// verification). The hierarchy is:
+///
+/// | Manifest entry? | Publisher allowlisted? | Label | Trust root |
+/// |---|---|---|---|
+/// | Yes | Yes or No | `Curated` | Signed manifest |
+/// | No  | Yes | `Curated` (degraded) | Live API (`lfs.oid`) |
+/// | No  | No  | `Community` | Live API + user consent |
+///
+/// The manifest entry provides a pinned commit revision and manifest-sourced
+/// file hashes — the only path that decouples verification from the content
+/// host (see [`ModelManifest`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
-    /// Publisher is on the trusted allowlist — eligible for Staff-picks, no
-    /// community warning.
-    Trusted,
+    /// Publisher is on the curated allowlist — eligible for Staff-picks.
+    /// When a [`ModelManifest`] entry exists, the download uses a pinned
+    /// commit revision and manifest-sourced hashes for integrity; without
+    /// a manifest entry this is degraded curation (hashes from the live
+    /// API, same trust root as the bytes).
+    Curated,
     /// Any other publisher — the UI must show a "community model — provenance is
     /// the publisher's" label before download.
     Community,
@@ -189,6 +219,135 @@ pub struct HfModelDetail {
 }
 
 // ---------------------------------------------------------------------------
+// Curated-model manifest (P09 / H-08 — supply-chain trust root)
+// ---------------------------------------------------------------------------
+
+/// A manifest entry: a pinned commit revision and expected SHA-256 digests
+/// for every file in the model at that revision. The authoritative trust
+/// root — overrides the live API's self-reported values. When a model has a
+/// manifest entry, all download URLs use the pinned revision and integrity
+/// verification uses the manifest's hashes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    /// Immutable git commit SHA (full 40-hex) to pin tree listing and resolve
+    /// URLs to, instead of the mutable `resolve/main` path.
+    pub revision: String,
+    /// File path → expected SHA-256 (64 hex chars). An entry here overrides
+    /// whatever the live API reports for this file. Verification is done
+    /// against this value, not the API's `lfs.oid`.
+    pub files: BTreeMap<String, String>,
+}
+
+/// Independently-signed manifest of curated model revisions and hashes.
+/// Loaded from a file path; the Ed25519 signature is verified against a
+/// baked-in public key. Until the manifest is generated and signed by a
+/// human operator, this file may not exist — curated models then fall back
+/// to the live API for hashes (degraded curation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelManifest {
+    /// Schema version, for forward compatibility.
+    pub version: u32,
+    /// ISO-8601 timestamp of when the manifest was signed.
+    pub signed_at: String,
+    /// Ed25519 signature (lowercase hex) over the canonical JSON encoding of
+    /// `models`. The public key is baked into the binary at compile time.
+    pub signature: String,
+    /// The manifest data: model_id → pinned revision + file hashes.
+    pub models: BTreeMap<String, ManifestEntry>,
+}
+
+impl ModelManifest {
+    /// Load and verify a manifest from a JSON file. `NotFound` errors
+    /// silently return `None` (no manifest = degraded curation).
+    pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<Self>> {
+        let text = match std::fs::read_to_string(path.as_ref()) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let m: Self = serde_json::from_str(&text)?;
+        m.verify_signature()?;
+        Ok(Some(m))
+    }
+
+    /// Verify the Ed25519 signature against the baked-in public key.
+    fn verify_signature(&self) -> anyhow::Result<()> {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        // Decode the public key (from base64 constant).
+        let pub_key_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            MANIFEST_PUBLIC_KEY_B64,
+        )
+        .map_err(|e| anyhow::anyhow!("invalid manifest public key encoding: {e}"))?;
+        let verifying_key = VerifyingKey::from_bytes(&pub_key_bytes.try_into().map_err(|_| {
+            anyhow::anyhow!("manifest public key has wrong length (expected 32 bytes)")
+        })?)?;
+
+        // Decode the signature (hex-encoded in the manifest).
+        let sig_bytes = hex::decode(&self.signature)
+            .map_err(|e| anyhow::anyhow!("manifest signature is not valid hex: {e}"))?;
+        let signature = Signature::from_slice(&sig_bytes)
+            .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
+
+        // Canonical JSON of `models` (BTreeMap ensures deterministic key ordering).
+        let message = serde_json::to_string(&self.models)?;
+
+        verifying_key
+            .verify(message.as_bytes(), &signature)
+            .map_err(|_| {
+                anyhow::anyhow!("manifest signature does not match the baked-in public key")
+            })
+    }
+
+    /// Look up a model entry in the manifest. Returns `None` if the model
+    /// is not curated (no manifest entry or no manifest loaded).
+    #[must_use]
+    pub fn lookup(&self, model_id: &str) -> Option<&ManifestEntry> {
+        self.models.get(model_id)
+    }
+}
+
+/// Ed25519 public key (base64-encoded, 32 bytes) used to verify the
+/// signature on the curated-model manifest.
+///
+/// ⚠ THIS IS A PLACEHOLDER — it must be replaced with the real application
+/// signing key before production use. The current value is a development-only
+/// key that provides no security guarantees. To generate a real keypair:
+///
+/// ```
+/// # In a secure offline environment:
+/// openssl genpkey -algorithm ed25519 -out manifest_private.pem
+/// openssl pkey -in manifest_private.pem -pubout -out manifest_public.pem
+/// base64 -i manifest_public.pem -w0   # ← paste as MANIFEST_PUBLIC_KEY_B64
+/// ```
+///
+/// Then sign the manifest JSON's `models` block with the private key:
+///
+/// ```
+/// echo -n '{"model_id":{"revision":"...","files":{...}}}' | \
+///   openssl pkeyutl -sign -inkey manifest_private.pem -rawin | \
+///   xxd -p | tr -d '\n'   # ← paste as the manifest `signature` field
+/// ```
+const MANIFEST_PUBLIC_KEY_B64: &str =
+    "PLACEHOLDER_PUBLIC_KEY_REPLACE_ME_PLACEHOLDER_PUBLIC_KEY_REPLACE=";
+
+/// Path to the curated-model manifest file, relative to the application's
+/// storage base path (`~/Documents/Lost-Harness/`). This file maps model IDs
+/// to pinned commit revisions and expected SHA-256 digests, signed with the
+/// application's Ed25519 key. When absent or invalid, curated models fall
+/// back to the live API for hashes (degraded curation — see [`Provenance`]).
+pub const MANIFEST_FILENAME: &str = "model-manifest.json";
+
+/// Load the manifest from the given storage base path. Returns `None`
+/// (with no error) when the file does not exist. The signature is verified
+/// on every load.
+pub fn load_manifest(storage_base: &Path) -> anyhow::Result<Option<ModelManifest>> {
+    let path = storage_base.join(MANIFEST_FILENAME);
+    ModelManifest::load(&path)
+}
+
+// ---------------------------------------------------------------------------
 // Pure helpers (fixture-tested; no I/O)
 // ---------------------------------------------------------------------------
 
@@ -197,11 +356,11 @@ pub fn publisher_of(id: &str) -> &str {
     id.split('/').next().unwrap_or("")
 }
 
-/// Classify a publisher against the trusted allowlist (case-insensitive).
+/// Classify a publisher against the curated allowlist (case-insensitive).
 pub fn provenance_of(publisher: &str) -> Provenance {
     let p = publisher.trim().to_ascii_lowercase();
-    if !p.is_empty() && TRUSTED_PUBLISHERS.iter().any(|t| *t == p) {
-        Provenance::Trusted
+    if !p.is_empty() && CURATED_PUBLISHERS.iter().any(|t| *t == p) {
+        Provenance::Curated
     } else {
         Provenance::Community
     }
@@ -260,8 +419,7 @@ pub fn parse_quant_from_filename(filename: &str) -> Option<String> {
         // quant "family" token is the one starting Q/IQ + a digit; we want the
         // WHOLE quant descriptor, so reconstruct it from the stem instead).
         let is_q = bytes.first() == Some(&b'Q') && bytes.get(1).is_some_and(|c| c.is_ascii_digit());
-        let is_iq = tok.starts_with("IQ")
-            && bytes.get(2).is_some_and(|c| c.is_ascii_digit());
+        let is_iq = tok.starts_with("IQ") && bytes.get(2).is_some_and(|c| c.is_ascii_digit());
         if is_q || is_iq {
             return Some(reconstruct_quant(stem, raw));
         }
@@ -365,19 +523,26 @@ pub fn group_quants(files: Vec<QuantOption>) -> Vec<QuantGroup> {
                         && files
                             .iter()
                             .all(|f| f.part.is_some_and(|p| p.total == declared))
-                        && (1..=declared).all(|i| {
-                            files.iter().any(|f| f.part.is_some_and(|p| p.index == i))
-                        })
+                        && (1..=declared)
+                            .all(|i| files.iter().any(|f| f.part.is_some_and(|p| p.index == i)))
                 }
             };
-            QuantGroup { quant, total_size_bytes, files, complete }
+            QuantGroup {
+                quant,
+                total_size_bytes,
+                files,
+                complete,
+            }
         })
         .collect()
 }
 
-/// Build the pinned resolve URL for a file in a repo (`main` revision).
-fn resolve_url(model_id: &str, path: &str) -> String {
-    format!("https://huggingface.co/{model_id}/resolve/main/{path}")
+/// Build the pinned resolve URL for a file in a repo at a specific revision.
+/// When `revision` is `"main"`, the URL resolves to the mutable tip (the
+/// fallback for community models or models without a manifest entry). For
+/// manifest-curated models, `revision` is an immutable commit SHA.
+fn resolve_url(model_id: &str, path: &str, revision: &str) -> String {
+    format!("https://huggingface.co/{model_id}/resolve/{revision}/{path}")
 }
 
 // --- search results ---
@@ -443,13 +608,13 @@ struct RawLfs {
     size: u64,
 }
 
-/// Parse a `/api/models/{id}/tree/main` response into the model's downloadable
-/// files. Only `*.gguf` LFS files with a usable 64-hex oid and a safe path are
-/// surfaced (a GGUF small enough to not be LFS-tracked, or one whose oid isn't
-/// a sha256, can't be verify-installed — we drop it rather than offer an
-/// un-verifiable download). Pure over `(json, model_id)`; refuses a malformed
-/// model id loudly.
-pub fn parse_tree(json: &str, model_id: &str) -> anyhow::Result<Vec<QuantOption>> {
+/// Parse a `/api/models/{id}/tree/{revision}` response into the model's
+/// downloadable files. Only `*.gguf` LFS files with a usable 64-hex oid and
+/// a safe path are surfaced (a GGUF small enough to not be LFS-tracked, or
+/// one whose oid isn't a sha256, can't be verify-installed — we drop it
+/// rather than offer an un-verifiable download). Pure over
+/// `(json, model_id, revision)`; refuses a malformed model id loudly.
+pub fn parse_tree(json: &str, model_id: &str, revision: &str) -> anyhow::Result<Vec<QuantOption>> {
     if !valid_model_id(model_id) {
         anyhow::bail!("malformed model id: {model_id:?}");
     }
@@ -474,7 +639,7 @@ pub fn parse_tree(json: &str, model_id: &str) -> anyhow::Result<Vec<QuantOption>
         }
         out.push(QuantOption {
             quant: parse_quant_from_filename(&e.path),
-            url: resolve_url(model_id, &e.path),
+            url: resolve_url(model_id, &e.path, revision),
             part: parse_part_info(&e.path),
             filename: e.path,
             sha256: lfs.oid,
@@ -505,7 +670,13 @@ async fn get_allowlisted_text(client: &reqwest::Client, url: &str) -> anyhow::Re
     if !host_allowed(url) {
         anyhow::bail!("refusing to fetch a non-allowlisted host: {url}");
     }
-    let body = client.get(url).send().await?.error_for_status()?.text().await?;
+    let body = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     Ok(body)
 }
 
@@ -528,45 +699,86 @@ fn search_url(query: &str, sort: SearchSort, limit: u32) -> String {
 
 /// Search HuggingFace for GGUF models. `query` empty → the Staff-picks default
 /// (top by the chosen sort). Network I/O — live-tested only.
-pub async fn search(query: &str, sort: SearchSort, limit: u32) -> anyhow::Result<Vec<HfModelSummary>> {
+pub async fn search(
+    query: &str,
+    sort: SearchSort,
+    limit: u32,
+) -> anyhow::Result<Vec<HfModelSummary>> {
     let client = hf_client()?;
     let url = search_url(query, sort, limit.clamp(1, 100));
     let body = get_allowlisted_text(&client, &url).await?;
     parse_search_results(&body)
 }
 
-/// The Staff-picks default view: top trusted-publisher GGUF models by downloads.
-/// Filters the live top-N to the trusted allowlist (the 22c requirement — the
-/// default rows are trusted-only; arbitrary search surfaces community results
-/// with a label).
+/// The Staff-picks default view: top curated-publisher GGUF models by
+/// downloads. Filters the live top-N to the curated allowlist — the default
+/// rows are curated-only; arbitrary search surfaces community results with a
+/// label. Note: curation here refers to the publisher allowlist, not
+/// manifest-hash verification (see [`Provenance`]).
 pub async fn staff_picks(limit: u32) -> anyhow::Result<Vec<HfModelSummary>> {
-    // Over-fetch, then keep only trusted publishers, up to `limit`.
+    // Over-fetch, then keep only curated publishers, up to `limit`.
     let limit = limit.clamp(1, 25);
     let all = search("", SearchSort::Downloads, limit * 4).await?;
     Ok(all
         .into_iter()
-        .filter(|m| m.provenance == Provenance::Trusted)
+        .filter(|m| m.provenance == Provenance::Curated)
         .take(limit as usize)
         .collect())
 }
 
-/// List a model's downloadable GGUF files (ungrouped). Network I/O.
-pub async fn list_quants(model_id: &str) -> anyhow::Result<Vec<QuantOption>> {
+/// List a model's downloadable GGUF files (ungrouped) at the given revision.
+/// Pass `"main"` to use the mutable tip (community models, or curated models
+/// without a manifest entry). Network I/O.
+pub async fn list_quants(model_id: &str, revision: &str) -> anyhow::Result<Vec<QuantOption>> {
     if !valid_model_id(model_id) {
         anyhow::bail!("malformed model id: {model_id:?}");
     }
     let client = hf_client()?;
-    let url = format!("https://huggingface.co/api/models/{model_id}/tree/main");
+    let url = format!("https://huggingface.co/api/models/{model_id}/tree/{revision}");
     let body = get_allowlisted_text(&client, &url).await?;
-    parse_tree(&body, model_id)
+    parse_tree(&body, model_id, revision)
 }
 
 /// The full detail view for a model: publisher/provenance + every quant grouped
 /// into logical (multi-part-aware) download units.
+///
+/// If a [`ModelManifest`] exists and contains an entry for `model_id`, the
+/// download URLs are pinned to the manifest's immutable revision and file
+/// hashes are overridden from the manifest (the proper trust-root path). If
+/// the manifest is absent or the model is not in it, URLs use `main` and
+/// hashes come from the live API (degraded curation, or community model).
 pub async fn model_detail(model_id: &str) -> anyhow::Result<HfModelDetail> {
-    let files = list_quants(model_id).await?;
+    // Try loading the manifest. Not-found is silent (degraded curation).
+    let manifest = ModelManifest::load::<&Path>(&Path::new("model_manifest.json")).unwrap_or(None);
+
+    let (revision, provenance) = match manifest.as_ref().and_then(|m| m.lookup(model_id)) {
+        Some(entry) => {
+            // Manifest says this model is curated: pin the revision.
+            // The provenance is Curated regardless of the publisher allowlist.
+            (entry.revision.as_str(), Provenance::Curated)
+        }
+        None => {
+            // No manifest entry: fall back to main branch + publisher allowlist.
+            let publisher = publisher_of(model_id);
+            ("main", provenance_of(publisher))
+        }
+    };
+
+    let mut files = list_quants(model_id, revision).await?;
+
+    // When a manifest entry exists, override file SHA-256 values with
+    // manifest-sourced ones — the manifest is the trust root, not the live API.
+    if let Some(ref manifest) = manifest {
+        if let Some(entry) = manifest.lookup(model_id) {
+            for file in &mut files {
+                if let Some(manifest_sha) = entry.files.get(&file.filename) {
+                    file.sha256 = manifest_sha.clone();
+                }
+            }
+        }
+    }
+
     let publisher = publisher_of(model_id).to_string();
-    let provenance = provenance_of(&publisher);
     Ok(HfModelDetail {
         id: model_id.to_string(),
         publisher,
@@ -580,15 +792,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn publisher_and_provenance_classify_trusted_vs_community() {
+    fn publisher_and_provenance_classify_curated_vs_community() {
         assert_eq!(publisher_of("Qwen/Qwen3-0.6B-GGUF"), "Qwen");
         assert_eq!(publisher_of("no-slash-id"), "no-slash-id");
         assert_eq!(publisher_of(""), "");
-        // Trusted: official org + community requantizers, case-insensitive.
-        assert_eq!(provenance_of("Qwen"), Provenance::Trusted);
-        assert_eq!(provenance_of("lmstudio-community"), Provenance::Trusted);
-        assert_eq!(provenance_of("BARTOWSKI"), Provenance::Trusted);
-        assert_eq!(provenance_of("unsloth"), Provenance::Trusted);
+        // Curated: official org + community requantizers, case-insensitive.
+        assert_eq!(provenance_of("Qwen"), Provenance::Curated);
+        assert_eq!(provenance_of("lmstudio-community"), Provenance::Curated);
+        assert_eq!(provenance_of("BARTOWSKI"), Provenance::Curated);
+        assert_eq!(provenance_of("unsloth"), Provenance::Curated);
         // Anyone else is community (the conservative default).
         assert_eq!(provenance_of("some-random-user"), Provenance::Community);
         assert_eq!(provenance_of(""), Provenance::Community);
@@ -650,7 +862,7 @@ mod tests {
         QuantOption {
             quant: parse_quant_from_filename(filename),
             filename: filename.to_string(),
-            url: resolve_url("org/repo", filename),
+            url: resolve_url("org/repo", filename, "main"),
             sha256: "a".repeat(64),
             size_bytes: size,
             part: parse_part_info(filename),
@@ -666,12 +878,18 @@ mod tests {
         ];
         let groups = group_quants(files);
         assert_eq!(groups.len(), 2, "two logical quants");
-        let big = groups.iter().find(|g| g.quant.as_deref() == Some("Q4_K_M")).unwrap();
+        let big = groups
+            .iter()
+            .find(|g| g.quant.as_deref() == Some("Q4_K_M"))
+            .unwrap();
         assert_eq!(big.total_size_bytes, 100, "size is the SUM across parts");
         assert!(big.complete, "1..=2 all present");
         assert_eq!(big.files.len(), 2);
         assert_eq!(big.files[0].part.unwrap().index, 1, "parts sorted by index");
-        let small = groups.iter().find(|g| g.quant.as_deref() == Some("Q8_0")).unwrap();
+        let small = groups
+            .iter()
+            .find(|g| g.quant.as_deref() == Some("Q8_0"))
+            .unwrap();
         assert!(small.complete);
         assert_eq!(small.total_size_bytes, 7);
     }
@@ -685,7 +903,10 @@ mod tests {
         ];
         let groups = group_quants(files);
         assert_eq!(groups.len(), 1);
-        assert!(!groups[0].complete, "a missing part must not be downloadable");
+        assert!(
+            !groups[0].complete,
+            "a missing part must not be downloadable"
+        );
     }
 
     #[test]
@@ -704,15 +925,19 @@ mod tests {
         assert_eq!(out.len(), 3, "the no-id row is skipped");
         assert_eq!(out[0].id, "Qwen/Qwen3-0.6B-GGUF");
         assert_eq!(out[0].publisher, "Qwen");
-        assert_eq!(out[0].provenance, Provenance::Trusted);
+        assert_eq!(out[0].provenance, Provenance::Curated);
         assert_eq!(out[0].downloads, Some(123456));
         // Explicit nulls parse as honest absence — never a fabricated 0.
-        assert_eq!(out[1].provenance, Provenance::Community, "unknown publisher → community");
+        assert_eq!(
+            out[1].provenance,
+            Provenance::Community,
+            "unknown publisher → community"
+        );
         assert_eq!(out[1].downloads, None);
         assert!(out[1].tags.is_empty());
         // `modelId` alias + missing counts still parse.
         assert_eq!(out[2].id, "unsloth/Qwen3-4B-GGUF");
-        assert_eq!(out[2].provenance, Provenance::Trusted);
+        assert_eq!(out[2].provenance, Provenance::Curated);
         assert_eq!(out[2].downloads, None);
     }
 
@@ -732,25 +957,34 @@ mod tests {
             {"type":"file","path":"../escape.gguf",
              "lfs":{"oid":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":10}}
         ]"#;
-        let quants = parse_tree(json, "Qwen/Qwen3-0.6B-GGUF").unwrap();
+        let quants = parse_tree(json, "Qwen/Qwen3-0.6B-GGUF", "main").unwrap();
         assert_eq!(quants.len(), 2, "only the two verifiable, safe-path GGUFs");
-        let q8 = quants.iter().find(|q| q.quant.as_deref() == Some("Q8_0")).unwrap();
+        let q8 = quants
+            .iter()
+            .find(|q| q.quant.as_deref() == Some("Q8_0"))
+            .unwrap();
         assert_eq!(q8.size_bytes, 650000000);
         assert_eq!(q8.filename, "Qwen3-0.6B-Q8_0.gguf");
         assert_eq!(
             q8.url,
             "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
         );
-        assert!(host_allowed(&q8.url), "every surfaced url is host-allowlisted");
+        assert!(
+            host_allowed(&q8.url),
+            "every surfaced url is host-allowlisted"
+        );
         assert_eq!(q8.sha256.len(), 64);
         // A malformed model id refuses loudly before any URL is built.
-        assert!(parse_tree(json, "../../evil.com").is_err());
+        assert!(parse_tree(json, "../../evil.com", "main").is_err());
     }
 
     #[test]
     fn search_url_is_well_formed_and_allowlisted() {
         let u = search_url("qwen 3", SearchSort::Downloads, 20);
-        assert!(host_allowed(&u), "constructed search url must be allowlisted");
+        assert!(
+            host_allowed(&u),
+            "constructed search url must be allowlisted"
+        );
         assert!(u.contains("filter=gguf"));
         assert!(u.contains("sort=downloads"));
         assert!(u.contains("limit=20"));
@@ -769,7 +1003,9 @@ mod tests {
             eprintln!("skipping live HF search test — set LHP_HF_LIVE=1 to run");
             return;
         }
-        let results = search("qwen3", SearchSort::Downloads, 10).await.expect("search");
+        let results = search("qwen3", SearchSort::Downloads, 10)
+            .await
+            .expect("search");
         assert!(!results.is_empty(), "a real search returns rows");
         // Every row's publisher/provenance is derived, and ids are non-empty.
         for r in &results {
