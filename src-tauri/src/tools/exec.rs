@@ -84,10 +84,7 @@ pub enum ExecError {
 /// after `wait()` is race-free (`sandbox-exec` has finished reading the
 /// profile by the time its process exits).
 pub trait SandboxedSpawn: Send + Sync {
-    fn spawn(
-        &self,
-        spec: &ExecSpec,
-    ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError>;
+    fn spawn(&self, spec: &ExecSpec) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError>;
 }
 
 // ── platform helpers (process-group kill + sandbox-failure detection) ────────
@@ -96,28 +93,102 @@ pub trait SandboxedSpawn: Send + Sync {
 mod platform {
     use std::process::ExitStatus;
 
-    /// Kill the whole process group (`pgid == child pid`, because the spawner
-    /// set `.process_group(0)` and nothing calls `setpgid`). One `kill(-pgid)`
-    /// reaps `sandbox-exec` → its fork → any grandchild that stayed in the
-    /// group.
-    ///
-    /// **Known limitation (bounded, not a containment break):** a descendant
-    /// that deliberately detaches into its own session/group (`setsid(2)`)
-    /// escapes this group kill and survives past the timeout as an orphan.
-    /// It stays fully Seatbelt-confined (no network, writes only to
-    /// workspace/tmp), so the blast radius is a runaway *sandboxed* process
-    /// (CPU/disk within the sandbox), never an escape or exfiltration. The
-    /// durable fix is VM/container isolation (`Virtualization.framework` /
-    /// `Containerization`) behind this same trait — deferred per Fable's
-    /// decision. Enumerating and killing the pid tree (sysctl `KERN_PROC`) is
-    /// a possible best-effort hardening, not done here.
+    /// Kill the whole process group (`pgid == child pid`) AND walk the
+    /// process tree to catch any descendant that escaped via `setsid(2)`.
+    /// One `kill(-pgid)` reaps `sandbox-exec` → its fork → any grandchild
+    /// that stayed in the group; the tree walk catches the rest.
     pub fn kill_group(pgid: i32) {
         // SAFETY: `kill(2)` with a negative pid targets the process group. A
         // missing group (already-exited) just returns ESRCH, which we ignore.
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
+        // Catch any descendant that escaped the group kill via setsid(2).
+        kill_descendants(pgid);
     }
+
+    /// Walk the process tree from `leader_pid` and SIGKILL every descendant.
+    /// This defeats `setsid(2)` escape: the descendant still has a parent
+    /// link back to the leader even after creating a new session.
+    #[cfg(target_os = "macos")]
+    fn kill_descendants(leader_pid: i32) {
+        // Use libproc(3) to list all PIDs and query each for its BSD info.
+        // proc_listallpids returns the full pid list; proc_pidinfo with
+        // PROC_PIDTBSDINFO fills proc_bsdinfo which has pbi_ppid + pbi_pgid.
+        // BFS from the leader to find every descendant — catches setsid(2)
+        // escapees because the parent chain is intact at enumeration time.
+        use libc::c_int;
+        use std::mem;
+
+        const PROC_PIDTBSDINFO: c_int = 3;
+
+        extern "C" {
+            fn proc_listallpids(buffer: *mut c_int, buffersize: c_int) -> c_int;
+            fn proc_pidinfo(
+                pid: c_int,
+                flavor: c_int,
+                arg: u64,
+                buffer: *mut libc::c_void,
+                buffersize: c_int,
+            ) -> c_int;
+        }
+
+        unsafe {
+            let max_pids = 4096;
+            let mut pids: Vec<c_int> = vec![0; max_pids];
+            let count = proc_listallpids(
+                pids.as_mut_ptr(),
+                (max_pids * mem::size_of::<c_int>()) as c_int,
+            );
+            if count <= 0 {
+                return;
+            }
+            let count = count as usize;
+
+            // BFS: every process whose parent pid is in the worklist
+            // is a descendant.
+            let mut to_kill: Vec<i32> = vec![leader_pid];
+            let mut i = 0;
+            while i < to_kill.len() {
+                let parent = to_kill[i];
+                for &pid in &pids[..count] {
+                    if pid <= 0 {
+                        continue;
+                    }
+                    let mut info: libc::proc_bsdinfo = mem::zeroed();
+                    let ret = proc_pidinfo(
+                        pid,
+                        PROC_PIDTBSDINFO,
+                        0,
+                        &mut info as *mut _ as *mut libc::c_void,
+                        mem::size_of::<libc::proc_bsdinfo>() as c_int,
+                    );
+                    // proc_pidinfo returns the number of bytes written.
+                    if ret as usize == mem::size_of::<libc::proc_bsdinfo>() {
+                        if info.pbi_ppid as i32 == parent {
+                            let child = info.pbi_pid as i32;
+                            if child != leader_pid && !to_kill.contains(&child) {
+                                to_kill.push(child);
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+
+            // Kill every descendant (leader was already signalled above).
+            for &pid in &to_kill {
+                if pid != leader_pid {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// Stub for non-macOS unices.  No portable tree-walk; group kill suffices.
+    /// A Linux sandbox backend should use /proc or PID-cgroup iteration.
+    #[cfg(not(target_os = "macos"))]
+    fn kill_descendants(_leader_pid: i32) {}
 
     /// Distinguish a sandbox-APPLY failure from the command's own result. Two
     /// forms, both verified empirically on macOS 15 (see the module spec): the
@@ -239,10 +310,19 @@ pub async fn run_guarded(
     let err_handle = tokio::spawn(drain_reader(child.stderr.take()));
 
     let mut timed_out = false;
+    let mut wait_err: Option<String> = None;
+
     let status: Option<std::process::ExitStatus> = tokio::select! {
         res = child.wait() => match res {
             Ok(s) => Some(s),
-            Err(e) => return Err(ExecError::Io(format!("waiting on child: {e}"))),
+            Err(e) => {
+                // L-05 fix: collect the error + kill the group before the
+                // drain/cleanup below, so EVERY exit path joins drain tasks
+                // and deletes temp profiles.
+                platform::kill_group(pgid);
+                wait_err = Some(format!("waiting on child: {e}"));
+                None
+            }
         },
         _ = tokio::time::sleep(spec.timeout) => {
             platform::kill_group(pgid);
@@ -250,20 +330,27 @@ pub async fn run_guarded(
             None
         }
     };
+
     if timed_out {
         // Reap the killed group leader so it isn't left a zombie.
         let _ = child.wait().await;
     }
 
+    // ── cleanup (L-05 fix: runs on EVERY exit path, including wait_err) ──
+    // stdout/stderr pipes close when the process exits (even on a wait(2)
+    // error like ECHILD), and sandbox-exec read the profile at exec time so
+    // deleting it after wait/close is race-free.
     let stdout = out_handle.await.unwrap_or_default().render();
     let stderr = err_handle.await.unwrap_or_default().render();
     let duration_ms = start.elapsed().as_millis();
 
-    // The child has been reaped — delete any spawner temp files (e.g. the
-    // Seatbelt .sb profile). Race-free now: sandbox-exec read it at startup,
-    // long before exit. Best-effort; a failed unlink just leaves a temp file.
     for p in &cleanup_paths {
         let _ = std::fs::remove_file(p);
+    }
+
+    // Now handle any error that was collected during the select.
+    if let Some(msg) = wait_err {
+        return Err(ExecError::Io(msg));
     }
 
     match status {
@@ -303,11 +390,7 @@ pub struct MacSeatbeltSpawn;
 
 #[cfg(target_os = "macos")]
 impl SandboxedSpawn for MacSeatbeltSpawn {
-    fn spawn(
-        &self,
-        spec: &ExecSpec,
-    ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
-
+    fn spawn(&self, spec: &ExecSpec) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
         // Both roots must be canonical absolute paths for the Seatbelt
         // `subpath` rules to match the process's real cwd/writes.
         let ws = spec
@@ -319,7 +402,7 @@ impl SandboxedSpawn for MacSeatbeltSpawn {
             .canonicalize()
             .map_err(|e| ExecError::SandboxApply(format!("tmp root unavailable: {e}")))?;
 
-        let profile = build_seatbelt_profile(&ws, &tmp, spec.network);
+        let profile = build_seatbelt_profile(&ws, &tmp, spec.network)?;
         // The profile file lives OUTSIDE the sandboxed dirs — sandbox-exec
         // reads it before the restriction takes effect, so its location is
         // unconstrained. It's small and left in the OS temp dir (OS-cleaned);
@@ -351,12 +434,57 @@ impl SandboxedSpawn for MacSeatbeltSpawn {
     }
 }
 
+/// Escape a path for embedding as a `<string>` in a Seatbelt S-expression
+/// profile.  Backslash and double-quote are the only characters meaningful
+/// inside a double-quoted Scheme string; we escape them and fail-closed on
+/// any control character (NUL, newlines, etc.) because a canonicalised real
+/// path cannot contain one, and a malicious input must not reach the parser.
+#[cfg(target_os = "macos")]
+fn seatbelt_escape_path(path: &Path) -> Result<String, ExecError> {
+    let s = path.to_str().ok_or_else(|| {
+        ExecError::SandboxApply(
+            "sandbox path is not valid UTF-8 — refusing to embed in profile".to_string(),
+        )
+    })?;
+    if s.contains('\0') {
+        return Err(ExecError::SandboxApply(
+            "sandbox path contains null byte — refusing to embed in profile".to_string(),
+        ));
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            // Control characters (including \n, \r, \t) could truncate or
+            // alter the S-expression.  A canonicalised path from the OS
+            // should never contain them; reject rather than risk weakening
+            // the policy (fail-closed).
+            c if c.is_control() => {
+                return Err(ExecError::SandboxApply(format!(
+                    "sandbox path contains control character U+{:04X} — refusing to embed",
+                    c as u32
+                )));
+            }
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
 /// Build the Seatbelt profile. Verified on macOS 15 — see the module spec for
 /// the `import system.sb` gotcha and the tested deny/allow set.
+///
+/// Paths are escaped via [`seatbelt_escape_path`] — a quote, backslash, or
+/// control character in a workspace/tmp path cannot break or weaken the policy.
 #[cfg(target_os = "macos")]
-fn build_seatbelt_profile(workspace: &Path, tmp: &Path, network: bool) -> String {
-    let ws = workspace.display();
-    let tmp = tmp.display();
+fn build_seatbelt_profile(
+    workspace: &Path,
+    tmp: &Path,
+    network: bool,
+) -> Result<String, ExecError> {
+    let ws = seatbelt_escape_path(workspace)?;
+    let tmp = seatbelt_escape_path(tmp)?;
     let mut p = format!(
         "(version 1)\n\
          (deny default)\n\
@@ -381,7 +509,7 @@ fn build_seatbelt_profile(workspace: &Path, tmp: &Path, network: bool) -> String
     if network {
         p.push_str("(allow network*)\n");
     }
-    p
+    Ok(p)
 }
 
 // ── UnsupportedSandbox (non-macOS placeholder) ───────────────────────────────
@@ -394,10 +522,7 @@ pub struct UnsupportedSandbox;
 
 #[cfg(not(target_os = "macos"))]
 impl SandboxedSpawn for UnsupportedSandbox {
-    fn spawn(
-        &self,
-        _spec: &ExecSpec,
-    ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
+    fn spawn(&self, _spec: &ExecSpec) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
         Err(ExecError::SandboxApply(
             "no sandbox backend for this platform yet".to_string(),
         ))
@@ -454,8 +579,11 @@ impl ShellExecTool {
         let Some(storage) = &self.storage else {
             return true; // unwired → legacy behavior
         };
-        match storage.open_profile(profile).and_then(|db| db.get_sandbox_config()) {
-            Ok(None) => true,                            // unconfigured → unconstrained
+        match storage
+            .open_profile(profile)
+            .and_then(|db| db.get_sandbox_config())
+        {
+            Ok(None) => true,                             // unconfigured → unconstrained
             Ok(Some(cfg)) => cfg.permits_shell_network(), // configured → the ceiling
             Err(e) => {
                 tracing::warn!(
@@ -562,9 +690,7 @@ impl Tool for ShellExecTool {
                 Err(ExecError::SandboxApply(msg)) => ToolResult::Err(format!(
                     "shell sandbox failed to apply — the command did NOT run: {msg}"
                 )),
-                Err(ExecError::Io(msg)) => {
-                    ToolResult::Err(format!("shell_exec i/o error: {msg}"))
-                }
+                Err(ExecError::Io(msg)) => ToolResult::Err(format!("shell_exec i/o error: {msg}")),
             }
         })
     }
@@ -615,7 +741,10 @@ mod tests {
     fn match_text_returns_bare_decoded_command_not_json_envelope() {
         let t = dummy_tool();
         let text = t.match_text(&serde_json::json!({"command": "rm -rf /", "network": false}));
-        assert_eq!(text, "rm -rf /", "must be the decoded command, not the JSON envelope");
+        assert_eq!(
+            text, "rm -rf /",
+            "must be the decoded command, not the JSON envelope"
+        );
     }
 
     #[tokio::test]
@@ -693,12 +822,22 @@ mod tests {
         );
 
         // A `work`-profile call jails BOTH roots to their per-profile subdirs.
-        let ctx = ExecCtx { profile: "work".to_string(), ..ExecCtx::default() };
+        let ctx = ExecCtx {
+            profile: "work".to_string(),
+            ..ExecCtx::default()
+        };
         let _ = tool
-            .run(ToolInput::new(serde_json::json!({"command": "echo hi"})), &ctx)
+            .run(
+                ToolInput::new(serde_json::json!({"command": "echo hi"})),
+                &ctx,
+            )
             .await;
         assert_eq!(
-            seen_ws.lock().unwrap().clone().expect("spawner should have been called"),
+            seen_ws
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("spawner should have been called"),
             base.join("work"),
             "shell must run under the per-profile workspace root, not the shared base"
         );
@@ -707,17 +846,34 @@ mod tests {
             tmp_base.join("work"),
             "the tmp scratch must ALSO be per-profile — a shared tmp is a cross-profile exfil channel"
         );
-        assert!(base.join("work").is_dir(), "the per-profile workspace root is created before spawn");
-        assert!(tmp_base.join("work").is_dir(), "the per-profile tmp root is created before spawn");
+        assert!(
+            base.join("work").is_dir(),
+            "the per-profile workspace root is created before spawn"
+        );
+        assert!(
+            tmp_base.join("work").is_dir(),
+            "the per-profile tmp root is created before spawn"
+        );
 
         // Empty profile (default ctx) → the shared base, unchanged (tests).
         *seen_ws.lock().unwrap() = None;
         *seen_tmp.lock().unwrap() = None;
         let _ = tool
-            .run(ToolInput::new(serde_json::json!({"command": "echo hi"})), &ExecCtx::default())
+            .run(
+                ToolInput::new(serde_json::json!({"command": "echo hi"})),
+                &ExecCtx::default(),
+            )
             .await;
-        assert_eq!(seen_ws.lock().unwrap().clone().unwrap(), base, "empty profile → shared base ws");
-        assert_eq!(seen_tmp.lock().unwrap().clone().unwrap(), tmp_base, "empty profile → shared base tmp");
+        assert_eq!(
+            seen_ws.lock().unwrap().clone().unwrap(),
+            base,
+            "empty profile → shared base ws"
+        );
+        assert_eq!(
+            seen_tmp.lock().unwrap().clone().unwrap(),
+            tmp_base,
+            "empty profile → shared base tmp"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&tmp_base);
@@ -745,15 +901,30 @@ mod tests {
                 allow_unix_sockets: vec![],
             },
         };
-        storage.open_profile("work").unwrap().set_sandbox_config(&locked).unwrap();
+        storage
+            .open_profile("work")
+            .unwrap()
+            .set_sandbox_config(&locked)
+            .unwrap();
         // A network-permitting config for "school".
-        storage.open_profile("school").unwrap().set_sandbox_config(&SandboxConfig::default()).ok();
+        storage
+            .open_profile("school")
+            .unwrap()
+            .set_sandbox_config(&SandboxConfig::default())
+            .ok();
         // Note: SandboxConfig::default().network.allow_localhost == true → permits.
         let permit = SandboxConfig {
-            network: SandboxNetworkConfig { allow_localhost: true, ..Default::default() },
+            network: SandboxNetworkConfig {
+                allow_localhost: true,
+                ..Default::default()
+            },
             ..locked.clone()
         };
-        storage.open_profile("school").unwrap().set_sandbox_config(&permit).unwrap();
+        storage
+            .open_profile("school")
+            .unwrap()
+            .set_sandbox_config(&permit)
+            .unwrap();
 
         let seen_network = Arc::new(std::sync::Mutex::new(None));
         let tool = ShellExecTool::new(
@@ -771,7 +942,10 @@ mod tests {
         let run = |profile: &'static str, net: bool| {
             let tool = &tool;
             let input = ToolInput::new(serde_json::json!({"command": "echo hi", "network": net}));
-            let ctx = ExecCtx { profile: profile.to_string(), ..ExecCtx::default() };
+            let ctx = ExecCtx {
+                profile: profile.to_string(),
+                ..ExecCtx::default()
+            };
             async move {
                 let _ = tool.run(input, &ctx).await;
             }
@@ -779,22 +953,38 @@ mod tests {
 
         // Locked profile requests network → DENIED by the ceiling.
         run("work", true).await;
-        assert_eq!(*seen_network.lock().unwrap(), Some(false), "locked profile denies shell network");
+        assert_eq!(
+            *seen_network.lock().unwrap(),
+            Some(false),
+            "locked profile denies shell network"
+        );
 
         // Unconfigured profile (no row) → the request stands (legacy behavior).
         *seen_network.lock().unwrap() = None;
         run("personal", true).await;
-        assert_eq!(*seen_network.lock().unwrap(), Some(true), "unconfigured profile keeps today's behavior");
+        assert_eq!(
+            *seen_network.lock().unwrap(),
+            Some(true),
+            "unconfigured profile keeps today's behavior"
+        );
 
         // Permitting config → ceiling lifted.
         *seen_network.lock().unwrap() = None;
         run("school", true).await;
-        assert_eq!(*seen_network.lock().unwrap(), Some(true), "a network-permitting config allows it");
+        assert_eq!(
+            *seen_network.lock().unwrap(),
+            Some(true),
+            "a network-permitting config allows it"
+        );
 
         // A call that doesn't ask for network never gets it, regardless of config.
         *seen_network.lock().unwrap() = None;
         run("school", false).await;
-        assert_eq!(*seen_network.lock().unwrap(), Some(false), "no request → no network");
+        assert_eq!(
+            *seen_network.lock().unwrap(),
+            Some(false),
+            "no request → no network"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -850,7 +1040,11 @@ mod tests {
         .await
         .expect("must be a normal Ok, not a false SandboxApply Err");
         assert_eq!(out.exit_code, Some(65));
-        assert!(out.stdout.contains("real-output"), "stdout must be preserved: {}", out.stdout);
+        assert!(
+            out.stdout.contains("real-output"),
+            "stdout must be preserved: {}",
+            out.stdout
+        );
     }
 
     #[cfg(unix)]
@@ -859,8 +1053,13 @@ mod tests {
         // Print ~200 KiB of 'a' — over HEAD+TAIL (80 KiB), so it elides.
         let mut s = spec("head -c 204800 /dev/zero | tr '\\0' 'a'");
         s.timeout = Duration::from_secs(20);
-        let out = run_guarded(&PlainUnixSpawn, &s).await.expect("must succeed");
-        assert!(out.stdout.contains("bytes elided"), "expected an elision marker");
+        let out = run_guarded(&PlainUnixSpawn, &s)
+            .await
+            .expect("must succeed");
+        assert!(
+            out.stdout.contains("bytes elided"),
+            "expected an elision marker"
+        );
         // Bounded to roughly HEAD + TAIL + a short marker, nowhere near 200 KiB.
         assert!(
             out.stdout.len() < OUTPUT_HEAD_CAP_BYTES + OUTPUT_TAIL_CAP_BYTES + 128,
@@ -868,7 +1067,10 @@ mod tests {
             out.stdout.len()
         );
         assert!(out.stdout.starts_with("aaaa"), "head content preserved");
-        assert!(out.stdout.ends_with("aaaa\n") || out.stdout.ends_with('a'), "tail content preserved");
+        assert!(
+            out.stdout.ends_with("aaaa\n") || out.stdout.ends_with('a'),
+            "tail content preserved"
+        );
     }
 
     #[cfg(unix)]
@@ -889,7 +1091,9 @@ mod tests {
         s.timeout = Duration::from_millis(300);
 
         let start = std::time::Instant::now();
-        let out = run_guarded(&PlainUnixSpawn, &s).await.expect("must not error");
+        let out = run_guarded(&PlainUnixSpawn, &s)
+            .await
+            .expect("must not error");
         assert!(out.timed_out, "must report a timeout");
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -905,7 +1109,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── M-14: setsid escape is caught by process-tree walk ─────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setsid_descendant_is_killed_on_timeout() {
+        // A grandchild that calls setsid(2) creates a new session/process
+        // group and escapes kill(-pgid,SIGKILL).  The tree-walk in
+        // kill_descendants must find and kill it.
+        //
+        // Race-safe design: the Perl fork-parent stays alive for 10s (past
+        // the 300 ms timeout), so the setsid grandchild's parent (ppid) is
+        // still in the process table when the BFS runs.
+        let dir = std::env::temp_dir().join(format!("lhp-exec-setsid-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker");
+        let command = format!(
+            "perl -MPOSIX -e 'defined(my$p=fork) or die 1; if($p){{sleep 10;exit}} setsid();sleep 3;open(my$f,\">\",\"{}\");close$f;exit' & exec sleep 30",
+            marker.display()
+        );
+        let mut s = spec(&command);
+        s.workspace_root = dir.clone();
+        s.tmp_root = dir.clone();
+        s.timeout = Duration::from_millis(300);
+
+        let start = std::time::Instant::now();
+        let out = run_guarded(&PlainUnixSpawn, &s)
+            .await
+            .expect("must not error");
+        assert!(out.timed_out, "must report a timeout");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return near the timeout, not after 30s"
+        );
+
+        // Wait past when the setsid escapee would have touched the marker.
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert!(
+            !marker.exists(),
+            "the setsid grandchild survived — tree kill did not find it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── macOS-only: the real Seatbelt sandbox ────────────────────────────────
+
+    // ── M-15: seatbelt_escape_path adversarial tests ──────────────────────
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_escape_normal_path() {
+        let p = Path::new("/Users/test/workspace");
+        assert_eq!(seatbelt_escape_path(p).unwrap(), "/Users/test/workspace");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_escape_backslash() {
+        let p = Path::new("/Users/test/back\\slash");
+        assert_eq!(
+            seatbelt_escape_path(p).unwrap(),
+            "/Users/test/back\\\\slash"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_escape_double_quote() {
+        let p = Path::new("/Users/test/\"quote");
+        assert_eq!(seatbelt_escape_path(p).unwrap(), "/Users/test/\\\"quote");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_escape_backslash_and_quote() {
+        let p = Path::new("/Users/test/\"both\\path");
+        assert_eq!(
+            seatbelt_escape_path(p).unwrap(),
+            "/Users/test/\\\"both\\\\path"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_escape_null_fails_closed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = b"/Users/test/\0evil";
+        let p = Path::new(OsStr::from_bytes(bytes));
+        assert!(
+            seatbelt_escape_path(p).is_err(),
+            "null byte must be rejected (fail-closed)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_escape_control_char_fails_closed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = b"/Users/test/\nnewline";
+        let p = Path::new(OsStr::from_bytes(bytes));
+        assert!(
+            seatbelt_escape_path(p).is_err(),
+            "control character must be rejected (fail-closed)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_escape_non_utf8_fails_closed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = b"/Users/test/\xff\xffevil";
+        let p = Path::new(OsStr::from_bytes(bytes));
+        assert!(
+            seatbelt_escape_path(p).is_err(),
+            "non-UTF-8 path must be rejected (fail-closed)"
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
@@ -919,7 +1241,9 @@ mod tests {
         let mut s = spec("echo inside > allowed.txt && cat allowed.txt");
         s.workspace_root = ws.clone();
         s.tmp_root = tmp.clone();
-        let out = run_guarded(&MacSeatbeltSpawn, &s).await.expect("in-workspace write must run");
+        let out = run_guarded(&MacSeatbeltSpawn, &s)
+            .await
+            .expect("in-workspace write must run");
         assert_eq!(out.exit_code, Some(0), "stderr: {}", out.stderr);
         assert!(out.stdout.contains("inside"), "stdout: {}", out.stdout);
 
@@ -928,9 +1252,14 @@ mod tests {
         let mut s2 = spec(&format!("echo pwned > '{}'", outside.display()));
         s2.workspace_root = ws.clone();
         s2.tmp_root = tmp.clone();
-        let out2 = run_guarded(&MacSeatbeltSpawn, &s2).await.expect("must run (and be denied by the OS)");
+        let out2 = run_guarded(&MacSeatbeltSpawn, &s2)
+            .await
+            .expect("must run (and be denied by the OS)");
         assert_ne!(out2.exit_code, Some(0), "an out-of-sandbox write must fail");
-        assert!(!outside.exists(), "nothing may be written outside the sandbox roots");
+        assert!(
+            !outside.exists(),
+            "nothing may be written outside the sandbox roots"
+        );
 
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -949,7 +1278,9 @@ mod tests {
         s.workspace_root = ws.clone();
         s.tmp_root = tmp.clone();
         s.timeout = Duration::from_secs(10);
-        let out = run_guarded(&MacSeatbeltSpawn, &s).await.expect("curl must run (and be blocked)");
+        let out = run_guarded(&MacSeatbeltSpawn, &s)
+            .await
+            .expect("curl must run (and be blocked)");
         assert!(
             !out.stdout.contains("200"),
             "network is off by default; egress must be blocked, got stdout: {}",
