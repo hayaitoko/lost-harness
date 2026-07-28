@@ -67,6 +67,7 @@ Security-sensitive issues are covered by [SECURITY.md](SECURITY.md).
 
 ## License
 
-No open-source license has been published for this repository yet. Do not
-redistribute builds or reuse the source outside the collaborators' agreement
-until the maintainers select one.
+Licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
+
+This project vendors third-party binaries under their own licenses; see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for details.
