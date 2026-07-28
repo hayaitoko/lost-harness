@@ -170,16 +170,23 @@ fn command_error(output: &std::process::Output) -> CuError {
 }
 
 fn osascript(script: &str, args: &[&str]) -> Result<String, CuError> {
-    let output = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .args(args)
-        .output()
-        .map_err(|e| CuError::Failed(format!("could not start macOS automation: {e}")))?;
-    if !output.status.success() {
-        return Err(command_error(&output));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    // Move the blocking subprocess call off the tokio worker thread via
+    // block_in_place so the runtime can schedule other tasks while this
+    // thread is blocked on osascript output (M-21 / M-04).
+    let script_str = script.to_string();
+    let arg_vec: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    tokio::task::block_in_place(move || {
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(&script_str)
+            .args(&arg_vec)
+            .output()
+            .map_err(|e| CuError::Failed(format!("could not start macOS automation: {e}")))?;
+        if !output.status.success() {
+            return Err(command_error(&output));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })
 }
 
 fn event_source() -> Result<CGEventSource, CuError> {

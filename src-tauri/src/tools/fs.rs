@@ -1,16 +1,44 @@
-//! Read-only filesystem tools — the first real tools wired through the M3
-//! spine. Spec `docs/PLAN.md` §8 (M3 build order item 10: "file read/list/
-//! search"). Write/delete tools are deliberately a later round, because
-//! they need the approval spine (item 9) which isn't built yet.
+//! Filesystem tools — the first real tools wired through the M3 spine. Spec
+//! `docs/PLAN.md` §8 (M3 build order item 10: "file read/list/search").
 //!
-//! Every tool here requires `Capability::Filesystem` and is confined to a
-//! single **workspace root**: paths are relative, `..` is rejected, and the
-//! canonicalized target must stay inside the root (so a symlink can't be
-//! used to escape). This is defense-in-depth *below* the hook chain — even
-//! before a call reaches the sandbox/permission gates, a read tool
+//! Tools:
+//! - **read_file** (RiskClass::Safe) — read UTF-8 text
+//! - **list_dir** (RiskClass::Safe) — list directory entries
+//! - **search_files** (RiskClass::Safe) — substring search over names + contents
+//! - **write_file** (RiskClass::Write) — create or overwrite
+//! - **edit_file** (RiskClass::Write) — replace a unique substring
+//! - **delete_file** (RiskClass::Write) — remove a single file (not a directory)
+//!
+//! ### Confinement
+//! Every tool requires `Capability::Filesystem` and is confined to a single
+//! **workspace root**: paths are relative, `..` is rejected, and the resolved
+//! target must stay inside the root. This is defense-in-depth *below* the hook
+//! chain — even before a call reaches the sandbox/permission gates, a tool
 //! structurally cannot wander to `/etc/shadow`.
+//!
+//! ### Risk classes
+//! - **Safe** (read_file, list_dir, search_files): no approval needed.
+//! - **Write** (write_file, edit_file, delete_file): routes through the
+//!   approval spine (`RiskClass::Write`). All three also enforce a
+//!   read-before-write guard: an existing file must have been read in the
+//!   current conversation before it can be overwritten or deleted.
+//!
+//! ### TOCTOU mitigations
+//! Paths are resolved via canonicalization, then every open uses `O_NOFOLLOW`
+//! on the last component so a symlink swapped between check and use causes
+//! `open()` to fail with `ELOOP`, preventing workspace escape. After opening,
+//! the descriptor's real path is verified against the workspace root via
+//! `fcntl(F_GETPATH)`. Write operations additionally verify containment of
+//! the opened descriptor.
+//!
+//! These mitigations narrow but do not eliminate the TOCTOU window — an
+//! intermediate directory symlink swap between canonicalize and openat walk
+//! remains possible. Full `openat(2)`-based descriptor-relative traversal is
+//! tracked as a follow-up hardening item.
 
 use std::future::Future;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 
@@ -67,44 +95,107 @@ fn arg_str<'a>(input: &'a ToolInput, key: &str) -> Option<&'a str> {
     input.args.get(key).and_then(|v| v.as_str())
 }
 
-/// Wave 5.4 / M7 (Tier-P) — the PER-PROFILE workspace root under `base`. Each
-/// profile gets its own physically-separate directory (`base/<profile>`), the
-/// same in-process isolation walled memory (§7) gives, so a `work` profile's
-/// files never sit in the `personal` profile's tree. This is the primary
-/// filesystem-confinement boundary; a kernel jail (Tier-K) is the on-target
-/// hardening layered ON TOP.
-///
-/// Pure + TRAVERSAL-SAFE by construction. The rule MIRRORS
-/// `Storage::open_profile` EXACTLY: apply the identical denylist to the RAW name
-/// (reject only the path-escaping forms — `/`, `\`, `..`, a leading `.`, empty),
-/// then use it VERBATIM as the subdir. This byte-for-byte equivalence is
-/// load-bearing and adversarially verified: `open_profile` keys a distinct
-/// `profiles/<name>.db` (and a distinct walled-memory island) off the raw name,
-/// so this MUST bucket by the raw name too, or two names `open_profile` treats
-/// as DISTINCT profiles would share one filesystem tree. Two traps that broke
-/// earlier cuts, both now avoided:
-/// - An allowlist (`[A-Za-z0-9_-]`) collapses a space/Unicode/punctuation name
-///   that `open_profile` accepts ("my work", "café") down to `base`.
-/// - A `.trim()` before the denylist collapses `" work"`/`"work "` onto `work`
-///   (and a whitespace-only name onto `base` itself), even though `open_profile`
-///   does NOT trim and treats each as its own profile. So do NOT trim.
-///
-/// Because a passing name has no separator and isn't `..`, `base.join(name)` is
-/// always a unique direct child of `base` (distinct names → distinct trees, no
-/// escape); the only name that collapses to `base` is the EMPTY string — the
-/// default/scratch `ExecCtx`, which `open_profile` also rejects, so it can never
-/// alias a real profile. Callers (the fs tools) create the dir; the
-/// `ProtectedPathHook` uses the path read-only.
-pub fn profile_workspace_path(base: &std::path::Path, profile: &str) -> PathBuf {
-    if profile.is_empty()
-        || profile.contains('/')
-        || profile.contains('\\')
-        || profile.contains("..")
-        || profile.starts_with('.')
-    {
-        return base.to_path_buf();
+/// Canonicalize a profile name for use as both a filesystem subdirectory and
+/// a DB cache key: validates the name using the same rules as
+/// [`crate::storage::validate_profile_name`], then normalises to lowercase so
+/// the workspace path and the DB key agree (a case-insensitive filesystem
+/// collapses "Work" and "work" onto the same inode — the same non-isolation
+/// hole the storage layer's normalisation closes).
+pub fn canonical_profile_name(profile: &str) -> Result<String, String> {
+    if profile.is_empty() {
+        return Err("profile name is empty".to_string());
     }
-    base.join(profile)
+    if profile.len() > 64 {
+        return Err(format!("profile name too long ({} chars)", profile.len()));
+    }
+    if !profile.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(format!(
+            "invalid profile name {profile:?} (only ASCII letters, digits, '_' and '-' allowed)"
+        ));
+    }
+    if profile.starts_with('.') || profile.contains("..") {
+        return Err(format!("invalid profile name {profile:?}"));
+    }
+    Ok(profile.to_ascii_lowercase())
+}
+
+/// Per-profile workspace root under `base`. Each profile gets its own
+/// physically-separate directory (`base/<canonical_name>`), matching the
+/// per-profile DB isolation in `Storage::open_profile`.
+///
+/// **Fail-closed**: an invalid or empty profile name returns an isolated
+/// sentinel path (`base/__invalid_profile__`) that is a unique child of base
+/// — it never collapses to `base` itself.
+pub fn profile_workspace_path(base: &std::path::Path, profile: &str) -> PathBuf {
+    let name = canonical_profile_name(profile).unwrap_or_else(|_| "__invalid_profile__".into());
+    base.join(name)
+}
+
+// ── profile-validation helper (for use in tool `run` methods) ───────
+
+fn ensure_valid_profile(profile: &str) -> Result<(), String> {
+    canonical_profile_name(profile).map(|_| ())
+}
+
+// ── async wrappers for sync resolvers (spawn_blocking) ─────────────
+
+async fn resolve_within_async(root: PathBuf, rel: String) -> Result<PathBuf, String> {
+    tokio::task::spawn_blocking(move || resolve_within(&root, &rel))
+        .await
+        .map_err(|e| format!("resolve task failed: {e}"))?
+}
+
+async fn resolve_within_new_async(root: PathBuf, rel: String) -> Result<PathBuf, String> {
+    tokio::task::spawn_blocking(move || resolve_within_new(&root, &rel))
+        .await
+        .map_err(|e| format!("resolve task failed: {e}"))?
+}
+
+// ── TOCTOU helpers: O_NOFOLLOW open + fd-verified containment ──────
+
+fn fd_realpath(fd: i32) -> Result<PathBuf, String> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let ret = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) };
+    if ret == -1 {
+        return Err(format!("fcntl(F_GETPATH) failed: {}", std::io::Error::last_os_error()));
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    Ok(PathBuf::from(
+        std::str::from_utf8(&buf).map_err(|_| "non-UTF-8 path from fcntl(F_GETPATH)".to_string())?,
+    ))
+}
+
+fn open_verified(path: &Path, ws_root_canon: &Path) -> Result<(std::fs::File, PathBuf), String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("open with O_NOFOLLOW: {e}"))?;
+    let real = fd_realpath(file.as_raw_fd())?;
+    if !real.starts_with(ws_root_canon) {
+        return Err(format!(
+            "opened file's real path {:?} is outside the workspace root {:?} (TOCTOU)",
+            real, ws_root_canon
+        ));
+    }
+    Ok((file, real))
+}
+
+fn open_verified_write(path: &Path, ws_root_canon: &Path) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("open with O_NOFOLLOW (write): {e}"))?;
+    let real = fd_realpath(file.as_raw_fd())?;
+    if !real.starts_with(ws_root_canon) {
+        return Err(format!(
+            "opened file's real path {:?} is outside the workspace root {:?} (TOCTOU)",
+            real, ws_root_canon
+        ));
+    }
+    Ok(file)
 }
 
 /// The filename that records the legacy-workspace migration already ran.
