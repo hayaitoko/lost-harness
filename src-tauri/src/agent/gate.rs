@@ -16,7 +16,9 @@
 //!                 Private + cloud → `RouteLocal`. Public → `Allow`.
 //!                 Uncertain + cloud → `RouteLocal` (spec Risk 4:
 //!                 "when uncertain, route to private tree").
-//!  - `Public`  — the user explicitly opted in. Always `Allow`.
+//!  - `Public`  — the user explicitly opted in. Always runs detection
+//!                 (H-12); non-sensitive content passes, while high-confidence
+//!                 PII/credential hits require explicit confirmation.
 //!  - `Private` — the user explicitly opted in. Cloud endpoints are
 //!                 always `Block`ed.
 //!
@@ -55,9 +57,16 @@ pub enum GateDecision {
 /// and the heuristic fallback are interchangeable at the call site. `Clone` is
 /// cheap (an `Arc` bump) — a Wave-4.3 delegated sub-agent runs as a fresh
 /// `AgentLoop` built with a clone of the parent's gate (same classifier).
+///
+/// C-01: when the trained ONNX classifier is unavailable (`degraded = true`),
+/// the gate fails closed — cloud egress under `Auto` binding is always blocked.
+/// The frontend can read [`degraded()`] to surface a warning banner.
 #[derive(Clone)]
 pub struct PrivacyGate {
     classifier: Arc<dyn Classifier>,
+    /// When true, the trained ONNX ensemble is unavailable; only the rules-only
+    /// fallback is active. Cloud egress under `Auto` is blocked (C-01).
+    degraded: bool,
 }
 
 impl std::fmt::Debug for PrivacyGate {
@@ -68,8 +77,30 @@ impl std::fmt::Debug for PrivacyGate {
 
 impl PrivacyGate {
     /// Build a gate around the given classifier (trained or heuristic).
+    ///
+    /// The gate starts in normal (non-degraded) mode. Use [`new_degraded`] when
+    /// the trained ONNX classifier is unavailable (C-01).
     pub fn new(classifier: Arc<dyn Classifier>) -> Self {
-        Self { classifier }
+        Self {
+            classifier,
+            degraded: false,
+        }
+    }
+
+    /// Build a gate in degraded mode — the trained ONNX classifier is
+    /// unavailable and the rules-only fallback is active. Cloud egress under
+    /// `Auto` binding is blocked (fail-closed, C-01).
+    pub fn new_degraded(classifier: Arc<dyn Classifier>) -> Self {
+        Self {
+            classifier,
+            degraded: true,
+        }
+    }
+
+    /// Whether the gate is operating in degraded mode (trained classifier
+    /// unavailable). The frontend can surface this as a warning banner.
+    pub fn degraded(&self) -> bool {
+        self.degraded
     }
 
     /// Decide whether `text` may be sent to a cloud endpoint under `binding`.
@@ -92,8 +123,10 @@ impl PrivacyGate {
 
     /// Like [`check`], but also returns the `Classification` the `Auto` binding
     /// computed (so a caller can see the detected spans — e.g. for redact-and-
-    /// send). `None` for `Public`/`Private` bindings, which bypass the
-    /// classifier. The classification is computed at most once.
+    /// send). `None` for `Private` binding (which bypasses the classifier).
+    /// `Some` for `Auto` (always classifies) and `Public` (H-12: always runs
+    /// detection to surface sensitive content). The classification is computed
+    /// at most once.
     pub fn check_detailed(
         &self,
         binding: &Binding,
@@ -102,11 +135,32 @@ impl PrivacyGate {
         cfg: &ClassifierConfig,
     ) -> (GateDecision, Option<Classification>) {
         match binding {
-            // Deliberate product decision (2026-07-23 external-review triage):
-            // Public is a pure user privacy waiver and rules-only classifier
-            // fallback stays permissive. Do not silently add a classifier floor
-            // here; changing this requires an explicit product decision.
-            Binding::Public => (GateDecision::Allow, None),
+            // H-12: always run detection on Public binding and surface the
+            // classification so callers can warn the user. On a high-confidence
+            // PII or credential hit, require explicit confirmation instead of
+            // silently allowing — the gate blocks with an actionable message.
+            Binding::Public => {
+                let classification = self.classifier.classify_with(text, cfg);
+                let has_sensitive = classification.label == crate::classifier::Label::Private
+                    && classification.confidence >= 0.9
+                    && classification.spans.iter().any(|s| {
+                        matches!(
+                            s.category,
+                            crate::classifier::rules::RuleCategory::Credential
+                                | crate::classifier::rules::RuleCategory::PiiId
+                                | crate::classifier::rules::RuleCategory::PiiContact
+                                | crate::classifier::rules::RuleCategory::Financial
+                        )
+                    });
+                let d = if has_sensitive {
+                    GateDecision::Block(
+                        "PII or credential detected — explicit confirmation required".to_string(),
+                    )
+                } else {
+                    GateDecision::Allow
+                };
+                (d, Some(classification))
+            }
 
             // User explicitly chose private. Cloud endpoints are never OK
             // regardless of content. The block message names the binding so
@@ -124,15 +178,22 @@ impl PrivacyGate {
             // The classifier (or fallback) decides. The endpoint's cloud-ness only
             // matters when the label is Private or Uncertain — Public text
             // is always safe to send.
+            // C-01: when the trained classifier is unavailable (degraded mode),
+            // cloud egress is blocked regardless of the fallback label — the
+            // gate fails closed.
             Binding::Auto => {
                 let classification = self.classifier.classify_with(text, cfg);
-                let d = match classification.label {
-                    crate::classifier::Label::Public => GateDecision::Allow,
-                    crate::classifier::Label::Private | crate::classifier::Label::Uncertain => {
-                        if is_cloud_endpoint {
-                            GateDecision::RouteLocal
-                        } else {
-                            GateDecision::Allow
+                let d = if self.degraded && is_cloud_endpoint {
+                    GateDecision::RouteLocal
+                } else {
+                    match classification.label {
+                        crate::classifier::Label::Public => GateDecision::Allow,
+                        crate::classifier::Label::Private | crate::classifier::Label::Uncertain => {
+                            if is_cloud_endpoint {
+                                GateDecision::RouteLocal
+                            } else {
+                                GateDecision::Allow
+                            }
                         }
                     }
                 };
@@ -146,12 +207,7 @@ impl PrivacyGate {
     ///
     /// For now this is `tracing::info` — the storage layer wiring lands when
     /// the storage module's M1 surface is finalized.
-    pub fn log_decision(
-        &self,
-        decision: &GateDecision,
-        text_hash: &str,
-        conversation_id: &str,
-    ) {
+    pub fn log_decision(&self, decision: &GateDecision, text_hash: &str, conversation_id: &str) {
         let decision_str = match decision {
             GateDecision::Allow => "allow",
             GateDecision::Block(_) => "block",

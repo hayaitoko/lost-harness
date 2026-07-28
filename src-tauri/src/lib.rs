@@ -169,6 +169,7 @@ pub fn run() {
             // gate and the tool gating chain classify identically either way.
             // Shared via Arc; a missing model dir never breaks boot.
             let classifier_models = base_path.join("models").join("classifier");
+            let classifier_degraded: bool;
             let classifier: Arc<dyn crate::classifier::Classifier> =
                 match crate::classifier::EnsembleClassifier::load(&classifier_models) {
                     Ok(ensemble) => {
@@ -177,14 +178,16 @@ pub fn run() {
                             path = %classifier_models.display(),
                             "loaded trained ONNX ensemble classifier"
                         );
+                        classifier_degraded = false;
                         Arc::new(ensemble)
                     }
                     Err(e) => {
-                        tracing::info!(
+                        tracing::warn!(
                             target: "lhp::classifier",
                             reason = %e,
-                            "trained classifier unavailable — using rules-only classifier"
+                            "trained classifier unavailable — fail-closed (degraded mode)"
                         );
+                        classifier_degraded = true;
                         Arc::new(RulesClassifier::new())
                     }
                 };
@@ -214,7 +217,13 @@ pub fn run() {
             }
 
             // §7 Privacy Gate for message egress.
-            let gate = PrivacyGate::new(Arc::clone(&classifier));
+            // C-01: when the trained classifier couldn't load, create the gate
+            // in degraded mode — cloud egress under Auto is blocked.
+            let gate = if classifier_degraded {
+                PrivacyGate::new_degraded(Arc::clone(&classifier))
+            } else {
+                PrivacyGate::new(Arc::clone(&classifier))
+            };
 
             // §3.5 approval spine: the shared grant ledger, the pending-prompt
             // registry, and the Tauri prompter that raises an in-app
