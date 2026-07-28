@@ -40,8 +40,8 @@ use uuid::Uuid;
 
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
-use crate::email::gmail::GmailApi as _; // trait methods on GmailClient (email round)
 use crate::agent::result_sink::{ResultSink, TauriResultSink};
+use crate::email::gmail::GmailApi as _; // trait methods on GmailClient (email round)
 use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget, PermissionMode, ToolRule};
 use crate::ipc::approval::ApprovalRegistry;
 use crate::ipc::ask_human::AskHumanRegistry;
@@ -138,7 +138,8 @@ impl From<Provider> for ProviderInfo {
         // Compute `is_private` first — it takes `&self` and we want to
         // move `id`/`name`/`base_url`/`kind` afterwards.
         let is_private = p.is_private();
-        let trusted_by_name = crate::agent::egress::is_private_endpoint_trusted_by_name(&p.base_url);
+        let trusted_by_name =
+            crate::agent::egress::is_private_endpoint_trusted_by_name(&p.base_url);
         Self {
             id: p.id,
             name: p.name,
@@ -298,10 +299,10 @@ fn default_binding() -> String {
 
 // ── Commands ─────────────────────────────────────────────────────────────
 
-/// Returns the app version string.
+/// Returns the app version string from Cargo.toml.
 #[tauri::command]
 pub fn get_app_version() -> String {
-    "0.1.0-m1".to_string()
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 /// Returns the id of the currently active profile — the one the user last
@@ -468,42 +469,93 @@ pub fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderInfo>, S
         .collect())
 }
 
+/// Validate a provider base URL.
+///
+/// Rejects:
+/// - Unparsable URLs.
+/// - Embedded credentials (`user:pass@host`).
+/// - Fragments (`#`).
+/// - Empty/ambiguous hosts.
+/// - Non-HTTPS schemes for non-loopback endpoints (loopback HTTP is
+///   explicitly gated so users can point at local LM Studio / Ollama /
+///   llama.cpp servers without TLS).
+fn validate_base_url(raw: &str) -> Result<(), String> {
+    let url = url::Url::parse(raw).map_err(|e| format!("invalid base URL: {e}"))?;
+
+    // Reject embedded credentials — bearer keys should never be in the URL.
+    if url.username() != "" || url.password().is_some() {
+        return Err("base URL must not contain embedded credentials (user:password@)".into());
+    }
+
+    // Reject fragments — server has no use for them.
+    if url.fragment().is_some() {
+        return Err("base URL must not contain a fragment (#)".into());
+    }
+
+    // Reject empty / ambiguous hosts.
+    let host = url.host_str().unwrap_or("");
+    if host.is_empty() {
+        return Err("base URL has no host".into());
+    }
+
+    // Scheme check: require HTTPS unless the host is a loopback address.
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host == "[::1]"
+        || host.starts_with("127.");
+    match url.scheme() {
+        "https" => {}               // always OK
+        "http" if is_loopback => {} // OK for local dev servers
+        "http" => {
+            return Err(
+                "non-loopback provider endpoints must use HTTPS (http:// is only allowed for localhost/127.x.x.x)"
+                    .into(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "unsupported URL scheme \"{other}\" (expected https or http)"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn add_provider(
     state: State<'_, AppState>,
     args: AddProviderArgs,
 ) -> Result<ProviderInfo, String> {
     let kind = parse_kind(&args.kind)?;
+    validate_base_url(&args.base_url)?;
     let id = Uuid::new_v4().to_string();
-    let provider = Provider::new(
-        id.clone(),
-        args.name,
-        args.base_url,
-        args.api_key,
-        kind,
-    )
-    .with_native_tools(args.supports_native_tools);
+    let provider = Provider::new(id.clone(), args.name, args.base_url, args.api_key, kind)
+        .with_native_tools(args.supports_native_tools);
     if let Some(secret) = provider.api_key.as_deref() {
         state.provider_secrets.set(&id, secret)?;
     }
+    // Persist metadata BEFORE publishing in-memory success. A storage
+    // failure is surfaced to the caller (not silently swallowed) so the
+    // frontend can show an error instead of a provider that vanishes on
+    // restart.
+    state
+        .storage
+        .global()
+        .insert_endpoint(&crate::storage::Endpoint {
+            id: id.clone(),
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            api_key_marker: provider
+                .api_key
+                .as_ref()
+                .map(|_| crate::secrets::KEYCHAIN_MARKER.to_vec()),
+            kind: args.kind.clone(),
+            created_at: chrono::Utc::now().timestamp(),
+            supports_native_tools: provider.supports_native_tools,
+        })
+        .map_err(|e| format!("failed to persist endpoint: {e}"))?;
     state.model_manager.add_provider(provider.clone());
-    // Persist so the flag (and the endpoint) survive a restart and hydrate
-    // back on next boot. Best-effort: a storage failure logs but the
-    // in-memory provider still works for this session.
-    if let Err(e) = state.storage.global().insert_endpoint(&crate::storage::Endpoint {
-        id: id.clone(),
-        name: provider.name.clone(),
-        base_url: provider.base_url.clone(),
-        api_key_marker: provider
-            .api_key
-            .as_ref()
-            .map(|_| crate::secrets::KEYCHAIN_MARKER.to_vec()),
-        kind: args.kind.clone(),
-        created_at: chrono::Utc::now().timestamp(),
-        supports_native_tools: provider.supports_native_tools,
-    }) {
-        tracing::warn!(error = %e, "failed to persist endpoint (in-memory only this session)");
-    }
     Ok(provider.into())
 }
 
@@ -513,29 +565,24 @@ pub fn update_provider(
     args: UpdateProviderArgs,
 ) -> Result<ProviderInfo, String> {
     let kind = parse_kind(&args.kind)?;
+    validate_base_url(&args.base_url)?;
     let existing = state
         .model_manager
         .get_provider(&args.id)
         .ok_or_else(|| format!("unknown provider: {}", args.id))?;
+
+    // Snapshot the old secret so we can restore it if persistence fails.
+    let old_secret = state.provider_secrets.get(&args.id).ok().flatten();
+
     let api_key = args.api_key.or(existing.api_key);
-    let provider = Provider::new(
-        args.id.clone(),
-        args.name,
-        args.base_url,
-        api_key,
-        kind,
-    )
-    .with_native_tools(args.supports_native_tools);
+    let provider = Provider::new(args.id.clone(), args.name, args.base_url, api_key, kind)
+        .with_native_tools(args.supports_native_tools);
+
+    // Persist metadata BEFORE publishing in-memory success.
+    // Keychain and DB must both succeed before the provider is visible.
     if let Some(secret) = provider.api_key.as_deref() {
         state.provider_secrets.set(&args.id, secret)?;
     }
-    // `ModelManager::add_provider` replaces by id and drops the cached
-    // client, so the next request is built from the new base URL/key.
-    state.model_manager.add_provider(provider.clone());
-    // Persist with the same best-effort discipline as add_provider. An
-    // UPDATE matching no row means the endpoint was never persisted (e.g.
-    // the insert failed at add time) — insert it so the edit still
-    // survives a restart.
     let api_key_marker = provider
         .api_key
         .as_ref()
@@ -555,19 +602,35 @@ pub fn update_provider(
             if updated {
                 return Ok(());
             }
-            state.storage.global().insert_endpoint(&crate::storage::Endpoint {
-                id: args.id.clone(),
-                name: provider.name.clone(),
-                base_url: provider.base_url.clone(),
-                api_key_marker,
-                kind: args.kind.clone(),
-                created_at: chrono::Utc::now().timestamp(),
-                supports_native_tools: provider.supports_native_tools,
-            })
+            state
+                .storage
+                .global()
+                .insert_endpoint(&crate::storage::Endpoint {
+                    id: args.id.clone(),
+                    name: provider.name.clone(),
+                    base_url: provider.base_url.clone(),
+                    api_key_marker,
+                    kind: args.kind.clone(),
+                    created_at: chrono::Utc::now().timestamp(),
+                    supports_native_tools: provider.supports_native_tools,
+                })
         });
     if let Err(e) = persisted {
-        tracing::warn!(error = %e, "failed to persist endpoint update (in-memory only this session)");
+        // Restore the old secret on failure so the keychain stays
+        // consistent with the rolled-back DB / memory state.
+        match old_secret {
+            Some(ref s) => {
+                let _ = state.provider_secrets.set(&args.id, s);
+            }
+            None => {
+                let _ = state.provider_secrets.delete(&args.id);
+            }
+        }
+        return Err(format!("failed to persist endpoint update: {e}"));
     }
+
+    // Publish in-memory success only after durable storage is updated.
+    state.model_manager.add_provider(provider.clone());
     Ok(provider.into())
 }
 
@@ -576,12 +639,14 @@ pub fn remove_provider(state: State<'_, AppState>, id: String) -> Result<bool, S
     if state.model_manager.get_provider(&id).is_none() {
         return Err(format!("unknown provider: {id}"));
     }
-    state.provider_secrets.delete(&id)?;
+    // Delete durable state first: DB before keychain, so a mid-failure
+    // leaves the two consistent (keychain entry has no backing row).
     state
         .storage
         .global()
         .delete_endpoint(&id)
         .map_err(|e| e.to_string())?;
+    state.provider_secrets.delete(&id)?;
     state.model_manager.remove_provider(&id);
     Ok(true)
 }
@@ -589,6 +654,32 @@ pub fn remove_provider(state: State<'_, AppState>, id: String) -> Result<bool, S
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderIdArgs {
     pub provider_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetProviderApiKeyArgs {
+    pub provider_id: String,
+    pub api_key: String,
+}
+
+/// One-shot command: update a provider's API key in the OS credential store
+/// without re-registering the provider. Used by packet P04 for key rotation.
+#[tauri::command]
+pub fn set_provider_api_key(
+    state: State<'_, AppState>,
+    args: SetProviderApiKeyArgs,
+) -> Result<(), String> {
+    if state
+        .model_manager
+        .get_provider(&args.provider_id)
+        .is_none()
+    {
+        return Err(format!("unknown provider: {}", args.provider_id));
+    }
+    state
+        .provider_secrets
+        .set(&args.provider_id, &args.api_key)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -691,8 +782,8 @@ pub async fn send_message(
         .ok()
         .and_then(|db| db.list_messages_by_conversation(&conversation_id).ok())
         .unwrap_or_default();
-    let (message_id, routing_decision) = latest_assistant_routing(&rows)
-        .unwrap_or_else(|| (Uuid::new_v4().to_string(), "allow".to_string()));
+    let (message_id, routing_decision) =
+        latest_assistant_routing(&rows).unwrap_or_else(|| (String::new(), "unknown".to_string()));
 
     Ok(SendMessageResponse {
         message_id,
@@ -885,9 +976,10 @@ pub fn set_skill_approval(
             let tool_name = crate::tools::skills::skill_tool_name(&skill.name);
             match skill.approval_status {
                 crate::storage::SkillApproval::Approved => {
-                    if let Some(tool) =
-                        crate::tools::skills::SkillTool::for_skill(&skill, Arc::clone(&state.storage))
-                    {
+                    if let Some(tool) = crate::tools::skills::SkillTool::for_skill(
+                        &skill,
+                        Arc::clone(&state.storage),
+                    ) {
                         state.tools.hot_register(Box::new(tool));
                     }
                 }
@@ -1007,9 +1099,16 @@ pub async fn get_model_detail(args: GetModelDetailArgs) -> Result<ModelDetailRes
             Ok((s, notes)) => (Some(s), notes),
             Err(e) => (None, vec![format!("Couldn't read model architecture: {e}")]),
         },
-        None => (None, vec!["No downloadable quant found for this model.".to_string()]),
+        None => (
+            None,
+            vec!["No downloadable quant found for this model.".to_string()],
+        ),
     };
-    Ok(ModelDetailResponse { detail, spec, spec_notes })
+    Ok(ModelDetailResponse {
+        detail,
+        spec,
+        spec_notes,
+    })
 }
 
 /// Args for [`calculate_model_fit`] — the model's architecture spec (from
@@ -1052,10 +1151,16 @@ pub fn get_sandbox_config(
     args: GetSandboxConfigArgs,
 ) -> Result<crate::hooks::SandboxConfig, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
     // `?` propagates a corrupt-row Err; `unwrap_or_default` only fills the
     // UNSET (None) case with the library default.
-    Ok(db.get_sandbox_config().map_err(|e| e.to_string())?.unwrap_or_default())
+    Ok(db
+        .get_sandbox_config()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1074,8 +1179,12 @@ pub fn set_sandbox_config(
 ) -> Result<crate::hooks::SandboxConfig, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     validate_sandbox_config(&args.config)?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
-    db.set_sandbox_config(&args.config).map_err(|e| e.to_string())?;
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.set_sandbox_config(&args.config)
+        .map_err(|e| e.to_string())?;
     Ok(args.config)
 }
 
@@ -1083,10 +1192,20 @@ pub fn set_sandbox_config(
 /// entries (a blank domain/socket/command is never meaningful and would just be
 /// dead weight the shell path has to skip). Fail closed on bad input.
 fn validate_sandbox_config(cfg: &crate::hooks::SandboxConfig) -> Result<(), String> {
-    if cfg.network.allowed_domains.iter().any(|d| d.trim().is_empty()) {
+    if cfg
+        .network
+        .allowed_domains
+        .iter()
+        .any(|d| d.trim().is_empty())
+    {
         return Err("sandbox_config: allowed_domains entries must not be empty".into());
     }
-    if cfg.network.allow_unix_sockets.iter().any(|s| s.trim().is_empty()) {
+    if cfg
+        .network
+        .allow_unix_sockets
+        .iter()
+        .any(|s| s.trim().is_empty())
+    {
         return Err("sandbox_config: allow_unix_sockets entries must not be empty".into());
     }
     if cfg.excluded_commands.iter().any(|c| c.trim().is_empty()) {
@@ -1114,8 +1233,13 @@ pub fn get_budget_settings(
     args: GetBudgetSettingsArgs,
 ) -> Result<BudgetSettings, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
-    Ok(BudgetSettings { cap_usd: db.budget_cap().map_err(|e| e.to_string())? })
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    Ok(BudgetSettings {
+        cap_usd: db.budget_cap().map_err(|e| e.to_string())?,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1134,9 +1258,14 @@ pub fn set_budget_settings(
     args: SetBudgetSettingsArgs,
 ) -> Result<BudgetSettings, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
     db.set_budget_cap(args.cap_usd).map_err(|e| e.to_string())?;
-    Ok(BudgetSettings { cap_usd: db.budget_cap().map_err(|e| e.to_string())? })
+    Ok(BudgetSettings {
+        cap_usd: db.budget_cap().map_err(|e| e.to_string())?,
+    })
 }
 
 /// Clear the cap entirely (uncapped).
@@ -1146,7 +1275,10 @@ pub fn reset_budget_settings(
     args: GetBudgetSettingsArgs,
 ) -> Result<BudgetSettings, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
     db.reset_budget_cap().map_err(|e| e.to_string())?;
     Ok(BudgetSettings { cap_usd: None })
 }
@@ -1213,7 +1345,11 @@ pub async fn register_mcp_server(
     // segment itself; letting two servers share it would let the EARLIER one
     // silently pre-claim (and answer for) the later one's tool names.
     let new_seg = crate::tools::mcp::sanitize_name_segment(args.name.trim());
-    let existing = state.storage.global().list_mcp_servers().map_err(|e| e.to_string())?;
+    let existing = state
+        .storage
+        .global()
+        .list_mcp_servers()
+        .map_err(|e| e.to_string())?;
     if let Some(clash) = existing
         .iter()
         .find(|r| crate::tools::mcp::sanitize_name_segment(&r.name) == new_seg)
@@ -1242,8 +1378,8 @@ pub async fn register_mcp_server(
             "remote".to_string()
         } else {
             match args.tier.as_deref() {
-            Some("local") => "local".to_string(),
-            _ => "remote".to_string(), // ambiguous ⇒ remote (the stricter tier)
+                Some("local") => "local".to_string(),
+                _ => "remote".to_string(), // ambiguous ⇒ remote (the stricter tier)
             }
         },
         trusted_read_only: args.trusted_read_only,
@@ -1274,7 +1410,11 @@ pub async fn register_mcp_server(
 /// The persisted MCP servers, annotated with live status.
 #[tauri::command]
 pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>, String> {
-    let rows = state.storage.global().list_mcp_servers().map_err(|e| e.to_string())?;
+    let rows = state
+        .storage
+        .global()
+        .list_mcp_servers()
+        .map_err(|e| e.to_string())?;
     let live = state.mcp.servers.lock();
     Ok(rows
         .into_iter()
@@ -1309,7 +1449,11 @@ pub async fn remove_mcp_server(
     args: RemoveMcpServerArgs,
 ) -> Result<bool, String> {
     crate::tools::mcp_stdio::tear_down_server(&args.id, &state.tools, &state.mcp).await;
-    state.storage.global().delete_mcp_server(&args.id).map_err(|e| e.to_string())
+    state
+        .storage
+        .global()
+        .delete_mcp_server(&args.id)
+        .map_err(|e| e.to_string())
 }
 
 // ── cancel_message (C7 — M6 Slice 4a: cooperative turn cancellation) ────────
@@ -1344,7 +1488,13 @@ pub struct LocalModelInfo {
 
 impl From<crate::storage::ModelEntry> for LocalModelInfo {
     fn from(m: crate::storage::ModelEntry) -> Self {
-        Self { id: m.id, name: m.name, path: m.path, size_bytes: m.size_bytes, status: m.status }
+        Self {
+            id: m.id,
+            name: m.name,
+            path: m.path,
+            size_bytes: m.size_bytes,
+            status: m.status,
+        }
     }
 }
 
@@ -1386,8 +1536,10 @@ pub async fn remove_local_model(
     }
     let global = state.storage.global();
     if let Ok(Some(m)) = global.get_model(&args.id) {
-        // Best-effort file delete (the row removal is the source of truth).
-        let _ = std::fs::remove_file(&m.path);
+        // Delete the file FIRST. If this fails, keep the DB row (so the user
+        // can retry) and surface the error instead of orphaning gigabytes of
+        // GGUF on disk with no catalog entry.
+        std::fs::remove_file(&m.path).map_err(|e| format!("failed to delete model file: {e}"))?;
     }
     global.delete_model(&args.id).map_err(|e| e.to_string())
 }
@@ -1448,8 +1600,16 @@ pub async fn download_model(
     let quant = detail
         .quants
         .into_iter()
-        .find(|q| q.complete && q.files.first().is_some_and(|f| f.filename == args.first_filename))
-        .ok_or_else(|| "the selected GGUF is no longer present or is incomplete; refresh the model details".to_string())?;
+        .find(|q| {
+            q.complete
+                && q.files
+                    .first()
+                    .is_some_and(|f| f.filename == args.first_filename)
+        })
+        .ok_or_else(|| {
+            "the selected GGUF is no longer present or is incomplete; refresh the model details"
+                .to_string()
+        })?;
     if quant.files.len() != 1 {
         return Err(
             "split GGUF files are not yet supported by the verified local runner; choose a single-file quant"
@@ -1472,7 +1632,12 @@ pub async fn download_model(
     let final_path = dir.join(format!("{id}.gguf"));
     let partial = dir.join(format!("{id}.gguf.partial"));
 
-    if let Some(existing) = state.storage.global().get_model(&id).map_err(|e| e.to_string())? {
+    if let Some(existing) = state
+        .storage
+        .global()
+        .get_model(&id)
+        .map_err(|e| e.to_string())?
+    {
         if existing.status == "ready" && std::path::Path::new(&existing.path).is_file() {
             return Ok(DownloadedModelInfo {
                 id: existing.id,
@@ -1489,7 +1654,11 @@ pub async fn download_model(
     crate::models::download::download_to_partial(&file.url, &partial, move |downloaded, total| {
         let _ = app_for_progress.emit(
             "model:download-progress",
-            DownloadProgress { id: id_for_progress.clone(), downloaded, total },
+            DownloadProgress {
+                id: id_for_progress.clone(),
+                downloaded,
+                total,
+            },
         );
     })
     .await
@@ -1501,7 +1670,11 @@ pub async fn download_model(
 
     let model = crate::storage::ModelEntry {
         id,
-        name: format!("{} · {}", detail.id, quant.quant.as_deref().unwrap_or("GGUF")),
+        name: format!(
+            "{} · {}",
+            detail.id,
+            quant.quant.as_deref().unwrap_or("GGUF")
+        ),
         path: final_path.to_string_lossy().to_string(),
         size_bytes: file.size_bytes as i64,
         quantization: quant.quant,
@@ -1509,7 +1682,11 @@ pub async fn download_model(
         sha256: file.sha256,
         status: "ready".to_string(),
     };
-    state.storage.global().insert_model(&model).map_err(|e| e.to_string())?;
+    state
+        .storage
+        .global()
+        .insert_model(&model)
+        .map_err(|e| e.to_string())?;
 
     Ok(DownloadedModelInfo {
         id: model.id,
@@ -1526,6 +1703,10 @@ pub struct InstallPackArgs {
     pub json: String,
 }
 
+/// Maximum bytes for a single pack-import JSON payload. Prevents OOM from
+/// an oversized or malicious pack file (used by packet P13).
+const PACK_IMPORT_MAX_BYTES: usize = 1_000_000;
+
 /// Install a Capability Pack (Wave 4.5): register its skills + agent types
 /// (GLOBAL) + cron jobs (this profile) at once. Everything lands INERT — skills
 /// + agent types `Pending` (review in Settings → Skills / Agent types), cron
@@ -1535,6 +1716,12 @@ pub fn install_pack(
     state: State<'_, AppState>,
     args: InstallPackArgs,
 ) -> Result<crate::packs::InstallReport, String> {
+    if args.json.len() > PACK_IMPORT_MAX_BYTES {
+        return Err(format!(
+            "pack JSON exceeds maximum size ({} bytes)",
+            PACK_IMPORT_MAX_BYTES
+        ));
+    }
     let pack = crate::packs::parse_pack(&args.json).map_err(|e| e.to_string())?;
     crate::packs::install_pack(
         &state.storage,
@@ -1748,7 +1935,9 @@ pub fn get_usage_summary(
         .storage
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
-    db.usage_summary().map(Into::into).map_err(|e| e.to_string())
+    db.usage_summary()
+        .map(Into::into)
+        .map_err(|e| e.to_string())
 }
 
 /// Deliver the user's answer to a parked `ask_human` question. Touches only the
@@ -1907,8 +2096,7 @@ pub fn set_classifier_settings(
         .storage
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
-    let cfg =
-        crate::classifier::ClassifierConfig::from_ui(args.strictness, &args.uncertainty_band);
+    let cfg = crate::classifier::ClassifierConfig::from_ui(args.strictness, &args.uncertainty_band);
     db.set_classifier_config(&cfg).map_err(|e| e.to_string())?;
     let redaction = db.redaction_enabled().map_err(|e| e.to_string())?;
     Ok(ClassifierSettingsInfo::from_parts(cfg, redaction))
@@ -2122,7 +2310,10 @@ mod explain_tests {
         let (label, hard) = category_display("PROPRIETARY");
         assert!(hard, "proprietary is a hard-block category");
         assert_eq!(label, "confidential / proprietary");
-        assert!(!category_display("PII_CONTACT").1, "contact info is not hard");
+        assert!(
+            !category_display("PII_CONTACT").1,
+            "contact info is not hard"
+        );
     }
 
     #[test]
@@ -2141,7 +2332,9 @@ mod explain_tests {
         );
         // A credential span → never-persist (dropped).
         assert_eq!(
-            route_memory_sensitivity(&clf.classify("my api key is sk-ABCD1234efgh5678ijkl9012mnop3456")),
+            route_memory_sensitivity(
+                &clf.classify("my api key is sk-ABCD1234efgh5678ijkl9012mnop3456")
+            ),
             MemoryRoute::NeverPersist
         );
         // Sensitive-but-durable PII (an SSN — PII_ID, not a credential) → local.
@@ -2174,7 +2367,10 @@ fn bucket_str(b: crate::storage::MemoryBucket) -> &'static str {
     }
 }
 
-fn to_memory_info(fact: crate::storage::MemoryFact, bucket: crate::storage::MemoryBucket) -> MemoryInfo {
+fn to_memory_info(
+    fact: crate::storage::MemoryFact,
+    bucket: crate::storage::MemoryBucket,
+) -> MemoryInfo {
     MemoryInfo {
         id: fact.id,
         content: fact.content,
@@ -2207,7 +2403,11 @@ pub fn list_memory(
         .memory_db_for_profile(&args.profile)
         .map_err(|e| e.to_string())?
         .list_memory_by_profile(&args.profile, true)
-        .map(|rows| rows.into_iter().map(|(f, b)| to_memory_info(f, b)).collect())
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(f, b)| to_memory_info(f, b))
+                .collect()
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -2389,7 +2589,8 @@ pub fn set_memory_settings(
         semantic_search_enabled: args.semantic_search_enabled,
         walled: args.walled,
     };
-    db.set_memory_settings(&settings).map_err(|e| e.to_string())?;
+    db.set_memory_settings(&settings)
+        .map_err(|e| e.to_string())?;
     Ok(MemorySettingsInfo::from(settings))
 }
 
@@ -2524,7 +2725,8 @@ pub fn delete_cron_job(
 /// In-flight OAuth dances + soft state for the email round.
 pub struct EmailRuntime {
     /// profile → the pending loopback-listener auth (consumed by finish).
-    pending: parking_lot::Mutex<std::collections::HashMap<String, crate::email::oauth::PendingAuth>>,
+    pending:
+        parking_lot::Mutex<std::collections::HashMap<String, crate::email::oauth::PendingAuth>>,
     /// Profiles whose last Gmail call failed with a dead grant. An
     /// `Arc<Mutex<_>>` rather than a bare `Mutex` so this same set can be
     /// handed to `tools::email::EmailToolDeps` (see
@@ -2572,7 +2774,10 @@ fn email_endpoint() -> Result<std::sync::Arc<dyn crate::email::oauth::TokenEndpo
 }
 
 /// A per-profile Gmail client over the keychain token provider.
-fn email_client(state: &AppState, profile: &str) -> Result<crate::email::gmail::GmailClient, String> {
+fn email_client(
+    state: &AppState,
+    profile: &str,
+) -> Result<crate::email::gmail::GmailClient, String> {
     let endpoint = email_endpoint()?;
     let http = crate::email::gmail::ReqwestGmailHttp::new().map_err(|e| e.to_string())?;
     Ok(crate::email::gmail::GmailClient::new(
@@ -2588,7 +2793,10 @@ fn email_client(state: &AppState, profile: &str) -> Result<crate::email::gmail::
 /// A per-profile authenticated Google JSON client. Calendar and Tasks share
 /// Gmail's keychain-backed OAuth session, but have their own narrow REST
 /// clients and IPC surfaces.
-fn google_client(state: &AppState, profile: &str) -> Result<crate::email::google::GoogleClient, String> {
+fn google_client(
+    state: &AppState,
+    profile: &str,
+) -> Result<crate::email::google::GoogleClient, String> {
     let endpoint = email_endpoint()?;
     crate::email::google::GoogleClient::new(Box::new(
         crate::email::token_provider::KeychainTokenProvider::new(
@@ -2600,19 +2808,33 @@ fn google_client(state: &AppState, profile: &str) -> Result<crate::email::google
     .map_err(|e| e.to_string())
 }
 
-fn calendar_client(state: &AppState, profile: &str) -> Result<crate::email::calendar::CalendarClient, String> {
-    Ok(crate::email::calendar::CalendarClient::new(google_client(state, profile)?))
+fn calendar_client(
+    state: &AppState,
+    profile: &str,
+) -> Result<crate::email::calendar::CalendarClient, String> {
+    Ok(crate::email::calendar::CalendarClient::new(google_client(
+        state, profile,
+    )?))
 }
 
-fn tasks_client(state: &AppState, profile: &str) -> Result<crate::email::tasks::TasksClient, String> {
-    Ok(crate::email::tasks::TasksClient::new(google_client(state, profile)?))
+fn tasks_client(
+    state: &AppState,
+    profile: &str,
+) -> Result<crate::email::tasks::TasksClient, String> {
+    Ok(crate::email::tasks::TasksClient::new(google_client(
+        state, profile,
+    )?))
 }
 
 /// Notes a NeedsReconnect failure for `profile` when `err` carries the marker,
 /// so `gmail_setup_status` can drive the calm reconnect UI.
 fn note_reconnect_if_needed(state: &AppState, profile: &str, err: &str) {
     if err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER) {
-        state.email.needs_reconnect.lock().insert(profile.to_string());
+        state
+            .email
+            .needs_reconnect
+            .lock()
+            .insert(profile.to_string());
     }
 }
 
@@ -2701,7 +2923,9 @@ pub fn set_gmail_client(
         return Err("the client secret is empty — copy it from the same Credentials page".into());
     }
     let s = &state.provider_secrets;
-    let previous_id = s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?;
+    let previous_id = s
+        .get(crate::email::SECRET_GMAIL_CLIENT_ID)
+        .map_err(|e| e.to_string())?;
     let client_changed = previous_id.as_deref().is_some_and(|prev| prev != id);
     if client_changed {
         if let Ok(names) = state.storage.list_profile_names() {
@@ -2713,8 +2937,10 @@ pub fn set_gmail_client(
             }
         }
     }
-    s.set(crate::email::SECRET_GMAIL_CLIENT_ID, id).map_err(|e| e.to_string())?;
-    s.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, secret).map_err(|e| e.to_string())?;
+    s.set(crate::email::SECRET_GMAIL_CLIENT_ID, id)
+        .map_err(|e| e.to_string())?;
+    s.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, secret)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2734,21 +2960,34 @@ pub async fn gmail_begin_connect(
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     let s = &state.provider_secrets;
     let (Some(client_id), Some(client_secret)) = (
-        s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?,
-        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET).map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_ID)
+            .map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET)
+            .map_err(|e| e.to_string())?,
     ) else {
         return Err("paste your Google OAuth client first (Settings → Email setup)".into());
     };
-    let gcp = crate::email::oauth::GcpClient { client_id, client_secret };
-    let pending = crate::email::oauth::begin_auth(&gcp).await.map_err(|e| e.to_string())?;
+    let gcp = crate::email::oauth::GcpClient {
+        client_id,
+        client_secret,
+    };
+    let pending = crate::email::oauth::begin_auth(&gcp)
+        .await
+        .map_err(|e| e.to_string())?;
     let auth_url = pending.auth_url.clone();
-    state.email.pending.lock().insert(args.profile.clone(), pending);
+    state
+        .email
+        .pending
+        .lock()
+        .insert(args.profile.clone(), pending);
 
     // Best-effort browser launch; the UI also shows the URL for copy/paste
     // (the honest fallback on other OSes or if `open` fails).
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("/usr/bin/open").arg(&auth_url).spawn();
+        let _ = std::process::Command::new("/usr/bin/open")
+            .arg(&auth_url)
+            .spawn();
     }
 
     Ok(GmailBeginConnect { auth_url })
@@ -2779,27 +3018,32 @@ pub async fn gmail_finish_connect(
         .ok_or_else(|| "no connection attempt in progress — click Connect first".to_string())?;
     let s = &state.provider_secrets;
     let (Some(client_id), Some(client_secret)) = (
-        s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?,
-        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET).map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_ID)
+            .map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET)
+            .map_err(|e| e.to_string())?,
     ) else {
         return Err("the Google OAuth client was removed mid-connect — start over".into());
     };
-    let gcp = crate::email::oauth::GcpClient { client_id, client_secret };
+    let gcp = crate::email::oauth::GcpClient {
+        client_id,
+        client_secret,
+    };
     let endpoint = email_endpoint()?;
     let tokens = pending
         .finish(endpoint.as_ref(), &gcp)
         .await
         .map_err(|e| e.to_string())?;
-    let refresh = tokens
-        .refresh_token
-        .clone()
-        .ok_or_else(|| {
-            "Google didn't return a refresh token — remove the app's access at \
+    let refresh = tokens.refresh_token.clone().ok_or_else(|| {
+        "Google didn't return a refresh token — remove the app's access at \
              myaccount.google.com/permissions and connect again"
-                .to_string()
-        })?;
-    s.set(&crate::email::secret_gmail_refresh_token(&args.profile), &refresh)
-        .map_err(|e| e.to_string())?;
+            .to_string()
+    })?;
+    s.set(
+        &crate::email::secret_gmail_refresh_token(&args.profile),
+        &refresh,
+    )
+    .map_err(|e| e.to_string())?;
 
     // One profile call with the fresh access token to capture the address.
     struct OneShot(String);
@@ -2822,7 +3066,10 @@ pub async fn gmail_finish_connect(
     // were real. A missing address is an honest, UI-tolerated state.
     let account_email = client.get_profile().await.ok();
     if let Some(email) = &account_email {
-        let _ = s.set(&crate::email::secret_gmail_account_email(&args.profile), email);
+        let _ = s.set(
+            &crate::email::secret_gmail_account_email(&args.profile),
+            email,
+        );
     }
     state.email.needs_reconnect.lock().remove(&args.profile);
     Ok(GmailConnected { account_email })
@@ -3115,7 +3362,13 @@ pub struct GoogleTaskInfo {
 
 impl From<crate::email::tasks::Task> for GoogleTaskInfo {
     fn from(task: crate::email::tasks::Task) -> Self {
-        Self { id: task.id, title: task.title, notes: task.notes, due: task.due, completed: task.completed }
+        Self {
+            id: task.id,
+            title: task.title,
+            notes: task.notes,
+            due: task.due,
+            completed: task.completed,
+        }
     }
 }
 
@@ -3265,7 +3518,11 @@ pub fn list_workspace_files(
     if sub.split('/').any(|c| c == ".." || c.starts_with('\\')) || sub.starts_with('/') {
         return Err("invalid subpath".into());
     }
-    let dir = if sub.is_empty() { ws.clone() } else { ws.join(sub) };
+    let dir = if sub.is_empty() {
+        ws.clone()
+    } else {
+        ws.join(sub)
+    };
 
     // Canonicalize-confine: the listed dir must still live under the
     // workspace after symlink resolution.
@@ -3313,8 +3570,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_version_is_m1_tag() {
-        assert_eq!(get_app_version(), "0.1.0-m1");
+    fn app_version_is_from_cargo() {
+        assert_eq!(get_app_version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -3400,7 +3657,10 @@ mod tests {
     fn latest_assistant_routing_reads_the_real_decision() {
         // The regression this guards: a live send must surface the real
         // persisted decision (e.g. "route_local"), not a hardcoded "allow".
-        let rows = vec![msg("u1", "user", None), msg("a1", "assistant", Some("route_local"))];
+        let rows = vec![
+            msg("u1", "user", None),
+            msg("a1", "assistant", Some("route_local")),
+        ];
         let (id, decision) = latest_assistant_routing(&rows).expect("assistant present");
         assert_eq!(id, "a1");
         assert_eq!(decision, "route_local");
@@ -3421,7 +3681,10 @@ mod tests {
             msg("a2", "assistant", Some("route_local")),
         ];
         let (id, decision) = latest_assistant_routing(&rows).unwrap();
-        assert_eq!(id, "a2", "must pick the newest assistant row, not the first");
+        assert_eq!(
+            id, "a2",
+            "must pick the newest assistant row, not the first"
+        );
         assert_eq!(decision, "route_local");
     }
 

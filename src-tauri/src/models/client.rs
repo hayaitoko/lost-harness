@@ -11,11 +11,54 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use reqwest::Response;
 use serde::{Deserialize, Serialize};
 
 use super::provider::Provider;
 use super::sse::SseStream;
 
+/// Maximum bytes read from a non-success HTTP response body for error
+/// reporting. Prevents OOM from a provider that sends back an unbounded
+/// error payload (M-01).
+const ERROR_BODY_MAX_BYTES: usize = 4096;
+
+/// Maximum bytes read from a successful HTTP response body for JSON
+/// deserialization. Prevents OOM from a provider that sends back a
+/// gigabyte-sized response (M-01).
+const JSON_BODY_MAX_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// Read at most `ERROR_BODY_MAX_BYTES` from a response body for error
+/// diagnostics. Large bodies are truncated rather than discarded so an
+/// actionable error prefix is still visible.
+async fn capped_error_body(resp: &mut Response) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(ERROR_BODY_MAX_BYTES.min(256));
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if buf.len() >= ERROR_BODY_MAX_BYTES {
+            buf.extend_from_slice(b"... (truncated)");
+            break;
+        }
+        let remaining = ERROR_BODY_MAX_BYTES.saturating_sub(buf.len());
+        let end = remaining.min(chunk.len());
+        buf.extend_from_slice(&chunk[..end]);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read at most `JSON_BODY_MAX_BYTES` from a response body, then
+/// deserialize it as JSON. Returns an error when the body exceeds the cap
+/// or cannot be parsed.
+async fn capped_json_body<'a, T: serde::de::DeserializeOwned>(resp: &'a mut Response) -> Result<T> {
+    let mut buf: Vec<u8> = Vec::with_capacity(JSON_BODY_MAX_BYTES.min(4096));
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() >= JSON_BODY_MAX_BYTES {
+            anyhow::bail!("response body exceeds {} byte cap", JSON_BODY_MAX_BYTES);
+        }
+        let remaining = JSON_BODY_MAX_BYTES.saturating_sub(buf.len());
+        let end = remaining.min(chunk.len());
+        buf.extend_from_slice(&chunk[..end]);
+    }
+    Ok(serde_json::from_slice(&buf)?)
+}
 /// A single message in a chat history. OpenAI's `role` is a string at the
 /// wire level (`"system" | "user" | "assistant" | "tool"`); we keep it as a
 /// string here so non-OpenAI extensions (e.g. Anthropic-via-proxy) can
@@ -141,6 +184,7 @@ impl ModelClient {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed to build reqwest client")?;
         Ok(Self { client, provider })
@@ -159,17 +203,16 @@ impl ModelClient {
         if let Some(key) = &self.provider.api_key {
             req = req.bearer_auth(key);
         }
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .with_context(|| format!("GET {url} failed"))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = capped_error_body(&mut resp).await;
             anyhow::bail!("list_models: HTTP {status} — {body}");
         }
-        let body: ModelsResponse = resp
-            .json()
+        let body: ModelsResponse = capped_json_body(&mut resp)
             .await
             .context("list_models: failed to decode response JSON")?;
         Ok(body.data.into_iter().map(|m| m.id).collect())
@@ -177,11 +220,7 @@ impl ModelClient {
 
     /// `POST {base_url}/chat/completions` with `stream: true`. Returns the
     /// raw SSE stream for the caller to consume via `SseStream::next_event`.
-    pub async fn stream_chat(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-    ) -> Result<SseStream> {
+    pub async fn stream_chat(&self, model: &str, messages: Vec<ChatMessage>) -> Result<SseStream> {
         self.stream_chat_with_tools(model, messages, None).await
     }
 
@@ -204,8 +243,9 @@ impl ModelClient {
         // there's no reason to send the field there (and the more-likely-strict
         // self-hosted servers never see it). Mirrors the `tools` field's "omit
         // where not needed" precedent.
-        let stream_options = (!self.provider.is_private())
-            .then_some(StreamOptions { include_usage: true });
+        let stream_options = (!self.provider.is_private()).then_some(StreamOptions {
+            include_usage: true,
+        });
         let body = ChatRequest {
             model,
             messages: &messages,
@@ -217,13 +257,13 @@ impl ModelClient {
         if let Some(key) = &self.provider.api_key {
             req = req.bearer_auth(key);
         }
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .with_context(|| format!("POST {url} failed"))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = capped_error_body(&mut resp).await;
             anyhow::bail!("stream_chat: HTTP {status} — {body}");
         }
         Ok(SseStream::new(resp))
@@ -232,11 +272,7 @@ impl ModelClient {
     /// `POST {base_url}/chat/completions` with `stream: false`. Returns the
     /// full assistant text. Useful for short prompts (titles, routing TRM
     /// calls) where the streaming overhead isn't worth it.
-    pub async fn complete(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-    ) -> Result<String> {
+    pub async fn complete(&self, model: &str, messages: Vec<ChatMessage>) -> Result<String> {
         let url = format!(
             "{}/chat/completions",
             self.provider.base_url.trim_end_matches('/')
@@ -252,17 +288,16 @@ impl ModelClient {
         if let Some(key) = &self.provider.api_key {
             req = req.bearer_auth(key);
         }
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .with_context(|| format!("POST {url} failed"))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = capped_error_body(&mut resp).await;
             anyhow::bail!("complete: HTTP {status} — {body}");
         }
-        let body: ChatResponse = resp
-            .json()
+        let body: ChatResponse = capped_json_body(&mut resp)
             .await
             .context("complete: failed to decode response JSON")?;
         let choice = body
