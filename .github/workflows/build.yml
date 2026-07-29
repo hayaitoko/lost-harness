@@ -89,12 +89,25 @@ jobs:
         working-directory: src-tauri
         run: cargo test --verbose
 
-      - name: cargo audit (advisory)
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: src-tauri
-        continue-on-error: true
+      # cargo audit is a HARD gate, not advisory noise.
+      #
+      # It was previously `rustsec/audit-check` + `continue-on-error: true`,
+      # which meant 19 known-and-unfixable warnings scrolled past on every run
+      # and a genuinely new advisory would have looked exactly the same. The
+      # exceptions are now codified with rationale and revisit dates in
+      # src-tauri/.cargo/audit.toml, so this step can fail the build: that file
+      # also sets `deny = ["warnings"]`, meaning ANY advisory not explicitly
+      # justified there breaks CI.
+      #
+      # Run direct rather than via the action so the audit.toml exception list
+      # is the single source of truth (the action carries its own ignore inputs
+      # and does not read that file). Lockfile-only check, so one OS is enough.
+      - name: cargo audit (gate — exceptions in src-tauri/.cargo/audit.toml)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: src-tauri
+        run: |
+          cargo install cargo-audit --locked --version ^0.22
+          cargo audit
 
       # ── Frontend build ──────────────────────────────────────────────────
       - name: Frontend build
