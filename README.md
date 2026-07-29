@@ -25,16 +25,38 @@ See [HANDOFF.md](HANDOFF.md) for the current engineering state, and
 
 | Component | Constraint |
 |-----------|-----------|
-| **Architecture** | Apple Silicon (arm64) only. No x86_64 runtime files are shipped — the vendored `llama-server` binary and its dylibs are arm64 only. |
-| **Minimum OS** | macOS 15 (Sequoia) or later. The vendored llama-server binary (`LC_BUILD_VERSION minos 26.0`) requires at least this version; rebuilding it against an older SDK is a manual build task (see [Needs human decision](#needs-human-decision)). |
-| **Xcode** | Xcode Command Line Tools (macOS) or Xcode.app. |
+| **Operating system** | macOS only. There is no Linux or Windows build, and CI runs on macOS alone. |
+| **Architecture** | Apple Silicon (arm64) only. No x86_64 runtime files are shipped — the vendored `llama-server` binary and its dylibs are arm64-only Mach-O. |
+| **Minimum macOS** | **macOS 26 (Tahoe)** or later. <!-- MIN_MACOS=26.0 --> |
+| **Xcode** | Xcode Command Line Tools, or Xcode.app. |
 | **Node.js** | 20 or newer. |
 | **Rust** | 1.77 or newer via `rustup`. |
 
-> **Note:** The vendored llama.cpp runtime is a pre-built binary distributed in
-> `vendor/llama-cpp/macos-arm64/`. If you need to run on an older macOS version,
-> you must rebuild llama.cpp against the appropriate SDK and update the
-> vendored files.
+### Why the minimum is macOS 26
+
+The floor is set by the vendored llama.cpp runtime, not by the app's own code.
+Every Mach-O file in `src-tauri/vendor/llama-cpp/macos-arm64/` (the
+`llama-server` executable and all ten dylibs, llama.cpp build `b10088`) declares
+a macOS 26.0 deployment target:
+
+```sh
+otool -l src-tauri/vendor/llama-cpp/macos-arm64/llama-server | grep -A3 LC_BUILD_VERSION
+#      cmd LC_BUILD_VERSION
+#  platform 1
+#     minos 26.0
+#       sdk 26.5
+```
+
+That is what the binaries promise the loader, so it is what this README
+promises users. Lowering it is a real build task — llama.cpp has to be
+recompiled with an older `CMAKE_OSX_DEPLOYMENT_TARGET` and re-vendored — not a
+documentation change. Until that happens, macOS 26 is the honest minimum, even
+though nothing else in the app is known to require it.
+
+The two numbers are kept in sync by CI: the `build` workflow runs `otool -l`
+and `lipo -archs` over every vendored binary and fails if the declared `minos`
+drifts from the `MIN_MACOS` marker in the table above, or if any file is not
+arm64-only. Re-vendoring llama.cpp therefore forces a matching README edit.
 
 ## Development setup
 
