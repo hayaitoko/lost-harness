@@ -19,13 +19,14 @@
 //! it loudly (`WorkState::Failed`, "no runner for this work kind yet") rather
 //! than leaving it stuck `running` forever or silently dropping it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
 use crate::hooks::budget::{self, BudgetVerdict};
 use crate::queue::{WorkItem, WorkKind, WorkState};
-use crate::storage::{Message, ProfileDb, Storage};
+use crate::storage::{Message, ProfileDb, Storage, UsageSummary};
 
 /// Max helper sub-agents allowed to run concurrently, across every profile.
 /// A shared bound (not per-profile) so a burst of `delegate` calls can't spin
@@ -43,11 +44,84 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// (and frees its concurrency permit) rather than hanging forever.
 const HELPER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Shared state for transactional budget reservations across concurrent helpers.
+/// Keyed by profile name, value is USD reserved but not yet spent.
+/// The Mutex ensures atomic check-and-reserve (M-09), so concurrent helpers
+/// cannot collectively exceed the configured cap.
+type BudgetLock = Arc<tokio::sync::Mutex<HashMap<String, f64>>>;
+
+/// Lock, check the budget against both on-disk spend and in-memory reservations,
+/// and — if the profile is capped — reserve the estimated max spend (the full
+/// remaining budget) before dispatch. The caller MUST reconcile after the run.
+///
+/// Returns `true` when the item should proceed; `false` when it was already
+/// `finish_work_item`'d as `Failed` with a budget reason (caller MUST `return`).
+///
+/// **Hard financial control** (M-09): the reservation is visible to every
+/// concurrent helper so that a second helper checking the same ledger sees
+/// the first's committed-but-unbooked spend and halts.
+async fn budget_check_and_reserve(
+    budget_lock: &BudgetLock,
+    db: &ProfileDb,
+    profile: &str,
+    item: &WorkItem,
+) -> bool {
+    let mut reservations = budget_lock.lock().await;
+    let since = budget::month_start_ts(chrono::Utc::now());
+    match (db.budget_cap(), db.usage_summary_since(since)) {
+        (Ok(cap), Ok(sum)) => {
+            let reserved = reservations.get(profile).copied().unwrap_or(0.0);
+            let effective = UsageSummary {
+                total_calls: sum.total_calls,
+                known_cost_usd: sum.known_cost_usd + reserved,
+                unknown_cost_calls: sum.unknown_cost_calls,
+            };
+            if let BudgetVerdict::Halt(reason) = budget::evaluate(cap, &effective, false) {
+                let now = chrono::Utc::now().timestamp();
+                let _ = db.finish_work_item(
+                    &item.id,
+                    WorkState::Failed,
+                    None,
+                    Some(&format!("budget: {reason}")),
+                    now,
+                );
+                return false;
+            }
+            // Reserve the remaining budget so concurrent helpers see a reduced cap.
+            if let Some(cap_val) = cap {
+                let remaining = (cap_val - effective.known_cost_usd).max(0.0);
+                reservations.insert(profile.to_string(), reserved + remaining);
+            }
+            true
+        }
+        _ => {
+            let now = chrono::Utc::now().timestamp();
+            let _ = db.finish_work_item(
+                &item.id,
+                WorkState::Failed,
+                None,
+                Some("budget: budget check unavailable — halting to fail closed"),
+                now,
+            );
+            false
+        }
+    }
+}
+
+/// Release the per-profile budget reservation (reconcile).
+/// Called after the helper run completes (success, error, or timeout) so the
+/// next budget check sees actual on-disk spend rather than the reservation.
+async fn budget_reconcile(budget_lock: &BudgetLock, profile: &str) {
+    let mut reservations = budget_lock.lock().await;
+    reservations.remove(profile);
+}
+
 /// Spawn the background work-queue runner. Fire-and-forget: runs for the
 /// life of the process on the Tauri async runtime. Call once at boot, after
 /// the `Arc<AgentLoop>` exists (`lib.rs`'s `setup` closure).
 pub fn spawn_work_runner(agent_loop: Arc<AgentLoop>, storage: Arc<Storage>) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HELPERS));
+    let budget_lock: BudgetLock = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     tauri::async_runtime::spawn(async move {
         loop {
             let profiles = storage.list_profile_names().unwrap_or_default();
@@ -79,9 +153,17 @@ pub fn spawn_work_runner(agent_loop: Arc<AgentLoop>, storage: Arc<Storage>) {
                         // rather than run unbounded.
                         break;
                     };
+                    let budget_for_task = Arc::clone(&budget_lock);
                     tauri::async_runtime::spawn(async move {
                         let _permit = permit; // held for the whole run
-                        supervise_one_item(agent_loop, db_for_task, profile_for_task, item).await;
+                        supervise_one_item(
+                            agent_loop,
+                            db_for_task,
+                            profile_for_task,
+                            item,
+                            budget_for_task,
+                        )
+                        .await;
                     });
                 }
             }
@@ -100,11 +182,18 @@ async fn supervise_one_item(
     db: Arc<ProfileDb>,
     profile: String,
     item: WorkItem,
+    budget_lock: BudgetLock,
 ) {
     let item_id = item.id.clone();
     let db_supervise = Arc::clone(&db);
-    let inner = tauri::async_runtime::spawn(run_one_item(agent_loop, db, profile, item));
+    let profile_for_reconcile = profile.clone();
+    let budget_for_cleanup = Arc::clone(&budget_lock);
+    let inner =
+        tauri::async_runtime::spawn(run_one_item(agent_loop, db, profile, item, budget_lock));
     if inner.await.is_err() {
+        // run_one_item panicked — release the budget reservation so it
+        // doesn't leak and block future helpers for this profile.
+        budget_reconcile(&budget_for_cleanup, &profile_for_reconcile).await;
         let now = chrono::Utc::now().timestamp();
         let _ = db_supervise.finish_work_item(
             &item_id,
@@ -149,11 +238,32 @@ fn budget_verdict_for(db: &ProfileDb, attended: bool) -> BudgetVerdict {
 /// Run one claimed item to completion (or failure) and finish it. Never
 /// panics on a malformed payload or a failed helper run — every path ends in
 /// a `finish_work_item` call, so a bad item can never sit `running` forever.
-async fn run_one_item(agent_loop: Arc<AgentLoop>, db: Arc<ProfileDb>, profile: String, item: WorkItem) {
+async fn run_one_item(
+    agent_loop: Arc<AgentLoop>,
+    db: Arc<ProfileDb>,
+    profile: String,
+    item: WorkItem,
+    budget_lock: BudgetLock,
+) {
     match item.kind {
         WorkKind::AgentDispatch => {}
         WorkKind::Cron => {
+            // Parse job_id early for cron failure recording.
+            let cron_payload: serde_json::Value =
+                serde_json::from_str(&item.input_json).unwrap_or(serde_json::Value::Null);
+            let cron_job_id = cron_payload
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // Budget check + reservation before running the cron turn.
+            if !budget_check_and_reserve(&budget_lock, &db, &profile, &item).await {
+                if let Some(ref id) = cron_job_id {
+                    let _ = db.record_cron_run(id, "failed");
+                }
+                return;
+            }
             run_cron_item(&agent_loop, &db, &profile, &item).await;
+            budget_reconcile(&budget_lock, &profile).await;
             return;
         }
         WorkKind::ServerResult => {
@@ -211,31 +321,64 @@ async fn run_one_item(agent_loop: Arc<AgentLoop>, db: Arc<ProfileDb>, profile: S
     let tools_allowlist: Vec<String> = payload
         .get("tools_allowlist")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
-    let provider_id = payload.get("provider").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let task = payload.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let profile = payload.get("profile").and_then(|v| v.as_str()).unwrap_or("personal").to_string();
-    let binding = parse_binding_lenient(payload.get("binding").and_then(|v| v.as_str()).unwrap_or("auto"));
+    let provider_id = payload
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let model = payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let task = payload
+        .get("task")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let profile = payload
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("personal")
+        .to_string();
+    let binding = parse_binding_lenient(
+        payload
+            .get("binding")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto"),
+    );
 
-    // C1: the budget governor. An UNATTENDED helper HALTS before it spends if
-    // this profile is over its cap (or spend is unknowable → fail-closed). Same
-    // "every path ends in finish_work_item" idiom as the malformed-payload /
-    // panic / timeout paths — the model call never fires, so no more can be spent.
-    if let BudgetVerdict::Halt(reason) = budget_verdict_for(&db, false) {
-        let now = chrono::Utc::now().timestamp();
-        let _ = db.finish_work_item(&item.id, WorkState::Failed, None, Some(&format!("budget: {reason}")), now);
+    // C1: the budget governor — hard ceiling (M-09). Lock, check, and reserve
+    // estimated max spend TRANSACTIONALLY before dispatch so concurrent helpers
+    // see each other's committed-but-unbooked spend. Reconcile after the run.
+    if !budget_check_and_reserve(&budget_lock, &db, &profile, &item).await {
         return;
     }
 
     // Wave 4.3c review fix: a wall-clock deadline so a stalled model stream
     // can't hang a helper forever (and, at MAX_CONCURRENT_HELPERS stalls,
     // permanently starve every future helper of a semaphore permit).
-    let run =
-        agent_loop.run_subagent(&system_prompt, &tools_allowlist, &provider_id, &model, &profile, binding, &task);
+    let run = agent_loop.run_subagent(
+        &system_prompt,
+        &tools_allowlist,
+        &provider_id,
+        &model,
+        &profile,
+        binding,
+        &task,
+    );
     let outcome = tokio::time::timeout(HELPER_DEADLINE, run).await;
     let finished_at = chrono::Utc::now().timestamp();
+
+    // Reconcile: release the budget reservation. Actual per-round costs have
+    // already been booked by process_message → record_usage during the run.
+    budget_reconcile(&budget_lock, &profile).await;
 
     // Resolve the run into (terminal state, result payload, error, and the
     // human-facing note posted into the parent). Success, failure, AND timeout
@@ -293,7 +436,13 @@ async fn run_one_item(agent_loop: Arc<AgentLoop>, db: Arc<ProfileDb>, profile: S
             );
         }
     }
-    let _ = db.finish_work_item(&item.id, state, result_json.as_deref(), error.as_deref(), finished_at);
+    let _ = db.finish_work_item(
+        &item.id,
+        state,
+        result_json.as_deref(),
+        error.as_deref(),
+        finished_at,
+    );
 }
 
 /// Enqueue every enabled cron job that is DUE this minute as a `Cron`
@@ -341,37 +490,58 @@ fn schedule_due_cron_jobs_at(db: &ProfileDb, now: i64, local_now: chrono::DateTi
 async fn run_cron_item(agent_loop: &AgentLoop, db: &ProfileDb, profile: &str, item: &WorkItem) {
     let payload: serde_json::Value =
         serde_json::from_str(&item.input_json).unwrap_or(serde_json::Value::Null);
-    let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let job_id = payload.get("job_id").and_then(|v| v.as_str()).map(str::to_string);
+    let prompt = payload
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let job_id = payload
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let target = item.target_conversation_id.clone();
     let now = chrono::Utc::now().timestamp();
 
-    // C1: a cron turn is unattended — HALT before spending if over the cap.
-    if let BudgetVerdict::Halt(reason) = budget_verdict_for(db, false) {
-        let _ = db.finish_work_item(&item.id, WorkState::Failed, None, Some(&format!("budget: {reason}")), now);
-        if let Some(id) = &job_id {
-            let _ = db.record_cron_run(id, "failed");
-        }
-        return;
-    }
+    // Budget check is handled by the caller (run_one_item) via the lock-guarded
+    // budget_check_and_reserve + budget_reconcile pair.
 
     if prompt.trim().is_empty() {
-        let _ = db.finish_work_item(&item.id, WorkState::Failed, None, Some("cron: empty prompt"), now);
+        let _ = db.finish_work_item(
+            &item.id,
+            WorkState::Failed,
+            None,
+            Some("cron: empty prompt"),
+            now,
+        );
         if let Some(id) = &job_id {
             let _ = db.record_cron_run(id, "failed");
         }
         return;
     }
 
-    let outcome =
-        tokio::time::timeout(HELPER_DEADLINE, agent_loop.run_cron(&prompt, profile, target)).await;
+    let outcome = tokio::time::timeout(
+        HELPER_DEADLINE,
+        agent_loop.run_cron(&prompt, profile, target),
+    )
+    .await;
     let finished_at = chrono::Utc::now().timestamp();
     let (state, result, error, status) = match outcome {
         Ok(Ok(text)) => (WorkState::Done, Some(text), None, "ok"),
         Ok(Err(e)) => (WorkState::Failed, None, Some(e.to_string()), "failed"),
-        Err(_) => (WorkState::Failed, None, Some("cron: timed out".to_string()), "timed_out"),
+        Err(_) => (
+            WorkState::Failed,
+            None,
+            Some("cron: timed out".to_string()),
+            "timed_out",
+        ),
     };
-    let _ = db.finish_work_item(&item.id, state, result.as_deref(), error.as_deref(), finished_at);
+    let _ = db.finish_work_item(
+        &item.id,
+        state,
+        result.as_deref(),
+        error.as_deref(),
+        finished_at,
+    );
     if let Some(id) = &job_id {
         let _ = db.record_cron_run(id, status);
     }
@@ -419,26 +589,39 @@ mod tests {
         let (storage, root) = temp_storage();
         let db = storage.open_profile("personal").unwrap();
         db.insert_cron_job(&job("due", "30 9 * * *", true)).unwrap();
-        db.insert_cron_job(&job("not-due", "0 0 * * *", true)).unwrap();
-        db.insert_cron_job(&job("disabled", "30 9 * * *", false)).unwrap();
+        db.insert_cron_job(&job("not-due", "0 0 * * *", true))
+            .unwrap();
+        db.insert_cron_job(&job("disabled", "30 9 * * *", false))
+            .unwrap();
 
         // 2026-07-15 09:30 local → only "due" matches.
-        let local = chrono::Local.with_ymd_and_hms(2026, 7, 15, 9, 30, 0).unwrap();
+        let local = chrono::Local
+            .with_ymd_and_hms(2026, 7, 15, 9, 30, 0)
+            .unwrap();
         let now = local.timestamp();
         schedule_due_cron_jobs_at(&db, now, local);
 
         // Exactly one Cron work_item enqueued, for the due job.
-        let claimed = db.claim_next_due_work(now + 1).unwrap().expect("a cron item");
+        let claimed = db
+            .claim_next_due_work(now + 1)
+            .unwrap()
+            .expect("a cron item");
         assert_eq!(claimed.kind, WorkKind::Cron);
         assert_eq!(claimed.source_ref.as_deref(), Some("due"));
         let payload: serde_json::Value = serde_json::from_str(&claimed.input_json).unwrap();
         assert_eq!(payload["job_id"], "due");
-        assert!(db.claim_next_due_work(now + 1).unwrap().is_none(), "only the due+enabled job enqueues");
+        assert!(
+            db.claim_next_due_work(now + 1).unwrap().is_none(),
+            "only the due+enabled job enqueues"
+        );
 
         // Re-running the SAME minute does not enqueue again (last_run guard +
         // the cron:<id>@<minute> claim_key).
         schedule_due_cron_jobs_at(&db, now, local);
-        assert!(db.claim_next_due_work(now + 1).unwrap().is_none(), "no double-fire within the minute");
+        assert!(
+            db.claim_next_due_work(now + 1).unwrap().is_none(),
+            "no double-fire within the minute"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -463,7 +646,8 @@ mod tests {
             &'a self,
             _m: &'a str,
             _msgs: Vec<ChatMessage>,
-        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>> {
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>>
+        {
             Box::pin(std::future::pending())
         }
     }
@@ -479,13 +663,20 @@ mod tests {
             &'a self,
             _m: &'a str,
             _msgs: Vec<ChatMessage>,
-        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>> {
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>>
+        {
             Box::pin(async { panic!("boom — a bug inside the helper run") })
         }
     }
 
     fn cloud() -> Provider {
-        Provider::new("cloudco", "Cloud", "https://api.cloudco.example/v1", None, ProviderKind::Cloud)
+        Provider::new(
+            "cloudco",
+            "Cloud",
+            "https://api.cloudco.example/v1",
+            None,
+            ProviderKind::Cloud,
+        )
     }
 
     fn agent_with(streamer: Arc<dyn ModelStreamer>, storage: Arc<Storage>) -> Arc<AgentLoop> {
@@ -493,8 +684,13 @@ mod tests {
         mm.add_provider(cloud());
         let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
         Arc::new(
-            AgentLoop::new(gate, mm, storage, Arc::new(crate::tools::ToolDispatcher::empty()))
-                .with_model_streamer_override(streamer),
+            AgentLoop::new(
+                gate,
+                mm,
+                storage,
+                Arc::new(crate::tools::ToolDispatcher::empty()),
+            )
+            .with_model_streamer_override(streamer),
         )
     }
 
@@ -531,16 +727,31 @@ mod tests {
         // `tokio::spawn` (NOT tauri's spawn) so the task runs on THIS test's
         // paused runtime — otherwise the timeout would burn 300s of real time.
         let db2 = Arc::clone(&db);
-        let handle = tokio::spawn(run_one_item(agent, db2, "personal".into(), claimed));
+        let budget_lock: BudgetLock = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let bl2 = Arc::clone(&budget_lock);
+        let handle = tokio::spawn(run_one_item(agent, db2, "personal".into(), claimed, bl2));
         tokio::task::yield_now().await; // let the spawned task reach its stalled await
         tokio::time::advance(HELPER_DEADLINE + std::time::Duration::from_secs(1)).await;
         handle.await.unwrap();
 
         let done = db.get_work_item(&id).unwrap().expect("item exists");
-        assert_eq!(done.state, WorkState::Failed, "a stalled helper must be Failed, not stuck running");
+        assert_eq!(
+            done.state,
+            WorkState::Failed,
+            "a stalled helper must be Failed, not stuck running"
+        );
         assert!(
-            done.error.as_deref().unwrap_or("").to_lowercase().contains("timed out")
-                || done.error.as_deref().unwrap_or("").to_lowercase().contains("timeout"),
+            done.error
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("timed out")
+                || done
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains("timeout"),
             "the failure must name the timeout, got: {:?}",
             done.error
         );
@@ -572,9 +783,20 @@ mod tests {
         let id = item.id.clone();
         db.insert_work_item(&item).unwrap();
         let claimed = db.claim_next_due_work(now).unwrap().expect("claimed");
-        run_one_item(agent, Arc::clone(&db), "personal".into(), claimed).await;
+        run_one_item(
+            agent,
+            Arc::clone(&db),
+            "personal".into(),
+            claimed,
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        )
+        .await;
         let done = db.get_work_item(&id).unwrap().expect("item");
-        assert_eq!(done.state, WorkState::Failed, "over-budget unattended work must halt");
+        assert_eq!(
+            done.state,
+            WorkState::Failed,
+            "over-budget unattended work must halt"
+        );
         assert!(
             done.error.as_deref().unwrap_or("").contains("budget"),
             "the failure names the budget, got: {:?}",
@@ -598,15 +820,120 @@ mod tests {
 
         // supervise_one_item runs run_one_item in an inner task; the panic there
         // must be caught and the item finalized Failed (never left running).
-        supervise_one_item(agent, Arc::clone(&db), "personal".into(), claimed).await;
+        supervise_one_item(
+            agent,
+            Arc::clone(&db),
+            "personal".into(),
+            claimed,
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        )
+        .await;
 
         let done = db.get_work_item(&id).unwrap().expect("item exists");
-        assert_eq!(done.state, WorkState::Failed, "a panicked helper must be Failed, not stuck running");
+        assert_eq!(
+            done.state,
+            WorkState::Failed,
+            "a panicked helper must be Failed, not stuck running"
+        );
         assert!(
             done.error.as_deref().unwrap_or("").contains("panicked"),
             "the failure must name the panic, got: {:?}",
             done.error
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// M-09: four concurrent helpers racing the same ledger must not collectively
+    /// exceed the configured cap. The budget lock serializes check-and-reserve so
+    /// that only one helper can hold the remaining budget at a time.
+    #[tokio::test(start_paused = true)]
+    async fn budget_lock_prevents_four_concurrent_helpers_from_exceeding_the_cap() {
+        let (storage, root) = temp_storage();
+        let storage = Arc::new(storage);
+        let db = storage.open_profile("personal").unwrap();
+        let budget_lock: BudgetLock = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Cap: $2.00, spend so far: $0.50 (leaves $1.50 remaining).
+        db.set_budget_cap(Some(2.0)).unwrap();
+        db.record_usage(&crate::storage::UsageEvent {
+            id: "seed".into(),
+            conversation_id: None,
+            model: "gpt".into(),
+            provider_id: Some("cloud".into()),
+            provider_kind: "cloud".into(),
+            cost_usd: Some(0.50),
+            created_at: chrono::Utc::now().timestamp(),
+        })
+        .unwrap();
+
+        let agent = agent_with(Arc::new(StallStreamer(cloud())), Arc::clone(&storage));
+        let now = 5_000_000;
+
+        // Create and claim 4 items at the same due time.
+        let mut items = Vec::new();
+        for i in 0..4 {
+            let mut item = dispatch_item(now);
+            item.id = format!("race-{i}");
+            db.insert_work_item(&item).unwrap();
+            items.push(item);
+        }
+        let mut claimed = Vec::new();
+        while let Ok(Some(item)) = db.claim_next_due_work(now) {
+            claimed.push(item);
+        }
+        assert_eq!(claimed.len(), 4, "all 4 items must be claimable");
+
+        // Spawn all 4 concurrently with the shared budget_lock.
+        let mut handles = Vec::new();
+        for item in claimed {
+            let a = Arc::clone(&agent);
+            let d = Arc::clone(&db);
+            let b = Arc::clone(&budget_lock);
+            handles.push(tokio::spawn(async move {
+                run_one_item(a, d, "personal".into(), item, b).await;
+            }));
+        }
+
+        // Let each task reach its budget check (or the stall point).
+        tokio::task::yield_now().await;
+        // Advance past HELPER_DEADLINE so the one helper that passed the budget
+        // check (and is stalled on the stream) times out.
+        tokio::time::advance(HELPER_DEADLINE + std::time::Duration::from_secs(1)).await;
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        // Total known spend must still be within the $2.00 cap.
+        let since = budget::month_start_ts(chrono::Utc::now());
+        let summary = db.usage_summary_since(since).unwrap();
+        assert!(
+            summary.known_cost_usd <= 2.0,
+            "total spend ${:.2} exceeded ${:.2} cap across 4 concurrent helpers",
+            summary.known_cost_usd,
+            2.0
+        );
+
+        // At least 2 helpers must have been budget-halted (only one can reserve
+        // the remaining $1.50; the other 3 see effective == cap and halt).
+        let halted = items
+            .iter()
+            .filter(|item| {
+                db.get_work_item(&item.id)
+                    .ok()
+                    .flatten()
+                    .map(|wi| {
+                        wi.state == WorkState::Failed
+                            && wi.error.as_deref().unwrap_or("").contains("budget")
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            halted >= 2,
+            "at least 2 of 4 helpers must have been budget-halted (got {halted})"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 }
