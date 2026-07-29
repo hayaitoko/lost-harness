@@ -13,22 +13,27 @@
 //! existing items back into a portable pack to share.
 //!
 //! Atomicity note: skills + agent types live in `global.db` while cron jobs live
-//! in the active profile's DB, so a pack that spans both cannot be one SQL
-//! transaction. The global.db segment (skills + agent types) IS wrapped in a
-//! transaction; cron jobs are best-effort last. A mid-install failure inside the
-//! global segment rolls back; a failure after global commit returns a partial
-//! [`InstallReport`] of exactly what landed, with the already-inserted (inert)
-//! items in place rather than corrupting either store.
+//! in the active profile's DB — two separate SQLite files, so a pack that spans
+//! both cannot be ONE transaction. Each side gets its own: a failure anywhere in
+//! the global segment rolls back every skill + agent type, and a failure
+//! anywhere in the cron segment rolls back every cron job. The one remaining
+//! non-atomic point is the seam between the two commits — if the global segment
+//! commits and the cron segment then fails, [`install_pack`] returns `Err` (no
+//! [`InstallReport`] at all) with the skills + agent types committed and zero
+//! cron jobs. Everything a pack installs is inert by design (skills + agent
+//! types `Pending`, cron jobs disabled), so that residue is reviewable in
+//! Settings, never armed.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{AgentTypeApproval, CronJob, SkillApproval, Storage};
+use crate::storage::{AgentTypeApproval, SkillApproval, Storage};
 
 // ── Validation constants ────────────────────────────────────────────────────
 
-/// Total byte limit for a pack JSON payload (P05 enforces this at the IPC
-/// boundary; we re-enforce at the domain layer as defense-in-depth).
+/// Total byte limit for a pack JSON payload. This is the ONLY place it is
+/// enforced: `ipc::install_pack` hands its raw `json` string straight to
+/// [`parse_pack`] with no size guard of its own.
 pub const PACK_IMPORT_MAX_BYTES: usize = 1_000_000;
 
 /// Maximum number of items per category in a single pack.
@@ -247,6 +252,11 @@ fn validate_pack(pack: &Pack) -> Result<()> {
         check_len(&prefix, "name", &c.name, PACK_MAX_NAME_LEN)?;
         check_len(&prefix, "prompt", &c.prompt, PACK_MAX_CONTENT_LEN)?;
         check_len(&prefix, "schedule", &c.schedule, PACK_MAX_SCHEDULE_LEN)?;
+        // A blank prompt would install a job that dispatches nothing — the same
+        // empty-field guard `name` and `schedule` already get.
+        if c.prompt.trim().is_empty() {
+            anyhow::bail!("{} prompt must not be empty", prefix);
+        }
         if c.schedule.trim().is_empty() {
             anyhow::bail!("{} schedule must not be empty", prefix);
         }
@@ -307,12 +317,14 @@ fn check_list(
 /// is the caller's timestamp. Returns what landed.
 ///
 /// # Atomicity
-/// Skills and agent types are inserted in a single SQLite transaction on
-/// `global.db` — a mid-install failure there rolls back completely. Cron jobs
-/// live in the profile's own DB and cannot share the same transaction; they are
-/// installed best-effort after the global transaction commits. The profile DB
-/// is opened *before* the global transaction starts, so a missing profile is
-/// caught before any mutation.
+/// Two transactions, one per database. Skills + agent types are inserted in a
+/// single SQLite transaction on `global.db`; cron jobs in a single transaction
+/// on the profile's DB. A failure inside either segment rolls that whole segment
+/// back. The two files cannot share one transaction, so the seam between the
+/// commits is the one non-atomic point: if the cron segment fails after the
+/// global segment committed, this returns `Err` and the (inert) skills + agent
+/// types stay. The profile DB is opened *before* the global transaction starts,
+/// so a missing/invalid profile is caught before any mutation at all.
 pub fn install_pack(
     storage: &Storage,
     profile: &str,
@@ -396,21 +408,36 @@ pub fn install_pack(
         tx.commit()?;
     }
 
-    // ── Profile DB (cron jobs) — best-effort, no cross-DB transaction ────────
+    // ── Profile DB (cron jobs) — its own atomic transaction ──────────────────
+    // A separate SQLite file, so this cannot join the global transaction above.
+    // It still gets a transaction of its own: a failure part-way through the
+    // loop must not leave half a pack's cron jobs behind. Raw SQL (rather than
+    // `insert_cron_job`) because the guard from `raw()` holds the connection
+    // mutex — calling another locking method here would deadlock.
     if let Some(db) = profile_db {
-        for c in &pack.cron_jobs {
-            let job = CronJob {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: c.name.clone(),
-                prompt: c.prompt.clone(),
-                schedule: c.schedule.clone(),
-                // Installed DISABLED — the user turns it on deliberately.
-                enabled: false,
-                last_run_at: None,
-                last_status: None,
-                target_conversation_id: None,
-            };
-            db.insert_cron_job(&job)?;
+        if !pack.cron_jobs.is_empty() {
+            let mut conn = db.raw();
+            let tx = conn.transaction()?;
+            for c in &pack.cron_jobs {
+                tx.execute(
+                    "INSERT INTO cron_jobs
+                     (id, name, prompt, schedule, enabled, last_run_at,
+                      last_status, target_conversation_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().to_string(),
+                        c.name,
+                        c.prompt,
+                        c.schedule,
+                        // Installed DISABLED — the user turns it on deliberately.
+                        0_i64,
+                        None::<i64>,
+                        None::<String>,
+                        None::<String>,
+                    ],
+                )?;
+            }
+            tx.commit()?;
         }
     }
 
@@ -571,11 +598,42 @@ mod tests {
 
     #[test]
     fn validate_rejects_oversized_json() {
-        let big = "x".repeat(PACK_IMPORT_MAX_BYTES + 1);
-        let json = format!("{{\"name\": \"Huge\", \"description\": \"{big}\"}}");
+        // This payload must trip the TOTAL-BYTE cap and nothing else, otherwise
+        // the test would still pass with `PACK_IMPORT_MAX_BYTES` deleted. So:
+        // 5 skills (≤ PACK_MAX_SKILLS) whose content is 210 KB each (each well
+        // under PACK_MAX_CONTENT_LEN) — every individual field is legal, only
+        // the sum is not.
+        let chunk = "x".repeat(210_000);
+        let pack = Pack {
+            format: 1,
+            name: "Huge".into(),
+            version: "1.0.0".into(),
+            description: "big in total, legal field by field".into(),
+            skills: (0..5)
+                .map(|i| PackSkill {
+                    name: format!("skill {i}"),
+                    description: String::new(),
+                    content: chunk.clone(),
+                    capabilities_required: vec![],
+                    version: String::new(),
+                })
+                .collect(),
+            agent_types: vec![],
+            cron_jobs: vec![],
+        };
+        // Guard the isolation itself: no per-field limit fires on this pack.
+        validate_pack(&pack).expect("every individual field is within its own cap");
+
+        let json = serde_json::to_string(&pack).unwrap();
         assert!(
-            parse_pack(&json).is_err(),
-            "oversized JSON should be rejected"
+            json.len() > PACK_IMPORT_MAX_BYTES,
+            "test payload must exceed the byte cap ({} bytes)",
+            json.len()
+        );
+        let err = parse_pack(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("payload too large"),
+            "rejection must come from the byte cap, not another limit: {err}"
         );
     }
 
@@ -658,6 +716,17 @@ mod tests {
             .map(|i| format!("tool{i}"))
             .collect();
         assert!(validate_pack(&pack).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cron_with_empty_prompt() {
+        let mut pack = sample_pack();
+        pack.cron_jobs[0].prompt = "   ".into();
+        let err = validate_pack(&pack).unwrap_err();
+        assert!(
+            err.to_string().contains("prompt must not be empty"),
+            "a blank cron prompt must be rejected by its own guard: {err}"
+        );
     }
 
     #[test]
@@ -749,6 +818,106 @@ mod tests {
             g.list_agent_types().unwrap().len(),
             0,
             "no agent types inserted on profile failure"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_rolls_back_the_global_transaction_on_a_mid_segment_failure() {
+        let (storage, root) = temp_storage();
+        let g = storage.global();
+
+        // Force a deterministic failure PART WAY THROUGH the global segment.
+        // `install_pack` inserts every skill first, then every agent type, so a
+        // trigger that aborts agent_types inserts fails only AFTER a skill has
+        // already been written inside the transaction.
+        {
+            let conn = g.raw();
+            conn.execute_batch(
+                "CREATE TRIGGER packs_test_block_agent_types
+                 BEFORE INSERT ON agent_types
+                 BEGIN SELECT RAISE(ABORT, 'blocked by test trigger'); END;",
+            )
+            .unwrap();
+        } // drop the guard — install_pack re-locks this same connection
+
+        let pack = Pack {
+            cron_jobs: vec![],
+            ..sample_pack()
+        };
+        assert_eq!(
+            pack.skills.len(),
+            1,
+            "the pack must carry a skill to strand"
+        );
+        assert_eq!(pack.agent_types.len(), 1);
+
+        let err = install_pack(&storage, "personal", &pack, 100).unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by test trigger"),
+            "the failure must be the agent_types insert, not an earlier bail: {err}"
+        );
+
+        // THE POINT: the skill written before the failure must be rolled back.
+        assert_eq!(
+            g.list_skills().unwrap().len(),
+            0,
+            "the global transaction must roll back the already-inserted skill"
+        );
+        assert_eq!(
+            g.list_agent_types().unwrap().len(),
+            0,
+            "the aborted agent type must not be present either"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_rolls_back_the_cron_transaction_on_a_mid_segment_failure() {
+        let (storage, root) = temp_storage();
+        let db = storage.open_profile("personal").unwrap();
+
+        // Abort only the SECOND cron job, so the first one is already inside
+        // the transaction when the failure hits.
+        {
+            let conn = db.raw();
+            conn.execute_batch(
+                "CREATE TRIGGER packs_test_block_second_cron
+                 BEFORE INSERT ON cron_jobs WHEN NEW.name = 'Second job'
+                 BEGIN SELECT RAISE(ABORT, 'blocked by test trigger'); END;",
+            )
+            .unwrap();
+        }
+
+        let pack = Pack {
+            skills: vec![],
+            agent_types: vec![],
+            cron_jobs: vec![
+                PackCron {
+                    name: "First job".into(),
+                    prompt: "run the first job".into(),
+                    schedule: "0 2 * * *".into(),
+                },
+                PackCron {
+                    name: "Second job".into(),
+                    prompt: "run the second job".into(),
+                    schedule: "0 3 * * *".into(),
+                },
+            ],
+            ..sample_pack()
+        };
+
+        let err = install_pack(&storage, "personal", &pack, 100).unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by test trigger"),
+            "the failure must be the second cron insert: {err}"
+        );
+
+        // THE POINT: the first cron job must not survive the failed install.
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            0,
+            "the cron transaction must roll back the first job"
         );
         let _ = std::fs::remove_dir_all(root);
     }
