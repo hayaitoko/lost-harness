@@ -225,11 +225,25 @@ fn private_endpoint_rfc1918_boundary() {
 }
 
 #[test]
-fn private_endpoint_hostname_suffixes() {
-    assert!(is_private_endpoint("http://tadashi.lan:8080/v1"));
-    assert!(is_private_endpoint("http://nas.local:5000"));
-    assert!(is_private_endpoint("http://server.internal:80"));
-    assert!(is_private_endpoint("http://friday.tail.ts.net:8765"));
+fn private_endpoint_hostname_suffixes_are_not_auto_trusted() {
+    // H-05 (P02): a private-network *name* suffix is spoofable — anyone who can
+    // answer DNS for `evil.lan` would otherwise be handed private trust. Names are
+    // recognised so the UI can warn, but they never grant access on their own.
+    for url in [
+        "http://tadashi.lan:8080/v1",
+        "http://nas.local:5000",
+        "http://server.internal:80",
+        "http://friday.tail.ts.net:8765",
+    ] {
+        assert!(
+            !is_private_endpoint(url),
+            "name suffixes must not be auto-trusted: {url}"
+        );
+        assert!(
+            crate::agent::egress::is_private_endpoint_trusted_by_name(url),
+            "but they must still be recognised as name-trusted: {url}"
+        );
+    }
 }
 
 #[test]

@@ -46,7 +46,11 @@ fn provider_is_private_uses_egress_check() {
     assert!(rfc1918.is_private(), "RFC 1918 192.168.0.0/16");
     assert!(!openai.is_private());
     assert!(!lookalike.is_private(), "host is a public name, not a dotted-quad");
-    assert!(m_dns.is_private(), ".local mDNS suffix");
+    assert!(
+        !m_dns.is_private(),
+        "H-05 (P02): a .local mDNS name is spoofable and no longer grants private trust \
+         on its own — it is surfaced to the user as trusted-by-name instead"
+    );
     assert!(!unparseable.is_private(), "unparseable URL is treated as public (refuse)");
 }
 
