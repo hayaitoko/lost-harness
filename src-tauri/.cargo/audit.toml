@@ -21,9 +21,19 @@
 #   published timeline — so this is a re-justification checkpoint, not a
 #   predicted fix date.
 #
-# VERIFIED 2026-07-29 on this exact Cargo.lock:
-#   - `cargo audit` → 0 vulnerabilities, 19 warnings (18 unmaintained, 1 unsound)
-#   - none of the 19 is vulnerability-class; all are informational advisories
+#   !! THE REVISIT DATE IS A COMMENT ONLY — NOTHING ENFORCES IT. !!
+#   cargo-audit's `ignore` list is a flat array of advisory IDs with no expiry
+#   support: these entries never lapse, and CI will stay green past 2027-01-31
+#   without anyone noticing. (cargo-deny does support expiry, via
+#   `[[advisories.ignore]] { id, reason, expires }` — adopting cargo-deny is
+#   the only way to make this date enforceable, and it is not adopted here.)
+#   Until then, the only mechanism is a human opening this file on purpose.
+#
+# VERIFIED 2026-07-29 against Cargo.lock at campaign base eb17b94
+# (no `cargo update` was required for these advisories — see review-fixes/progress/P20.md):
+#   - `cargo audit` with this config → exit 0, clean
+#   - `cargo audit` on the same lock WITHOUT this config → 0 vulnerabilities,
+#     19 warnings (18 unmaintained, 1 unsound) — exactly the 19 IDs below
 # ─────────────────────────────────────────────────────────────────────────────
 ignore = [
   # ───────────────────────────────────────────────────────────────────────────
@@ -120,7 +130,7 @@ ignore = [
 # anything new is loud and fails CI. Turning these categories off instead of
 # enumerating them would hide future unmaintained/unsound crates as well, which
 # is exactly the "quietly permanent" failure mode this file exists to prevent.
-informational_warnings = ["unmaintained", "unsound", "notice", "unnotice"]
+informational_warnings = ["unmaintained", "unsound", "notice"]
 
 [output]
 # Hard gate. With the exceptions above codified, `cargo audit` exits non-zero on
