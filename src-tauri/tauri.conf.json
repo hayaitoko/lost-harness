@@ -28,7 +28,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg"],
+    "targets": "all",
     "resources": {
       "vendor/llama-cpp": "llama-cpp"
     },

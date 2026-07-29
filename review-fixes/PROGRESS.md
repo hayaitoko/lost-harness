@@ -24,7 +24,7 @@ this board is regenerated from those (see fix-runbook.md §9).
 | P14 | Agent-loop lock granularity | M-08 | ☐ | | | |
 | P15 | Background budget hard caps | M-09 | ☐ | | | |
 | P16 | OAuth rotation & Gmail efficiency | M-06, M-07 | ☐ | | | |
-|| P17 | Supported-arch & release matrix | H-09, H-10 | ☑ | fix/p17-release-matrix | Rebuild vendored llama.cpp against min macOS (Needs decision) | Rebuild vendored llama.cpp + dylibs against macOS 15 SDK; verify DMG build end-to-end |
+| P17 | Supported-arch & release matrix | H-09, H-10 | ☐ | | | |
 | P18 | Content Security Policy | M-16 | ☐ | | | |
 | P19 | Minimum Rust version | M-17 | ☐ | | | |
 | P20 | Dependency upgrades | H-11, M-20 | ☐ | | | |

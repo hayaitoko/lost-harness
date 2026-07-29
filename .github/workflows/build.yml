@@ -14,8 +14,7 @@ jobs:
   # Lost Harness is a macOS-only, Apple-Silicon-only desktop app:
   #   * the vendored llama.cpp runtime ships as arm64 Mach-O only
   #     (src-tauri/vendor/llama-cpp/macos-arm64/),
-  #   * the computer-use backend is built on macOS Accessibility + CoreGraphics,
-  #   * bundle.targets is ["dmg"].
+  #   * the computer-use backend is built on macOS Accessibility + CoreGraphics.
   # There is therefore no ubuntu/windows job: those runners could not run any of
   # the steps below (every cargo step is pinned to aarch64-apple-darwin), so
   # listing them in a matrix was a false support claim rather than a real gate.
