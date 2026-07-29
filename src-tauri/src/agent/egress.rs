@@ -15,7 +15,11 @@
 //!   - `192.168.0.0/16`     RFC 1918
 //!   - `172.16.0.0/12`      RFC 1918
 //!   - `100.64.0.0/10`      Tailscale CGNAT
-//!   - `.local`, `.lan`, `.internal`, `.ts.net` suffixes
+//!
+//! Named private-network suffixes (`.local`, `.lan`, `.internal`, `.ts.net`) are NOT
+//! auto-trusted — they require explicit enrollment by the caller. Use
+//! [`is_private_endpoint_trusted_by_name`] to identify such names without granting
+//! network access.
 
 /// Returns `true` if `base_url` points to a private/local endpoint.
 ///
@@ -67,12 +71,8 @@ pub fn is_private_endpoint(base_url: &str) -> bool {
         return false;
     }
 
-    // mDNS / private-network / tailnet hostname suffixes.
-    let lower = host.to_ascii_lowercase();
-    lower.ends_with(".local")
-        || lower.ends_with(".lan")
-        || lower.ends_with(".internal")
-        || lower.ends_with(".ts.net")
+    // Hostname is not a private IP literal — do not trust by name alone.
+    false
 }
 
 /// Returns whether `base_url` is considered private solely because its host
@@ -99,15 +99,20 @@ mod tests {
 
     #[test]
     fn trusted_by_name_distinguishes_names_from_private_literals() {
+        // Suffix-based names are NOT auto-trusted by is_private_endpoint (H-05).
         for url in [
             "http://model.local:1234/v1",
             "http://host.lan/v1",
             "https://node.internal/v1",
             "https://machine.tailnet.ts.net/v1",
         ] {
-            assert!(is_private_endpoint(url));
+            assert!(
+                !is_private_endpoint(url),
+                "suffix-based names must not be auto-trusted: {url}"
+            );
             assert!(is_private_endpoint_trusted_by_name(url));
         }
+        // Loopback, private IPs, and public names are unaffected.
         for url in [
             "http://localhost:1234/v1",
             "http://127.0.0.1:1234/v1",
@@ -117,5 +122,60 @@ mod tests {
         ] {
             assert!(!is_private_endpoint_trusted_by_name(url));
         }
+    }
+
+    #[test]
+    fn loopback_is_always_private() {
+        // IPv4 loopback
+        assert!(is_private_endpoint("http://127.0.0.1:1234/v1"));
+        assert!(is_private_endpoint("http://127.255.255.255:80"));
+        // IPv6 / localhost literals
+        assert!(is_private_endpoint("http://localhost:1234/v1"));
+        assert!(is_private_endpoint("http://[::1]:8080/v1"));
+    }
+
+    #[test]
+    fn suffix_names_cannot_slip_as_private() {
+        // A .ts.net name must NOT be treated as private (H-05).
+        assert!(!is_private_endpoint("https://friday.tail.ts.net:8765"));
+        // A .local name must NOT be treated as private.
+        assert!(!is_private_endpoint("http://nas.local:5000"));
+        // A .lan name must NOT be treated as private.
+        assert!(!is_private_endpoint("http://tadashi.lan:8080/v1"));
+        // A .internal name must NOT be treated as private.
+        assert!(!is_private_endpoint("http://server.internal:80"));
+        // A hostname ending in a substring of a private suffix must not be caught.
+        assert!(!is_private_endpoint("https://evil.local.com/v1"));
+    }
+
+    #[test]
+    fn public_ips_are_not_private() {
+        // Public DNS (8.8.8.8, 1.1.1.1) is not private.
+        assert!(!is_private_endpoint("http://8.8.8.8:80"));
+        assert!(!is_private_endpoint("http://1.1.1.1:53"));
+    }
+
+    #[test]
+    fn malformed_input_is_not_private() {
+        assert!(!is_private_endpoint("not a url"));
+        assert!(!is_private_endpoint(""));
+    }
+
+    #[test]
+    fn private_ipv4_ranges_are_private() {
+        assert!(is_private_endpoint("http://10.0.0.5:8080/v1"));
+        assert!(is_private_endpoint("http://10.255.255.255:80"));
+        assert!(is_private_endpoint("http://192.168.1.1:80"));
+        assert!(is_private_endpoint("http://172.16.0.1:80"));
+        assert!(is_private_endpoint("http://172.31.255.255:80"));
+        assert!(is_private_endpoint("http://100.97.80.2:8765"));
+        assert!(is_private_endpoint("http://100.64.0.1:80"));
+        assert!(is_private_endpoint("http://100.127.255.254:80"));
+
+        // Just outside private ranges
+        assert!(!is_private_endpoint("http://172.15.0.1:80"));
+        assert!(!is_private_endpoint("http://172.32.0.1:80"));
+        assert!(!is_private_endpoint("http://100.63.255.255:80"));
+        assert!(!is_private_endpoint("http://100.128.0.0:80"));
     }
 }
