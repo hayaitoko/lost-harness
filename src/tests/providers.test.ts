@@ -41,16 +41,31 @@ describe("providers store — initial state", () => {
     expect(providersStore.loading).toBe(false);
   });
 
-  it("loads from localStorage when present", () => {
+  it("does not adopt seeded browser-fallback storage until hydrateProviders() runs", async () => {
+    resetProviders();
     seedLocalStorage([
       { id: "p1", name: "LocalAI", base_url: "http://localhost:8080", kind: "local", is_private: true, trusted_by_name: false, supports_native_tools: false },
     ]);
-    // Reload module state by triggering hydrate — but first we need to re-init.
-    // The module loads initial state at import time, so we test via hydrate path.
-    // Reset first.
-    providersStore.providers = [];
-    providersStore.activeProviderId = null;
-    providersStore.activeModel = null;
+
+    // Seeding the fallback store alone must not mutate the live store — the
+    // module read localStorage once at import time and never polls it.
+    expect(providersStore.providers).toEqual([]);
+
+    await hydrateProviders();
+
+    // After hydration the snake_case ProviderInfo is mapped to camelCase
+    // Provider, and the apiKey is deliberately blanked (backend omits it).
+    expect(providersStore.providers).toHaveLength(1);
+    expect(providersStore.providers[0]).toMatchObject({
+      id: "p1",
+      name: "LocalAI",
+      baseUrl: "http://localhost:8080",
+      kind: "local",
+      isPrivate: true,
+      supportsNativeTools: false,
+      trustedByName: false,
+      apiKey: "",
+    });
   });
 });
 
