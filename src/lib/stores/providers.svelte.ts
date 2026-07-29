@@ -57,7 +57,8 @@ const ACTIVE_KEY = "lh.providers.active.v1";
 function migrateProviders(raw: unknown): Provider[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((p: Record<string, unknown>) => {
-    const hadKey = typeof p.apiKey === "string" && (p.apiKey as string).length > 0;
+    const hadKey =
+      typeof p.apiKey === "string" && (p.apiKey as string).length > 0;
     const { apiKey: _, ...rest } = p;
     return { ...rest, hasApiKey: hadKey } as unknown as Provider;
   });
@@ -73,7 +74,9 @@ function loadFromStorage(): {
   try {
     const rawProv = localStorage.getItem(STORAGE_KEY);
     const rawActive = localStorage.getItem(ACTIVE_KEY);
-    const providers: Provider[] = rawProv ? migrateProviders(JSON.parse(rawProv)) : [];
+    const providers: Provider[] = rawProv
+      ? migrateProviders(JSON.parse(rawProv))
+      : [];
     let activeProviderId: string | null = null;
     let activeModel: string | null = null;
     if (rawActive) {
@@ -111,9 +114,16 @@ function persistProviders(): void {
   if (typeof localStorage === "undefined") return;
   try {
     // Strip any residual apiKey field before persisting (defense in depth).
-    const cleaned = providersStore.providers.map(
-      (p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl, hasApiKey: p.hasApiKey, kind: p.kind, isPrivate: p.isPrivate, supportsNativeTools: p.supportsNativeTools, trustedByName: p.trustedByName }),
-    );
+    const cleaned = providersStore.providers.map((p) => ({
+      id: p.id,
+      name: p.name,
+      baseUrl: p.baseUrl,
+      hasApiKey: p.hasApiKey,
+      kind: p.kind,
+      isPrivate: p.isPrivate,
+      supportsNativeTools: p.supportsNativeTools,
+      trustedByName: p.trustedByName,
+    }));
     localStorage.setItem(STORAGE_KEY, JSON.stringify(cleaned));
   } catch {
     // localStorage may be unavailable; non-fatal.
@@ -135,28 +145,44 @@ function persistActive(): void {
   }
 }
 
+// On startup, immediately overwrite any legacy localStorage payload with the
+// already-stripped in-memory providers (migrateProviders() dropped `apiKey`
+// during load). This ensures a plaintext key from a pre-fix build cannot
+// linger on disk until the first hydrate/persist cycle. If the stored blob
+// was unparseable, providers is [] and we simply clear it — fail closed.
+if (
+  typeof localStorage !== "undefined" &&
+  localStorage.getItem(STORAGE_KEY) !== null
+) {
+  persistProviders();
+}
+
 // ── One-shot key injection IPC ────────────────────────────────────────────
 
 /**
  * Sends an API key to the backend via the dedicated `set_provider_api_key`
  * one-shot IPC. The backend stores it in the OS keychain. The frontend
- * NEVER retains the key in memory or localStorage. In browser fallback
- * mode this is a no-op (no keychain available).
+ * NEVER retains the key in memory or localStorage.
+ *
+ * SECURITY: this function does NOT swallow IPC failures. If the durable
+ * write fails, the rejection propagates so callers keep the provider in a
+ * truthful state (unconfigured / un-rotated) instead of reporting a phantom
+ * success. In browser fallback mode (no Tauri shell / no keychain) the key
+ * is simply dropped — the localStorage store is a dev-only convenience.
  */
 async function setProviderApiKey(
   providerId: string,
   apiKey: string,
 ): Promise<void> {
-  if (typeof window !== "undefined" && typeof (window as any).__TAURI_INTERNALS__ !== "undefined") {
-    try {
-      await invoke("set_provider_api_key", {
-        args: { provider_id: providerId, api_key: apiKey },
-      });
-    } catch (err) {
-      console.error("setProviderApiKey failed", err);
-    }
-  }
-  // Browser fallback: no keychain — key is dropped.
+  // Browser fallback: no keychain available — the plaintext key is dropped
+  // and never persisted. Nothing to durably store, so this resolves.
+  if (!api.isTauriRuntime()) return;
+
+  // Tauri runtime: hand the key to the backend one-shot IPC. Deliberately
+  // NOT wrapped in try/catch — a rejection must reach the caller.
+  await invoke("set_provider_api_key", {
+    args: { provider_id: providerId, api_key: apiKey },
+  });
 }
 
 // ── Hydration from backend ──────────────────────────────────────────────────
@@ -171,27 +197,27 @@ export async function hydrateProviders(): Promise<void> {
   try {
     const remote = await api.listProviders();
     // Map ProviderInfo → Provider (camelCase for the frontend).
-        // The backend never returns the API key itself; it may or may not
-        // return has_api_key (P05 adds this). We default to false and rely
-        // on the local-merge below until the backend catches up.
-        const mapped: Provider[] = remote.map((p) => ({
-          id: p.id,
-          name: p.name,
-          baseUrl: p.base_url,
-          hasApiKey: (p as any).has_api_key ?? false,
-          kind: (p.kind as ProviderKind) ?? "custom",
-          isPrivate: p.is_private,
-          supportsNativeTools: p.supports_native_tools,
-          trustedByName: p.trusted_by_name,
-        }));
+    // The backend never returns the API key itself; it may or may not
+    // return has_api_key (P05 adds this). We default to false and rely
+    // on the local-merge below until the backend catches up.
+    const mapped: Provider[] = remote.map((p) => ({
+      id: p.id,
+      name: p.name,
+      baseUrl: p.base_url,
+      hasApiKey: (p as any).has_api_key ?? false,
+      kind: (p.kind as ProviderKind) ?? "custom",
+      isPrivate: p.is_private,
+      supportsNativeTools: p.supports_native_tools,
+      trustedByName: p.trusted_by_name,
+    }));
 
-        // Merge: if a local provider has the same id, preserve the local
-        // hasApiKey (the backend doesn't return it yet; P05 adds it).
-        const localById = new Map(providersStore.providers.map((p) => [p.id, p]));
-        const merged: Provider[] = mapped.map((p) => {
-          const local = localById.get(p.id);
-          return local ? { ...p, hasApiKey: local.hasApiKey } : p;
-        });
+    // Merge: if a local provider has the same id, preserve the local
+    // hasApiKey (the backend doesn't return it yet; P05 adds it).
+    const localById = new Map(providersStore.providers.map((p) => [p.id, p]));
+    const merged: Provider[] = mapped.map((p) => {
+      const local = localById.get(p.id);
+      return local ? { ...p, hasApiKey: local.hasApiKey } : p;
+    });
     // Browser fallback owns its local store. In the installed app, treating
     // an unknown cache entry as real would resurrect a failed/deleted
     // provider after restart and falsely imply it was saved.
@@ -244,10 +270,10 @@ export async function fetchModels(providerId: string): Promise<string[]> {
  *  The caller provides an apiKey string; the store sends it to the backend
  *  via the secure one-shot IPC (`set_provider_api_key`) and immediately
  *  drops it — only `hasApiKey: boolean` is kept in the frontend model. */
-export async function addProvider(
-  input: ProviderInput,
-): Promise<Provider> {
-  const existingIdx = providersStore.providers.findIndex((x) => x.id === input.id);
+export async function addProvider(input: ProviderInput): Promise<Provider> {
+  const existingIdx = providersStore.providers.findIndex(
+    (x) => x.id === input.id,
+  );
 
   if (existingIdx >= 0) {
     // Update existing — round-trip through the backend so the edit
@@ -258,8 +284,9 @@ export async function addProvider(
     // means "keep the existing key" (already stored in the OS keychain).
     const gotNewKey = !!input.apiKey;
 
+    let info;
     try {
-      const info = await api.updateProvider(
+      info = await api.updateProvider(
         id,
         input.name.trim(),
         input.baseUrl.trim(),
@@ -267,69 +294,96 @@ export async function addProvider(
         input.kind,
         input.supportsNativeTools,
       );
-
-      if (gotNewKey) {
-        await setProviderApiKey(id, input.apiKey);
-      }
-
-      providersStore.providers[existingIdx] = {
-        id: info.id,
-        name: info.name,
-        baseUrl: info.base_url,
-        hasApiKey: gotNewKey || existing.hasApiKey,
-        kind: (info.kind as ProviderKind) ?? input.kind,
-        isPrivate: info.is_private,
-        supportsNativeTools: info.supports_native_tools,
-        trustedByName: info.trusted_by_name,
-      };
     } catch (err) {
       // The bridge already supplies a browser-only mock. A real Tauri
       // failure must stay visible rather than pretending a durable edit won.
       console.error("updateProvider failed", err);
       throw err;
     }
+
+    // Metadata is durably updated. Reflect it now, but leave hasApiKey at its
+    // previous value — it flips only after (and unless) a new key durably
+    // rotates in below.
+    providersStore.providers[existingIdx] = {
+      id: info.id,
+      name: info.name,
+      baseUrl: info.base_url,
+      hasApiKey: existing.hasApiKey,
+      kind: (info.kind as ProviderKind) ?? input.kind,
+      isPrivate: info.is_private,
+      supportsNativeTools: info.supports_native_tools,
+      trustedByName: info.trusted_by_name,
+    };
     // Base URL or kind may have changed — drop the cached model list.
     modelCache.delete(id);
     persistProviders();
+
+    if (gotNewKey) {
+      // Rotate the key. If this rejects, the provider keeps its previous
+      // hasApiKey state (the old key is still valid) and the error surfaces
+      // to the UI — never a silent "rotation succeeded". Clear the plaintext
+      // input as soon as it has been handed off.
+      await setProviderApiKey(id, input.apiKey);
+      input.apiKey = "";
+      providersStore.providers[existingIdx].hasApiKey = true;
+      persistProviders();
+    }
     return providersStore.providers[existingIdx];
   }
 
   // New provider — round-trip through the backend.
+  let info;
   try {
-    const info = await api.addProvider(
+    info = await api.addProvider(
       input.name.trim(),
       input.baseUrl.trim(),
       null, // key never flows through the provider-creation IPC
       input.kind,
       input.supportsNativeTools,
     );
-
-    if (input.apiKey) {
-      await setProviderApiKey(info.id, input.apiKey);
-    }
-
-    const provider: Provider = {
-      id: info.id,
-      name: info.name,
-      baseUrl: info.base_url,
-      hasApiKey: !!input.apiKey,
-      kind: (info.kind as ProviderKind) ?? input.kind,
-      isPrivate: info.is_private,
-      supportsNativeTools: info.supports_native_tools,
-      trustedByName: info.trusted_by_name,
-    };
-    providersStore.providers.push(provider);
-    // First provider added → make it active by default.
-    if (providersStore.activeProviderId === null) {
-      providersStore.activeProviderId = provider.id;
-    }
-    persistProviders();
-    persistActive();
-    return provider;
   } catch (err) {
     console.error("addProvider failed", err);
     throw err;
   }
+
+  // Store the key BEFORE publishing hasApiKey. If the durable write fails,
+  // roll back the just-created provider row so we never leave a keyless
+  // provider that looks configured, and surface the error to the UI.
+  let hasApiKey = false;
+  if (input.apiKey) {
+    try {
+      await setProviderApiKey(info.id, input.apiKey);
+      input.apiKey = "";
+      hasApiKey = true;
+    } catch (err) {
+      console.error("setProviderApiKey failed; rolling back provider", err);
+      try {
+        await api.removeProvider(info.id);
+      } catch (rollbackErr) {
+        console.error("rollback removeProvider failed", rollbackErr);
+      }
+      throw err;
+    }
+  }
+
+  const provider: Provider = {
+    id: info.id,
+    name: info.name,
+    baseUrl: info.base_url,
+    hasApiKey,
+    kind: (info.kind as ProviderKind) ?? input.kind,
+    isPrivate: info.is_private,
+    supportsNativeTools: info.supports_native_tools,
+    trustedByName: info.trusted_by_name,
+  };
+  providersStore.providers.push(provider);
+  // First provider added → make it active by default.
+  if (providersStore.activeProviderId === null) {
+    providersStore.activeProviderId = provider.id;
+  }
+  persistProviders();
+  persistActive();
+  return provider;
 }
 
 /** Remove a provider only after the backend (or browser mock) confirms it. */
