@@ -27,7 +27,7 @@ Requirements:
 
 - macOS with Xcode Command Line Tools (the primary supported platform).
 - Node.js 20 or newer.
-- Rust 1.77 or newer via `rustup`.
+- Rust 1.82 or newer via `rustup`.
 
 ```sh
 git clone https://github.com/hayaitoko/lost-harness.git

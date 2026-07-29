@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Lost Harness — Rust + Tauri 2 + Svelte 5 desktop app"
 authors = ["Lukas Threlkeld"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.82"
 
 # The `_lib` suffix may seem redundant, but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
