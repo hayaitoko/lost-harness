@@ -922,11 +922,11 @@ fn build_tool_dispatcher(
     // observed), email tools are simply absent rather than half-wired.
     match crate::email::oauth::HttpTokenEndpoint::new() {
         Ok(endpoint) => {
-            let deps = crate::tools::email::EmailToolDeps {
-                secrets: provider_secrets,
-                endpoint: Arc::new(endpoint),
-                needs_reconnect: email_needs_reconnect,
-            };
+            let deps = crate::tools::email::EmailToolDeps::new(
+                provider_secrets,
+                Arc::new(endpoint),
+                email_needs_reconnect,
+            );
             registry.register(Box::new(crate::tools::email::EmailSearchTool::new(deps.clone())));
             registry.register(Box::new(crate::tools::email::EmailReadTool::new(deps.clone())));
             registry.register(Box::new(crate::tools::email::EmailSendTool::new(deps.clone())));
