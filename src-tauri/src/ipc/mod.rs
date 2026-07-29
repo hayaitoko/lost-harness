@@ -33,6 +33,8 @@ pub mod approval;
 pub mod ask_human;
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -96,6 +98,10 @@ pub struct AppState {
     /// the app-exit teardown.
     #[cfg(feature = "local-runner")]
     pub local_runner: Option<Arc<crate::models::runner::LocalRunnerContext>>,
+    /// H-07: outstanding MCP install nonces (nonce → issue time). Issued by
+    /// `generate_mcp_install_nonce` on the consent path, consumed once by
+    /// `register_mcp_server`, expired after [`MCP_INSTALL_NONCE_TTL`].
+    pub pending_mcp_nonces: Arc<Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
 // ── Response types ───────────────────────────────────────────────────────
@@ -1167,6 +1173,53 @@ pub struct RegisterMcpServerArgs {
     pub trusted_read_only: bool,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// H-07: a single-use install nonce from `generate_mcp_install_nonce`.
+    /// Required — a `register_mcp_server` call that never went through the
+    /// consent step has no nonce to present and is rejected before any spawn.
+    pub nonce: String,
+}
+
+/// How long an issued MCP install nonce stays usable.
+const MCP_INSTALL_NONCE_TTL: Duration = Duration::from_secs(300);
+
+/// Issue a single-use, short-lived MCP install nonce and remember it.
+/// Split out of the Tauri command so the gate is directly testable.
+fn issue_mcp_install_nonce(nonces: &Mutex<std::collections::HashMap<String, Instant>>) -> String {
+    let nonce = Uuid::new_v4().to_string();
+    let now = Instant::now();
+    if let Ok(mut map) = nonces.lock() {
+        // Opportunistically drop anything already past its TTL so an abandoned
+        // install flow can't grow the map without bound.
+        map.retain(|_, issued| now.duration_since(*issued) <= MCP_INSTALL_NONCE_TTL);
+        map.insert(nonce.clone(), now);
+    }
+    nonce
+}
+
+/// Consume a nonce. Fails closed on unknown, already-used, or expired values —
+/// and removes it either way, so a nonce is never usable twice.
+fn consume_mcp_install_nonce(
+    nonces: &Mutex<std::collections::HashMap<String, Instant>>,
+    nonce: &str,
+) -> Result<(), String> {
+    let mut map = nonces
+        .lock()
+        .map_err(|_| "the MCP install nonce store is poisoned".to_string())?;
+    let issued = map.remove(nonce).ok_or_else(|| {
+        "this MCP install was not confirmed — no valid install nonce was presented".to_string()
+    })?;
+    if issued.elapsed() > MCP_INSTALL_NONCE_TTL {
+        return Err("the MCP install confirmation expired — start the install again".to_string());
+    }
+    Ok(())
+}
+
+/// H-07: mint the install nonce that `register_mcp_server` demands. The UI must
+/// call this only from the confirmed-install path; it is the token that proves
+/// registration came from that flow rather than a bare `invoke(...)`.
+#[tauri::command]
+pub fn generate_mcp_install_nonce(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(issue_mcp_install_nonce(&state.pending_mcp_nonces))
 }
 
 /// What `register_mcp_server` / `list_mcp_servers` return per server.
@@ -1194,11 +1247,16 @@ pub struct McpServerInfo {
 /// that runs with the user's OS privileges and automatically restarts at app
 /// boot while enabled. Any UI exposing this command must present it as software
 /// installation and require explicit native confirmation before invoking it.
+/// H-07 enforces the second half of that contract mechanically: the call needs
+/// a single-use nonce from `generate_mcp_install_nonce`, and the executable it
+/// resolves to is hashed and pinned so a later swap can't ride this consent.
 #[tauri::command]
 pub async fn register_mcp_server(
     state: State<'_, AppState>,
     args: RegisterMcpServerArgs,
 ) -> Result<McpServerInfo, String> {
+    // H-07: consent gate FIRST — before any validation, resolution, or spawn.
+    consume_mcp_install_nonce(&state.pending_mcp_nonces, &args.nonce)?;
     if args.name.trim().is_empty() || args.command.trim().is_empty() {
         return Err("an MCP server needs a non-empty name and command".to_string());
     }
@@ -1233,6 +1291,17 @@ pub async fn register_mcp_server(
             ));
         }
     }
+    // H-07: for a stdio server, resolve the command to a concrete file and
+    // record its SHA-256 now — this registration IS the user approving that
+    // exact binary. HTTP endpoints have no local executable to pin.
+    let (executable_path, executable_hash) = if is_http {
+        (None, None)
+    } else {
+        let (path, hash) =
+            crate::tools::mcp_stdio::resolve_and_hash_executable(args.command.trim())
+                .map_err(|e| format!("couldn't pin the MCP server executable: {e}"))?;
+        (Some(path), Some(hash))
+    };
     let row = crate::storage::McpServerRow {
         id: uuid::Uuid::new_v4().to_string(),
         name: args.name.trim().to_string(),
@@ -1250,6 +1319,8 @@ pub async fn register_mcp_server(
         capabilities: args.capabilities,
         enabled: true,
         created_at: chrono::Utc::now().timestamp(),
+        executable_path,
+        executable_hash,
     };
     // Fail-closed ordering: bring the server up BEFORE persisting anything.
     let tools = crate::tools::mcp_stdio::bring_up_server(&row, &state.tools, &state.mcp).await?;
@@ -3311,6 +3382,90 @@ pub fn list_workspace_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── H-07: the MCP install consent gate ──────────────────────────────────
+    //
+    // These drive `consume_mcp_install_nonce` / `issue_mcp_install_nonce`
+    // directly. That IS the gate `register_mcp_server` runs before anything
+    // else — the full `#[tauri::command]` can't be called in a unit test
+    // because `State<'_, AppState>` needs a running Tauri app.
+
+    fn nonce_store() -> Mutex<std::collections::HashMap<String, Instant>> {
+        Mutex::new(std::collections::HashMap::new())
+    }
+
+    /// H-07 gap (b): a renderer that calls `register_mcp_server` without going
+    /// through the consent step has no nonce to present, and is refused.
+    #[test]
+    fn registering_without_a_nonce_fails() {
+        let store = nonce_store();
+        // The forged call: empty / made-up nonce, never issued by the backend.
+        for forged in [
+            "",
+            "not-a-real-nonce",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            let err = consume_mcp_install_nonce(&store, forged)
+                .expect_err("an unissued nonce must be rejected");
+            assert!(err.contains("not confirmed"), "got: {err}");
+        }
+        // Control: a nonce the backend actually issued is accepted.
+        let good = issue_mcp_install_nonce(&store);
+        consume_mcp_install_nonce(&store, &good).expect("an issued nonce must pass");
+    }
+
+    /// Single use: replaying a captured nonce is refused.
+    #[test]
+    fn an_install_nonce_cannot_be_replayed() {
+        let store = nonce_store();
+        let n = issue_mcp_install_nonce(&store);
+        consume_mcp_install_nonce(&store, &n).expect("first use passes");
+        let err = consume_mcp_install_nonce(&store, &n).expect_err("second use must fail");
+        assert!(err.contains("not confirmed"), "got: {err}");
+    }
+
+    /// A nonce older than the TTL is refused, and consuming it clears it.
+    #[test]
+    fn an_expired_install_nonce_fails() {
+        let store = nonce_store();
+        let stale = "stale-nonce".to_string();
+        let issued_at = Instant::now() - (MCP_INSTALL_NONCE_TTL + Duration::from_secs(1));
+        store.lock().unwrap().insert(stale.clone(), issued_at);
+        let err = consume_mcp_install_nonce(&store, &stale).expect_err("expired must fail");
+        assert!(err.contains("expired"), "got: {err}");
+        assert!(
+            store.lock().unwrap().is_empty(),
+            "a rejected nonce must not linger in the store"
+        );
+    }
+
+    /// One issued nonce does not authorize a second install.
+    #[test]
+    fn each_install_needs_its_own_nonce() {
+        let store = nonce_store();
+        let a = issue_mcp_install_nonce(&store);
+        let b = issue_mcp_install_nonce(&store);
+        assert_ne!(a, b, "nonces must be unique per issue");
+        consume_mcp_install_nonce(&store, &a).expect("first install");
+        consume_mcp_install_nonce(&store, &b).expect("second install");
+        assert!(store.lock().unwrap().is_empty());
+    }
+
+    /// `RegisterMcpServerArgs` has no `#[serde(default)]` on `nonce`, so a
+    /// renderer payload that simply omits it fails to deserialize at the IPC
+    /// boundary — the call never reaches the command body at all.
+    #[test]
+    fn register_args_without_a_nonce_do_not_deserialize() {
+        let no_nonce = serde_json::json!({ "name": "srv", "command": "echo" });
+        assert!(
+            serde_json::from_value::<RegisterMcpServerArgs>(no_nonce).is_err(),
+            "an args payload with no nonce field must be rejected by serde"
+        );
+        let with_nonce = serde_json::json!({ "name": "srv", "command": "echo", "nonce": "n" });
+        let parsed: RegisterMcpServerArgs =
+            serde_json::from_value(with_nonce).expect("a payload carrying a nonce parses");
+        assert_eq!(parsed.nonce, "n");
+    }
 
     #[test]
     fn app_version_is_m1_tag() {

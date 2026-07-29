@@ -65,14 +65,69 @@ fn schema_version_is_current_after_init_global() {
     // Global schema is now v8 (v2 memory buckets + FTS5; v3 private-bucket
     // vector table for the meaning lane; v4 endpoints.supports_native_tools;
     // v5 skills metadata columns — Wave 4.1; v6 agent_types — Wave 4.3;
-    // v7 model_catalog.sha256+status — Wave 5.3 / M8; v8 mcp_servers — C3).
+    // v7 model_catalog.sha256+status — Wave 5.3 / M8; v8 mcp_servers — C3;
+    // v9 mcp_servers.executable_path/_hash — H-07 binary pinning).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 8); // C3 added mcp_servers (v8)
+    assert_eq!(v, 9); // H-07 added the MCP executable pins (v9)
+}
+
+/// H-07 / migration v9: a FRESH database must end up with the pin columns.
+/// This is the regression guard for the `ALTER TABLE ADD COLUMN` convention —
+/// declaring these columns in GLOBAL_SCHEMA_SQL *as well* would make v9 fail
+/// with "duplicate column name" on every new install.
+#[test]
+fn fresh_global_db_has_the_mcp_executable_pin_columns() {
+    let db = GlobalDb::open_in_memory().unwrap();
+    let cols: Vec<String> = db
+        .raw()
+        .prepare("PRAGMA table_info(mcp_servers)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(cols.contains(&"executable_path".to_string()), "{cols:?}");
+    assert!(cols.contains(&"executable_hash".to_string()), "{cols:?}");
+}
+
+/// H-07: the pins survive a persist -> read round-trip, and a row written
+/// without them reads back as `None` (the pre-v9 shape bring-up refuses).
+#[test]
+fn mcp_server_executable_pins_round_trip() {
+    use crate::storage::McpServerRow;
+    let db = GlobalDb::open_in_memory().unwrap();
+    let mut row = McpServerRow {
+        id: "s1".into(),
+        name: "pinned".into(),
+        command: "sh".into(),
+        args: vec![],
+        tier: "local".into(),
+        trusted_read_only: false,
+        capabilities: vec![],
+        enabled: true,
+        created_at: 1,
+        executable_path: Some("/bin/sh".into()),
+        executable_hash: Some("deadbeef".into()),
+    };
+    db.insert_mcp_server(&row).unwrap();
+    let back = db.get_mcp_server("s1").unwrap().expect("row persisted");
+    assert_eq!(back.executable_path.as_deref(), Some("/bin/sh"));
+    assert_eq!(back.executable_hash.as_deref(), Some("deadbeef"));
+
+    row.id = "s2".into();
+    row.name = "unpinned".into();
+    row.executable_path = None;
+    row.executable_hash = None;
+    db.insert_mcp_server(&row).unwrap();
+    let back2 = db.get_mcp_server("s2").unwrap().expect("row persisted");
+    assert!(back2.executable_path.is_none());
+    assert!(back2.executable_hash.is_none());
+    assert_eq!(db.list_mcp_servers().unwrap().len(), 2);
 }
 
 #[test]

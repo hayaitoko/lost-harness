@@ -91,6 +91,12 @@ pub struct McpServerRow {
     pub capabilities: Vec<String>,
     pub enabled: bool,
     pub created_at: i64,
+    /// H-07: canonical absolute path the command resolved to at registration
+    /// time. `None` on rows written before migration v9.
+    pub executable_path: Option<String>,
+    /// H-07: hex SHA-256 of that file at registration time. `None` on rows
+    /// written before migration v9; bring-up refuses to spawn without it.
+    pub executable_hash: Option<String>,
 }
 
 fn row_to_mcp_server(r: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerRow> {
@@ -106,6 +112,8 @@ fn row_to_mcp_server(r: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerRow> {
         capabilities: serde_json::from_str(&caps_json).unwrap_or_default(),
         enabled: r.get::<_, i64>(7)? != 0,
         created_at: r.get(8)?,
+        executable_path: r.get(9)?,
+        executable_hash: r.get(10)?,
     })
 }
 
@@ -639,8 +647,9 @@ impl GlobalDb {
     pub fn insert_mcp_server(&self, s: &McpServerRow) -> Result<()> {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO mcp_servers
-             (id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at,
+              executable_path, executable_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 s.id,
                 s.name,
@@ -650,7 +659,9 @@ impl GlobalDb {
                 s.trusted_read_only as i64,
                 serde_json::to_string(&s.capabilities).unwrap_or_else(|_| "[]".into()),
                 s.enabled as i64,
-                s.created_at
+                s.created_at,
+                s.executable_path,
+                s.executable_hash,
             ],
         )?;
         Ok(())
@@ -659,7 +670,8 @@ impl GlobalDb {
     pub fn list_mcp_servers(&self) -> Result<Vec<McpServerRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at
+            "SELECT id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at,
+                    executable_path, executable_hash
              FROM mcp_servers ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -673,7 +685,8 @@ impl GlobalDb {
             .conn
             .lock()
             .query_row(
-                "SELECT id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at
+                "SELECT id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at,
+                        executable_path, executable_hash
                  FROM mcp_servers WHERE id = ?1",
                 params![id],
                 row_to_mcp_server,

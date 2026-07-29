@@ -207,6 +207,27 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
             created_at        INTEGER NOT NULL
         );",
     },
+    Migration {
+        version: 9,
+        // H-07: pin the approved MCP server binary. Registration records the
+        // canonical resolved path + its SHA-256; every later bring-up (including
+        // the unattended auto-start at boot) re-measures and refuses to spawn on
+        // a mismatch, so a swapped binary can't ride the old consent.
+        //
+        // Rows written before v9 get NULL in both columns. That is NOT treated
+        // as "trusted": `verify_pinned_executable` fails closed on a missing
+        // pin and asks the user to re-register — we never measured that binary,
+        // so we cannot attest to it.
+        //
+        // These columns live ONLY here, not in GLOBAL_SCHEMA_SQL's mcp_servers
+        // CREATE, because `ALTER TABLE ADD COLUMN` has no IF-NOT-EXISTS: a fresh
+        // DB runs v1 (CREATE without them) then v9 (ALTER adds them), matching
+        // an existing DB's upgrade path exactly. Same convention as v2's
+        // `memory_facts.pinned`.
+        name: "mcp_servers_executable_pinning",
+        sql: "ALTER TABLE mcp_servers ADD COLUMN executable_path TEXT;
+              ALTER TABLE mcp_servers ADD COLUMN executable_hash TEXT;",
+    },
 ];
 
 /// All per-profile DB migrations, in order.

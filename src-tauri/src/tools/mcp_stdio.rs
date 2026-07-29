@@ -18,9 +18,11 @@
 //! timeout all surface as `Err` — flowing through `McpTool::run`'s existing
 //! `ToolResult::Err` arm with no new error path.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
@@ -33,6 +35,121 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// Cap on a single response line — a malicious/broken server can't OOM us by
 /// streaming an endless line.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+// ── H-07: executable pinning ────────────────────────────────────────────────
+//
+// A registered stdio MCP server is third-party code we spawn with the app's own
+// privileges. Registration is the moment the user consents to *that specific
+// binary*; nothing afterwards re-asks. So registration records the canonical
+// absolute path AND the SHA-256 of the file, and every later bring-up
+// (including the silent auto-start at boot) re-resolves + re-hashes and refuses
+// to spawn on any mismatch. A swapped `~/.local/bin/foo` therefore cannot ride
+// the old consent.
+//
+// NOT covered here, and deliberately so: the child still runs with the app's
+// full privileges once it does start. See `review-fixes/progress/P08.md`.
+
+/// Is `p` a file we could actually exec? Mirrors what the OS will do when
+/// `StdioMcpTransport::spawn` hands `command` to `execvp`.
+#[cfg(unix)]
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Resolve `command` to an absolute, symlink-free path the same way the spawned
+/// child would. A command containing a separator is a path; a bare name is
+/// looked up along `PATH` — the same `PATH` the child inherits (see the
+/// allowlist in [`StdioMcpTransport::spawn`]), so resolution and execution
+/// agree.
+pub fn resolve_executable(command: &str) -> Result<PathBuf, String> {
+    let candidate = if command.contains('/') || command.contains('\\') {
+        PathBuf::from(command)
+    } else {
+        let path_var = std::env::var_os("PATH")
+            .ok_or_else(|| "PATH is unset — cannot resolve an MCP server command".to_string())?;
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(command))
+            .find(|p| is_executable_file(p))
+            .ok_or_else(|| format!("MCP server command `{command}` not found on PATH"))?
+    };
+    std::fs::canonicalize(&candidate).map_err(|e| {
+        format!(
+            "cannot resolve MCP server command `{}`: {e}",
+            candidate.display()
+        )
+    })
+}
+
+/// Hex-encoded SHA-256 of the file at `path`, read in chunks (a server binary
+/// can be hundreds of MB — never slurp it whole).
+pub fn sha256_of_file(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut f =
+        std::fs::File::open(path).map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Registration-time pin: the canonical path + its SHA-256, as a pair to store
+/// on the `mcp_servers` row.
+pub fn resolve_and_hash_executable(command: &str) -> Result<(String, String), String> {
+    let path = resolve_executable(command)?;
+    let hash = sha256_of_file(&path)?;
+    Ok((path.to_string_lossy().to_string(), hash))
+}
+
+/// Bring-up-time check. Fails CLOSED in all three bad cases:
+/// * the command now resolves somewhere else,
+/// * the file at that path hashes differently than at registration,
+/// * the row has no pin at all (registered before migration v9) — we cannot
+///   attest to a binary we never measured, so the user must re-register.
+pub fn verify_pinned_executable(
+    command: &str,
+    pinned_path: Option<&str>,
+    pinned_hash: Option<&str>,
+) -> Result<(), String> {
+    let (Some(expected_path), Some(expected_hash)) = (pinned_path, pinned_hash) else {
+        return Err(format!(
+            "MCP server `{command}` has no pinned executable hash — it was registered before \
+             executable pinning existed. Remove and re-register it to approve its binary."
+        ));
+    };
+    let actual_path = resolve_executable(command)?;
+    let actual_path = actual_path.to_string_lossy().to_string();
+    if actual_path != expected_path {
+        return Err(format!(
+            "refusing to start MCP server `{command}`: its executable moved (approved \
+             `{expected_path}`, now resolves to `{actual_path}`). Remove and re-register it."
+        ));
+    }
+    let actual_hash = sha256_of_file(Path::new(&actual_path))?;
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "refusing to start MCP server `{command}`: the binary at `{actual_path}` changed \
+             since it was approved (sha256 {expected_hash} → {actual_hash}). Remove and \
+             re-register it."
+        ));
+    }
+    Ok(())
+}
 
 struct Io {
     stdin: ChildStdin,
@@ -324,6 +441,13 @@ pub async fn bring_up_server(
             super::mcp_http::HttpMcpTransport::connect(&row.command).await?,
         ))
     } else {
+        // H-07: the pinned binary is the consent. Re-check it on EVERY bring-up
+        // — including the unattended auto-start at boot — before we spawn.
+        verify_pinned_executable(
+            &row.command,
+            row.executable_path.as_deref(),
+            row.executable_hash.as_deref(),
+        )?;
         McpRuntimeTransport::Stdio(std::sync::Arc::new(
             StdioMcpTransport::spawn(&row.command, &row.args).await?,
         ))
@@ -485,6 +609,10 @@ mod tests {
         use crate::tools::{BodyEnv, Capability, ExecCtx, ToolCall, ToolDispatcher, ToolRegistry};
 
         let script = fixture_script();
+        // H-07: bring-up now demands a matching pin. Measure the shell the same
+        // way registration would (never a hardcoded digest — it differs per host).
+        let (sh_path, sh_hash) =
+            resolve_and_hash_executable("sh").expect("the shell must resolve on PATH");
         let row = crate::storage::McpServerRow {
             id: "srv1".into(),
             name: "fixture".into(),
@@ -495,6 +623,8 @@ mod tests {
             capabilities: vec![],
             enabled: true,
             created_at: 1,
+            executable_path: Some(sh_path),
+            executable_hash: Some(sh_hash),
         };
         // Remote tier forces the Network capability — the env must grant it.
         let dispatcher = ToolDispatcher::new(
@@ -546,5 +676,143 @@ mod tests {
         // A nonexistent binary fails at spawn.
         let r2 = StdioMcpTransport::spawn("/nonexistent/lhp-mcp-server", &[]).await;
         assert!(r2.is_err());
+    }
+
+    // ── H-07: executable pinning ────────────────────────────────────────────
+
+    /// A standalone, executable copy of the working MCP fixture, so a test can
+    /// mutate the very file that would be spawned. Returns its path.
+    fn executable_fixture_server() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lhp-mcp-pin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server");
+        let body = std::fs::read_to_string(fixture_script()).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn pinned_row(id: &str, command: &str) -> crate::storage::McpServerRow {
+        let (path, hash) = resolve_and_hash_executable(command).expect("fixture resolves");
+        crate::storage::McpServerRow {
+            id: id.into(),
+            name: "pinned".into(),
+            command: command.into(),
+            args: vec![],
+            tier: "remote".into(),
+            trusted_read_only: false,
+            capabilities: vec![],
+            enabled: true,
+            created_at: 1,
+            executable_path: Some(path),
+            executable_hash: Some(hash),
+        }
+    }
+
+    /// H-07 gap (a): once the approved binary changes on disk, the unattended
+    /// auto-start path (`bring_up_server`, exactly what lib.rs runs at boot)
+    /// must REFUSE — not spawn the new binary under the old consent.
+    #[tokio::test]
+    async fn a_changed_binary_blocks_auto_start() {
+        use crate::hooks::HookChain;
+        use crate::tools::{BodyEnv, Capability, ToolDispatcher, ToolRegistry};
+
+        let server = executable_fixture_server();
+        let command = server.to_string_lossy().to_string();
+        let row = pinned_row("pin1", &command);
+
+        let dispatcher = ToolDispatcher::new(
+            ToolRegistry::new(),
+            HookChain::new(),
+            BodyEnv::new([Capability::Network]),
+        );
+        let runtime = McpRuntime::new();
+
+        // Control: the untouched binary matches its pin and comes up fine.
+        let names = bring_up_server(&row, &dispatcher, &runtime)
+            .await
+            .expect("an unmodified, pinned binary must still start");
+        assert_eq!(names, vec!["mcp__pinned__echo_upper".to_string()]);
+        assert!(tear_down_server("pin1", &dispatcher, &runtime).await);
+
+        // Now swap the binary's contents in place — same path, same mode, same
+        // row. This is the attack: consent was given for a different file.
+        let original = std::fs::read_to_string(&server).unwrap();
+        std::fs::write(&server, format!("{original}# tampered\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Sanity: the file really does hash differently now.
+        assert_ne!(
+            sha256_of_file(&server).unwrap(),
+            row.executable_hash.clone().unwrap(),
+            "the test must actually have changed the binary"
+        );
+
+        let err = bring_up_server(&row, &dispatcher, &runtime)
+            .await
+            .expect_err("a changed binary must NOT auto-start");
+        assert!(
+            err.contains("changed since it was approved"),
+            "expected a hash-mismatch refusal, got: {err}"
+        );
+        // And nothing was registered as a side effect of the refusal.
+        assert!(
+            runtime.servers.lock().get("pin1").is_none(),
+            "a refused bring-up must leave no live server behind"
+        );
+
+        let _ = std::fs::remove_dir_all(server.parent().unwrap());
+    }
+
+    /// A row with no pin at all (written before migration v9) is NOT trusted:
+    /// we never measured that binary, so bring-up fails closed.
+    #[test]
+    fn an_unpinned_row_fails_closed() {
+        let err = verify_pinned_executable("sh", None, None)
+            .expect_err("an unmeasured binary must not be trusted");
+        assert!(err.contains("no pinned executable hash"), "got: {err}");
+
+        let (path, _) = resolve_and_hash_executable("sh").unwrap();
+        let err2 = verify_pinned_executable("sh", Some(&path), None)
+            .expect_err("a path without a hash is still unmeasured");
+        assert!(err2.contains("no pinned executable hash"), "got: {err2}");
+    }
+
+    /// The same command resolving to a DIFFERENT file is a refusal too, even if
+    /// that other file happens to be a legitimate executable.
+    #[test]
+    fn a_moved_executable_fails_closed() {
+        let (sh_path, sh_hash) = resolve_and_hash_executable("sh").unwrap();
+        let err = verify_pinned_executable("sh", Some("/nonexistent/approved-sh"), Some(&sh_hash))
+            .expect_err("a relocated executable must not start");
+        assert!(err.contains("its executable moved"), "got: {err}");
+        // Control: the true pin passes.
+        verify_pinned_executable("sh", Some(&sh_path), Some(&sh_hash))
+            .expect("the recorded pin must still verify");
+    }
+
+    /// The pin must survive symlink games: `resolve_executable` canonicalizes,
+    /// so a symlink pointing at the approved file resolves to the same target.
+    #[test]
+    fn hashing_is_content_sensitive() {
+        let dir = std::env::temp_dir().join(format!("lhp-mcp-hash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a");
+        std::fs::write(&a, b"hello").unwrap();
+        let h1 = sha256_of_file(&a).unwrap();
+        assert_eq!(
+            h1, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "sha256(\"hello\") must be the standard digest"
+        );
+        std::fs::write(&a, b"hello!").unwrap();
+        assert_ne!(h1, sha256_of_file(&a).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

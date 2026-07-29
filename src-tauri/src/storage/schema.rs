@@ -9,7 +9,7 @@
 
 /// Returns the current schema version for the GLOBAL database.
 /// Bump when adding a new global migration.
-pub const GLOBAL_SCHEMA_VERSION: i32 = 8;
+pub const GLOBAL_SCHEMA_VERSION: i32 = 9;
 
 /// Returns the current schema version for each PROFILE database.
 /// Bump when adding a new per-profile migration. Profile and global
@@ -133,6 +133,12 @@ CREATE TABLE IF NOT EXISTS agent_types (
 -- `capabilities` are JSON arrays of strings; `tier` is "local" | "remote"
 -- (ambiguous ⇒ remote, matching McpTrustTier::default). The runtime transport
 -- (a spawned child) is derived session state — never persisted here.
+--
+-- H-07 note: `executable_path` / `executable_hash` (the approved binary pin)
+-- are NOT declared here — they are added by migration v9's ALTER TABLE, which
+-- has no IF-NOT-EXISTS. A fresh DB runs v1 (this CREATE, without them) then v9
+-- (which adds them), exactly matching an existing DB's upgrade path. Same
+-- convention as `memory_facts.pinned` in v2.
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id                TEXT PRIMARY KEY,
     name              TEXT NOT NULL,
