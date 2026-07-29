@@ -659,8 +659,12 @@ mod tests {
         let order = mailbox.completed.lock().clone();
         assert_eq!(order.last().map(String::as_str), Some("slow"), "order was {order:?}");
 
-        // Concurrency stayed inside the semaphore's budget.
-        assert_eq!(*mailbox.peak_in_flight.lock(), SEARCH_CONCURRENCY);
+        // Concurrency stayed inside the semaphore's budget. Pinned to the
+        // literal 3, NOT to SEARCH_CONCURRENCY: comparing the observed peak
+        // against the constant that produced it is self-referential — it would
+        // keep passing if the bound were raised, which is exactly the change
+        // this assertion exists to catch.
+        assert_eq!(*mailbox.peak_in_flight.lock(), 3);
 
         // Serial would be 300ms + 4×40ms = 460ms; bounded-concurrent is about
         // the slow fetch's own latency. Generous bound to stay non-flaky.

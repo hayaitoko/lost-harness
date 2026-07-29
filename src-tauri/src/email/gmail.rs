@@ -51,7 +51,10 @@ const ERROR_SNIPPET_CHARS: usize = 300;
 /// an `attachmentId` rather than inline data, so 32 MiB sits above anything
 /// legitimate while still being a bound. Exceeding it fails the request
 /// cleanly instead of buffering.
-const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+///
+/// Shared with the sibling Google fetch layer (`super::google`), which has the
+/// same exposure through the same reqwest surface.
+pub(super) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Public data shapes (what stage 2's tools serialize)
@@ -181,11 +184,19 @@ impl ReqwestGmailHttp {
 /// body byte is read) and the running total while streaming (the honest one —
 /// a chunked or mis-declared response only reveals its size as it arrives).
 /// Either way we stop at `cap` rather than growing the buffer.
-async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> anyhow::Result<String> {
+///
+/// `what` names the caller's API in the error text ("Gmail API", "Google API",
+/// "OAuth token endpoint") — the same defect exists on every reqwest fetch
+/// layer in this module, so they all share this one implementation.
+pub(super) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+    what: &str,
+) -> anyhow::Result<String> {
     if let Some(declared) = resp.content_length() {
         if declared > cap as u64 {
             anyhow::bail!(
-                "Gmail API response too large: declared {declared} bytes, cap is {cap} bytes"
+                "{what} response too large: declared {declared} bytes, cap is {cap} bytes"
             );
         }
     }
@@ -193,10 +204,10 @@ async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> anyhow::Re
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| anyhow::anyhow!("reading the Gmail API response failed: {e}"))?
+        .map_err(|e| anyhow::anyhow!("reading the {what} response failed: {e}"))?
     {
         if buf.len() + chunk.len() > cap {
-            anyhow::bail!("Gmail API response too large: exceeded the {cap}-byte cap");
+            anyhow::bail!("{what} response too large: exceeded the {cap}-byte cap");
         }
         buf.extend_from_slice(&chunk);
     }
@@ -227,7 +238,7 @@ impl GmailHttp for ReqwestGmailHttp {
                 .await
                 .map_err(|e| anyhow::anyhow!("{method:?} Gmail API failed: {e}"))?;
             let status = resp.status().as_u16();
-            let body = read_body_capped(resp, self.max_response_bytes).await?;
+            let body = read_body_capped(resp, self.max_response_bytes, "Gmail API").await?;
             Ok((status, body))
         })
     }
