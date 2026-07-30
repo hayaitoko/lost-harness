@@ -3847,4 +3847,478 @@ mod tests {
         let rows = vec![msg("u1", "user", None)];
         assert!(latest_assistant_routing(&rows).is_none());
     }
+
+    // ── M-22: send_message reports the read-back honestly ──────────────
+
+    #[test]
+    fn routing_lookup_resolves_a_persisted_assistant_row() {
+        let rows = vec![msg("a1", "assistant", Some("route_local"))];
+        assert_eq!(
+            routing_lookup(Ok(rows)),
+            RoutingLookup::Resolved {
+                message_id: "a1".to_string(),
+                routing_decision: "route_local".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn routing_lookup_distinguishes_every_way_the_read_back_can_fail() {
+        // The bug this replaced flattened all three of these into
+        // `("", "unknown")` inside an Ok payload. Each must stay its own
+        // reportable reason.
+        assert_eq!(
+            routing_lookup(Ok(vec![msg("u1", "user", None)])),
+            RoutingLookup::Unavailable(RoutingUnavailable::NoAssistantRow)
+        );
+        assert_eq!(
+            routing_lookup(Err(RoutingUnavailable::ProfileDbUnavailable)),
+            RoutingLookup::Unavailable(RoutingUnavailable::ProfileDbUnavailable)
+        );
+        assert_eq!(
+            routing_lookup(Err(RoutingUnavailable::MessageQueryFailed)),
+            RoutingLookup::Unavailable(RoutingUnavailable::MessageQueryFailed)
+        );
+    }
+
+    /// Build the response the way `send_message` does, from a lookup outcome.
+    /// Mirrors the command's own `match` so the serialized shape below is the
+    /// shape the frontend actually receives.
+    fn response_for(lookup: RoutingLookup) -> SendMessageResponse {
+        let (message_id, routing_decision, routing_unavailable) = match lookup {
+            RoutingLookup::Resolved {
+                message_id,
+                routing_decision,
+            } => (Some(message_id), Some(routing_decision), None),
+            RoutingLookup::Unavailable(why) => (None, None, Some(why)),
+        };
+        SendMessageResponse {
+            message_id,
+            content: "hi".to_string(),
+            conversation_id: "c1".to_string(),
+            profile: "personal".to_string(),
+            routing_decision,
+            routing_unavailable,
+            completed_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_degraded_send_response_never_fabricates_a_routing_decision() {
+        let json = serde_json::to_value(response_for(RoutingLookup::Unavailable(
+            RoutingUnavailable::ProfileDbUnavailable,
+        )))
+        .unwrap();
+        // No placeholder id, no invented decision — both explicitly null.
+        assert_eq!(json["message_id"], serde_json::Value::Null);
+        assert_eq!(json["routing_decision"], serde_json::Value::Null);
+        // And the failure is named, so the UI can suppress the routing badge
+        // on purpose instead of rendering a decision nobody made.
+        assert_eq!(json["routing_unavailable"], "profile_db_unavailable");
+        let raw = serde_json::to_string(&response_for(RoutingLookup::Unavailable(
+            RoutingUnavailable::NoAssistantRow,
+        )))
+        .unwrap();
+        assert!(
+            !raw.contains("unknown"),
+            "the old fabricated \"unknown\" decision is back: {raw}"
+        );
+    }
+
+    #[test]
+    fn a_resolved_send_response_carries_the_decision_and_omits_the_failure_field() {
+        let json = serde_json::to_value(response_for(RoutingLookup::Resolved {
+            message_id: "a1".to_string(),
+            routing_decision: "route_local".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(json["message_id"], "a1");
+        assert_eq!(json["routing_decision"], "route_local");
+        assert!(
+            json.get("routing_unavailable").is_none(),
+            "happy path must not carry a failure field: {json}"
+        );
+    }
+
+    // ── H-06: cleartext is gated on the ADDRESS, not on a string prefix ──
+
+    #[test]
+    fn cleartext_http_is_refused_for_hosts_that_only_look_local() {
+        // Every one of these passed the old `host.starts_with("127.")` /
+        // `"localhost"` string tests or is the same class of trick, and every
+        // one resolves through public DNS. Accepting any of them ships the
+        // provider's bearer key over plaintext HTTP to a stranger.
+        for hostile in [
+            "http://127.evil.com/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "http://localhost.evil.com/v1",
+            "http://10.evil.com/v1",
+            "http://192.168.1.1.evil.com/v1",
+            "http://172.16.evil.com/v1",
+            "http://100.64.evil.com/v1",
+            "http://evil.com/127.0.0.1/v1",
+        ] {
+            let err = validate_base_url(hostile)
+                .expect_err("hostile lookalike host must be rejected: {hostile}");
+            assert!(
+                err.contains("cleartext"),
+                "expected the cleartext refusal for {hostile}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_http_is_allowed_for_real_loopback_and_lan_addresses() {
+        for ok in [
+            "http://localhost:1234/v1",
+            "http://LocalHost:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://127.9.9.9:1234/v1",
+            // Decimal form of 127.0.0.1. No string test can see this; only
+            // parsing the host as an address does.
+            "http://2130706433:1234/v1",
+            "http://[::1]:8080/v1",
+            "http://10.0.0.100:8000/v1",
+            "http://192.168.1.50:11434/v1",
+            "http://172.20.4.4:8000/v1",
+            "http://169.254.7.7:8000/v1",
+            "http://100.85.52.127:8000/v1",
+        ] {
+            assert!(
+                validate_base_url(ok).is_ok(),
+                "local/LAN endpoint must stay addable over http: {ok} — {:?}",
+                validate_base_url(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn public_endpoints_must_use_https_and_https_is_always_accepted() {
+        for public_cleartext in [
+            "http://api.openai.com/v1",
+            // 8.8.8.8 and 172.32.x are outside every private range — the
+            // boundary just past 172.16/12.
+            "http://8.8.8.8/v1",
+            "http://172.32.0.1/v1",
+            "http://11.0.0.1/v1",
+        ] {
+            assert!(
+                validate_base_url(public_cleartext).is_err(),
+                "public cleartext endpoint must be refused: {public_cleartext}"
+            );
+        }
+        for tls in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            // TLS to a lookalike name is fine — the key is encrypted and the
+            // certificate is the server's problem, not ours.
+            "https://127.evil.com/v1",
+        ] {
+            assert!(
+                validate_base_url(tls).is_ok(),
+                "https endpoint must be accepted: {tls}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_rejects_credentials_fragments_and_odd_schemes() {
+        assert!(validate_base_url("https://user:pass@api.openai.com/v1").is_err());
+        assert!(validate_base_url("https://api.openai.com/v1#frag").is_err());
+        assert!(validate_base_url("ftp://api.openai.com/v1").is_err());
+        assert!(validate_base_url("file:///etc/passwd").is_err());
+        assert!(validate_base_url("not a url").is_err());
+    }
+
+    // ── H-06 (client side): a redirect must never carry the bearer key ──
+
+    /// One-shot HTTP server on an ephemeral loopback port. Answers the first
+    /// request with `raw` and closes. Returns the bound port.
+    fn one_shot_server(raw: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(raw.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn the_model_client_does_not_follow_redirects() {
+        // A 302 is how a compromised or misconfigured endpoint moves an
+        // authenticated request somewhere else; reqwest's default policy would
+        // replay it (up to 10 hops). `ModelClient::new` disables redirects, so
+        // the 302 must surface as the error instead of being followed to the
+        // destination — which here would answer with a valid model list and
+        // make `list_models` succeed.
+        let destination = one_shot_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 30\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"redirected\"}]}",
+        );
+        let hop = one_shot_server_redirecting_to(destination);
+        let provider = Provider::new(
+            "p1",
+            "Hop",
+            format!("http://127.0.0.1:{hop}"),
+            Some("sk-secret".into()),
+            ProviderKind::Local,
+        );
+        let client = crate::models::client::ModelClient::new(provider).expect("build client");
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a 302 must not be followed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("302"),
+            "expected the redirect to surface as a 302 error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("redirected"),
+            "the redirect was followed to its destination: {msg}"
+        );
+    }
+
+    /// A server that 302s to `port`. Separate from `one_shot_server` because
+    /// the Location header is built at runtime.
+    fn one_shot_server_redirecting_to(port: u16) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let hop = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/models\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        hop
+    }
+
+    // ── M-05 / rotation: provider mutations against a real AppState ─────
+
+    use crate::secrets::ProviderSecretStore as _; // get/set/delete on the doubles
+
+    /// Credential-store double that also records deletions, so a test can
+    /// assert the *compensating* delete happened (and against which id) —
+    /// `secrets::MemoryProviderSecretStore` only exposes the surviving values.
+    #[derive(Default)]
+    struct RecordingSecretStore {
+        values: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        deleted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingSecretStore {
+        /// Ids that currently hold a secret.
+        fn live_ids(&self) -> Vec<String> {
+            let mut ids: Vec<String> = self.values.lock().unwrap().keys().cloned().collect();
+            ids.sort();
+            ids
+        }
+
+        fn deleted_ids(&self) -> Vec<String> {
+            self.deleted.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::secrets::ProviderSecretStore for RecordingSecretStore {
+        fn get(&self, endpoint_id: &str) -> Result<Option<String>, String> {
+            Ok(self.values.lock().unwrap().get(endpoint_id).cloned())
+        }
+        fn set(&self, endpoint_id: &str, secret: &str) -> Result<(), String> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(endpoint_id.to_string(), secret.to_string());
+            Ok(())
+        }
+        fn delete(&self, endpoint_id: &str) -> Result<(), String> {
+            self.values.lock().unwrap().remove(endpoint_id);
+            self.deleted.lock().unwrap().push(endpoint_id.to_string());
+            Ok(())
+        }
+    }
+
+    /// A minimal but real `AppState`: on-disk temp storage, empty
+    /// `ModelManager`, recording secret store. No Tauri app — the command
+    /// bodies live in `*_inner(&AppState, ..)` precisely so this works.
+    fn test_state() -> (AppState, Arc<RecordingSecretStore>) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("lhp-ipc-p05-{}", Uuid::new_v4()));
+        let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+        let model_manager = Arc::new(ModelManager::new());
+        let secrets = Arc::new(RecordingSecretStore::default());
+        let tools = Arc::new(crate::tools::ToolDispatcher::empty());
+        let gate = crate::agent::gate::PrivacyGate::new(Arc::new(
+            crate::classifier::HeuristicClassifier::new(),
+        ));
+        let agent_loop = Arc::new(AgentLoop::new(
+            gate,
+            Arc::clone(&model_manager),
+            Arc::clone(&storage),
+            Arc::clone(&tools),
+        ));
+        let state = AppState {
+            agent_loop,
+            email: Arc::new(EmailRuntime::new()),
+            model_manager,
+            storage,
+            provider_secrets: Arc::clone(&secrets) as Arc<dyn crate::secrets::ProviderSecretStore>,
+            approvals: Arc::new(ApprovalRegistry::new()),
+            ask_human: Arc::new(AskHumanRegistry::new()),
+            classifier: Arc::new(crate::classifier::HeuristicClassifier::new()),
+            embedder: None,
+            tools,
+            mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new()),
+            hardware: Arc::new(Default::default()),
+            #[cfg(feature = "local-runner")]
+            local_runner: None,
+        };
+        (state, secrets)
+    }
+
+    fn add_args(name: &str, api_key: Option<&str>) -> AddProviderArgs {
+        AddProviderArgs {
+            name: name.to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: api_key.map(str::to_string),
+            kind: "cloud".to_string(),
+            supports_native_tools: false,
+        }
+    }
+
+    #[test]
+    fn add_provider_deletes_the_keychain_entry_when_the_db_insert_fails() {
+        let (state, secrets) = test_state();
+        // Force the insert to fail for real: drop the table the write targets.
+        // (`insert_endpoint` then errors with "no such table: endpoints".)
+        state
+            .storage
+            .global()
+            .raw()
+            .execute_batch("DROP TABLE endpoints")
+            .expect("drop endpoints table");
+
+        let err = add_provider_inner(&state, add_args("OpenAI", Some("sk-orphan")))
+            .expect_err("a failed insert must fail the command");
+        assert!(err.contains("failed to persist endpoint"), "got: {err}");
+
+        // The compensating delete is the whole point: without it the secret
+        // stays in the credential store under a random uuid that no endpoint
+        // row, and therefore no UI, will ever name again.
+        assert!(
+            secrets.live_ids().is_empty(),
+            "orphaned provider secret left behind: {:?}",
+            secrets.live_ids()
+        );
+        assert_eq!(
+            secrets.deleted_ids().len(),
+            1,
+            "expected exactly one compensating delete, saw {:?}",
+            secrets.deleted_ids()
+        );
+        assert!(
+            state.model_manager.list_providers().is_empty(),
+            "a provider that failed to persist must not be published in memory"
+        );
+    }
+
+    #[test]
+    fn add_provider_keeps_the_secret_when_the_insert_succeeds() {
+        // Guards the compensation from over-firing: the happy path must still
+        // leave the key in the store.
+        let (state, secrets) = test_state();
+        let info = add_provider_inner(&state, add_args("OpenAI", Some("sk-live")))
+            .expect("add must succeed");
+        assert_eq!(
+            secrets.get(&info.id).unwrap().as_deref(),
+            Some("sk-live"),
+            "the stored key must survive a successful add"
+        );
+        assert_eq!(state.model_manager.list_providers().len(), 1);
+    }
+
+    #[test]
+    fn rotating_a_key_takes_effect_without_a_restart() {
+        let (state, secrets) = test_state();
+        let info = add_provider_inner(&state, add_args("OpenAI", Some("sk-old")))
+            .expect("add must succeed");
+
+        // Prime the client cache the way a real session does — this is the
+        // handle that had baked the old key into its bearer header.
+        let cached = state
+            .model_manager
+            .get_client(&info.id)
+            .expect("client builds");
+        assert_eq!(cached.provider().api_key.as_deref(), Some("sk-old"));
+
+        set_provider_api_key_inner(
+            &state,
+            SetProviderApiKeyArgs {
+                provider_id: info.id.clone(),
+                api_key: "sk-new".to_string(),
+            },
+        )
+        .expect("rotation must succeed");
+
+        assert_eq!(
+            secrets.get(&info.id).unwrap().as_deref(),
+            Some("sk-new"),
+            "the credential store must hold the new key"
+        );
+        // Without the in-memory refresh both of these still say "sk-old" for
+        // the rest of the session: the keychain is only read at boot.
+        assert_eq!(
+            state
+                .model_manager
+                .get_provider(&info.id)
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("sk-new"),
+            "the live provider still carries the rotated-out key"
+        );
+        assert_eq!(
+            state
+                .model_manager
+                .get_client(&info.id)
+                .unwrap()
+                .provider()
+                .api_key
+                .as_deref(),
+            Some("sk-new"),
+            "the cached client still signs requests with the rotated-out key"
+        );
+        // The rest of the record must be untouched by a key rotation.
+        let after = state.model_manager.get_provider(&info.id).unwrap();
+        assert_eq!(after.name, "OpenAI");
+        assert_eq!(after.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn rotating_an_unknown_provider_writes_nothing() {
+        let (state, secrets) = test_state();
+        let err = set_provider_api_key_inner(
+            &state,
+            SetProviderApiKeyArgs {
+                provider_id: "nope".to_string(),
+                api_key: "sk-new".to_string(),
+            },
+        )
+        .expect_err("unknown provider must be rejected");
+        assert!(err.contains("unknown provider"), "got: {err}");
+        assert!(
+            secrets.live_ids().is_empty(),
+            "no secret may be written for an unregistered provider"
+        );
+    }
 }
