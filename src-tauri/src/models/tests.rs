@@ -14,7 +14,7 @@ use tokio_stream;
 use super::client::ChatMessage;
 use super::manager::ModelManager;
 use super::provider::{Provider, ProviderKind};
-use super::sse::{SseEvent, SseStream};
+use super::sse::{SseEvent, SseStream, MAX_LINE_LENGTH};
 
 // ── Provider ───────────────────────────────────────────────────────────────
 
@@ -285,6 +285,69 @@ async fn sse_emits_error_payload() {
         events,
         vec![SseEvent::Error("rate limited".to_string()), SseEvent::Done,]
     );
+}
+
+#[tokio::test]
+async fn sse_oversized_line_surfaces_an_error_not_an_empty_turn() {
+    // HI3 regression: a line past MAX_LINE_LENGTH used to be reported as a
+    // KeepAlive, so the whole assistant turn vanished — the message persisted
+    // empty, a tool call in that frame never dispatched, and `sink.error` was
+    // never called. The user saw a blank reply and no error. An over-cap line
+    // must be a loud, terminal failure instead.
+    let huge = "x".repeat(MAX_LINE_LENGTH + 1024);
+    let line = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{huge}\"}}}}]}}");
+    let line_len = line.len();
+    let events = collect(stream_from_chunks(vec![format!("{line}\n").into_bytes()])).await;
+    // Summarize before asserting — never splice a quarter-megabyte payload into
+    // a panic message.
+    let kinds: Vec<&str> = events.iter().map(event_kind).collect();
+    assert_eq!(kinds, vec!["error"], "over-cap line must yield one Error");
+    let SseEvent::Error(msg) = &events[0] else {
+        unreachable!("asserted above")
+    };
+    // The diagnostic has to name the cap and the observed size, or the user
+    // cannot tell what went wrong.
+    assert!(
+        msg.contains("line") && msg.contains(&MAX_LINE_LENGTH.to_string()),
+        "error must name the per-line cap: {msg}"
+    );
+    assert!(
+        msg.contains(&line_len.to_string()),
+        "error must name the observed line size ({line_len}): {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sse_delivers_a_large_single_frame_completion() {
+    // Fake streaming (LiteLLM, buffering reverse proxies, several local
+    // OpenAI-shim servers) delivers a whole turn as one `message` frame. A
+    // ~20 KB answer — or one `write_file` call whose `content` argument is a
+    // 20 KB document, well inside the fs tool's 1 MiB limit — is a legitimate
+    // provider shape and must come through intact.
+    let body_text = "y".repeat(20 * 1024);
+    let body = format!(
+        "data: {{\"choices\":[{{\"message\":{{\"content\":\"{body_text}\"}}}}]}}\ndata: [DONE]\n"
+    );
+    let events = collect(stream_from_chunks(vec![body.into_bytes()])).await;
+    match events.first() {
+        Some(SseEvent::Delta(d)) => assert_eq!(d.len(), 20 * 1024),
+        Some(SseEvent::Error(msg)) => panic!("20 KB single frame was rejected: {msg}"),
+        Some(other) => panic!("expected a Delta, got {}", event_kind(other)),
+        None => panic!("expected a Delta, got an empty (silently dropped) turn"),
+    }
+    assert_eq!(events.last(), Some(&SseEvent::Done));
+}
+
+/// Name an event's variant without formatting its (possibly huge) payload.
+fn event_kind(e: &SseEvent) -> &'static str {
+    match e {
+        SseEvent::Delta(_) => "delta",
+        SseEvent::Done => "done",
+        SseEvent::KeepAlive => "keepalive",
+        SseEvent::Error(_) => "error",
+        SseEvent::ToolCalls(_) => "tool_calls",
+        SseEvent::Usage { .. } => "usage",
+    }
 }
 
 #[tokio::test]
