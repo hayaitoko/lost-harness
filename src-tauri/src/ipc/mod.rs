@@ -104,7 +104,10 @@ pub struct AppState {
 /// tokens arrive separately via the `stream:token` event.
 #[derive(Debug, Clone, Serialize)]
 pub struct SendMessageResponse {
-    pub message_id: String,
+    /// Id of the persisted assistant row. `null` when there is no such row to
+    /// point at (see `routing_unavailable`) — never a placeholder, so the
+    /// frontend can't adopt an id that addresses nothing.
+    pub message_id: Option<String>,
     pub content: String,
     pub conversation_id: String,
     /// "personal" | "work" | "school" | "developer" — the profile the
@@ -112,8 +115,57 @@ pub struct SendMessageResponse {
     pub profile: String,
     /// "allow" | "route_local" — which branch of the gate served this
     /// message. Frontend uses this to label the chip / banner.
-    pub routing_decision: String,
+    ///
+    /// M-22: `null`, never a stand-in, when the persisted decision could not
+    /// be read. A fabricated value here is a privacy-UI lie: the routing badge
+    /// is how the user learns whether their text left the machine.
+    pub routing_decision: Option<String>,
+    /// Present *only* on the degraded path, naming why `message_id` /
+    /// `routing_decision` are `null`. Absent from the JSON on the happy path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_unavailable: Option<RoutingUnavailable>,
     pub completed_at: i64,
+}
+
+/// Why a completed `send_message` has no persisted routing decision to
+/// report. Serialized in snake_case on `SendMessageResponse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingUnavailable {
+    /// The profile database could not be opened for the read-back.
+    ProfileDbUnavailable,
+    /// The conversation's messages could not be queried.
+    MessageQueryFailed,
+    /// The read succeeded but the turn persisted no assistant row — the
+    /// normal shape of a gate *block*, where nothing was written.
+    NoAssistantRow,
+}
+
+/// What the post-turn read-back yielded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoutingLookup {
+    Resolved {
+        message_id: String,
+        routing_decision: String,
+    },
+    Unavailable(RoutingUnavailable),
+}
+
+/// Map the outcome of the post-turn profile-db read onto what we are willing
+/// to tell the frontend. Pure so it stays unit-tested: the bug this replaced
+/// substituted `("", "unknown")` into an otherwise-successful payload, which
+/// no test could see because the substitution happened inline in the command.
+fn routing_lookup(rows: Result<Vec<Message>, RoutingUnavailable>) -> RoutingLookup {
+    match rows {
+        Err(why) => RoutingLookup::Unavailable(why),
+        Ok(rows) => match latest_assistant_routing(&rows) {
+            Some((message_id, routing_decision)) => RoutingLookup::Resolved {
+                message_id,
+                routing_decision,
+            },
+            None => RoutingLookup::Unavailable(RoutingUnavailable::NoAssistantRow),
+        },
+    }
 }
 
 /// Mirrors a `Provider` row for the model picker (§4). API key is
@@ -469,6 +521,56 @@ pub fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderInfo>, S
         .collect())
 }
 
+/// Does `host` name a machine on this device or this LAN, such that talking
+/// to it over cleartext `http` never puts a bearer key on the public
+/// internet?
+///
+/// This is an *address* test, not a string test. The previous version asked
+/// `host.starts_with("127.")`, which `http://127.evil.com` satisfies — a
+/// public DNS name that would have been handed the provider's API key over
+/// plaintext HTTP. Everything here goes through `url::Host`, so a name is
+/// only ever accepted when it is the literal `localhost`; anything else must
+/// be an IP literal that the standard library agrees is loopback or
+/// private.
+///
+/// Accepted for cleartext:
+/// - the name `localhost` (and nothing else — `localhost.evil.com`,
+///   `127.evil.com`, `10.evil.com` are all `Domain`s and all rejected)
+/// - IPv4 loopback `127.0.0.0/8`, RFC 1918 (`10/8`, `172.16/12`,
+///   `192.168/16`), link-local `169.254/16`, CGNAT/Tailscale `100.64/10`
+/// - IPv6 loopback `::1`, unique-local `fc00::/7`, link-local `fe80::/10`
+///
+/// The RFC 1918 / CGNAT ranges are here deliberately: the product's own
+/// contract test and the documented deployment (a llama.cpp server on the
+/// user's LAN, e.g. `http://10.0.0.100:8000/v1`) add providers over
+/// cleartext HTTP on the local network. Requiring `is_loopback()` alone
+/// would have made every LAN endpoint unaddable. Private *names*
+/// (`.local`, `.lan`, `.ts.net`) stay rejected for cleartext even though
+/// `agent::egress` treats them as private, because a name is resolved by
+/// whatever DNS/mDNS answers first and cannot be trusted to hold a
+/// cleartext bearer key.
+fn host_allows_cleartext(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => {
+            let o = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                // 100.64.0.0/10 — CGNAT, which Tailscale hands out.
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        url::Host::Ipv6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                // fc00::/7 unique-local, fe80::/10 link-local. Both have
+                // unstable std predicates, so they're spelled out here.
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 /// Validate a provider base URL.
 ///
 /// Rejects:
@@ -476,9 +578,10 @@ pub fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderInfo>, S
 /// - Embedded credentials (`user:pass@host`).
 /// - Fragments (`#`).
 /// - Empty/ambiguous hosts.
-/// - Non-HTTPS schemes for non-loopback endpoints (loopback HTTP is
-///   explicitly gated so users can point at local LM Studio / Ollama /
-///   llama.cpp servers without TLS).
+/// - Non-HTTPS schemes for anything that isn't a loopback/private *address*
+///   (see [`host_allows_cleartext`]) — so users can point at a local or LAN
+///   LM Studio / Ollama / llama.cpp server without TLS, while a public host
+///   can never be handed a bearer key in cleartext.
 fn validate_base_url(raw: &str) -> Result<(), String> {
     let url = url::Url::parse(raw).map_err(|e| format!("invalid base URL: {e}"))?;
 
@@ -492,23 +595,26 @@ fn validate_base_url(raw: &str) -> Result<(), String> {
         return Err("base URL must not contain a fragment (#)".into());
     }
 
-    // Reject empty / ambiguous hosts.
-    let host = url.host_str().unwrap_or("");
-    if host.is_empty() {
+    // Reject empty / ambiguous hosts. `url::Url::host` gives the *parsed*
+    // host (Domain / Ipv4 / Ipv6), which is what the cleartext decision below
+    // needs — `host_str` would hand back a bare string and invite another
+    // prefix test.
+    let Some(host) = url.host() else {
+        return Err("base URL has no host".into());
+    };
+    if matches!(host, url::Host::Domain(d) if d.is_empty()) {
         return Err("base URL has no host".into());
     }
 
-    // Scheme check: require HTTPS unless the host is a loopback address.
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || host == "[::1]"
-        || host.starts_with("127.");
+    // Scheme check: require HTTPS unless the host is a loopback/private
+    // address. See `host_allows_cleartext` — this is an address test, not a
+    // string-prefix test.
     match url.scheme() {
-        "https" => {}               // always OK
-        "http" if is_loopback => {} // OK for local dev servers
+        "https" => {}                                // always OK
+        "http" if host_allows_cleartext(&host) => {} // OK for local/LAN servers
         "http" => {
             return Err(
-                "non-loopback provider endpoints must use HTTPS (http:// is only allowed for localhost/127.x.x.x)"
+                "cleartext http:// is only allowed for loopback or private-network addresses (localhost, 127.x, 10.x, 172.16–31.x, 192.168.x, 169.254.x, 100.64–127.x, ::1, fc00::/7, fe80::/10) — public endpoints must use HTTPS"
                     .into(),
             );
         }
@@ -527,19 +633,29 @@ pub fn add_provider(
     state: State<'_, AppState>,
     args: AddProviderArgs,
 ) -> Result<ProviderInfo, String> {
+    add_provider_inner(&state, args)
+}
+
+/// Body of [`add_provider`], taking `&AppState` instead of `State` so it is
+/// reachable from unit tests (a `State` can only be minted by a live Tauri
+/// app). The command above is a one-line forwarder.
+fn add_provider_inner(state: &AppState, args: AddProviderArgs) -> Result<ProviderInfo, String> {
     let kind = parse_kind(&args.kind)?;
     validate_base_url(&args.base_url)?;
     let id = Uuid::new_v4().to_string();
     let provider = Provider::new(id.clone(), args.name, args.base_url, args.api_key, kind)
         .with_native_tools(args.supports_native_tools);
-    if let Some(secret) = provider.api_key.as_deref() {
+    let wrote_secret = if let Some(secret) = provider.api_key.as_deref() {
         state.provider_secrets.set(&id, secret)?;
-    }
+        true
+    } else {
+        false
+    };
     // Persist metadata BEFORE publishing in-memory success. A storage
     // failure is surfaced to the caller (not silently swallowed) so the
     // frontend can show an error instead of a provider that vanishes on
     // restart.
-    state
+    let persisted = state
         .storage
         .global()
         .insert_endpoint(&crate::storage::Endpoint {
@@ -553,8 +669,18 @@ pub fn add_provider(
             kind: args.kind.clone(),
             created_at: chrono::Utc::now().timestamp(),
             supports_native_tools: provider.supports_native_tools,
-        })
-        .map_err(|e| format!("failed to persist endpoint: {e}"))?;
+        });
+    if let Err(e) = persisted {
+        // M-05: the keychain write happened first, so a failed insert would
+        // otherwise strand a secret under an id no row (and no UI) will ever
+        // mention again — unreachable, undeletable, and still holding a live
+        // API key. Compensate, exactly as `update_provider` does on its own
+        // persist failure.
+        if wrote_secret {
+            let _ = state.provider_secrets.delete(&id);
+        }
+        return Err(format!("failed to persist endpoint: {e}"));
+    }
     state.model_manager.add_provider(provider.clone());
     Ok(provider.into())
 }
@@ -669,16 +795,31 @@ pub fn set_provider_api_key(
     state: State<'_, AppState>,
     args: SetProviderApiKeyArgs,
 ) -> Result<(), String> {
-    if state
+    set_provider_api_key_inner(&state, args)
+}
+
+/// Body of [`set_provider_api_key`], taking `&AppState` so it is unit-testable
+/// without a live Tauri app.
+fn set_provider_api_key_inner(state: &AppState, args: SetProviderApiKeyArgs) -> Result<(), String> {
+    let existing = state
         .model_manager
         .get_provider(&args.provider_id)
-        .is_none()
-    {
-        return Err(format!("unknown provider: {}", args.provider_id));
-    }
+        .ok_or_else(|| format!("unknown provider: {}", args.provider_id))?;
     state
         .provider_secrets
         .set(&args.provider_id, &args.api_key)?;
+    // Rotation must take effect NOW, not after a restart. The keychain is only
+    // read at boot when seeding `ModelManager`; the live `Provider` (and the
+    // `ModelClient` cached against it, which copies the key into its bearer
+    // header) would otherwise keep signing requests with the revoked key for
+    // the rest of the session. `add_provider` replaces the record by id and
+    // drops the cached client, so the next `get_client` rebuilds with the new
+    // key.
+    let rotated = Provider {
+        api_key: Some(args.api_key),
+        ..existing
+    };
+    state.model_manager.add_provider(rotated);
     Ok(())
 }
 
@@ -776,14 +917,26 @@ pub async fn send_message(
     // that process_message stamped on it (one of "allow" / "route_local"),
     // so the frontend's RoutingBadge is honest on a live send instead of
     // only after a reload.
+    //
+    // M-22: each way this read can come up empty is reported as itself. It
+    // used to collapse into `("", "unknown")` inside an `Ok(..)` payload,
+    // which told the frontend "the turn succeeded and here is its routing" —
+    // with a message id addressing nothing and a decision nobody made.
     let rows = state
         .storage
         .open_profile(&profile)
-        .ok()
-        .and_then(|db| db.list_messages_by_conversation(&conversation_id).ok())
-        .unwrap_or_default();
-    let (message_id, routing_decision) =
-        latest_assistant_routing(&rows).unwrap_or_else(|| (String::new(), "unknown".to_string()));
+        .map_err(|_| RoutingUnavailable::ProfileDbUnavailable)
+        .and_then(|db| {
+            db.list_messages_by_conversation(&conversation_id)
+                .map_err(|_| RoutingUnavailable::MessageQueryFailed)
+        });
+    let (message_id, routing_decision, routing_unavailable) = match routing_lookup(rows) {
+        RoutingLookup::Resolved {
+            message_id,
+            routing_decision,
+        } => (Some(message_id), Some(routing_decision), None),
+        RoutingLookup::Unavailable(why) => (None, None, Some(why)),
+    };
 
     Ok(SendMessageResponse {
         message_id,
@@ -791,6 +944,7 @@ pub async fn send_message(
         conversation_id,
         profile,
         routing_decision,
+        routing_unavailable,
         completed_at: chrono::Utc::now().timestamp_millis().max(started),
     })
 }
