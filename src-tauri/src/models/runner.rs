@@ -348,32 +348,65 @@ impl Default for HttpHealthCheck {
     }
 }
 
+/// The endpoint used to prove IDENTITY (H-04), as opposed to readiness.
+///
+/// This is deliberately not `/v1/models`: llama-server keeps `/health`,
+/// `/models` and `/v1/models` **public**, exempt from `--api-key` enforcement, so
+/// their answers say nothing about who is listening. `/props` IS enforced, and it
+/// answers as soon as the server is up. Both halves of that claim are measured
+/// against the pinned vendored binary by
+/// `the_vendored_sidecar_enforces_the_api_key_on_props_but_not_on_models` — if a
+/// re-vendor ever changes the auth surface, that test fails instead of this check
+/// silently degrading (or refusing every legitimate start).
+const IDENTITY_PATH: &str = "/props";
+
+/// The server root for a `.../v1`-style base URL — `/props` lives at the root,
+/// not under `/v1`.
+fn server_root(base_url: &str) -> &str {
+    let trimmed = base_url.trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed)
+}
+
 impl HealthCheck for HttpHealthCheck {
-    /// H-04 — three things must hold before a port becomes a private provider:
+    /// H-04 — when a per-spawn token was issued, three things must hold before
+    /// this port may become a PRIVATE provider:
     ///
-    /// 1. **The server rejects an unauthenticated probe.** A squatter that
-    ///    already owned the port and answers `/v1/models` to anyone fails here;
-    ///    only a server started with OUR `--api-key` refuses a bare request.
-    ///    (Checked first, and any non-2xx counts as a refusal — llama.cpp's exact
-    ///    status for a missing key is not something we want to pin.)
-    /// 2. **It accepts the token.** Wrong/absent token on our side → not healthy.
-    /// 3. **The body is a models list**, not merely an HTTP 2xx.
+    /// 1. **An unauthenticated request to a protected endpoint is refused.** A
+    ///    squatter that already owned the port and answers everything cannot be
+    ///    enforcing a token it has never seen. (Any non-2xx counts as a refusal —
+    ///    the exact status is llama.cpp's business, not ours.)
+    /// 2. **The same endpoint accepts OUR token.** A server enforcing somebody
+    ///    else's key fails here, as does a wrong/absent token on our side.
+    /// 3. **`/v1/models` answers with a models list**, not merely an HTTP 2xx —
+    ///    the readiness half, as before.
+    ///
+    /// Residual (documented, not closed): an ADAPTIVE attacker holding the port
+    /// can refuse step 1, read our token out of step 2, and then answer step 3.
+    /// Closing that needs a challenge-response the sidecar does not offer; what
+    /// this does close is the realistic case — a process already serving an
+    /// OpenAI-compatible endpoint on the port we were handed.
     fn is_healthy<'a>(
         &'a self,
         base_url: &'a str,
         api_key: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            let url = format!("{base_url}/models");
-            if api_key.is_some() {
-                match self.client.get(&url).send().await {
-                    // Answered an unauthenticated probe with success → it is not
-                    // enforcing our key, so it is not our sidecar.
+            if let Some(key) = api_key {
+                let probe = format!("{}{IDENTITY_PATH}", server_root(base_url));
+                match self.client.get(&probe).send().await {
+                    // Served a protected endpoint to an anonymous caller → it is
+                    // not enforcing our key, so it is not our sidecar.
                     Ok(r) if r.status().is_success() => return false,
-                    Ok(_) => {}          // refused, as our own sidecar must
+                    Ok(_) => {}             // refused, as our own sidecar must
                     Err(_) => return false, // nothing there yet — poll again
                 }
+                match self.client.get(&probe).bearer_auth(key).send().await {
+                    Ok(r) if r.status().is_success() => {}
+                    // Refuses our token too → somebody else's server.
+                    _ => return false,
+                }
             }
+            let url = format!("{base_url}/models");
             let mut req = self.client.get(&url);
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
@@ -682,8 +715,9 @@ impl LocalRunnerSupervisor {
                 // Bounded: at most ~100 ms, and it stops as soon as anything
                 // arrived. Under tokio's paused clock this costs no real time.
                 for _ in 0..10 {
-                    if stderr.as_ref().is_none_or(|t| !t.snapshot().is_empty()) {
-                        break;
+                    match stderr.as_ref() {
+                        Some(t) if t.snapshot().is_empty() => {}
+                        _ => break,
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1784,18 +1818,20 @@ mod tests {
     // These drive the REAL `HttpHealthCheck` against a REAL socket, because the
     // whole finding is about what an HTTP response is allowed to prove.
 
-    /// What the thing squatting on / serving the port does.
+    /// What the thing squatting on / serving the port does. `EnforcesToken`
+    /// reproduces the REAL llama-server split measured in
+    /// `the_vendored_sidecar_enforces_the_api_key_on_props_but_not_on_models`:
+    /// `/v1/models` is PUBLIC, `/props` is protected.
     #[derive(Clone, Copy)]
     enum FakeServer {
-        /// A real llama-server started with `--api-key <token>`: refuses
-        /// unauthenticated requests, serves a models list to the right token.
+        /// A real llama-server started with `--api-key <token>`.
         EnforcesToken(&'static str),
-        /// The H-04 attacker: it won the port race and answers `/v1/models`
-        /// happily to anyone, hoping to be registered as the private provider.
+        /// The H-04 attacker: it won the port race and answers everything
+        /// happily, hoping to be registered as the private provider.
         OpenToAnyone,
         /// Rejects everything (e.g. a server holding a DIFFERENT key).
         RejectsEverything,
-        /// Enforces the token but is not a models endpoint — a generic 2xx.
+        /// Enforces the token but `/v1/models` is not a models list — a generic 2xx.
         WrongShape(&'static str),
     }
 
@@ -1834,17 +1870,41 @@ mod tests {
                                 .then(|| v.trim().trim_start_matches("Bearer ").to_string())
                         })
                         .unwrap_or_default();
+                    // The requested path (first line: "GET /props HTTP/1.1").
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    const DENY: (&str, &str) = ("401 Unauthorized", r#"{"error":"no"}"#);
+                    const MODELS: (&str, &str) = ("200 OK", r#"{"data":[{"id":"m"}]}"#);
+                    const PROPS: (&str, &str) = ("200 OK", r#"{"default_generation_settings":{}}"#);
                     let (status, body) = match kind {
-                        FakeServer::OpenToAnyone => ("200 OK", r#"{"data":[{"id":"evil"}]}"#),
-                        FakeServer::RejectsEverything => {
-                            ("401 Unauthorized", r#"{"error":"no"}"#)
+                        FakeServer::OpenToAnyone => {
+                            // Answers anything to anyone — including the models
+                            // list, which is what made the old check fall for it.
+                            if path.ends_with("/models") { MODELS } else { PROPS }
                         }
-                        FakeServer::EnforcesToken(t) if presented == t => {
-                            ("200 OK", r#"{"data":[{"id":"m"}]}"#)
+                        FakeServer::RejectsEverything => DENY,
+                        FakeServer::EnforcesToken(t) => {
+                            if path.ends_with("/models") {
+                                MODELS // public on the real binary, token or not
+                            } else if presented == t {
+                                PROPS
+                            } else {
+                                DENY
+                            }
                         }
-                        FakeServer::EnforcesToken(_) => ("401 Unauthorized", r#"{"error":"no"}"#),
-                        FakeServer::WrongShape(t) if presented == t => ("200 OK", r#"{"ok":true}"#),
-                        FakeServer::WrongShape(_) => ("401 Unauthorized", r#"{"error":"no"}"#),
+                        FakeServer::WrongShape(t) => {
+                            if path.ends_with("/models") {
+                                ("200 OK", r#"{"ok":true}"#)
+                            } else if presented == t {
+                                PROPS
+                            } else {
+                                DENY
+                            }
+                        }
                     };
                     let resp = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1863,8 +1923,9 @@ mod tests {
         // H-04: the attack. Something already owns the port and answers
         // /v1/models to anyone — under the old "any 2xx is healthy" rule it
         // would have been registered as the PRIVATE provider and handed private
-        // prompts. It cannot be enforcing a token it has never seen, and that is
-        // exactly what we check.
+        // prompts. Note that answering the models list is NOT what gives it away
+        // (the real sidecar serves that publicly too): what gives it away is
+        // serving a PROTECTED endpoint to an anonymous caller.
         let (base_url, server) = spawn_fake_server(FakeServer::OpenToAnyone).await;
         let health = HttpHealthCheck::new();
         assert!(
@@ -1872,6 +1933,14 @@ mod tests {
             "a server that serves anyone is NOT the sidecar we started"
         );
         server.abort();
+    }
+
+    #[test]
+    fn the_identity_probe_is_taken_from_the_server_root_not_the_v1_prefix() {
+        assert_eq!(server_root("http://127.0.0.1:9/v1"), "http://127.0.0.1:9");
+        assert_eq!(server_root("http://127.0.0.1:9/v1/"), "http://127.0.0.1:9");
+        assert_eq!(server_root("http://127.0.0.1:9"), "http://127.0.0.1:9");
+        assert_eq!(IDENTITY_PATH, "/props", "an endpoint the api-key DOES cover");
     }
 
     #[tokio::test]
@@ -1883,8 +1952,14 @@ mod tests {
         // A wrong token → the server rejects us, so we are not talking to a
         // sidecar we control.
         assert!(!health.is_healthy(&base_url, Some("wrong-token")).await);
-        // No token at all → we cannot tell whose server this is.
-        assert!(!health.is_healthy(&base_url, None).await);
+        // No token issued → nothing to prove identity WITH, so the check degrades
+        // to the old readiness-only behaviour (a public models list is enough).
+        // This is exactly why `ensure_running` always issues one; the assertion is
+        // here to state the degradation rather than let it be discovered later.
+        assert!(
+            health.is_healthy(&base_url, None).await,
+            "tokenless startup is readiness-only — no identity guarantee"
+        );
         server.abort();
 
         // A server that rejects even the right token is not healthy either.
@@ -1911,6 +1986,110 @@ mod tests {
                 .is_healthy(&format!("http://127.0.0.1:{port}/v1"), Some("tok"))
                 .await
         );
+    }
+
+    /// The load-bearing assumption behind [`IDENTITY_PATH`], measured against the
+    /// REAL vendored `llama-server` — no GGUF and no network needed, because
+    /// router mode (`--models-dir <empty>`) starts a server with no model.
+    ///
+    /// Two things are pinned:
+    ///   * `/v1/models` is **public** — an unauthenticated GET succeeds even with
+    ///     `--api-key` set. So requiring "/v1/models refuses anonymous callers"
+    ///     would refuse EVERY legitimate sidecar. (This is not hypothetical: it is
+    ///     the bug this test was written after finding.)
+    ///   * `/props` is **protected** — anonymous and wrong-key requests are
+    ///     refused, ours is accepted — which is what makes it usable as identity.
+    ///
+    /// If a re-vendor changes either, this fails loudly instead of the health
+    /// check quietly refusing to start local models (or quietly accepting a
+    /// squatter).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_vendored_sidecar_enforces_the_api_key_on_props_but_not_on_models() {
+        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/llama-cpp/macos-arm64/llama-server");
+        assert!(bin.is_file(), "the vendored sidecar must be present: {}", bin.display());
+        let empty = tmp_dir(); // no models in it — router mode needs no GGUF
+        let port = pick_free_port().unwrap();
+        let token = new_spawn_token();
+        let mut child = tokio::process::Command::new(&bin)
+            .args([
+                "--models-dir".to_string(),
+                empty.to_string_lossy().into_owned(),
+                "--port".to_string(),
+                port.to_string(),
+                "--api-key".to_string(),
+                token.clone(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the vendored llama-server in router mode");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let root = format!("http://127.0.0.1:{port}");
+        // Wait for the port (it listens in well under a second here).
+        let mut up = false;
+        for _ in 0..100 {
+            if client.get(format!("{root}/health")).send().await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(up, "the vendored server never started listening");
+
+        let status = |path: &'static str, key: Option<String>| {
+            let client = client.clone();
+            let root = root.clone();
+            async move {
+                let mut req = client.get(format!("{root}{path}"));
+                if let Some(k) = key {
+                    req = req.bearer_auth(k);
+                }
+                req.send().await.expect("request").status().as_u16()
+            }
+        };
+
+        // /v1/models is PUBLIC — this is why it cannot be the identity probe.
+        assert_eq!(
+            status("/v1/models", None).await,
+            200,
+            "llama-server exempts /v1/models from --api-key; the identity probe \
+             must not rely on it refusing anonymous callers"
+        );
+        // /props is PROTECTED, and answers with no model loaded.
+        assert_eq!(status(IDENTITY_PATH, None).await, 401, "anonymous must be refused");
+        assert_eq!(
+            status(IDENTITY_PATH, Some("not-the-token".into())).await,
+            401,
+            "a wrong key must be refused"
+        );
+        assert_eq!(
+            status(IDENTITY_PATH, Some(token.clone())).await,
+            200,
+            "our own token must be accepted"
+        );
+
+        // And the full check agrees, against the real binary.
+        let health = HttpHealthCheck::new();
+        let base_url = format!("{root}/v1");
+        assert!(
+            health.is_healthy(&base_url, Some(&token)).await,
+            "the real sidecar with our token must be healthy"
+        );
+        assert!(
+            !health.is_healthy(&base_url, Some("not-the-token")).await,
+            "the real sidecar with the wrong token must NOT be healthy"
+        );
+
+        let _ = child.kill().await;
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[tokio::test(start_paused = true)]
