@@ -35,6 +35,42 @@
      *  endpoint returned nothing. Shown inline in place of the models. */
     notice?: string | null;
   }
+
+  /**
+   * The composer's ARMED selection — the provider+model pair a Send will
+   * actually address. It comes from the provider store (`providersStore.active`
+   * plus that provider's row), which is the same source `canSend` and
+   * `handleSend` read.
+   *
+   * Deliberately NOT derived from {@link ModelGroup}s. The chip used to be
+   * found by searching the FETCHED listings for the selected key, so a provider
+   * whose `GET /models` failed (`items: []`) made the chip fall through to the
+   * amber "No model selected" placeholder — while the store's `active` pair was
+   * still set, Send stayed armed, and clicking it sent to that very provider.
+   * A failed listing must never be able to make an armed selection look
+   * unarmed: that is the original endpoint-routing bug's own shape (the UI
+   * saying one thing while the send does another) reintroduced one layer up.
+   */
+  export interface ArmedSelection {
+    /** `providerId::model`. Also what the popover highlights as chosen. */
+    key: string;
+    /** The model name the user picked. */
+    model: string;
+    /** The armed provider's display name. */
+    provider: string;
+    /** Trust zone of that endpoint as configured NOW — from `isPrivate` (the
+     *  base URL the bytes go to), never from the user-typed `kind` label. */
+    kind: "local" | "cloud";
+    /**
+     * Set when this endpoint's model listing did not confirm the armed model —
+     * the listing failed, or the endpoint stopped offering it. The selection is
+     * STILL armed and Send still goes exactly here; this is a warning about
+     * what we know of the endpoint, not about the selection. Rendered as its
+     * own affordance, distinct from both the healthy chip and the unarmed
+     * placeholder.
+     */
+    unconfirmed?: string | null;
+  }
 </script>
 
 <script lang="ts">
@@ -44,32 +80,54 @@
   interface Props {
     /** Every provider's models, in display order. */
     groups: ModelGroup[];
-    /** The currently selected model's `key`, or "" when nothing is selected. */
-    value: string;
+    /**
+     * The ARMED provider+model pair, or `null` when the composer really is
+     * unarmed. This is the picker's ONLY source of truth for what is selected —
+     * see {@link ArmedSelection} for why it must not come from `groups`.
+     */
+    selection: ArmedSelection | null;
     /** Shown on the button when nothing is selected. */
     placeholder?: string;
     onchange?: (key: string) => void;
-    /** Lets the surrounding composer close any competing popover before
-     *  opening this one — and re-list models past the cache. */
+    /**
+     * Fired when the popover OPENS — never when it closes. Lets the surrounding
+     * composer close any competing popover.
+     *
+     * It must stay side-effect-cheap. It was previously fired on both edges and
+     * wired to a cache-bypassing re-list of every configured endpoint, so a
+     * single open-then-close produced two authenticated `GET /models` fan-outs.
+     * Network re-listing lives on {@link Props.onrefresh}, which the user asks
+     * for explicitly.
+     */
     onopen?: () => void;
+    /** User-initiated re-list of the endpoints' models. This CONTACTS every
+     *  configured endpoint, so it is a button, not a side effect of opening. */
+    onrefresh?: () => void;
+    /** True while an {@link Props.onrefresh} round is in flight. */
+    refreshing?: boolean;
   }
 
-  let { groups, value, placeholder = "No model selected", onchange, onopen }: Props = $props();
+  let {
+    groups,
+    selection,
+    placeholder = "No model selected",
+    onchange,
+    onopen,
+    onrefresh,
+    refreshing = false,
+  }: Props = $props();
 
   let open = $state(false);
   let query = $state("");
   let thinkingStrength = $state<"light" | "balanced" | "deep">("balanced");
   let rootEl: HTMLDivElement;
 
-  // The selected model plus the provider it belongs to — the composer's
-  // trust-zone label, so it names both halves, never just the model.
-  const selected = $derived.by(() => {
-    for (const g of groups) {
-      const item = g.items.find((m) => m.key === value);
-      if (item) return { name: item.name, group: g.group, kind: g.kind };
-    }
-    return undefined;
-  });
+  // The highlighted option key follows the armed pair — one source of truth for
+  // "what is selected", shared by the chip and the option checkmarks. When the
+  // armed endpoint's listing failed there is no matching option to highlight,
+  // which is correct: nothing in the list IS the armed model right now. The
+  // chip still shows it, because the chip reports the SELECTION, not the list.
+  const value = $derived(selection?.key ?? "");
 
   const visibleGroups = $derived.by(() => {
     const q = query.trim().toLowerCase();
@@ -120,17 +178,26 @@
     aria-haspopup="listbox"
     aria-expanded={open}
     onclick={() => {
-      onopen?.();
-      open = !open;
+      // Rising edge only. `onopen?.(); open = !open;` fired on the CLOSING
+      // click too, which doubled whatever the host did on open — and the host
+      // did a live, cache-bypassing model listing against every configured
+      // endpoint, cloud ones included.
+      const next = !open;
+      if (next) onopen?.();
+      open = next;
     }}
-    title={selected
-      ? `Sending to ${selected.group} · ${selected.name} — click to change`
+    title={selection
+      ? selection.unconfirmed
+        ? `Sending to ${selection.provider} · ${selection.model} — ${selection.unconfirmed} Click to change.`
+        : `Sending to ${selection.provider} · ${selection.model} — click to change`
       : "No model selected — click to pick one"}
     class="relative flex h-[36px] max-w-[240px] items-center gap-[7px] rounded-full border px-[9px] transition-[background-color,color,border-color] duration-150 focus-visible:border-accent focus-visible:outline-none
-      {selected
-      ? open
-        ? 'border-border-strong bg-surface-hover text-text'
-        : 'border-transparent text-text-2 hover:bg-surface-hover hover:text-text'
+      {selection
+      ? selection.unconfirmed
+        ? 'border-warn/45 text-text-2 hover:bg-surface-hover hover:text-text'
+        : open
+          ? 'border-border-strong bg-surface-hover text-text'
+          : 'border-transparent text-text-2 hover:bg-surface-hover hover:text-text'
       : 'border-warn/40 bg-warn-soft text-warn hover:brightness-[1.03]'}"
   >
     <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true" class="shrink-0">
@@ -140,19 +207,47 @@
     </svg>
     <!-- The endpoint label is VISIBLE, not sr-only. Which provider a message
          goes to is a trust-zone fact, and the status bar alone is too quiet
-         for it — the user must be able to see it while typing. -->
-    {#if selected}
-      <span class="h-1.5 w-1.5 shrink-0 rounded-full {dotClass[selected.kind]}"></span>
+         for it — the user must be able to see it while typing.
+
+         Rendered from the ARMED PAIR, never from the fetched listings: an
+         endpoint whose `GET /models` failed still has an armed selection, and
+         showing the "no model selected" placeholder for it while Send remained
+         live is precisely the UI-says-one-thing / send-does-another failure
+         this component is meant to prevent. -->
+    {#if selection}
+      <span class="h-1.5 w-1.5 shrink-0 rounded-full {dotClass[selection.kind]}"></span>
       <span class="min-w-0 truncate text-[12px] font-medium leading-none">
-        <span class="text-text-3">{selected.group}</span>
-        <span class="text-text-3"> · </span>{selected.name}
+        <span class="text-text-3">{selection.provider}</span>
+        <span class="text-text-3"> · </span>{selection.model}
       </span>
+      {#if selection.unconfirmed}
+        <!-- Armed, but this endpoint's model list didn't confirm the choice.
+             Its own affordance: the selection is real and Send WILL use it, so
+             it must not wear the unarmed placeholder's amber fill — but the
+             user is owed the fact that we couldn't check the endpoint. -->
+        <svg
+          width="13"
+          height="13"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          aria-hidden="true"
+          class="shrink-0 text-warn"
+        >
+          <path d="M12 4.5 2.8 20h18.4L12 4.5Z" stroke-linejoin="round" />
+          <path d="M12 10v4M12 17h.01" stroke-linecap="round" />
+        </svg>
+      {/if}
     {:else}
       <span class="truncate text-[12px] font-semibold leading-none">{placeholder}</span>
     {/if}
     <!-- The provider+model is already in the visible label above, so it is
-         part of the accessible name; only the thinking strength needs adding. -->
-    <span class="sr-only">; thinking strength {thinkingStrength}</span>
+         part of the accessible name; only the thinking strength (and the
+         unconfirmed-listing warning) need adding. -->
+    <span class="sr-only"
+      >{selection?.unconfirmed ? `; ${selection.unconfirmed}` : ""}; thinking strength {thinkingStrength}</span
+    >
   </button>
 
   <div
@@ -183,12 +278,26 @@
         {/each}
       </div>
     </div>
-    <div class="border-b border-border p-2">
+    <div class="flex items-center gap-1.5 border-b border-border p-2">
       <input
         placeholder="Search models…"
         bind:value={query}
-        class="w-full rounded-[var(--r-sm)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12px] text-text outline-none"
+        class="min-w-0 flex-1 rounded-[var(--r-sm)] border border-border bg-surface-2 px-[9px] py-[6px] text-[12px] text-text outline-none"
       />
+      <!-- Re-listing CONTACTS every configured endpoint with its stored key, so
+           it is an explicit, labelled action. Doing it silently on every picker
+           click — which is what `onopen` used to do — is egress the user never
+           asked for, and in this app that is a privacy regression, not a
+           freshness feature. -->
+      <button
+        type="button"
+        onclick={() => onrefresh?.()}
+        disabled={refreshing || !onrefresh}
+        title="Ask every configured endpoint for its model list again. This contacts each endpoint, including cloud ones, with its stored key."
+        class="shrink-0 rounded-[var(--r-sm)] border border-border px-[9px] py-[6px] text-[11px] font-semibold text-text-2 transition-[0.1s] enabled:hover:bg-surface-hover enabled:hover:text-text disabled:opacity-50"
+      >
+        {refreshing ? "Refreshing…" : "Refresh"}
+      </button>
     </div>
     <div class="max-h-[250px] overflow-y-auto p-[5px]">
       <!-- Keyed by the provider ID. Two providers may legitimately share a

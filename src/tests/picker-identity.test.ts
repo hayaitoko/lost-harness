@@ -61,7 +61,7 @@ describe("ModelPicker — duplicate provider names", () => {
       },
     ];
 
-    const { container } = render(ModelPicker, { groups, value: "" });
+    const { container } = render(ModelPicker, { groups, selection: null });
 
     // Both sections rendered — neither provider was swallowed.
     const options = container.querySelectorAll('[role="option"]');
@@ -91,7 +91,15 @@ describe("ModelPicker — duplicate provider names", () => {
 
     // Same NAME on both endpoints too — the composite key is what keeps the
     // checkmark on the right one.
-    const { container } = render(ModelPicker, { groups, value: "prov-b::llama3" });
+    const { container } = render(ModelPicker, {
+      groups,
+      selection: {
+        key: "prov-b::llama3",
+        model: "llama3",
+        provider: "Ollama",
+        kind: "local" as const,
+      },
+    });
 
     const options = Array.from(container.querySelectorAll('[role="option"]'));
     expect(options).toHaveLength(2);
@@ -119,7 +127,7 @@ describe("ModelPicker — duplicate provider names", () => {
       },
     ];
 
-    const { container } = render(ModelPicker, { groups, value: "" });
+    const { container } = render(ModelPicker, { groups, selection: null });
 
     expect(container.textContent).toContain(
       "Couldn't list models — check the endpoint or key.",

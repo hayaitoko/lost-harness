@@ -6,7 +6,10 @@
   // `.lh-ghost-btn` prototype helpers for hover.
   import ChatMessage from "../components/ChatMessage.svelte";
   import IconButton from "../components/IconButton.svelte";
-  import ModelPicker, { type ModelGroup } from "../components/ModelPicker.svelte";
+  import ModelPicker, {
+    type ModelGroup,
+    type ArmedSelection,
+  } from "../components/ModelPicker.svelte";
   import PrivacyEventBar from "../components/PrivacyEventBar.svelte";
   import RoutingBadge from "../components/RoutingBadge.svelte";
   import Sidebar from "../components/Sidebar.svelte";
@@ -330,9 +333,17 @@
         items: models.map((name) => ({ name, key: modelKey(provider.id, name) })),
         // Every empty group says why it is empty — a failed listing and an
         // endpoint with no models are different problems with different fixes.
+        //
+        // The "listed nothing" wording is deliberately blunt about the dead
+        // end. Removing the Anthropic quick-add preset only helps NEW installs;
+        // an existing `global.db` still has that row, and its user sees an
+        // endpoint that is configured, answers, and can never be selected —
+        // because this app speaks only the OpenAI-compatible surface and
+        // Anthropic's native API rejects a Bearer key. We do not touch their
+        // data, so the notice has to be enough to act on.
         notice: result.ok
           ? models.length === 0
-            ? "This endpoint listed no models."
+            ? "This endpoint answered but listed no models, so nothing here can be selected. Lost Harness talks to OpenAI-compatible endpoints only — GET /models and POST /chat/completions with an Authorization: Bearer key. Check the base URL (it usually ends in /v1); if the service doesn't offer that API, remove it in Settings → Models."
             : null
           : `Couldn't list models — check the endpoint or key. (${result.error})`,
       });
@@ -341,9 +352,33 @@
     modelOwner = owner;
   }
 
+  // Listing on provider-list changes only — a cache miss (new provider, edited
+  // base URL) is the one thing that legitimately needs a live `GET /models`
+  // without the user asking. Opening the picker no longer triggers anything.
   $effect(() => {
     void loadModelGroups(providersStore.providers, false);
   });
+
+  /**
+   * The picker's explicit "Refresh" affordance.
+   *
+   * This is now the ONLY interaction in the composer that contacts configured
+   * endpoints on demand. Opening the picker used to run this on every click —
+   * on open AND on close — bypassing the cache and issuing an authenticated
+   * `GET {base_url}/models` to every provider, cloud ones included. In a
+   * privacy-first app that is egress the user never asked for, so it is now
+   * behind a button that says what it does.
+   */
+  let modelsRefreshing = $state(false);
+  async function refreshModelGroups(): Promise<void> {
+    if (modelsRefreshing) return;
+    modelsRefreshing = true;
+    try {
+      await loadModelGroups(providersStore.providers, true);
+    } finally {
+      modelsRefreshing = false;
+    }
+  }
 
   function handleModelChange(key: string) {
     const owner = modelOwner.get(key);
@@ -361,13 +396,60 @@
     composerError = null;
   }
 
-  // The picker's selection identity: the active provider+model as a composite
-  // key, or "" when nothing is selected (the picker then shows its placeholder).
-  const activeModelKey = $derived(
-    providersStore.active
-      ? modelKey(providersStore.active.providerId, providersStore.active.model)
-      : "",
+  const activeProvider = $derived(
+    providersStore.providers.find((provider) => provider.id === providersStore.activeProviderId),
   );
+
+  /**
+   * THE armed endpoint — the single expression every "is the composer armed?"
+   * question in this screen answers from: the picker chip, the Send button's
+   * enabled state and colour, and the knot.
+   *
+   * `handleSend` reads `providersStore.active` directly (it must — it is the
+   * authority), and this is that same pair plus the provider row it names.
+   * Anything that wants to *display* armed-ness derives from here, so the
+   * composer and the send can no longer disagree.
+   */
+  const armed = $derived.by(() => {
+    const selection = providersStore.active;
+    if (!selection || !activeProvider) return null;
+    return { selection, provider: activeProvider };
+  });
+
+  /**
+   * What the picker chip shows. Built from {@link armed} — the ARMED pair —
+   * and never from `modelGroups`.
+   *
+   * The old chip searched the fetched listings for the selected key, so a
+   * provider whose `GET /models` failed (`items: []`) rendered the amber "No
+   * model selected" placeholder while `canSend` stayed true and Send still went
+   * to that provider. `unconfirmed` is the honest version of that state: the
+   * selection is shown as armed, with a distinct warning that we could not
+   * confirm the model against the endpoint.
+   *
+   * A provider with no group yet (the first listing round hasn't landed) is NOT
+   * flagged — "we haven't asked yet" is not "we asked and it wasn't there", and
+   * flashing a warning on every launch would train the user to ignore it.
+   */
+  const armedSelection = $derived.by((): ArmedSelection | null => {
+    if (!armed) return null;
+    const { selection, provider } = armed;
+    const key = modelKey(selection.providerId, selection.model);
+    const group = modelGroups.find((g) => g.id === provider.id);
+    const listed = group?.items.some((m) => m.key === key) ?? true;
+    return {
+      key,
+      model: selection.model,
+      provider: provider.name,
+      // `isPrivate` (the base URL), not `kind` (a user-typed label) — the same
+      // predicate the backend stamps the turn's trust zone with.
+      kind: provider.isPrivate ? "local" : "cloud",
+      unconfirmed: listed
+        ? null
+        : (group?.notice ??
+          "this endpoint's model list doesn't currently include it"),
+    };
+  });
 
   // The send color reflects the actual route commitment we can make before a
   // turn starts: explicit local/cloud models get their own colors, Auto stays
@@ -376,16 +458,15 @@
   // is not a routing decision waiting to happen; it is a turn that cannot go
   // anywhere, and it must look different from one that can.
   type SendRoute = "local" | "public" | "filter" | "unset";
-  const activeProvider = $derived(
-    providersStore.providers.find((provider) => provider.id === providersStore.activeProviderId),
-  );
   const sendRoute = $derived.by((): SendRoute => {
-    if (!providersStore.active || !activeProvider) return "unset";
+    // Same `armed` the chip renders from. A failed model listing does not
+    // disarm anything, and must not be able to make these two disagree.
+    if (!armed) return "unset";
     if (binding === "auto") return "filter";
     // `isPrivate`, not `kind` — same reason as the picker groups above. A
     // Custom-kind provider pointed at a public API would otherwise turn the
     // Send button green and read "Send via local model".
-    if (binding === "private" || activeProvider.isPrivate) return "local";
+    if (binding === "private" || armed.provider.isPrivate) return "local";
     return "public";
   });
   const canSend = $derived(sendRoute !== "unset");
@@ -1076,15 +1157,20 @@
 
             <ModelPicker
               groups={modelGroups}
-              value={activeModelKey}
+              selection={armedSelection}
               onchange={handleModelChange}
               onopen={() => {
+                // OPENING only, and NO network. This used to fire on open AND
+                // close and kick off a cache-bypassing `GET {base_url}/models`
+                // — bearer key attached — to every configured provider,
+                // including cloud ones, on every picker click. Listing is now
+                // either cached, driven by the provider list changing, or
+                // explicitly requested via the Refresh button below.
                 composerPopover = null;
                 permissionOpen = false;
-                // Re-ask each endpoint past the cache, so a model added on a
-                // live endpoint shows up without restarting the app.
-                void loadModelGroups(providersStore.providers, true);
               }}
+              refreshing={modelsRefreshing}
+              onrefresh={() => void refreshModelGroups()}
             />
 
             <div class="relative flex items-center">
