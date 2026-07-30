@@ -167,22 +167,28 @@ if (
  * SECURITY: this function does NOT swallow IPC failures. If the durable
  * write fails, the rejection propagates so callers keep the provider in a
  * truthful state (unconfigured / un-rotated) instead of reporting a phantom
- * success. In browser fallback mode (no Tauri shell / no keychain) the key
- * is simply dropped — the localStorage store is a dev-only convenience.
+ * success.
+ *
+ * Returns `true` only when the key was handed to a real keychain-backed
+ * backend. In browser fallback mode (no Tauri shell, therefore no keychain)
+ * the plaintext key is dropped and `false` is returned, so callers must NOT
+ * flip `hasApiKey` — claiming a stored key there would be the same lie the
+ * IPC-failure path used to tell.
  */
 async function setProviderApiKey(
   providerId: string,
   apiKey: string,
-): Promise<void> {
+): Promise<boolean> {
   // Browser fallback: no keychain available — the plaintext key is dropped
-  // and never persisted. Nothing to durably store, so this resolves.
-  if (!api.isTauriRuntime()) return;
+  // and never persisted. Nothing was durably stored, so report that.
+  if (!api.isTauriRuntime()) return false;
 
   // Tauri runtime: hand the key to the backend one-shot IPC. Deliberately
   // NOT wrapped in try/catch — a rejection must reach the caller.
   await invoke("set_provider_api_key", {
     args: { provider_id: providerId, api_key: apiKey },
   });
+  return true;
 }
 
 // ── Hydration from backend ──────────────────────────────────────────────────
@@ -323,10 +329,13 @@ export async function addProvider(input: ProviderInput): Promise<Provider> {
       // hasApiKey state (the old key is still valid) and the error surfaces
       // to the UI — never a silent "rotation succeeded". Clear the plaintext
       // input as soon as it has been handed off.
-      await setProviderApiKey(id, input.apiKey);
+      const stored = await setProviderApiKey(id, input.apiKey);
       input.apiKey = "";
-      providersStore.providers[existingIdx].hasApiKey = true;
-      persistProviders();
+      // Only claim a stored key when a keychain-backed backend took it.
+      if (stored) {
+        providersStore.providers[existingIdx].hasApiKey = true;
+        persistProviders();
+      }
     }
     return providersStore.providers[existingIdx];
   }
@@ -352,9 +361,12 @@ export async function addProvider(input: ProviderInput): Promise<Provider> {
   let hasApiKey = false;
   if (input.apiKey) {
     try {
-      await setProviderApiKey(info.id, input.apiKey);
+      // `hasApiKey` mirrors what the backend actually accepted: true only in
+      // the Tauri runtime after the keychain write resolved, false in browser
+      // fallback where the key was dropped.
+      const stored = await setProviderApiKey(info.id, input.apiKey);
       input.apiKey = "";
-      hasApiKey = true;
+      hasApiKey = stored;
     } catch (err) {
       console.error("setProviderApiKey failed; rolling back provider", err);
       try {
