@@ -15,24 +15,33 @@
 //!
 //! ## Provenance architecture (P09 / H-08 — supply-chain boundary)
 //!
-//! The expected SHA-256 for a curated model no longer comes from the live HF
-//! API (`lfs.oid`). Instead, a **signed manifest** (on disk at a well-known
-//! path) maps each curated model id to an immutable commit revision and the
-//! exact file hashes at that revision. The app verifies the manifest's
-//! Ed25519 signature against a baked-in public key, then uses the pinned
-//! revision for all download URLs and the manifest's hashes for integrity
-//! verification. This decouples the trust root from the content host:
+//! The expected SHA-256 for a curated model never comes from the live HF API
+//! (`lfs.oid`). Instead a **signed manifest** on disk maps each curated model
+//! id to an immutable commit revision and the exact file hashes at that
+//! revision. The app verifies the manifest's Ed25519 signature against a
+//! compiled-in public key, then uses the pinned revision for all download URLs
+//! and the manifest's hashes for integrity verification. This decouples the
+//! trust root from the content host.
 //!
-//! - **Curated** (in the manifest + signature valid): download uses the pinned
-//!   commit revision; the expected hash comes from the manifest, not the live
-//!   API. A compromised HF repo cannot forge a verified download.
-//! - **Curated (publisher-allowlisted, not in manifest)**: the publisher is on
-//!   the curated-name allowlist for the staff-picks view, but without a
-//!   manifest entry there is no revision pinning or manifest-hash override.
-//!   This is a degraded form — the label still says "Curated" but the trust
-//!   root is still the live API. See [`Provenance`].
-//! - **Community**: any other publisher. The UI shows a warning and requires
-//!   explicit consent before download.
+//! **This resolution is FAIL-CLOSED.** A missing manifest, an unreadable or
+//! malformed manifest, a bad signature, an unsupported schema, a replayed
+//! (rolled-back) manifest, a build with no signing key compiled in, or a model
+//! that simply is not listed — every one of those yields
+//! [`Provenance::Community`] and NO pinned revision. There is no
+//! publisher-allowlist path to the `Curated` label and no silent degradation:
+//!
+//! - **Curated** ⇔ the manifest loaded, its signature verified against the
+//!   compiled-in key, and it lists this model at an immutable 40-hex commit.
+//!   Download URLs use that commit and the expected hashes come from the
+//!   manifest, so a compromised HF repo cannot forge a verified download.
+//! - **Community** ⇔ everything else, including allowlisted publishers. The UI
+//!   must warn and the backend requires explicit consent before download. The
+//!   *reason* is not swallowed: [`HfModelDetail::manifest`] carries the exact
+//!   [`ManifestState`] (absent / not-listed / invalid-with-reason).
+//!
+//! [`CURATED_PUBLISHERS`] survives only as a **discovery** filter for the
+//! Staff-picks list ([`HfModelSummary::curated_publisher`]); it never sets a
+//! trust label.
 //!
 //! The network functions are thin; every parse/classify step is a **pure**
 //! helper unit-tested with fixtures (the live endpoints are exercised only by an
@@ -55,12 +64,13 @@ use crate::models::download::{allowlisted_redirect_policy, host_allowed, is_real
 /// conservative default (more warnings, never fewer). Matched case-insensitively
 /// against the publisher (the segment before `/` in a repo id).
 ///
-/// ⚠ This is a **curation** allowlist, not a trust root. A publisher on this
-/// list still has their model hashes verified against the signed manifest
-/// (see [`ModelManifest`]) before a download is accepted. Models from these
-/// publishers that are NOT in the manifest still use the live API for hashes
-/// (degraded curation — the label says "Curated" but the trust root is the
-/// content host, not the manifest).
+/// ⚠ This is a **discovery** allowlist, not a trust root and not a label. It
+/// only decides which rows the Staff-picks default view shows
+/// ([`HfModelSummary::curated_publisher`]). Being on this list grants a model
+/// NOTHING: [`Provenance::Curated`] comes exclusively from a verified
+/// [`ModelManifest`] entry (see [`resolve_manifest`]), so an allowlisted
+/// publisher with no manifest entry is still [`Provenance::Community`] and
+/// still consent-gated.
 const CURATED_PUBLISHERS: &[&str] = &[
     // Trusted community requantizers (design §22b + 22c note).
     "lmstudio-community",
@@ -89,28 +99,28 @@ const CURATED_PUBLISHERS: &[&str] = &[
 
 /// How much we vouch for a model's bytes. This enum replaces the pre-P09
 /// "Trusted" label (which conflated namespace curation with cryptographic
-/// verification). The hierarchy is:
+/// verification). There are exactly two states and only ONE way in:
 ///
-/// | Manifest entry? | Publisher allowlisted? | Label | Trust root |
+/// | Verified manifest entry? | Label | Trust root | Revision |
 /// |---|---|---|---|
-/// | Yes | Yes or No | `Curated` | Signed manifest |
-/// | No  | Yes | `Curated` (degraded) | Live API (`lfs.oid`) |
-/// | No  | No  | `Community` | Live API + user consent |
+/// | Yes | `Curated`   | signed manifest        | pinned 40-hex commit |
+/// | No  | `Community` | none — consent-gated   | `main` (mutable) |
 ///
-/// The manifest entry provides a pinned commit revision and manifest-sourced
-/// file hashes — the only path that decouples verification from the content
-/// host (see [`ModelManifest`]).
+/// The publisher allowlist deliberately does NOT appear in that table: it
+/// cannot produce `Curated`. See [`resolve_manifest`] for the fail-closed
+/// resolution and [`ManifestState`] for the reason a model landed in
+/// `Community`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
-    /// Publisher is on the curated allowlist — eligible for Staff-picks.
-    /// When a [`ModelManifest`] entry exists, the download uses a pinned
-    /// commit revision and manifest-sourced hashes for integrity; without
-    /// a manifest entry this is degraded curation (hashes from the live
-    /// API, same trust root as the bytes).
+    /// A verified [`ModelManifest`] entry exists: the download URL is pinned to
+    /// an immutable commit and the expected hash comes from the manifest, not
+    /// from the host serving the bytes.
     Curated,
-    /// Any other publisher — the UI must show a "community model — provenance is
-    /// the publisher's" label before download.
+    /// Everything else — no manifest, bad signature, replayed manifest, or the
+    /// model simply is not listed. The UI must show the "community model —
+    /// provenance is the publisher's" warning and the backend requires an
+    /// explicit acknowledgement before downloading.
     Community,
 }
 
@@ -154,8 +164,15 @@ pub struct HfModelSummary {
     pub likes: Option<u64>,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Trusted vs community — the compensating trust-root control.
+    /// The trust label. [`Provenance::Curated`] ONLY when the verified manifest
+    /// lists this exact id; otherwise [`Provenance::Community`].
     pub provenance: Provenance,
+    /// Is the publisher on the [`CURATED_PUBLISHERS`] discovery allowlist? This
+    /// is what the Staff-picks view filters on. It is NOT a trust signal and
+    /// must never be rendered as one — a row can be `curated_publisher: true`
+    /// and `provenance: community` at the same time (the normal state before a
+    /// signed manifest exists).
+    pub curated_publisher: bool,
 }
 
 /// One downloadable GGUF file in the repo tree. The `sha256` is the LFS `oid`
@@ -215,6 +232,13 @@ pub struct HfModelDetail {
     pub id: String,
     pub publisher: String,
     pub provenance: Provenance,
+    /// Why this model has the provenance it has — the fail-closed resolution
+    /// result, surfaced instead of swallowed. `Verified { revision }` is the
+    /// only state that pairs with [`Provenance::Curated`].
+    pub manifest: ManifestState,
+    /// Is the publisher on the discovery allowlist? Same caveat as
+    /// [`HfModelSummary::curated_publisher`] — not a trust signal.
+    pub curated_publisher: bool,
     pub quants: Vec<QuantGroup>,
 }
 
@@ -222,129 +246,466 @@ pub struct HfModelDetail {
 // Curated-model manifest (P09 / H-08 — supply-chain trust root)
 // ---------------------------------------------------------------------------
 
-/// A manifest entry: a pinned commit revision and expected SHA-256 digests
-/// for every file in the model at that revision. The authoritative trust
-/// root — overrides the live API's self-reported values. When a model has a
-/// manifest entry, all download URLs use the pinned revision and integrity
-/// verification uses the manifest's hashes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Ed25519 public key — standard base64 of the RAW 32 key bytes (not a PEM
+/// SubjectPublicKeyInfo blob) — used to verify the curated-model manifest.
+///
+/// `None` means **this build has no manifest trust root compiled in**.
+/// Verification then fails closed with [`ManifestError::NoKeyConfigured`], so
+/// no model can be labelled [`Provenance::Curated`], nothing is pinned, and
+/// every download is consent-gated as [`Provenance::Community`]. That is the
+/// intended, safe shipping state until the ceremony below is performed.
+///
+/// There is deliberately NO placeholder value here: a syntactically plausible
+/// dummy key is worse than `None`, because it reads like a configured trust
+/// root while verifying nothing.
+///
+/// # NEEDS-LUKAS — manifest key ceremony (human-only, offline)
+///
+/// 1. On an **offline** machine, generate the keypair:
+///    ```text
+///    openssl genpkey -algorithm ed25519 -out lh-manifest-private.pem
+///    chmod 600 lh-manifest-private.pem
+///    ```
+///    The private key NEVER leaves that machine and is NEVER committed. Store
+///    it encrypted (e.g. an offline volume / password manager attachment) with
+///    a written recovery plan; losing it means a key rotation, and leaking it
+///    means an attacker can mint "Curated" labels.
+/// 2. Extract the raw 32-byte public key and base64 it (openssl emits a
+///    44-byte DER SPKI whose last 32 bytes are the key):
+///    ```text
+///    openssl pkey -in lh-manifest-private.pem -pubout -outform DER \
+///      | tail -c 32 | base64
+///    ```
+/// 3. Paste that string here as `Some("…")` and commit ONLY the public half.
+/// 4. Build the manifest JSON (schema in [`ModelManifest`]), then emit the
+///    exact bytes to sign — do not hand-canonicalise it:
+///    ```text
+///    LHP_MANIFEST_IN=/path/model-manifest.json \
+///    LHP_MANIFEST_PAYLOAD_OUT=/path/payload.bin \
+///      cargo test -p lost-harness-product --lib \
+///      models::hf_search::tests::emit_manifest_signing_payload -- --ignored --nocapture
+///    ```
+/// 5. Sign those bytes and paste the hex into the manifest's `signature`:
+///    ```text
+///    openssl pkeyutl -sign -inkey lh-manifest-private.pem -rawin \
+///      -in /path/payload.bin | xxd -p | tr -d '\n'
+///    ```
+/// 6. Install the manifest at `<storage base>/model-manifest.json` and confirm
+///    the app reports `manifest: {"state":"verified", …}` for a listed model.
+///    Bump `serial` on every re-sign — the app records the highest serial it
+///    has accepted and refuses anything older (see [`ManifestError::Rollback`]).
+const MANIFEST_PUBLIC_KEY_B64: Option<&str> = None;
+
+/// Domain-separation prefix for the signed payload. Keeps a manifest signature
+/// from ever being valid for some other Ed25519 message in the product, and
+/// pins the payload framing to a version so it can be changed deliberately.
+const MANIFEST_PAYLOAD_DOMAIN: &str = "lost-harness/model-manifest/v1";
+
+/// The only manifest schema version this build accepts.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// The manifest filename, inside the app storage base directory.
+pub const MANIFEST_FILENAME: &str = "model-manifest.json";
+
+/// Anti-rollback high-water mark: the highest manifest `serial` this
+/// installation has ever accepted. A validly-signed but OLDER manifest (a
+/// replay of a superseded one, e.g. re-adding a model that was pulled for a
+/// bad hash) is refused.
+pub const MANIFEST_SERIAL_FILENAME: &str = "model-manifest.serial";
+
+/// The mutable-tip revision. Only ever used for models that are explicitly NOT
+/// curated — [`Provenance::Community`], consent-gated. By construction a
+/// `Curated` model can never carry this: `Curated` comes only from
+/// [`ManifestState::Verified`], whose revision is a validated 40-hex commit.
+pub const UNPINNED_REVISION: &str = "main";
+
+/// Every way manifest verification can fail. There is no success-with-warning
+/// variant on purpose: any of these means "not curated, nothing pinned".
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ManifestError {
+    #[error("no signed model manifest at {0}")]
+    Missing(String),
+    #[error("the model manifest could not be read: {0}")]
+    Io(String),
+    #[error("the model manifest is malformed: {0}")]
+    Malformed(String),
+    #[error("this build has no manifest signing key compiled in")]
+    NoKeyConfigured,
+    #[error("the compiled-in manifest public key is unusable: {0}")]
+    BadKey(String),
+    #[error("the model manifest signature does not verify against the compiled-in public key")]
+    BadSignature,
+    #[error(
+        "model manifest schema version {found} is not supported (this build accepts {expected})"
+    )]
+    UnsupportedSchema { found: u32, expected: u32 },
+    #[error(
+        "model manifest serial {found} is older than the highest serial already accepted ({floor}) — refusing a rollback/replay"
+    )]
+    Rollback { found: u64, floor: u64 },
+}
+
+/// A manifest entry: a pinned commit revision plus the expected SHA-256 of
+/// every file the app is allowed to download at that revision. This is the
+/// authoritative trust root — it never merges with the live API's
+/// self-reported values, it replaces them, and a file the manifest does not
+/// list is not downloadable for a verified model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
-    /// Immutable git commit SHA (full 40-hex) to pin tree listing and resolve
-    /// URLs to, instead of the mutable `resolve/main` path.
+    /// Immutable git commit SHA (full 40-hex). Validated at load time —
+    /// `"main"` or any other mutable ref is rejected outright.
     pub revision: String,
-    /// File path → expected SHA-256 (64 hex chars). An entry here overrides
-    /// whatever the live API reports for this file. Verification is done
-    /// against this value, not the API's `lfs.oid`.
+    /// File path → expected SHA-256 (64 hex). Validated at load time.
     pub files: BTreeMap<String, String>,
 }
 
+impl ManifestEntry {
+    fn validate(&self, model_id: &str) -> Result<(), ManifestError> {
+        if !is_pinned_revision(&self.revision) {
+            return Err(ManifestError::Malformed(format!(
+                "model {model_id:?} pins revision {:?}, which is not an immutable 40-hex commit sha",
+                self.revision
+            )));
+        }
+        if self.files.is_empty() {
+            return Err(ManifestError::Malformed(format!(
+                "model {model_id:?} lists no files"
+            )));
+        }
+        for (path, sha) in &self.files {
+            if !safe_tree_path(path) {
+                return Err(ManifestError::Malformed(format!(
+                    "model {model_id:?} lists an unsafe file path {path:?}"
+                )));
+            }
+            if !is_real_sha256(sha) {
+                return Err(ManifestError::Malformed(format!(
+                    "model {model_id:?} file {path:?} has no real sha256"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Independently-signed manifest of curated model revisions and hashes.
-/// Loaded from a file path; the Ed25519 signature is verified against a
-/// baked-in public key. Until the manifest is generated and signed by a
-/// human operator, this file may not exist — curated models then fall back
-/// to the live API for hashes (degraded curation).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// JSON shape (all fields required):
+/// ```json
+/// {
+///   "version": 1,
+///   "serial": 1,
+///   "signed_at": "2026-07-29T00:00:00Z",
+///   "signature": "<128 hex chars — ed25519 over the signing payload>",
+///   "models": {
+///     "Qwen/Qwen3-0.6B-GGUF": {
+///       "revision": "<40-hex commit sha>",
+///       "files": { "Qwen3-0.6B-Q8_0.gguf": "<64-hex sha256>" }
+///     }
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelManifest {
-    /// Schema version, for forward compatibility.
+    /// Schema version — must equal [`MANIFEST_SCHEMA_VERSION`].
     pub version: u32,
-    /// ISO-8601 timestamp of when the manifest was signed.
+    /// Monotonic counter, bumped on every re-sign. Anti-rollback: an
+    /// installation refuses a manifest whose serial is below the highest it has
+    /// already accepted.
+    pub serial: u64,
+    /// ISO-8601 timestamp of when the manifest was signed. Covered by the
+    /// signature; must not contain a newline (it is a framed payload line).
     pub signed_at: String,
-    /// Ed25519 signature (lowercase hex) over the canonical JSON encoding of
-    /// `models`. The public key is baked into the binary at compile time.
+    /// Ed25519 signature, hex, over [`ModelManifest::signing_payload`].
     pub signature: String,
-    /// The manifest data: model_id → pinned revision + file hashes.
+    /// model_id → pinned revision + file hashes.
     pub models: BTreeMap<String, ManifestEntry>,
 }
 
 impl ModelManifest {
-    /// Load and verify a manifest from a JSON file. `NotFound` errors
-    /// silently return `None` (no manifest = degraded curation).
-    pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<Self>> {
-        let text = match std::fs::read_to_string(path.as_ref()) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let m: Self = serde_json::from_str(&text)?;
-        m.verify_signature()?;
-        Ok(Some(m))
-    }
-
-    /// Verify the Ed25519 signature against the baked-in public key.
-    fn verify_signature(&self) -> anyhow::Result<()> {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-        // Decode the public key (from base64 constant).
-        let pub_key_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            MANIFEST_PUBLIC_KEY_B64,
+    /// The exact bytes the signature covers: a domain-separated, newline-framed
+    /// header over `version`/`serial`/`signed_at` followed by the canonical
+    /// JSON of `models` (`BTreeMap` ⇒ deterministic key order).
+    ///
+    /// Framing the header INTO the signed bytes is what makes the anti-rollback
+    /// serial meaningful — an attacker cannot lift a valid signature onto a
+    /// manifest with a different serial or schema version.
+    pub fn signing_payload(&self) -> Result<Vec<u8>, ManifestError> {
+        if self.signed_at.contains('\n') {
+            return Err(ManifestError::Malformed(
+                "signed_at must not contain a newline".to_string(),
+            ));
+        }
+        let models = serde_json::to_string(&self.models)
+            .map_err(|e| ManifestError::Malformed(format!("models are not serialisable: {e}")))?;
+        Ok(format!(
+            "{MANIFEST_PAYLOAD_DOMAIN}\nversion={}\nserial={}\nsigned_at={}\n{models}",
+            self.version, self.serial, self.signed_at
         )
-        .map_err(|e| anyhow::anyhow!("invalid manifest public key encoding: {e}"))?;
-        let verifying_key = VerifyingKey::from_bytes(&pub_key_bytes.try_into().map_err(|_| {
-            anyhow::anyhow!("manifest public key has wrong length (expected 32 bytes)")
-        })?)?;
-
-        // Decode the signature (hex-encoded in the manifest).
-        let sig_bytes = hex::decode(&self.signature)
-            .map_err(|e| anyhow::anyhow!("manifest signature is not valid hex: {e}"))?;
-        let signature = Signature::from_slice(&sig_bytes)
-            .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
-
-        // Canonical JSON of `models` (BTreeMap ensures deterministic key ordering).
-        let message = serde_json::to_string(&self.models)?;
-
-        verifying_key
-            .verify(message.as_bytes(), &signature)
-            .map_err(|_| {
-                anyhow::anyhow!("manifest signature does not match the baked-in public key")
-            })
+        .into_bytes())
     }
 
-    /// Look up a model entry in the manifest. Returns `None` if the model
-    /// is not curated (no manifest entry or no manifest loaded).
+    /// Look up a model. Only reachable on a signature-verified manifest, so a
+    /// hit here is a genuine trust decision.
     #[must_use]
     pub fn lookup(&self, model_id: &str) -> Option<&ManifestEntry> {
         self.models.get(model_id)
     }
+
+    fn validate(&self) -> Result<(), ManifestError> {
+        if self.version != MANIFEST_SCHEMA_VERSION {
+            return Err(ManifestError::UnsupportedSchema {
+                found: self.version,
+                expected: MANIFEST_SCHEMA_VERSION,
+            });
+        }
+        for (id, entry) in &self.models {
+            if !valid_model_id(id) {
+                return Err(ManifestError::Malformed(format!(
+                    "manifest lists a malformed model id {id:?}"
+                )));
+            }
+            entry.validate(id)?;
+        }
+        Ok(())
+    }
 }
 
-/// Ed25519 public key (base64-encoded, 32 bytes) used to verify the
-/// signature on the curated-model manifest.
+/// Verify a manifest document. FAIL-CLOSED: every failure path returns `Err`,
+/// and there is no way to obtain a [`ModelManifest`] value except through this
+/// function, so an unverified manifest cannot reach a trust decision.
 ///
-/// ⚠ THIS IS A PLACEHOLDER — it must be replaced with the real application
-/// signing key before production use. The current value is a development-only
-/// key that provides no security guarantees. To generate a real keypair:
-///
-/// ```
-/// # In a secure offline environment:
-/// openssl genpkey -algorithm ed25519 -out manifest_private.pem
-/// openssl pkey -in manifest_private.pem -pubout -out manifest_public.pem
-/// base64 -i manifest_public.pem -w0   # ← paste as MANIFEST_PUBLIC_KEY_B64
-/// ```
-///
-/// Then sign the manifest JSON's `models` block with the private key:
-///
-/// ```
-/// echo -n '{"model_id":{"revision":"...","files":{...}}}' | \
-///   openssl pkeyutl -sign -inkey manifest_private.pem -rawin | \
-///   xxd -p | tr -d '\n'   # ← paste as the manifest `signature` field
-/// ```
-const MANIFEST_PUBLIC_KEY_B64: &str =
-    "PLACEHOLDER_PUBLIC_KEY_REPLACE_ME_PLACEHOLDER_PUBLIC_KEY_REPLACE=";
+/// `public_key_b64` is the trust root (`None` ⇒ refuse everything).
+/// `serial_floor` is the highest serial already accepted on this installation.
+pub fn verify_manifest_json(
+    text: &str,
+    public_key_b64: Option<&str>,
+    serial_floor: u64,
+) -> Result<ModelManifest, ManifestError> {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-/// Path to the curated-model manifest file, relative to the application's
-/// storage base path (`~/Documents/Lost-Harness/`). This file maps model IDs
-/// to pinned commit revisions and expected SHA-256 digests, signed with the
-/// application's Ed25519 key. When absent or invalid, curated models fall
-/// back to the live API for hashes (degraded curation — see [`Provenance`]).
-pub const MANIFEST_FILENAME: &str = "model-manifest.json";
+    let manifest: ModelManifest = serde_json::from_str(text)
+        .map_err(|e| ManifestError::Malformed(format!("not valid manifest JSON: {e}")))?;
 
-/// Load the manifest from the given storage base path. Returns `None`
-/// (with no error) when the file does not exist. The signature is verified
-/// on every load.
-pub fn load_manifest(storage_base: &Path) -> anyhow::Result<Option<ModelManifest>> {
-    let path = storage_base.join(MANIFEST_FILENAME);
-    ModelManifest::load(&path)
+    // The trust root must exist before anything is believed.
+    let key_b64 = public_key_b64.ok_or(ManifestError::NoKeyConfigured)?;
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(key_b64.trim())
+        .map_err(|e| ManifestError::BadKey(format!("not valid base64: {e}")))?;
+    let key_bytes: [u8; 32] = key_bytes.try_into().map_err(|v: Vec<u8>| {
+        ManifestError::BadKey(format!("expected 32 raw key bytes, got {}", v.len()))
+    })?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| ManifestError::BadKey(format!("not a valid ed25519 public key: {e}")))?;
+
+    let sig_bytes = hex::decode(manifest.signature.trim())
+        .map_err(|e| ManifestError::Malformed(format!("signature is not hex: {e}")))?;
+    let signature = Signature::from_slice(&sig_bytes)
+        .map_err(|e| ManifestError::Malformed(format!("signature is not 64 bytes: {e}")))?;
+
+    let payload = manifest.signing_payload()?;
+    verifying_key
+        .verify(&payload, &signature)
+        .map_err(|_| ManifestError::BadSignature)?;
+
+    // Only now is any field of the manifest believable.
+    manifest.validate()?;
+    if manifest.serial < serial_floor {
+        return Err(ManifestError::Rollback {
+            found: manifest.serial,
+            floor: serial_floor,
+        });
+    }
+    Ok(manifest)
+}
+
+/// The recorded anti-rollback high-water mark, or `0` when there is none
+/// (first run) or the file is unreadable/garbage. A missing floor cannot make
+/// anything MORE trusted — the signature check is independent — it only means
+/// no replay has been observed yet.
+fn read_serial_floor(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join(MANIFEST_SERIAL_FILENAME))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Record a newly-accepted serial as the high-water mark. Best-effort: a write
+/// failure is logged, never fatal (it only weakens future replay detection, it
+/// cannot grant trust).
+fn record_serial_floor(dir: &Path, serial: u64) {
+    if serial <= read_serial_floor(dir) {
+        return;
+    }
+    if let Err(e) = std::fs::write(dir.join(MANIFEST_SERIAL_FILENAME), serial.to_string()) {
+        tracing::warn!(
+            error = %e,
+            "could not record the model-manifest serial high-water mark; manifest replay detection is degraded"
+        );
+    }
+}
+
+/// Load + verify the manifest from `dir` using the given trust root. On
+/// success the serial is recorded as the new high-water mark.
+fn load_manifest_with(
+    dir: &Path,
+    public_key_b64: Option<&str>,
+) -> Result<ModelManifest, ManifestError> {
+    let path = dir.join(MANIFEST_FILENAME);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ManifestError::Missing(path.display().to_string()))
+        }
+        Err(e) => return Err(ManifestError::Io(e.to_string())),
+    };
+    let manifest = verify_manifest_json(&text, public_key_b64, read_serial_floor(dir))?;
+    record_serial_floor(dir, manifest.serial);
+    Ok(manifest)
+}
+
+/// Load + verify the manifest from the app storage base directory against the
+/// compiled-in trust root.
+pub fn load_manifest(storage_base: &Path) -> Result<ModelManifest, ManifestError> {
+    load_manifest_with(storage_base, MANIFEST_PUBLIC_KEY_B64)
+}
+
+/// The fail-closed outcome of resolving one model against the manifest. Only
+/// [`ManifestState::Verified`] yields [`Provenance::Curated`] and a pinned
+/// revision; the other variants carry the reason so the UI can be honest
+/// instead of silently degrading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ManifestState {
+    /// Manifest loaded, signature verified, model listed at this immutable commit.
+    Verified { revision: String },
+    /// Manifest loaded and verified, but it does not list this model.
+    NotListed,
+    /// There is no manifest file at all.
+    Absent,
+    /// A manifest exists but could not be trusted — bad signature, malformed,
+    /// unsupported schema, replayed, or no key compiled into this build.
+    Invalid { reason: String },
+}
+
+/// A resolved model: its [`ManifestState`] and, only when verified, the entry
+/// that pins it. The entry is private so it cannot be obtained without going
+/// through the verified path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestResolution {
+    state: ManifestState,
+    entry: Option<ManifestEntry>,
+}
+
+impl ManifestResolution {
+    #[must_use]
+    pub fn state(&self) -> &ManifestState {
+        &self.state
+    }
+
+    /// The verified entry, if any. `Some` ⇔ [`ManifestState::Verified`].
+    #[must_use]
+    pub fn entry(&self) -> Option<&ManifestEntry> {
+        self.entry.as_ref()
+    }
+
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        matches!(self.state, ManifestState::Verified { .. })
+    }
+
+    /// The trust label. The ONLY place [`Provenance::Curated`] is produced.
+    #[must_use]
+    pub fn provenance(&self) -> Provenance {
+        if self.is_verified() {
+            Provenance::Curated
+        } else {
+            Provenance::Community
+        }
+    }
+
+    /// The revision to build URLs from: the pinned commit when verified, the
+    /// mutable tip otherwise (which is only ever paired with
+    /// [`Provenance::Community`], i.e. consent-gated).
+    #[must_use]
+    pub fn revision(&self) -> &str {
+        match &self.state {
+            ManifestState::Verified { revision } => revision,
+            _ => UNPINNED_REVISION,
+        }
+    }
+}
+
+/// Resolve one model against the manifest in `dir`, using the given trust root.
+fn resolve_manifest_with(
+    dir: &Path,
+    public_key_b64: Option<&str>,
+    model_id: &str,
+) -> ManifestResolution {
+    match load_manifest_with(dir, public_key_b64) {
+        Ok(manifest) => match manifest.lookup(model_id) {
+            // Entries were validated during verification, so `revision` here is
+            // guaranteed to be an immutable 40-hex commit.
+            Some(entry) => ManifestResolution {
+                state: ManifestState::Verified {
+                    revision: entry.revision.clone(),
+                },
+                entry: Some(entry.clone()),
+            },
+            None => ManifestResolution {
+                state: ManifestState::NotListed,
+                entry: None,
+            },
+        },
+        Err(ManifestError::Missing(_)) => ManifestResolution {
+            state: ManifestState::Absent,
+            entry: None,
+        },
+        Err(e) => ManifestResolution {
+            state: ManifestState::Invalid {
+                reason: e.to_string(),
+            },
+            entry: None,
+        },
+    }
+}
+
+/// Resolve one model against the signed manifest in the app storage base
+/// directory. FAIL-CLOSED — see [`ManifestState`].
+#[must_use]
+pub fn resolve_manifest(storage_base: &Path, model_id: &str) -> ManifestResolution {
+    resolve_manifest_with(storage_base, MANIFEST_PUBLIC_KEY_B64, model_id)
+}
+
+/// Is this an immutable pinned revision (a full 40-hex git commit sha)? Mutable
+/// refs (`main`, tags, short shas) are refused, so a manifest cannot pin to
+/// something the content host can move under us.
+#[must_use]
+pub fn is_pinned_revision(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Is a revision safe to splice into a URL path? Either the literal mutable tip
+/// or a pinned commit sha — nothing else, so a manifest- or caller-supplied
+/// revision can never smuggle a path segment, query, or scheme into a request.
+fn revision_ok_for_url(revision: &str) -> bool {
+    revision == UNPINNED_REVISION || is_pinned_revision(revision)
+}
+
+/// Reduce a live tree listing to what a VERIFIED manifest entry authorises: a
+/// file the manifest does not list is DROPPED (never offered with a
+/// host-supplied hash under a `Curated` label), and a listed file's expected
+/// digest is replaced by the manifest's.
+fn apply_manifest_entry(files: Vec<QuantOption>, entry: &ManifestEntry) -> Vec<QuantOption> {
+    files
+        .into_iter()
+        .filter_map(|mut f| {
+            let sha = entry.files.get(&f.filename)?;
+            f.sha256 = sha.clone();
+            Some(f)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -356,14 +717,14 @@ pub fn publisher_of(id: &str) -> &str {
     id.split('/').next().unwrap_or("")
 }
 
-/// Classify a publisher against the curated allowlist (case-insensitive).
-pub fn provenance_of(publisher: &str) -> Provenance {
+/// Is this publisher on the [`CURATED_PUBLISHERS`] **discovery** allowlist
+/// (case-insensitive)? Replaces the pre-P09 `provenance_of`, which returned a
+/// trust label from a name — the exact conflation H-08 flagged. This answers a
+/// list-filtering question only; it can never produce [`Provenance::Curated`].
+#[must_use]
+pub fn is_curated_publisher(publisher: &str) -> bool {
     let p = publisher.trim().to_ascii_lowercase();
-    if !p.is_empty() && CURATED_PUBLISHERS.iter().any(|t| *t == p) {
-        Provenance::Curated
-    } else {
-        Provenance::Community
-    }
+    !p.is_empty() && CURATED_PUBLISHERS.iter().any(|t| *t == p)
 }
 
 /// Is this a well-formed HF repo id (`org/repo`, both segments limited to
@@ -537,10 +898,9 @@ pub fn group_quants(files: Vec<QuantOption>) -> Vec<QuantGroup> {
         .collect()
 }
 
-/// Build the pinned resolve URL for a file in a repo at a specific revision.
-/// When `revision` is `"main"`, the URL resolves to the mutable tip (the
-/// fallback for community models or models without a manifest entry). For
-/// manifest-curated models, `revision` is an immutable commit SHA.
+/// Build the resolve URL for a file in a repo at a specific revision. Callers
+/// must have validated `revision` with [`revision_ok_for_url`] first
+/// ([`parse_tree`] and [`list_quants`] both do, and are the only paths in).
 fn resolve_url(model_id: &str, path: &str, revision: &str) -> String {
     format!("https://huggingface.co/{model_id}/resolve/{revision}/{path}")
 }
@@ -571,15 +931,27 @@ struct RawSearchRow {
 
 /// Parse the JSON body of a `/api/models` search response into summaries. A row
 /// with no usable id at all is skipped (never a blank entry). Pure.
-pub fn parse_search_results(json: &str) -> anyhow::Result<Vec<HfModelSummary>> {
+///
+/// `manifest` is the VERIFIED manifest (`None` when this installation has none,
+/// which is the fail-closed default). A row is labelled
+/// [`Provenance::Curated`] only when that manifest lists its id — the publisher
+/// allowlist sets `curated_publisher` for the Staff-picks filter and nothing else.
+pub fn parse_search_results(
+    json: &str,
+    manifest: Option<&ModelManifest>,
+) -> anyhow::Result<Vec<HfModelSummary>> {
     let rows: Vec<RawSearchRow> = serde_json::from_str(json)?;
     Ok(rows
         .into_iter()
         .filter_map(|r| {
             let id = r.id.or(r.model_id).filter(|s| !s.is_empty())?;
             let publisher = publisher_of(&id).to_string();
-            let provenance = provenance_of(&publisher);
+            let provenance = match manifest.and_then(|m| m.lookup(&id)) {
+                Some(_) => Provenance::Curated,
+                None => Provenance::Community,
+            };
             Some(HfModelSummary {
+                curated_publisher: is_curated_publisher(&publisher),
                 id,
                 publisher,
                 downloads: r.downloads,
@@ -617,6 +989,11 @@ struct RawLfs {
 pub fn parse_tree(json: &str, model_id: &str, revision: &str) -> anyhow::Result<Vec<QuantOption>> {
     if !valid_model_id(model_id) {
         anyhow::bail!("malformed model id: {model_id:?}");
+    }
+    if !revision_ok_for_url(revision) {
+        anyhow::bail!(
+            "refusing to build urls for revision {revision:?}: expected an immutable 40-hex commit sha or {UNPINNED_REVISION:?}"
+        );
     }
     let entries: Vec<RawTreeEntry> = serde_json::from_str(json)?;
     let mut out = Vec::new();
@@ -698,40 +1075,50 @@ fn search_url(query: &str, sort: SearchSort, limit: u32) -> String {
 }
 
 /// Search HuggingFace for GGUF models. `query` empty → the Staff-picks default
-/// (top by the chosen sort). Network I/O — live-tested only.
+/// (top by the chosen sort). `storage_base` is where the signed manifest lives;
+/// rows it lists are labelled [`Provenance::Curated`], everything else is
+/// `Community`. Network I/O — live-tested only.
 pub async fn search(
     query: &str,
     sort: SearchSort,
     limit: u32,
+    storage_base: &Path,
 ) -> anyhow::Result<Vec<HfModelSummary>> {
     let client = hf_client()?;
     let url = search_url(query, sort, limit.clamp(1, 100));
     let body = get_allowlisted_text(&client, &url).await?;
-    parse_search_results(&body)
+    // Fail-closed: an unverifiable manifest is simply no manifest, which means
+    // no `Curated` labels — never a fallback to publisher-name trust.
+    let manifest = load_manifest(storage_base).ok();
+    parse_search_results(&body, manifest.as_ref())
 }
 
-/// The Staff-picks default view: top curated-publisher GGUF models by
-/// downloads. Filters the live top-N to the curated allowlist — the default
-/// rows are curated-only; arbitrary search surfaces community results with a
-/// label. Note: curation here refers to the publisher allowlist, not
-/// manifest-hash verification (see [`Provenance`]).
-pub async fn staff_picks(limit: u32) -> anyhow::Result<Vec<HfModelSummary>> {
-    // Over-fetch, then keep only curated publishers, up to `limit`.
+/// The Staff-picks default view: top allowlisted-publisher GGUF models by
+/// downloads. Filters on [`HfModelSummary::curated_publisher`] — a
+/// **discovery** filter. It does not imply the rows are verified: their
+/// `provenance` is still `Community` unless the signed manifest lists them.
+pub async fn staff_picks(limit: u32, storage_base: &Path) -> anyhow::Result<Vec<HfModelSummary>> {
+    // Over-fetch, then keep only allowlisted publishers, up to `limit`.
     let limit = limit.clamp(1, 25);
-    let all = search("", SearchSort::Downloads, limit * 4).await?;
+    let all = search("", SearchSort::Downloads, limit * 4, storage_base).await?;
     Ok(all
         .into_iter()
-        .filter(|m| m.provenance == Provenance::Curated)
+        .filter(|m| m.curated_publisher)
         .take(limit as usize)
         .collect())
 }
 
 /// List a model's downloadable GGUF files (ungrouped) at the given revision.
-/// Pass `"main"` to use the mutable tip (community models, or curated models
-/// without a manifest entry). Network I/O.
+/// `revision` must be [`UNPINNED_REVISION`] or an immutable 40-hex commit sha.
+/// Network I/O.
 pub async fn list_quants(model_id: &str, revision: &str) -> anyhow::Result<Vec<QuantOption>> {
     if !valid_model_id(model_id) {
         anyhow::bail!("malformed model id: {model_id:?}");
+    }
+    if !revision_ok_for_url(revision) {
+        anyhow::bail!(
+            "refusing to fetch revision {revision:?}: expected an immutable 40-hex commit sha or {UNPINNED_REVISION:?}"
+        );
     }
     let client = hf_client()?;
     let url = format!("https://huggingface.co/api/models/{model_id}/tree/{revision}");
@@ -742,47 +1129,37 @@ pub async fn list_quants(model_id: &str, revision: &str) -> anyhow::Result<Vec<Q
 /// The full detail view for a model: publisher/provenance + every quant grouped
 /// into logical (multi-part-aware) download units.
 ///
-/// If a [`ModelManifest`] exists and contains an entry for `model_id`, the
-/// download URLs are pinned to the manifest's immutable revision and file
-/// hashes are overridden from the manifest (the proper trust-root path). If
-/// the manifest is absent or the model is not in it, URLs use `main` and
-/// hashes come from the live API (degraded curation, or community model).
-pub async fn model_detail(model_id: &str) -> anyhow::Result<HfModelDetail> {
-    // Try loading the manifest. Not-found is silent (degraded curation).
-    let manifest = ModelManifest::load::<&Path>(&Path::new("model_manifest.json")).unwrap_or(None);
+/// FAIL-CLOSED provenance (P09 / H-08). The signed manifest in `storage_base` is
+/// resolved first ([`resolve_manifest`]):
+///
+/// - **Verified**: URLs are pinned to the manifest's immutable commit, the
+///   expected hashes are the manifest's, files the manifest does not list are
+///   dropped, and the label is [`Provenance::Curated`].
+/// - **Anything else** (absent / not listed / bad signature / replayed / no key
+///   compiled in): the label is [`Provenance::Community`] — which the download
+///   command consent-gates — the listing uses the mutable tip, and
+///   [`HfModelDetail::manifest`] states the reason. There is no path here in
+///   which a publisher name produces `Curated`.
+pub async fn model_detail(model_id: &str, storage_base: &Path) -> anyhow::Result<HfModelDetail> {
+    let resolution = resolve_manifest(storage_base, model_id);
+    let revision = resolution.revision().to_string();
 
-    let (revision, provenance) = match manifest.as_ref().and_then(|m| m.lookup(model_id)) {
-        Some(entry) => {
-            // Manifest says this model is curated: pin the revision.
-            // The provenance is Curated regardless of the publisher allowlist.
-            (entry.revision.as_str(), Provenance::Curated)
-        }
-        None => {
-            // No manifest entry: fall back to main branch + publisher allowlist.
-            let publisher = publisher_of(model_id);
-            ("main", provenance_of(publisher))
-        }
-    };
+    let mut files = list_quants(model_id, &revision).await?;
 
-    let mut files = list_quants(model_id, revision).await?;
-
-    // When a manifest entry exists, override file SHA-256 values with
-    // manifest-sourced ones — the manifest is the trust root, not the live API.
-    if let Some(ref manifest) = manifest {
-        if let Some(entry) = manifest.lookup(model_id) {
-            for file in &mut files {
-                if let Some(manifest_sha) = entry.files.get(&file.filename) {
-                    file.sha256 = manifest_sha.clone();
-                }
-            }
-        }
+    // Only a VERIFIED entry may touch hashes — and when one does, it is
+    // authoritative in both directions: it replaces the host's digest AND
+    // removes files it does not vouch for.
+    if let Some(entry) = resolution.entry() {
+        files = apply_manifest_entry(files, entry);
     }
 
     let publisher = publisher_of(model_id).to_string();
     Ok(HfModelDetail {
         id: model_id.to_string(),
+        curated_publisher: is_curated_publisher(&publisher),
         publisher,
-        provenance,
+        provenance: resolution.provenance(),
+        manifest: resolution.state().clone(),
         quants: group_quants(files),
     })
 }
@@ -792,18 +1169,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn publisher_and_provenance_classify_curated_vs_community() {
+    fn publisher_allowlist_is_discovery_only() {
         assert_eq!(publisher_of("Qwen/Qwen3-0.6B-GGUF"), "Qwen");
         assert_eq!(publisher_of("no-slash-id"), "no-slash-id");
         assert_eq!(publisher_of(""), "");
-        // Curated: official org + community requantizers, case-insensitive.
-        assert_eq!(provenance_of("Qwen"), Provenance::Curated);
-        assert_eq!(provenance_of("lmstudio-community"), Provenance::Curated);
-        assert_eq!(provenance_of("BARTOWSKI"), Provenance::Curated);
-        assert_eq!(provenance_of("unsloth"), Provenance::Curated);
-        // Anyone else is community (the conservative default).
-        assert_eq!(provenance_of("some-random-user"), Provenance::Community);
-        assert_eq!(provenance_of(""), Provenance::Community);
+        // Allowlisted: official orgs + the named requantizers, case-insensitive.
+        assert!(is_curated_publisher("Qwen"));
+        assert!(is_curated_publisher("lmstudio-community"));
+        assert!(is_curated_publisher("BARTOWSKI"));
+        assert!(is_curated_publisher("unsloth"));
+        // Anyone else is off the list.
+        assert!(!is_curated_publisher("some-random-user"));
+        assert!(!is_curated_publisher(""));
     }
 
     #[test]
@@ -921,24 +1298,49 @@ mod tests {
             {"modelId":"unsloth/Qwen3-4B-GGUF","tags":["gguf","moe"]},
             {"likes":3,"tags":["gguf"]}
         ]"#;
-        let out = parse_search_results(json).unwrap();
+        // No manifest on this installation — the fail-closed default.
+        let out = parse_search_results(json, None).unwrap();
         assert_eq!(out.len(), 3, "the no-id row is skipped");
         assert_eq!(out[0].id, "Qwen/Qwen3-0.6B-GGUF");
         assert_eq!(out[0].publisher, "Qwen");
-        assert_eq!(out[0].provenance, Provenance::Curated);
         assert_eq!(out[0].downloads, Some(123456));
-        // Explicit nulls parse as honest absence — never a fabricated 0.
-        assert_eq!(
-            out[1].provenance,
-            Provenance::Community,
-            "unknown publisher → community"
+        // H-08: an allowlisted publisher is a DISCOVERY hit, never a trust label.
+        assert!(
+            out[0].curated_publisher,
+            "Qwen is on the discovery allowlist"
         );
+        assert_eq!(
+            out[0].provenance,
+            Provenance::Community,
+            "without a signed manifest even an allowlisted publisher is community"
+        );
+        // Explicit nulls parse as honest absence — never a fabricated 0.
+        assert_eq!(out[1].provenance, Provenance::Community);
+        assert!(!out[1].curated_publisher, "unknown publisher, off the list");
         assert_eq!(out[1].downloads, None);
         assert!(out[1].tags.is_empty());
         // `modelId` alias + missing counts still parse.
         assert_eq!(out[2].id, "unsloth/Qwen3-4B-GGUF");
-        assert_eq!(out[2].provenance, Provenance::Curated);
+        assert!(out[2].curated_publisher);
+        assert_eq!(out[2].provenance, Provenance::Community);
         assert_eq!(out[2].downloads, None);
+
+        // With a VERIFIED manifest that lists exactly one of them, only that row
+        // is Curated — the allowlisted-but-unlisted rows stay Community.
+        let manifest = signed_test_manifest(1, 1, &[("Qwen/Qwen3-0.6B-GGUF", PINNED_REV)]);
+        let verified = verify_manifest_json(
+            &serde_json::to_string(&manifest).unwrap(),
+            Some(&test_public_key_b64()),
+            0,
+        )
+        .expect("test-key manifest verifies");
+        let out = parse_search_results(json, Some(&verified)).unwrap();
+        assert_eq!(out[0].provenance, Provenance::Curated, "listed → curated");
+        assert_eq!(
+            out[2].provenance,
+            Provenance::Community,
+            "allowlisted publisher, not in the manifest → still community"
+        );
     }
 
     #[test]
@@ -995,6 +1397,461 @@ mod tests {
         assert!(empty.contains("sort=trendingScore"));
     }
 
+    // -----------------------------------------------------------------------
+    // Signed-manifest fixtures (P09 / H-08). Everything below signs with a
+    // THROWAWAY TEST KEY that exists only in this module. It is deliberately
+    // NOT a production key, and
+    // `a_manifest_signed_with_the_test_key_is_refused_by_the_shipped_build`
+    // asserts the shipped binary refuses anything it signs.
+    // -----------------------------------------------------------------------
+
+    /// Deterministic test-only Ed25519 seed. Never use for anything real.
+    const TEST_SEED: [u8; 32] = [0x2a; 32];
+    /// A syntactically valid immutable commit sha for fixtures.
+    const PINNED_REV: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OLDER_REV: &str = "fedcba9876543210fedcba9876543210fedcba98";
+    const FIXTURE_ID: &str = "Qwen/Qwen3-0.6B-GGUF";
+    const FIXTURE_FILE: &str = "model-Q4_K_M.gguf";
+
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&TEST_SEED)
+    }
+
+    fn test_public_key_b64() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(test_signing_key().verifying_key().to_bytes())
+    }
+
+    /// Build a manifest over `models` and sign it with the TEST key.
+    fn signed_test_manifest(version: u32, serial: u64, models: &[(&str, &str)]) -> ModelManifest {
+        use ed25519_dalek::Signer;
+        let mut m = ModelManifest {
+            version,
+            serial,
+            signed_at: "2026-07-29T00:00:00Z".to_string(),
+            signature: String::new(),
+            models: models
+                .iter()
+                .map(|(id, rev)| {
+                    let mut files = BTreeMap::new();
+                    files.insert(FIXTURE_FILE.to_string(), "a".repeat(64));
+                    (
+                        (*id).to_string(),
+                        ManifestEntry {
+                            revision: (*rev).to_string(),
+                            files,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let payload = m.signing_payload().expect("fixture payload");
+        m.signature = hex::encode(test_signing_key().sign(&payload).to_bytes());
+        m
+    }
+
+    fn fixture_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("lhp-manifest-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).expect("fixture dir");
+        d
+    }
+
+    fn write_manifest(dir: &Path, m: &ModelManifest) {
+        std::fs::write(
+            dir.join(MANIFEST_FILENAME),
+            serde_json::to_string_pretty(m).expect("serialise fixture"),
+        )
+        .expect("write fixture manifest");
+    }
+
+    #[test]
+    fn a_test_key_signed_manifest_verifies_and_pins_an_immutable_revision() {
+        let dir = fixture_dir("valid");
+        let key = test_public_key_b64();
+        write_manifest(
+            &dir,
+            &signed_test_manifest(1, 1, &[(FIXTURE_ID, PINNED_REV)]),
+        );
+
+        let res = resolve_manifest_with(&dir, Some(&key), FIXTURE_ID);
+        assert!(res.is_verified(), "a valid signature must verify");
+        assert_eq!(res.provenance(), Provenance::Curated);
+        assert_eq!(res.revision(), PINNED_REV, "the pinned commit, not `main`");
+        assert_eq!(
+            res.state(),
+            &ManifestState::Verified {
+                revision: PINNED_REV.to_string()
+            }
+        );
+        assert_eq!(
+            res.entry().map(|e| e.files[FIXTURE_FILE].clone()),
+            Some("a".repeat(64)),
+            "the verified entry carries the manifest's own digests"
+        );
+
+        // A model the (valid) manifest does not list gets nothing.
+        let other = resolve_manifest_with(&dir, Some(&key), "unsloth/Qwen3-4B-GGUF");
+        assert_eq!(other.state(), &ManifestState::NotListed);
+        assert_eq!(other.provenance(), Provenance::Community);
+        assert_eq!(other.revision(), UNPINNED_REVISION);
+        assert!(other.entry().is_none());
+    }
+
+    #[test]
+    fn a_tampered_manifest_is_refused() {
+        let key = test_public_key_b64();
+        let sign_then = |mutate: fn(&mut ModelManifest)| {
+            let mut m = signed_test_manifest(1, 5, &[(FIXTURE_ID, PINNED_REV)]);
+            mutate(&mut m);
+            serde_json::to_string(&m).expect("serialise")
+        };
+
+        // (a) a file digest swapped after signing
+        let json = sign_then(|m| {
+            m.models
+                .get_mut(FIXTURE_ID)
+                .unwrap()
+                .files
+                .insert(FIXTURE_FILE.to_string(), "b".repeat(64));
+        });
+        assert_eq!(
+            verify_manifest_json(&json, Some(&key), 0).unwrap_err(),
+            ManifestError::BadSignature,
+            "a swapped digest must not verify"
+        );
+
+        // (b) the revision repointed after signing
+        let json = sign_then(|m| {
+            m.models.get_mut(FIXTURE_ID).unwrap().revision = OLDER_REV.to_string();
+        });
+        assert_eq!(
+            verify_manifest_json(&json, Some(&key), 0).unwrap_err(),
+            ManifestError::BadSignature,
+            "a repointed revision must not verify"
+        );
+
+        // (c) an extra model spliced in after signing
+        let json = sign_then(|m| {
+            let mut files = BTreeMap::new();
+            files.insert("evil-Q4_K_M.gguf".to_string(), "c".repeat(64));
+            m.models.insert(
+                "attacker/evil-GGUF".to_string(),
+                ManifestEntry {
+                    revision: OLDER_REV.to_string(),
+                    files,
+                },
+            );
+        });
+        assert_eq!(
+            verify_manifest_json(&json, Some(&key), 0).unwrap_err(),
+            ManifestError::BadSignature,
+            "an added model must not verify"
+        );
+
+        // (d) the anti-rollback serial bumped after signing — proves the serial
+        //     is INSIDE the signed payload and cannot be forged to defeat the
+        //     high-water mark.
+        let json = sign_then(|m| m.serial = 9_999);
+        assert_eq!(
+            verify_manifest_json(&json, Some(&key), 0).unwrap_err(),
+            ManifestError::BadSignature,
+            "the serial must be covered by the signature"
+        );
+
+        // (e) resolution surfaces the failure instead of degrading silently.
+        let dir = fixture_dir("tampered");
+        std::fs::write(dir.join(MANIFEST_FILENAME), &json).expect("write");
+        let res = resolve_manifest_with(&dir, Some(&key), FIXTURE_ID);
+        assert_eq!(res.provenance(), Provenance::Community);
+        assert_eq!(res.revision(), UNPINNED_REVISION);
+        match res.state() {
+            ManifestState::Invalid { reason } => {
+                assert!(reason.contains("signature"), "reason was {reason:?}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_manifest_fails_closed_instead_of_trusting_main() {
+        // The exact H-08 regression: the pre-fix code did
+        // `ModelManifest::load(..).unwrap_or(None)` and then fell back to the
+        // publisher allowlist, so an absent manifest still produced "Curated"
+        // against the mutable `main` tip.
+        let dir = fixture_dir("missing");
+        let key = test_public_key_b64();
+        assert!(matches!(
+            load_manifest_with(&dir, Some(&key)).unwrap_err(),
+            ManifestError::Missing(_)
+        ));
+
+        // `Qwen` IS on the discovery allowlist — the old code's Curated path.
+        assert!(is_curated_publisher(publisher_of(FIXTURE_ID)));
+        let res = resolve_manifest_with(&dir, Some(&key), FIXTURE_ID);
+        assert_eq!(res.state(), &ManifestState::Absent);
+        assert_eq!(
+            res.provenance(),
+            Provenance::Community,
+            "no manifest ⇒ no Curated label, even for an allowlisted publisher"
+        );
+        assert!(!res.is_verified());
+        assert!(
+            res.entry().is_none(),
+            "nothing may be pinned or hash-overridden without a manifest"
+        );
+    }
+
+    #[test]
+    fn a_replayed_older_manifest_is_refused() {
+        let dir = fixture_dir("rollback");
+        let key = test_public_key_b64();
+
+        // Accept serial 7; the high-water mark is recorded.
+        write_manifest(
+            &dir,
+            &signed_test_manifest(1, 7, &[(FIXTURE_ID, PINNED_REV)]),
+        );
+        assert!(load_manifest_with(&dir, Some(&key)).is_ok());
+        assert_eq!(read_serial_floor(&dir), 7, "serial recorded on acceptance");
+
+        // An attacker replays a genuinely-signed OLDER manifest (e.g. one that
+        // still vouches for a revision since pulled for a bad hash).
+        let old = signed_test_manifest(1, 3, &[(FIXTURE_ID, OLDER_REV)]);
+        let old_json = serde_json::to_string(&old).expect("serialise");
+        // Its signature is perfectly valid — only the serial floor stops it.
+        assert!(
+            verify_manifest_json(&old_json, Some(&key), 0).is_ok(),
+            "the replayed manifest is authentically signed"
+        );
+        write_manifest(&dir, &old);
+        assert_eq!(
+            load_manifest_with(&dir, Some(&key)).unwrap_err(),
+            ManifestError::Rollback { found: 3, floor: 7 }
+        );
+        let res = resolve_manifest_with(&dir, Some(&key), FIXTURE_ID);
+        assert!(!res.is_verified(), "a rolled-back manifest grants nothing");
+        assert_eq!(res.provenance(), Provenance::Community);
+        assert_ne!(res.revision(), OLDER_REV, "the stale pin is never used");
+
+        // Re-presenting the current serial still loads (idempotent reload).
+        write_manifest(
+            &dir,
+            &signed_test_manifest(1, 7, &[(FIXTURE_ID, PINNED_REV)]),
+        );
+        assert!(load_manifest_with(&dir, Some(&key)).is_ok());
+        // And a newer serial advances the mark.
+        write_manifest(
+            &dir,
+            &signed_test_manifest(1, 8, &[(FIXTURE_ID, PINNED_REV)]),
+        );
+        assert!(load_manifest_with(&dir, Some(&key)).is_ok());
+        assert_eq!(read_serial_floor(&dir), 8);
+    }
+
+    #[test]
+    fn a_manifest_signed_with_the_test_key_is_refused_by_the_shipped_build() {
+        // Guards against the test key (or any dev key) ever becoming the
+        // compiled-in trust root. Today `MANIFEST_PUBLIC_KEY_B64` is `None`
+        // (NoKeyConfigured); after the human key ceremony it is a real key and
+        // this becomes BadSignature. Both are refusals — a success here would
+        // mean the shipped binary trusts a key that lives in the test module.
+        let json = serde_json::to_string(&signed_test_manifest(1, 1, &[(FIXTURE_ID, PINNED_REV)]))
+            .expect("serialise");
+        let err = verify_manifest_json(&json, MANIFEST_PUBLIC_KEY_B64, 0)
+            .expect_err("the shipped build must never trust the test key");
+        assert!(
+            matches!(
+                err,
+                ManifestError::NoKeyConfigured | ManifestError::BadSignature
+            ),
+            "unexpected refusal reason: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_build_with_no_signing_key_cannot_label_anything_curated() {
+        let dir = fixture_dir("nokey");
+        write_manifest(
+            &dir,
+            &signed_test_manifest(1, 1, &[(FIXTURE_ID, PINNED_REV)]),
+        );
+
+        // No trust root compiled in ⇒ a perfectly-formed manifest buys nothing.
+        let res = resolve_manifest_with(&dir, None, FIXTURE_ID);
+        assert_eq!(res.provenance(), Provenance::Community);
+        assert_eq!(res.revision(), UNPINNED_REVISION);
+        match res.state() {
+            ManifestState::Invalid { reason } => {
+                assert!(reason.contains("signing key"), "reason was {reason:?}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        // The shipped resolver must agree while the ceremony is outstanding.
+        assert!(
+            !resolve_manifest(&dir, FIXTURE_ID).is_verified(),
+            "the shipped build must not verify a test-key manifest"
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_pins_a_mutable_ref_or_an_unknown_schema_is_refused() {
+        let key = test_public_key_b64();
+        // Correctly signed, but pins the MUTABLE tip — the whole point of the
+        // manifest is an immutable pin, so this is refused outright.
+        let json = serde_json::to_string(&signed_test_manifest(
+            1,
+            1,
+            &[(FIXTURE_ID, UNPINNED_REVISION)],
+        ))
+        .expect("serialise");
+        match verify_manifest_json(&json, Some(&key), 0).unwrap_err() {
+            ManifestError::Malformed(r) => assert!(r.contains("immutable"), "reason {r:?}"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+
+        // A short sha is not an immutable pin either.
+        let json =
+            serde_json::to_string(&signed_test_manifest(1, 1, &[(FIXTURE_ID, "0123456")])).unwrap();
+        assert!(matches!(
+            verify_manifest_json(&json, Some(&key), 0).unwrap_err(),
+            ManifestError::Malformed(_)
+        ));
+
+        // A future schema version is refused rather than half-understood.
+        let json = serde_json::to_string(&signed_test_manifest(2, 1, &[(FIXTURE_ID, PINNED_REV)]))
+            .unwrap();
+        assert_eq!(
+            verify_manifest_json(&json, Some(&key), 0).unwrap_err(),
+            ManifestError::UnsupportedSchema {
+                found: 2,
+                expected: MANIFEST_SCHEMA_VERSION
+            }
+        );
+
+        // Truncated / non-JSON content is Malformed, never accepted.
+        assert!(matches!(
+            verify_manifest_json("{ not json", Some(&key), 0).unwrap_err(),
+            ManifestError::Malformed(_)
+        ));
+
+        // A malformed model id inside an otherwise valid manifest is refused.
+        let json =
+            serde_json::to_string(&signed_test_manifest(1, 1, &[("../evil", PINNED_REV)])).unwrap();
+        assert!(matches!(
+            verify_manifest_json(&json, Some(&key), 0).unwrap_err(),
+            ManifestError::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn a_verified_entry_replaces_hashes_and_drops_unlisted_files() {
+        let mut files = BTreeMap::new();
+        files.insert("listed-Q4_K_M.gguf".to_string(), "c".repeat(64));
+        let entry = ManifestEntry {
+            revision: PINNED_REV.to_string(),
+            files,
+        };
+        // `qopt` gives every file the live API's "aaa…" oid.
+        let live = vec![
+            qopt("listed-Q4_K_M.gguf", 10),
+            qopt("unlisted-Q8_0.gguf", 20),
+        ];
+        let out = apply_manifest_entry(live, &entry);
+        assert_eq!(
+            out.len(),
+            1,
+            "a file the manifest does not vouch for is not downloadable"
+        );
+        assert_eq!(out[0].filename, "listed-Q4_K_M.gguf");
+        assert_eq!(
+            out[0].sha256,
+            "c".repeat(64),
+            "the manifest digest replaces the host-reported one"
+        );
+    }
+
+    #[test]
+    fn a_revision_is_validated_before_it_reaches_a_url() {
+        assert!(is_pinned_revision(PINNED_REV));
+        assert!(!is_pinned_revision(UNPINNED_REVISION));
+        assert!(!is_pinned_revision(&PINNED_REV[..39]), "short sha");
+        assert!(
+            !is_pinned_revision(&format!("{}g", &PINNED_REV[..39])),
+            "non-hex"
+        );
+
+        // Only the tip or a pinned sha may be spliced into a URL — a crafted
+        // revision cannot smuggle extra path segments into the request.
+        assert!(parse_tree("[]", "org/repo", UNPINNED_REVISION).is_ok());
+        assert!(parse_tree("[]", "org/repo", PINNED_REV).is_ok());
+        for bad in [
+            "../../../etc/passwd",
+            "refs/heads/main",
+            "main/../../evil",
+            "",
+        ] {
+            let err = parse_tree("[]", "org/repo", bad)
+                .expect_err("a non-pinned revision must be refused")
+                .to_string();
+            assert!(
+                err.contains("revision"),
+                "revision {bad:?} refused for the wrong reason: {err}"
+            );
+        }
+
+        // The pinned sha is what actually lands in the resolve URL.
+        let tree = format!(
+            r#"[{{"type":"file","path":"m-Q8_0.gguf","lfs":{{"oid":"{}","size":1}}}}]"#,
+            "a".repeat(64)
+        );
+        let q = parse_tree(&tree, "org/repo", PINNED_REV).unwrap();
+        assert_eq!(
+            q[0].url,
+            format!("https://huggingface.co/org/repo/resolve/{PINNED_REV}/m-Q8_0.gguf")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_quants_refuses_a_non_pinned_revision_before_any_request() {
+        let err = list_quants("org/repo", "refs/heads/main")
+            .await
+            .expect_err("a non-pinned revision must be refused")
+            .to_string();
+        assert!(
+            err.contains("refusing to fetch revision"),
+            "expected the pre-flight revision guard, got: {err}"
+        );
+    }
+
+    /// Ceremony helper, not an assertion: writes the exact bytes a manifest
+    /// signature must cover, so the human key ceremony never re-derives the
+    /// canonical framing by hand. The input's `signature` field may be `""`.
+    ///
+    /// ```text
+    /// LHP_MANIFEST_IN=model-manifest.json LHP_MANIFEST_PAYLOAD_OUT=payload.bin \
+    ///   cargo test --lib models::hf_search::tests::emit_manifest_signing_payload \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "ceremony helper — needs LHP_MANIFEST_IN / LHP_MANIFEST_PAYLOAD_OUT"]
+    fn emit_manifest_signing_payload() {
+        let in_path = std::env::var("LHP_MANIFEST_IN").expect("set LHP_MANIFEST_IN");
+        let out_path =
+            std::env::var("LHP_MANIFEST_PAYLOAD_OUT").expect("set LHP_MANIFEST_PAYLOAD_OUT");
+        let text = std::fs::read_to_string(&in_path).expect("read the manifest");
+        let manifest: ModelManifest = serde_json::from_str(&text).expect("parse the manifest");
+        manifest
+            .validate()
+            .expect("fix the manifest content before signing it");
+        let payload = manifest
+            .signing_payload()
+            .expect("build the signing payload");
+        std::fs::write(&out_path, &payload).expect("write the payload");
+        eprintln!("wrote {} payload bytes to {out_path}", payload.len());
+    }
+
     /// Live HF search + tree round-trip. Opt-in — set `LHP_HF_LIVE=1` to run
     /// (self-skips offline / in CI). Mirrors the `LHP_NATIVE_ENDPOINT` pattern.
     #[tokio::test]
@@ -1003,16 +1860,28 @@ mod tests {
             eprintln!("skipping live HF search test — set LHP_HF_LIVE=1 to run");
             return;
         }
-        let results = search("qwen3", SearchSort::Downloads, 10)
+        // No manifest in this empty dir → the fail-closed path, which is what a
+        // pre-ceremony build does in production.
+        let dir = fixture_dir("live");
+        let results = search("qwen3", SearchSort::Downloads, 10, &dir)
             .await
             .expect("search");
         assert!(!results.is_empty(), "a real search returns rows");
         // Every row's publisher/provenance is derived, and ids are non-empty.
         for r in &results {
             assert!(!r.id.is_empty());
+            assert_eq!(
+                r.provenance,
+                Provenance::Community,
+                "with no manifest present, no live row may claim Curated"
+            );
         }
         // The tiny live-test model must list at least one verifiable quant.
-        let detail = model_detail("Qwen/Qwen3-0.6B-GGUF").await.expect("detail");
+        let detail = model_detail("Qwen/Qwen3-0.6B-GGUF", &dir)
+            .await
+            .expect("detail");
+        assert_eq!(detail.manifest, ManifestState::Absent);
+        assert_eq!(detail.provenance, Provenance::Community);
         assert!(!detail.quants.is_empty(), "Qwen3-0.6B-GGUF lists quants");
         for g in &detail.quants {
             assert!(g.total_size_bytes > 0);

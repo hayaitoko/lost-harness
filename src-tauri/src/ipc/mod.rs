@@ -946,25 +946,29 @@ pub struct SearchModelsArgs {
 }
 
 /// Search HuggingFace for GGUF models (M8 S2′). An empty query returns the
-/// trusted-publisher Staff-picks default; a non-empty query searches live and
-/// surfaces community results, each carrying its provenance label. Networked.
+/// allowlisted-publisher Staff-picks default; a non-empty query searches live.
+/// Every row's `provenance` is resolved against the signed model manifest under
+/// the storage base (P09 / H-08) — fail-closed, so without a verified manifest
+/// entry a row is `community` no matter who published it. Networked.
 #[tauri::command]
 pub async fn search_models(
+    state: State<'_, AppState>,
     args: SearchModelsArgs,
 ) -> Result<Vec<crate::models::hf_search::HfModelSummary>, String> {
     use crate::models::hf_search::{search, staff_picks, SearchSort};
     let limit = args.limit.unwrap_or(25);
-    let q = args.query.trim();
+    let q = args.query.trim().to_string();
+    let sort = match args.sort.as_deref() {
+        Some("likes") => SearchSort::Likes,
+        Some("trending") => SearchSort::Trending,
+        Some("last_modified") => SearchSort::LastModified,
+        _ => SearchSort::Downloads,
+    };
+    let storage_base = state.storage.base_path().to_path_buf();
     let result = if q.is_empty() {
-        staff_picks(limit).await
+        staff_picks(limit, &storage_base).await
     } else {
-        let sort = match args.sort.as_deref() {
-            Some("likes") => SearchSort::Likes,
-            Some("trending") => SearchSort::Trending,
-            Some("last_modified") => SearchSort::LastModified,
-            _ => SearchSort::Downloads,
-        };
-        search(q, sort, limit).await
+        search(&q, sort, limit, &storage_base).await
     };
     result.map_err(|e| e.to_string())
 }
@@ -988,10 +992,16 @@ pub struct GetModelDetailArgs {
     pub model_id: String,
 }
 
-/// Fetch a model's quants + a representative [`ModelSpec`] (M8 S2′). Networked.
+/// Fetch a model's quants + a representative [`ModelSpec`] (M8 S2′). The
+/// provenance/pinning decision comes from the signed manifest under the storage
+/// base (P09 / H-08); `detail.manifest` reports why. Networked.
 #[tauri::command]
-pub async fn get_model_detail(args: GetModelDetailArgs) -> Result<ModelDetailResponse, String> {
-    let detail = crate::models::hf_search::model_detail(&args.model_id)
+pub async fn get_model_detail(
+    state: State<'_, AppState>,
+    args: GetModelDetailArgs,
+) -> Result<ModelDetailResponse, String> {
+    let storage_base = state.storage.base_path().to_path_buf();
+    let detail = crate::models::hf_search::model_detail(&args.model_id, &storage_base)
         .await
         .map_err(|e| e.to_string())?;
     // All quants share the architecture geometry — read the spec once from a
@@ -1442,7 +1452,8 @@ pub async fn download_model(
 ) -> Result<DownloadedModelInfo, String> {
     use crate::models::hf_search::Provenance;
 
-    let detail = crate::models::hf_search::model_detail(args.model_id.trim())
+    let storage_base = state.storage.base_path().to_path_buf();
+    let detail = crate::models::hf_search::model_detail(args.model_id.trim(), &storage_base)
         .await
         .map_err(|e| e.to_string())?;
     let quant = detail
