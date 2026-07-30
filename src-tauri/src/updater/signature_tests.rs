@@ -341,6 +341,66 @@ async fn the_release_workflows_manifest_shape_is_one_the_updater_accepts() {
     assert_eq!(verified, payload_bytes());
 }
 
+/// The same check → download → verify path, run against a **real bundle this
+/// repo actually produced** rather than the small committed fixture. Ignored by
+/// default because it needs a `tauri build` (minutes, and ~28 MB of output that
+/// has no business in git).
+///
+/// To run it:
+///
+/// ```sh
+/// # 1. a throwaway signing key — NEVER the one in ~/.tauri
+/// npx tauri signer generate --ci -p "" -w /tmp/lh-test.key -f
+/// # 2. a real bundle, signed with it
+/// TAURI_SIGNING_PRIVATE_KEY="$(cat /tmp/lh-test.key)" \
+/// TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
+///   npm run tauri build -- --bundles app
+/// # 3. point the test at the bundle and the key's public half
+/// LH_REAL_BUNDLE_DIR="src-tauri/target/release/bundle/macos" \
+/// LH_REAL_BUNDLE_PUBKEY="$(cat /tmp/lh-test.key.pub)" \
+///   cargo test --lib updater::signature_tests -- --ignored --nocapture
+/// ```
+///
+/// What it adds over the fixture tests: proof that the BUNDLER's own
+/// `.app.tar.gz` + `.sig` (not a hand-made tarball) are what the updater
+/// accepts, end to end, over a real socket.
+#[tokio::test]
+#[ignore = "needs a local `tauri build`; see the doc comment for the exact steps"]
+async fn a_real_bundler_produced_artifact_verifies() {
+    let dir = match std::env::var("LH_REAL_BUNDLE_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            panic!("set LH_REAL_BUNDLE_DIR (and LH_REAL_BUNDLE_PUBKEY) — see the doc comment")
+        }
+    };
+    let pubkey = std::env::var("LH_REAL_BUNDLE_PUBKEY")
+        .expect("set LH_REAL_BUNDLE_PUBKEY to the .pub that signed the bundle");
+
+    let archive = std::fs::read_dir(&dir)
+        .expect("bundle dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.to_string_lossy().ends_with(".app.tar.gz"))
+        .expect("no .app.tar.gz in the bundle dir — is createUpdaterArtifacts still true?");
+    let signature = std::fs::read_to_string(format!("{}.sig", archive.display()))
+        .expect("the bundle has no .sig — the build did not sign the updater payload")
+        .trim()
+        .to_string();
+    let payload = std::fs::read(&archive).expect("read the real bundle");
+    eprintln!("verifying {} ({} bytes)", archive.display(), payload.len());
+
+    let verified = check_and_download_for_target(
+        "darwin-aarch64",
+        pubkey.trim(),
+        "0.1.1",
+        payload.clone(),
+        &signature,
+    )
+    .await
+    .expect("a real, freshly signed bundle must verify");
+
+    assert_eq!(verified, payload);
+}
+
 #[tokio::test]
 async fn a_manifest_announcing_the_running_version_is_not_an_update() {
     // The plugin's own comparison should already drop this; `check_now`'s

@@ -142,9 +142,12 @@ fn an_unparseable_version_is_never_newer() {
 fn nothing_is_pending_before_a_check() {
     let pending = PendingUpdate::default();
     assert!(
-        pending.take().is_none(),
+        pending.peek().is_none(),
         "install must refuse when no check has run"
     );
+    // Clearing an empty slot is a no-op, not a panic.
+    pending.clear();
+    assert!(pending.peek().is_none());
 }
 
 // ── Payload shape (the frontend deserializes these) ─────────────────────────

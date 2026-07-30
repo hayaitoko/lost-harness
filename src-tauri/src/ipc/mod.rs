@@ -2275,9 +2275,14 @@ pub async fn check_for_update(app: AppHandle) -> Result<crate::updater::ManualCh
 /// this returns the error rather than installing anything.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
-    let pending = tauri::Manager::try_state::<crate::updater::PendingUpdate>(&app)
-        .ok_or_else(|| "Update state is not initialised.".to_string())?
-        .take()
+    let state = tauri::Manager::try_state::<crate::updater::PendingUpdate>(&app)
+        .ok_or_else(|| "Update state is not initialised.".to_string())?;
+
+    // One install at a time; two would unpack over the same .app bundle.
+    let _guard = state.install_guard().await;
+
+    let pending = state
+        .peek()
         .ok_or_else(|| "No update is staged — check for updates first.".to_string())?;
 
     tracing::info!(version = %pending.version, "egress: downloading the signed update bundle");
@@ -2285,9 +2290,14 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         .download_and_install(|_, _| {}, || {})
         .await
         .map_err(|e| {
+            // The offer stays staged on failure — a refused signature should
+            // leave "Try again" meaningful rather than turning into "nothing
+            // is staged".
             tracing::error!(error = %e, "update install refused or failed");
             e.to_string()
         })?;
+
+    state.clear();
     tracing::info!("update installed; awaiting the user's relaunch");
     Ok(())
 }

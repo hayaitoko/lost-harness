@@ -196,6 +196,11 @@ pub enum ManualCheckResult {
 #[derive(Default)]
 pub struct PendingUpdate {
     inner: parking_lot::Mutex<Option<Arc<tauri_plugin_updater::Update>>>,
+    /// Serializes installs. Two concurrent `download_and_install` calls would
+    /// both unpack over the running `.app` bundle; the UI already disables its
+    /// button while one is in flight, but the bundle is not something to
+    /// protect with a UI convention alone.
+    install_lock: tokio::sync::Mutex<()>,
 }
 
 impl PendingUpdate {
@@ -203,10 +208,25 @@ impl PendingUpdate {
         *self.inner.lock() = Some(Arc::new(update));
     }
 
-    /// Hands the staged update to the installer and clears the slot, so a
-    /// double-click can't run two installs of the same payload.
-    pub fn take(&self) -> Option<Arc<tauri_plugin_updater::Update>> {
-        self.inner.lock().take()
+    /// Clone the staged handle **without** clearing the slot.
+    ///
+    /// Deliberately not a `take`: a download that fails verification must leave
+    /// the offer intact, or the banner's "Try again" would come back with "no
+    /// update is staged" instead of retrying. The slot is cleared by
+    /// [`PendingUpdate::clear`] once an install has actually succeeded.
+    pub fn peek(&self) -> Option<Arc<tauri_plugin_updater::Update>> {
+        self.inner.lock().clone()
+    }
+
+    /// Drop the staged update — called after a successful install, so the same
+    /// payload can't be installed twice.
+    pub fn clear(&self) {
+        *self.inner.lock() = None;
+    }
+
+    /// Held for the duration of an install.
+    pub async fn install_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.install_lock.lock().await
     }
 }
 
