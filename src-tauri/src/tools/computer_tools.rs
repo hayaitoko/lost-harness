@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::tools::computer_backend::ComputerBackend;
+use crate::tools::computer_backend::{ComputerBackend, ResolvedElement};
 use crate::tools::computer_use::{ActionTarget, ComputerAction};
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
@@ -78,39 +78,53 @@ async fn act(
             "{tool_name} requires a semantic locator: {{\"app\",\"role\",\"label\"}} (never pixel coordinates)"
         ));
     };
-    // The primary locator to re-resolve (a drag re-resolves both endpoints).
-    let targets: Vec<&ActionTarget> = match &action {
-        ComputerAction::Scroll { target }
-        | ComputerAction::Click { target }
-        | ComputerAction::Type { target, .. }
-        | ComputerAction::Key { target, .. } => vec![target],
-        ComputerAction::Drag { from, to } => vec![from, to],
-        _ => vec![],
-    };
-    let mut resolved = None;
-    for t in &targets {
-        match backend.resolve(t) {
-            Ok(Some(r)) => resolved = Some(r),
-            Ok(None) => {
-                return ToolResult::Err(format!(
-                    "target moved or vanished (\"{}\" {} in {}) — refusing to act on a stale position; re-read the screen first",
-                    t.label, t.role, t.app
-                ))
+    // `ComputerBackend` is a SYNCHRONOUS trait and its native implementations are
+    // heavily blocking — the macOS one shells out to `osascript`, posts Quartz
+    // events, and sleeps between drag steps. On an async worker that stalls the
+    // worker (M-21), so the whole resolve→synthesize sequence goes to the blocking
+    // pool as ONE task: that also keeps the fresh re-resolve and the actuation on
+    // the same thread and adjacent in time, which is the entire point of
+    // re-resolving immediately before acting.
+    let backend = Arc::clone(backend);
+    let acted = tokio::task::spawn_blocking(move || -> Result<ResolvedElement, String> {
+        // The primary locator to re-resolve (a drag re-resolves both endpoints).
+        let targets: Vec<&ActionTarget> = match &action {
+            ComputerAction::Scroll { target }
+            | ComputerAction::Click { target }
+            | ComputerAction::Type { target, .. }
+            | ComputerAction::Key { target, .. } => vec![target],
+            ComputerAction::Drag { from, to } => vec![from, to],
+            _ => vec![],
+        };
+        let mut resolved = None;
+        for t in &targets {
+            match backend.resolve(t) {
+                Ok(Some(r)) => resolved = Some(r),
+                Ok(None) => {
+                    return Err(format!(
+                        "target moved or vanished (\"{}\" {} in {}) — refusing to act on a stale position; re-read the screen first",
+                        t.label, t.role, t.app
+                    ))
+                }
+                Err(e) => return Err(e.to_string()),
             }
-            Err(e) => return ToolResult::Err(e.to_string()),
         }
-    }
-    let Some(elem) = resolved else {
-        return ToolResult::Err("no target to act on".to_string());
-    };
-    match backend.synthesize(&action, &elem) {
-        Ok(()) => ToolResult::Ok(json!({
+        let Some(elem) = resolved else {
+            return Err("no target to act on".to_string());
+        };
+        backend.synthesize(&action, &elem).map_err(|e| e.to_string())?;
+        Ok(elem)
+    })
+    .await;
+    match acted {
+        Ok(Ok(elem)) => ToolResult::Ok(json!({
             "acted": tool_name,
             "app": elem.app,
             "role": elem.role,
             "label": elem.label,
         })),
-        Err(e) => ToolResult::Err(e.to_string()),
+        Ok(Err(e)) => ToolResult::Err(e),
+        Err(e) => ToolResult::Err(format!("{tool_name} task failed: {e}")),
     }
 }
 

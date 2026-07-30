@@ -169,14 +169,36 @@ fn command_error(output: &std::process::Output) -> CuError {
     }
 }
 
+/// Run one `osascript` subprocess and return its trimmed stdout (M-21).
+///
+/// ### Why this is not `spawn_blocking`
+/// `spawn_blocking` needs an `.await`, and there is nowhere here to put one:
+/// every entry point into this backend is a **synchronous** trait method
+/// ([`ComputerBackend::ui_tree`]/`resolve`/`synthesize`), and `resolve` is
+/// additionally reached from [`crate::hooks::OnScreenActionHook`], whose
+/// `GatingHook::on_event` is synchronous too. Making this function `async` would
+/// force the whole `ComputerBackend` seam and the gating-hook trait async — far
+/// outside this change.
+///
+/// The real off-load therefore happens one level up, at the only async seam that
+/// exists: `crate::tools::computer_tools::act` puts the entire
+/// resolve→synthesize sequence (this subprocess, the Quartz event posts, and the
+/// `thread::sleep`s in `drag`) inside a single `spawn_blocking`, so the `ui_*`
+/// tool path never blocks a runtime worker.
+///
+/// What is left is the synchronous hook path, and for that `block_in_place` is
+/// the right primitive — it hands this worker's remaining tasks to a sibling
+/// worker before we block. But it MUST be flavour-gated: on a current-thread
+/// runtime (or inside a `LocalSet`) tokio makes it **panic**
+/// ("can call blocking only when running on the multi-threaded runtime"), which
+/// would turn a UI action into a crash. On a `spawn_blocking` thread there is no
+/// worker core to release, so `Handle::try_current()` reporting `MultiThread`
+/// there is harmless — `block_in_place` degenerates to a plain call.
 fn osascript(script: &str, args: &[&str]) -> Result<String, CuError> {
-    // Move the blocking subprocess call off the tokio worker thread via
-    // block_in_place so the runtime can schedule other tasks while this
-    // thread is blocked on osascript output (M-21 / M-04).
     let script_str = script.to_string();
     let arg_vec: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    tokio::task::block_in_place(move || {
-        let output = std::process::Command::new("/usr/bin/osascript")
+    let run = move || {
+        let output = Command::new("/usr/bin/osascript")
             .arg("-e")
             .arg(&script_str)
             .args(&arg_vec)
@@ -186,7 +208,13 @@ fn osascript(script: &str, args: &[&str]) -> Result<String, CuError> {
             return Err(command_error(&output));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    })
+    };
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(run),
+        // Current-thread runtime, or no runtime at all: blocking here is either
+        // unavoidable or already fine, and `block_in_place` would panic.
+        _ => run(),
+    }
 }
 
 fn event_source() -> Result<CGEventSource, CuError> {
@@ -403,5 +431,32 @@ mod tests {
         assert!(key.command && key.shift);
         assert!(parse_key_spec("cmd+invalid key").is_err());
         assert!(parse_key_spec("cmd+q+z").is_err());
+    }
+
+    /// `#[tokio::test]` is a CURRENT-THREAD runtime, and an unguarded
+    /// `tokio::task::block_in_place` panics there ("can call blocking only when
+    /// running on the multi-threaded runtime"). Since `osascript` is reached from
+    /// synchronous trait methods, it must survive whatever runtime flavour the
+    /// caller happens to be on rather than taking the process down.
+    ///
+    /// The script is deliberately inert — no `tell application`, so it needs no
+    /// Accessibility or Automation grant and cannot raise a consent dialog.
+    #[tokio::test]
+    async fn osascript_does_not_panic_on_a_current_thread_runtime() {
+        assert_eq!(osascript(r#"return "ok""#, &[]), Ok("ok".to_string()));
+    }
+
+    /// The multi-thread flavour is the one that DOES take the `block_in_place`
+    /// branch (releasing this worker's core to a sibling before we block).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn osascript_works_on_a_multi_thread_runtime() {
+        assert_eq!(osascript(r#"return "ok""#, &[]), Ok("ok".to_string()));
+    }
+
+    /// And with no runtime at all (a plain `#[test]` thread) — the third path
+    /// through the flavour match.
+    #[test]
+    fn osascript_works_outside_any_runtime() {
+        assert_eq!(osascript(r#"return "ok""#, &[]), Ok("ok".to_string()));
     }
 }
