@@ -505,6 +505,10 @@ pub fn run() {
                 hardware,
                 #[cfg(feature = "local-runner")]
                 local_runner: local_runner_ctx,
+                // H-07: single-use MCP install nonces (empty at boot).
+                pending_mcp_nonces: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             };
             app.manage(state);
 
@@ -607,6 +611,7 @@ pub fn run() {
             ipc::set_budget_settings,
             ipc::reset_budget_settings,
             ipc::cancel_message,
+            ipc::generate_mcp_install_nonce,
             ipc::register_mcp_server,
             ipc::list_mcp_servers,
             ipc::remove_mcp_server,

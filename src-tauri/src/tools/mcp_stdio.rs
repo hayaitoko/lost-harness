@@ -18,9 +18,11 @@
 //! timeout all surface as `Err` — flowing through `McpTool::run`'s existing
 //! `ToolResult::Err` arm with no new error path.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
@@ -33,6 +35,207 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// Cap on a single response line — a malicious/broken server can't OOM us by
 /// streaming an endless line.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+// ── H-07: invocation pinning ────────────────────────────────────────────────
+//
+// A registered stdio MCP server is third-party code we spawn with the app's own
+// privileges. Registration is the moment the user consents to *that specific
+// invocation*; nothing afterwards re-asks.
+//
+// What "invocation" has to mean: the dominant real-world MCP registration shape
+// is `npx -y @scope/server`, `node /path/server.js`, `uvx …`, `python -m foo`.
+// In every one of those the executable is a generic INTERPRETER — pinning only
+// the resolved `command` would leave the actual server code freely swappable
+// through `args`, which is most of the attack. So the pin is a digest over the
+// WHOLE invocation:
+//
+//   * the canonical resolved path of the executable, and its file contents;
+//   * the argv vector, verbatim and length-prefixed (so no two distinct argv
+//     vectors can collide);
+//   * plus, for every arg that is an absolute path to an existing regular file
+//     (`node /opt/srv/server.js`), that file's canonical path and contents too.
+//
+// Every later bring-up — including the silent auto-start at boot — recomputes
+// that digest from the row's own command+args and refuses to spawn on any
+// mismatch. A swapped `~/.local/bin/foo`, a rewritten `server.js`, or a row
+// whose args were edited underneath us therefore cannot ride the old consent.
+//
+// NOT covered here, and deliberately so:
+//   * the child still runs with the app's full privileges once it does start;
+//   * code fetched at run time by the interpreter (`npx -y @scope/server`
+//     re-resolves from the registry; `python -m foo` from site-packages) is not
+//     a local file we can measure at pin time, so argv is the only pin there;
+//   * there is a TOCTOU window between hashing and `execvp`.
+// See `review-fixes/progress/P08.md`.
+
+/// Is `p` a file we could actually exec? Mirrors what the OS will do when
+/// `StdioMcpTransport::spawn` hands `command` to `execvp`.
+#[cfg(unix)]
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Resolve `command` to an absolute, symlink-free path the same way the spawned
+/// child would. A command containing a separator is a path; a bare name is
+/// looked up along `PATH` — the same `PATH` the child inherits (see the
+/// allowlist in [`StdioMcpTransport::spawn`]), so resolution and execution
+/// agree.
+pub fn resolve_executable(command: &str) -> Result<PathBuf, String> {
+    let candidate = if command.contains('/') || command.contains('\\') {
+        PathBuf::from(command)
+    } else {
+        let path_var = std::env::var_os("PATH")
+            .ok_or_else(|| "PATH is unset — cannot resolve an MCP server command".to_string())?;
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(command))
+            .find(|p| is_executable_file(p))
+            .ok_or_else(|| format!("MCP server command `{command}` not found on PATH"))?
+    };
+    std::fs::canonicalize(&candidate).map_err(|e| {
+        format!(
+            "cannot resolve MCP server command `{}`: {e}",
+            candidate.display()
+        )
+    })
+}
+
+/// Hex-encoded SHA-256 of the file at `path`, read in chunks (a server binary
+/// can be hundreds of MB — never slurp it whole).
+pub fn sha256_of_file(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut f =
+        std::fs::File::open(path).map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Domain tag on the invocation digest, so a pin can never be confused with a
+/// bare file hash and a future format change stays distinguishable.
+const INVOCATION_PIN_DOMAIN: &str = "lhp-mcp-invocation-pin-v1";
+
+/// Append one length-prefixed `label:len:value` field. Length-prefixing is what
+/// makes the digest unambiguous: without it `["ab", "c"]` and `["a", "bc"]`
+/// would serialize to the same bytes, and an attacker could re-split argv
+/// without changing the pin.
+fn feed_field(h: &mut Sha256, label: &str, value: &str) {
+    h.update(label.as_bytes());
+    h.update(b":");
+    h.update(value.len().to_string().as_bytes());
+    h.update(b":");
+    h.update(value.as_bytes());
+    h.update(b"\n");
+}
+
+/// If `arg` names a concrete file on disk — the `server.js` in
+/// `node /opt/srv/server.js` — return its canonical path so its *contents* can
+/// be folded into the pin too.
+///
+/// Deliberately conservative: only **absolute** paths that canonicalize to an
+/// existing regular file qualify. Flags (`-y`), package specs (`@scope/pkg`),
+/// module names (`foo.bar`) and relative paths are all skipped, so the pin never
+/// depends on guessing an interpreter's module-resolution rules or on the app's
+/// current working directory (which would make the digest unstable). Those args
+/// are still covered verbatim as argv — only their *content* is unmeasured.
+fn resolve_arg_file(arg: &str) -> Option<PathBuf> {
+    if arg.starts_with('-') || !Path::new(arg).is_absolute() {
+        return None;
+    }
+    let p = std::fs::canonicalize(arg).ok()?;
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// The pin digest for one invocation: the executable's path + contents, the
+/// argv vector, and the contents of any absolute script/module file argv names.
+/// See the module-level H-07 note for why argv must be in here.
+pub fn invocation_pin_digest(executable: &Path, args: &[String]) -> Result<String, String> {
+    let mut h = Sha256::new();
+    h.update(INVOCATION_PIN_DOMAIN.as_bytes());
+    h.update(b"\n");
+    feed_field(&mut h, "exe", &executable.to_string_lossy());
+    feed_field(&mut h, "exe-sha256", &sha256_of_file(executable)?);
+    feed_field(&mut h, "argc", &args.len().to_string());
+    for arg in args {
+        feed_field(&mut h, "arg", arg);
+        if let Some(file) = resolve_arg_file(arg) {
+            feed_field(&mut h, "arg-file", &file.to_string_lossy());
+            feed_field(&mut h, "arg-file-sha256", &sha256_of_file(&file)?);
+        }
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+/// Registration-time pin: the canonical executable path + the invocation digest
+/// (executable contents **and** argv — see [`invocation_pin_digest`]), as a pair
+/// to store on the `mcp_servers` row.
+pub fn resolve_and_hash_executable(
+    command: &str,
+    args: &[String],
+) -> Result<(String, String), String> {
+    let path = resolve_executable(command)?;
+    let pin = invocation_pin_digest(&path, args)?;
+    Ok((path.to_string_lossy().to_string(), pin))
+}
+
+/// Bring-up-time check. Fails CLOSED in all three bad cases:
+/// * the command now resolves somewhere else,
+/// * anything inside the pinned invocation differs from registration — the
+///   executable's contents, the argv vector, or a script file argv names,
+/// * the row has no pin at all (registered before migration v9) — we cannot
+///   attest to an invocation we never measured, so the user must re-register.
+pub fn verify_pinned_executable(
+    command: &str,
+    args: &[String],
+    pinned_path: Option<&str>,
+    pinned_hash: Option<&str>,
+) -> Result<(), String> {
+    let (Some(expected_path), Some(expected_hash)) = (pinned_path, pinned_hash) else {
+        return Err(format!(
+            "MCP server `{command}` has no pinned executable hash — it was registered before \
+             executable pinning existed. Remove and re-register it to approve its binary."
+        ));
+    };
+    let actual_path = resolve_executable(command)?;
+    let actual_path_display = actual_path.to_string_lossy().to_string();
+    if actual_path_display != expected_path {
+        return Err(format!(
+            "refusing to start MCP server `{command}`: its executable moved (approved \
+             `{expected_path}`, now resolves to `{actual_path_display}`). Remove and re-register \
+             it."
+        ));
+    }
+    let actual_hash = invocation_pin_digest(&actual_path, args)?;
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "refusing to start MCP server `{command}`: its approved invocation — the executable \
+             at `{actual_path_display}`, its arguments, and any script files they name — changed \
+             since it was approved (pin {expected_hash} → {actual_hash}). Remove and re-register \
+             it."
+        ));
+    }
+    Ok(())
+}
 
 struct Io {
     stdin: ChildStdin,
@@ -324,6 +527,16 @@ pub async fn bring_up_server(
             super::mcp_http::HttpMcpTransport::connect(&row.command).await?,
         ))
     } else {
+        // H-07: the pinned invocation is the consent. Re-check it on EVERY
+        // bring-up — including the unattended auto-start at boot — before we
+        // spawn. `row.args` is the exact argv handed to `spawn` two lines down,
+        // so the thing verified is the thing executed.
+        verify_pinned_executable(
+            &row.command,
+            &row.args,
+            row.executable_path.as_deref(),
+            row.executable_hash.as_deref(),
+        )?;
         McpRuntimeTransport::Stdio(std::sync::Arc::new(
             StdioMcpTransport::spawn(&row.command, &row.args).await?,
         ))
@@ -484,17 +697,24 @@ mod tests {
         use crate::tools::dispatch::ToolOutcome;
         use crate::tools::{BodyEnv, Capability, ExecCtx, ToolCall, ToolDispatcher, ToolRegistry};
 
-        let script = fixture_script();
+        let script_args = vec![fixture_script()];
+        // H-07: bring-up now demands a matching pin over command AND args.
+        // Measure them the same way registration would (never a hardcoded
+        // digest — it differs per host).
+        let (sh_path, sh_hash) = resolve_and_hash_executable("sh", &script_args)
+            .expect("the shell must resolve on PATH");
         let row = crate::storage::McpServerRow {
             id: "srv1".into(),
             name: "fixture".into(),
             command: "sh".into(),
-            args: vec![script],
+            args: script_args,
             tier: "remote".into(),
             trusted_read_only: false,
             capabilities: vec![],
             enabled: true,
             created_at: 1,
+            executable_path: Some(sh_path),
+            executable_hash: Some(sh_hash),
         };
         // Remote tier forces the Network capability — the env must grant it.
         let dispatcher = ToolDispatcher::new(
@@ -546,5 +766,235 @@ mod tests {
         // A nonexistent binary fails at spawn.
         let r2 = StdioMcpTransport::spawn("/nonexistent/lhp-mcp-server", &[]).await;
         assert!(r2.is_err());
+    }
+
+    // ── H-07: executable pinning ────────────────────────────────────────────
+
+    /// A standalone, executable copy of the working MCP fixture, so a test can
+    /// mutate the very file that would be spawned. Returns its path.
+    fn executable_fixture_server() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lhp-mcp-pin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server");
+        let body = std::fs::read_to_string(fixture_script()).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn pinned_row(id: &str, command: &str, args: &[String]) -> crate::storage::McpServerRow {
+        let (path, hash) = resolve_and_hash_executable(command, args).expect("fixture resolves");
+        crate::storage::McpServerRow {
+            id: id.into(),
+            name: "pinned".into(),
+            command: command.into(),
+            args: args.to_vec(),
+            tier: "remote".into(),
+            trusted_read_only: false,
+            capabilities: vec![],
+            enabled: true,
+            created_at: 1,
+            executable_path: Some(path),
+            executable_hash: Some(hash),
+        }
+    }
+
+    /// H-07 gap (a): once the approved binary changes on disk, the unattended
+    /// auto-start path (`bring_up_server`, exactly what lib.rs runs at boot)
+    /// must REFUSE — not spawn the new binary under the old consent.
+    #[tokio::test]
+    async fn a_changed_binary_blocks_auto_start() {
+        use crate::hooks::HookChain;
+        use crate::tools::{BodyEnv, Capability, ToolDispatcher, ToolRegistry};
+
+        let server = executable_fixture_server();
+        let command = server.to_string_lossy().to_string();
+        let row = pinned_row("pin1", &command, &[]);
+
+        let dispatcher = ToolDispatcher::new(
+            ToolRegistry::new(),
+            HookChain::new(),
+            BodyEnv::new([Capability::Network]),
+        );
+        let runtime = McpRuntime::new();
+
+        // Control: the untouched binary matches its pin and comes up fine.
+        let names = bring_up_server(&row, &dispatcher, &runtime)
+            .await
+            .expect("an unmodified, pinned binary must still start");
+        assert_eq!(names, vec!["mcp__pinned__echo_upper".to_string()]);
+        assert!(tear_down_server("pin1", &dispatcher, &runtime).await);
+
+        // Now swap the binary's contents in place — same path, same mode, same
+        // row. This is the attack: consent was given for a different file.
+        let original = std::fs::read_to_string(&server).unwrap();
+        std::fs::write(&server, format!("{original}# tampered\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Sanity: the same invocation really does pin differently now.
+        assert_ne!(
+            resolve_and_hash_executable(&command, &row.args).unwrap().1,
+            row.executable_hash.clone().unwrap(),
+            "the test must actually have changed the binary"
+        );
+
+        let err = bring_up_server(&row, &dispatcher, &runtime)
+            .await
+            .expect_err("a changed binary must NOT auto-start");
+        assert!(
+            err.contains("changed since it was approved"),
+            "expected a hash-mismatch refusal, got: {err}"
+        );
+        // And nothing was registered as a side effect of the refusal.
+        assert!(
+            runtime.servers.lock().get("pin1").is_none(),
+            "a refused bring-up must leave no live server behind"
+        );
+
+        let _ = std::fs::remove_dir_all(server.parent().unwrap());
+    }
+
+    /// H-07, the headline attack on an interpreter-shaped registration
+    /// (`node …`, `npx …`, `python …`): the executable is untouched and still
+    /// matches, but the ARGS — which is where the actual server code lives —
+    /// changed. The unattended auto-start path must refuse, because argv is
+    /// part of what the user approved.
+    #[tokio::test]
+    async fn changed_args_block_auto_start() {
+        use crate::hooks::HookChain;
+        use crate::tools::{BodyEnv, Capability, ToolDispatcher, ToolRegistry};
+
+        // `sh <script>` — the interpreter shape. The pin must cover <script>.
+        let approved = vec![fixture_script()];
+        let row = pinned_row("pinargs", "sh", &approved);
+
+        let dispatcher = ToolDispatcher::new(
+            ToolRegistry::new(),
+            HookChain::new(),
+            BodyEnv::new([Capability::Network]),
+        );
+        let runtime = McpRuntime::new();
+
+        // Control: the approved argv comes up fine.
+        let names = bring_up_server(&row, &dispatcher, &runtime)
+            .await
+            .expect("the approved command+args must still start");
+        assert_eq!(names, vec!["mcp__pinned__echo_upper".to_string()]);
+        assert!(tear_down_server("pinargs", &dispatcher, &runtime).await);
+
+        // The attack: same command, same (unmodified) interpreter binary, same
+        // stored pin — but argv now names a DIFFERENT script. Note the swapped
+        // script is a perfectly working MCP server, so nothing except the pin
+        // can stop it: if argv were not hashed, this would come up clean.
+        let mut swapped = row.clone();
+        swapped.args = vec![fixture_script()];
+        assert_ne!(swapped.args, row.args, "the swap must really change argv");
+        assert_eq!(
+            resolve_executable("sh").unwrap().to_string_lossy(),
+            row.executable_path.clone().unwrap(),
+            "the executable itself must be untouched — argv is the only difference"
+        );
+
+        let err = bring_up_server(&swapped, &dispatcher, &runtime)
+            .await
+            .expect_err("changed args must NOT auto-start under the old consent");
+        assert!(
+            err.contains("changed since it was approved"),
+            "expected a pin-mismatch refusal, got: {err}"
+        );
+        assert!(
+            runtime.servers.lock().get("pinargs").is_none(),
+            "a refused bring-up must leave no live server behind"
+        );
+    }
+
+    /// The other half of the interpreter problem: argv is unchanged, but the
+    /// script it names was rewritten. Because absolute script args are hashed by
+    /// content, the pin catches that too.
+    #[test]
+    fn a_rewritten_script_argument_invalidates_the_pin() {
+        let script = fixture_script();
+        let args = vec![script.clone()];
+        let (path, pin) = resolve_and_hash_executable("sh", &args).unwrap();
+        // Control: nothing changed yet.
+        verify_pinned_executable("sh", &args, Some(&path), Some(&pin))
+            .expect("the freshly recorded pin must verify");
+
+        std::fs::write(&script, "echo tampered\n").unwrap();
+        let err = verify_pinned_executable("sh", &args, Some(&path), Some(&pin))
+            .expect_err("a rewritten script must invalidate the pin");
+        assert!(err.contains("changed since it was approved"), "got: {err}");
+    }
+
+    /// Argv is length-prefixed in the digest, so an attacker cannot re-split it
+    /// (`--flag=x` ⇄ `--flag` `=x`, `["ab","c"]` ⇄ `["a","bc"]`) and keep the
+    /// same pin.
+    #[test]
+    fn argv_encoding_is_unambiguous() {
+        let exe = resolve_executable("sh").unwrap();
+        let split = |v: &[&str]| {
+            invocation_pin_digest(&exe, &v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap()
+        };
+        assert_ne!(split(&["ab", "c"]), split(&["a", "bc"]));
+        assert_ne!(split(&["--flag=x"]), split(&["--flag", "=x"]));
+        assert_ne!(split(&[]), split(&[""]), "argc must be part of the digest");
+        // Same argv ⇒ same pin (the check is deterministic, not just noisy).
+        assert_eq!(split(&["--mode", "safe"]), split(&["--mode", "safe"]));
+    }
+
+    /// A row with no pin at all (written before migration v9) is NOT trusted:
+    /// we never measured that binary, so bring-up fails closed.
+    #[test]
+    fn an_unpinned_row_fails_closed() {
+        let err = verify_pinned_executable("sh", &[], None, None)
+            .expect_err("an unmeasured binary must not be trusted");
+        assert!(err.contains("no pinned executable hash"), "got: {err}");
+
+        let (path, _) = resolve_and_hash_executable("sh", &[]).unwrap();
+        let err2 = verify_pinned_executable("sh", &[], Some(&path), None)
+            .expect_err("a path without a hash is still unmeasured");
+        assert!(err2.contains("no pinned executable hash"), "got: {err2}");
+    }
+
+    /// The same command resolving to a DIFFERENT file is a refusal too, even if
+    /// that other file happens to be a legitimate executable.
+    #[test]
+    fn a_moved_executable_fails_closed() {
+        let (sh_path, sh_pin) = resolve_and_hash_executable("sh", &[]).unwrap();
+        let err =
+            verify_pinned_executable("sh", &[], Some("/nonexistent/approved-sh"), Some(&sh_pin))
+                .expect_err("a relocated executable must not start");
+        assert!(err.contains("its executable moved"), "got: {err}");
+        // Control: the true pin passes.
+        verify_pinned_executable("sh", &[], Some(&sh_path), Some(&sh_pin))
+            .expect("the recorded pin must still verify");
+    }
+
+    /// `sha256_of_file` — the primitive both the executable and the script-arg
+    /// legs of the pin are built on — is a real SHA-256 of the file's bytes and
+    /// changes when the content changes. (It does no path resolution of its own;
+    /// canonicalization lives in `resolve_executable`/`resolve_arg_file`.)
+    #[test]
+    fn hashing_is_content_sensitive() {
+        let dir = std::env::temp_dir().join(format!("lhp-mcp-hash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a");
+        std::fs::write(&a, b"hello").unwrap();
+        let h1 = sha256_of_file(&a).unwrap();
+        assert_eq!(
+            h1, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "sha256(\"hello\") must be the standard digest"
+        );
+        std::fs::write(&a, b"hello!").unwrap();
+        assert_ne!(h1, sha256_of_file(&a).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

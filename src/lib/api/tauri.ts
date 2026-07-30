@@ -1019,7 +1019,11 @@ export interface McpServer {
 }
 
 /** Register an MCP server (spawn + handshake first — fail-closed; persisted on
- *  success). Returns the server + its namespaced tools. */
+ *  success). Returns the server + its namespaced tools.
+ *
+ *  H-07: the backend requires a single-use install nonce, minted here on the
+ *  confirmed-install path. It must be requested immediately before the register
+ *  call and is consumed by it; it expires after 5 minutes. */
 export async function registerMcpServer(server: {
   name: string;
   command: string;
@@ -1028,8 +1032,9 @@ export async function registerMcpServer(server: {
   trusted_read_only?: boolean;
   capabilities?: string[];
 }): Promise<McpServer | null> {
-  if (isTauri()) return tauriInvoke<McpServer>("register_mcp_server", { args: server });
-  return null;
+  if (!isTauri()) return null;
+  const nonce = await tauriInvoke<string>("generate_mcp_install_nonce", {});
+  return tauriInvoke<McpServer>("register_mcp_server", { args: { ...server, nonce } });
 }
 
 /** The persisted MCP servers, annotated with live status. */

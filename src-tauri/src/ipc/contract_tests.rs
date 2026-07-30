@@ -93,6 +93,8 @@ fn test_app() -> App<MockRuntime> {
         hardware: Arc::new(Default::default()),
         #[cfg(feature = "local-runner")]
         local_runner: None,
+        // H-07: MCP install nonces — empty, like a fresh boot.
+        pending_mcp_nonces: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = mock_builder()
@@ -132,6 +134,7 @@ fn test_app() -> App<MockRuntime> {
             ipc::set_budget_settings,
             ipc::reset_budget_settings,
             ipc::cancel_message,
+            ipc::generate_mcp_install_nonce,
             ipc::register_mcp_server,
             ipc::list_mcp_servers,
             ipc::remove_mcp_server,
@@ -1404,5 +1407,105 @@ fn confirm_public_send_rejects_the_old_unwrapped_arg_shape() {
     assert!(
         is_ipc_arg_rejection(msg),
         "expected an IPC-level arg rejection, got: {msg}"
+    );
+}
+// ── H-07: the MCP install consent gate, through the real command ────────────
+//
+// These drive the actual `#[tauri::command] register_mcp_server` over IPC —
+// real `App<MockRuntime>`, real `AppState`, real `generate_handler!`
+// deserialization — so what is proven is the deployed boundary, not just the
+// helper the gate is factored into (`ipc::tests` covers that separately).
+
+/// The command's own error string, for a call that is expected to fail.
+fn call_err(webview: &WebviewWindow<MockRuntime>, cmd: &str, body: Value) -> String {
+    match call(webview, cmd, body) {
+        Ok(ok) => panic!("{cmd}: expected a refusal, got success: {ok:?}"),
+        Err(e) => e.as_str().unwrap_or_default().to_string(),
+    }
+}
+
+/// A nonce minted by the backend, over IPC.
+fn issued_nonce(webview: &WebviewWindow<MockRuntime>) -> String {
+    let v: Value = call(webview, "generate_mcp_install_nonce", json!({}))
+        .expect("generate_mcp_install_nonce must dispatch")
+        .deserialize()
+        .expect("the nonce response must be JSON");
+    v.as_str().expect("the nonce must be a string").to_string()
+}
+
+/// A registration payload for a command that cannot possibly resolve, so the
+/// only thing under test is *where* the call dies.
+fn register_body(nonce: Option<&str>) -> Value {
+    let mut args = json!({"name": "srv", "command": "/nonexistent/lhp-mcp-server"});
+    if let Some(n) = nonce {
+        args["nonce"] = json!(n);
+    }
+    json!({"args": args})
+}
+
+/// H-07 gap (b) at the real boundary: a renderer that calls
+/// `register_mcp_server` without going through the consent step is refused.
+///
+/// The third leg is what makes the second meaningful: a *valid* nonce gets past
+/// the gate and the call then dies further in (at pinning), so "not confirmed"
+/// is specifically the gate talking and not an incidental failure.
+#[test]
+fn register_mcp_server_demands_a_backend_nonce() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // (1) No `nonce` field at all — serde rejects the args before the body runs.
+    let msg = call_err(&webview, "register_mcp_server", register_body(None));
+    assert!(
+        msg.contains("invalid args") && msg.contains("nonce"),
+        "a payload omitting nonce must be rejected at the IPC boundary, got: {msg}"
+    );
+
+    // (2) A forged nonce the backend never issued — the gate refuses.
+    let msg = call_err(
+        &webview,
+        "register_mcp_server",
+        register_body(Some("00000000-0000-0000-0000-000000000000")),
+    );
+    assert!(
+        msg.contains("was not confirmed"),
+        "a forged nonce must hit the consent gate, got: {msg}"
+    );
+
+    // (3) A backend-issued nonce passes the gate and the call proceeds — it then
+    // fails on the unresolvable command, which is a *different* error.
+    let msg = call_err(
+        &webview,
+        "register_mcp_server",
+        register_body(Some(&issued_nonce(&webview))),
+    );
+    assert!(
+        !msg.contains("was not confirmed"),
+        "an issued nonce must get past the gate, got: {msg}"
+    );
+    assert!(
+        msg.contains("couldn't pin the MCP server executable"),
+        "expected the call to proceed as far as pinning, got: {msg}"
+    );
+}
+
+/// Single-use, proven through the command: the same issued nonce cannot be
+/// replayed even though the first call ultimately failed downstream of the gate.
+#[test]
+fn a_replayed_install_nonce_is_refused_by_the_command() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let nonce = issued_nonce(&webview);
+
+    let first = call_err(&webview, "register_mcp_server", register_body(Some(&nonce)));
+    assert!(
+        first.contains("couldn't pin the MCP server executable"),
+        "the first call must consume the nonce and die later, got: {first}"
+    );
+
+    let second = call_err(&webview, "register_mcp_server", register_body(Some(&nonce)));
+    assert!(
+        second.contains("was not confirmed"),
+        "a replayed nonce must be refused, got: {second}"
     );
 }
