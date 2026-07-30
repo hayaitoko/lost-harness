@@ -102,7 +102,9 @@ beforeEach(async () => {
       case "send_message":
         sendCalls.push(args as SendArgs);
         return {
-          message_id: "msg-1",
+          // Unique per turn, like the real backend — a repeated id would
+          // collide in the transcript's keyed each block.
+          message_id: `msg-${sendCalls.length}`,
           content: "ok",
           conversation_id: args!.conversation_id,
           profile: args!.profile,
@@ -308,7 +310,7 @@ describe("per-turn route indicator", () => {
       const args = (payload as { args: Record<string, any> }).args;
       sendCalls.push(args as SendArgs);
       return {
-        message_id: "msg-1",
+        message_id: `msg-${sendCalls.length}`,
         content: "answered locally",
         conversation_id: args.conversation_id,
         profile: args.profile,
