@@ -132,38 +132,66 @@ mod platform {
     pub fn kill_group(pgid: i32) {
         // SAFETY: getpid/getpgrp are always-succeeding syscalls.
         let (self_pid, self_pgid) = unsafe { (libc::getpid(), libc::getpgrp()) };
+        kill_tree_with(pgid, self_pid, self_pgid, snapshot_processes, |target| {
+            // SAFETY: `kill(2)` with a negative target addresses the process
+            // group; a missing target just returns ESRCH, which we ignore.
+            unsafe {
+                libc::kill(target, libc::SIGKILL);
+            }
+        });
+    }
 
-        // Every pid we have ever believed to be in the tree. Used only as BFS
-        // *seeds* on later rounds (a pid that has since died and been reused
-        // must not be signalled), so a child of an already-dead intermediate
-        // is still reachable while that intermediate lingers in the table.
+    /// The discovery/signal loop of [`kill_group`], with the two syscalls it
+    /// depends on injected: `snapshot` reads the process table, and `signal`
+    /// SIGKILLs one target (negative = process group). Split out so a test can
+    /// drive it with a scripted sequence of process tables and observe the exact
+    /// ORDER of snapshots and signals — the property this whole function is
+    /// about — without racing real processes.
+    pub fn kill_tree_with<S, K>(
+        pgid: i32,
+        protect_pid: i32,
+        protect_pgid: i32,
+        mut snapshot: S,
+        mut signal: K,
+    ) where
+        S: FnMut() -> Vec<ProcRow>,
+        K: FnMut(i32),
+    {
+        // Every pid we have ever believed to be in the tree. Carried across
+        // rounds as BFS *seeds*, so a child of an intermediate that has since
+        // died is still reachable. Seeds are never signalled just for being
+        // seeds — only what the current table still shows is (a pid that died
+        // could have been recycled onto an unrelated process).
         let mut seeds: HashSet<i32> = HashSet::new();
         seeds.insert(pgid);
 
         for round in 0..MAX_KILL_ROUNDS {
-            let table = snapshot_processes();
-            let found = expand_tree(&table, &seeds, self_pid, self_pgid);
+            let table = snapshot();
+            let found = expand_tree(&table, &seeds, protect_pid, protect_pgid);
             let discovered = found.difference(&seeds).count();
             seeds.extend(found.iter().copied());
             if round > 0 && discovered == 0 {
                 // Nothing new since the previous round's signal: the set is
-                // stable, and SIGKILL cannot be blocked or handled, so
+                // stable, and SIGKILL can be neither blocked nor handled, so
                 // re-signalling would be pure noise.
                 break;
             }
-            // SAFETY: `kill(2)` with a negative pid targets the process group;
-            // a missing target just returns ESRCH, which we ignore. SIGKILL is
-            // idempotent, so re-signalling across rounds is harmless.
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
-            for &pid in &found {
-                // Never signal pid 0 (our own group), pid 1, or ourselves.
-                if pid > 1 && pid != self_pid {
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                    }
-                }
+            // One group kill sweeps up everything that stayed in the group…
+            signal(-pgid);
+            // …and every individually-discovered pid covers what left it.
+            // SIGKILL is idempotent, so re-signalling across rounds is safe.
+            let mut targets: Vec<i32> = found
+                .iter()
+                .copied()
+                // Never signal pid 0 (that would mean our own group), pid 1, or
+                // ourselves.
+                .filter(|&pid| pid > 1 && pid != protect_pid)
+                .collect();
+            // Deterministic order: the set iteration order is not, and a
+            // deterministic kill order makes this function testable.
+            targets.sort_unstable();
+            for pid in targets {
+                signal(pid);
             }
         }
     }
@@ -1395,24 +1423,63 @@ mod tests {
 
     // ── M-14: setsid escape is caught by process-tree walk ─────────────────
 
+    /// A process layout that actively tries to outrun the tree kill.
+    ///
+    /// * 40 sibling sleepers in the process group — their only job is to make a
+    ///   kill-FIRST implementation's post-hoc walk expensive (the old code ran
+    ///   one `proc_pidinfo` per pid *per BFS level*, so a wide tree cost tens of
+    ///   ms), which is exactly the window in which the group dies and the
+    ///   parent links that walk needs evaporate.
+    /// * a 5-deep chain of intermediates, all inside the group, so a post-hoc
+    ///   walk needs five sequential levels of links that the kill it just sent
+    ///   is busy destroying.
+    /// * at the bottom, `setsid()` (out of the process group, so `kill(-pgid)`
+    ///   misses it) and then ANOTHER fork, so the process that would touch the
+    ///   marker is a child of the escapee rather than the escapee itself.
+    ///
+    /// The marker is written relative to the command's cwd (the workspace
+    /// root), so nothing has to be interpolated into the program text.
+    #[cfg(unix)]
+    const ESCAPE_ARTIST: &str = concat!(
+        "i=0; while [ $i -lt 40 ]; do sleep 25 & i=$((i+1)); done; ",
+        "perl -MPOSIX -e '",
+        "for my $d (1..5) { my $p = fork; defined $p or exit 1; if ($p) { sleep 25; exit } } ",
+        "setsid(); ",
+        "my $q = fork; defined $q or exit 1; if ($q) { sleep 25; exit } ",
+        "sleep 3; open(my $f, \">\", \"marker\") or exit 1; close $f; exit",
+        "' & exec sleep 25"
+    );
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn setsid_descendant_is_killed_on_timeout() {
-        // A grandchild that calls setsid(2) creates a new session/process
-        // group and escapes kill(-pgid,SIGKILL).  The tree-walk in
-        // kill_descendants must find and kill it.
-        //
-        // Race-safe design: the Perl fork-parent stays alive for 10s (past
-        // the 300 ms timeout), so the setsid grandchild's parent (ppid) is
-        // still in the process table when the BFS runs.
+    async fn setsid_descendant_that_orphans_itself_is_still_reaped() {
+        // POSITIVE CONTROL first: spawn the same layout and DON'T kill it, to
+        // prove the escape actually happens. Without this the real assertion
+        // below could pass vacuously — e.g. if perl merely failed to start.
+        let ctl = std::env::temp_dir().join(format!("lhp-exec-ctl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ctl).unwrap();
+        let mut s_ctl = spec(ESCAPE_ARTIST);
+        s_ctl.workspace_root = ctl.clone();
+        s_ctl.tmp_root = ctl.clone();
+        let (mut ctl_child, _) = PlainUnixSpawn
+            .spawn(&s_ctl)
+            .expect("control layout must spawn");
+        let ctl_pid = ctl_child.id().expect("control child has a pid") as i32;
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert!(
+            ctl.join("marker").exists(),
+            "control: the layout never reached the marker, so this test proves nothing"
+        );
+        platform::kill_group(ctl_pid);
+        let _ = ctl_child.wait().await;
+        let _ = std::fs::remove_dir_all(&ctl);
+
+        // The real thing: run_guarded must reap the escapee's child even though
+        // the group kill orphans it and every parent link in between dies.
         let dir = std::env::temp_dir().join(format!("lhp-exec-setsid-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("marker");
-        let command = format!(
-            "perl -MPOSIX -e 'defined(my$p=fork) or die 1; if($p){{sleep 10;exit}} setsid();sleep 3;open(my$f,\">\",\"{}\");close$f;exit' & exec sleep 30",
-            marker.display()
-        );
-        let mut s = spec(&command);
+        let mut s = spec(ESCAPE_ARTIST);
         s.workspace_root = dir.clone();
         s.tmp_root = dir.clone();
         s.timeout = Duration::from_millis(300);
@@ -1424,19 +1491,420 @@ mod tests {
         assert!(out.timed_out, "must report a timeout");
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "must return near the timeout, not after 30s"
+            "must return near the timeout, not after 25s"
         );
 
-        // Wait past when the setsid escapee would have touched the marker.
+        // Wait past when the escapee's child would have touched the marker.
         tokio::time::sleep(Duration::from_millis(4500)).await;
         assert!(
             !marker.exists(),
-            "the setsid grandchild survived — tree kill did not find it"
+            "the setsid escapee's child survived — the tree kill lost the race"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    fn row(pid: i32, ppid: i32, pgid: i32) -> platform::ProcRow {
+        platform::ProcRow { pid, ppid, pgid }
+    }
+
+    #[cfg(unix)]
+    fn seeds(pids: &[i32]) -> std::collections::HashSet<i32> {
+        pids.iter().copied().collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_tree_follows_ppid_and_groups_led_by_an_in_tree_pid() {
+        // 100 = the leader (process_group(0) ⇒ pgid == pid).
+        // 101 = an intermediate that stayed in the group.
+        // 102 = called setsid(2): new session, own group — kill(-100) misses it.
+        // 103 = forked by the escapee, so it is in the ESCAPEE's group.
+        // 104 = also forked by the escapee, but the escapee has since died, so
+        //       it has been reparented to launchd: its ONLY remaining link is
+        //       that its process group is led by 102. The ppid chain alone
+        //       cannot find it.
+        // 200/201 = unrelated processes that must never be touched.
+        let table = vec![
+            row(100, 10, 100),
+            row(101, 100, 100),
+            row(102, 101, 102),
+            row(103, 102, 102),
+            row(104, 1, 102),
+            row(200, 1, 200),
+            row(201, 200, 200),
+        ];
+        let found = platform::expand_tree(&table, &seeds(&[100]), 9999, 9998);
+        assert_eq!(
+            found,
+            seeds(&[100, 101, 102, 103, 104]),
+            "the setsid escapee, its child, and its orphaned child are in the tree; 200/201 are not"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_tree_finds_a_child_forked_after_the_first_scan() {
+        // Round 1 saw 100→101→102(setsid)→103. By round 2 the group kill has
+        // taken 101 (so 102 is reparented to launchd, its link to the leader
+        // gone) and 103 has forked 104 in the meantime.
+        let round2 = vec![
+            row(100, 10, 100),
+            row(102, 1, 102),
+            row(103, 102, 102),
+            row(104, 103, 103),
+            row(200, 1, 200),
+        ];
+        // Seeded with the CUMULATIVE set from round 1, the late child is found.
+        let found = platform::expand_tree(&round2, &seeds(&[100, 101, 102, 103]), 9999, 9998);
+        assert!(
+            found.contains(&104),
+            "a child forked between snapshot and signal must be caught by the re-scan: {found:?}"
+        );
+        assert!(!found.contains(&200), "unrelated pid pulled in: {found:?}");
+
+        // And this is the race that the snapshot-first order exists to avoid:
+        // with only the leader as a seed — all a kill-first walk has left once
+        // the group is dead — the whole escaped branch is invisible.
+        let leader_only = platform::expand_tree(&round2, &seeds(&[100]), 9999, 9998);
+        assert_eq!(
+            leader_only,
+            seeds(&[100]),
+            "post-kill links are gone, so discovery must happen BEFORE signalling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_tree_never_targets_the_harness_or_its_process_group() {
+        // We are pid 500 in pgid 400. 102 is a genuine descendant that has
+        // setpgid(2)'d itself INTO our group — a hostile move that must not
+        // make our group in-tree, since killing 400 would kill the harness.
+        let table = vec![
+            row(100, 10, 100),
+            row(101, 100, 100),
+            row(102, 101, 400),
+            row(500, 100, 400), // us — even though our parent is the leader
+            row(499, 1, 400),   // an unrelated member of our group
+        ];
+        let found = platform::expand_tree(&table, &seeds(&[100]), 500, 400);
+        assert!(!found.contains(&500), "must never target our own pid");
+        assert!(
+            !found.contains(&499),
+            "a descendant joining our group must not drag the group in: {found:?}"
+        );
+        assert!(
+            found.contains(&102),
+            "the descendant itself is still in the tree: {found:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_tree_snapshots_before_it_signals_and_rescans_until_stable() {
+        // Drives the real discovery loop with a scripted process table, so the
+        // ORDER of syscalls is observable without racing anything.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Ev {
+            Snapshot,
+            Signal(i32),
+        }
+        let log = std::cell::RefCell::new(Vec::<Ev>::new());
+        let round = std::cell::Cell::new(0usize);
+
+        // Round 0: the full tree, still linked. Round 1: the group kill has
+        // taken 101, and 103 has forked 104 in the meantime. Round 2: quiet.
+        let tables = [
+            vec![
+                row(100, 10, 100),
+                row(101, 100, 100),
+                row(102, 101, 102),
+                row(103, 102, 102),
+                row(900, 1, 900),
+            ],
+            vec![row(102, 1, 102), row(103, 102, 102), row(104, 103, 103)],
+            vec![row(104, 103, 103)],
+        ];
+
+        platform::kill_tree_with(
+            100,
+            500,
+            400,
+            || {
+                log.borrow_mut().push(Ev::Snapshot);
+                let i = round.get();
+                round.set(i + 1);
+                tables.get(i).cloned().unwrap_or_default()
+            },
+            |t| log.borrow_mut().push(Ev::Signal(t)),
+        );
+
+        let log = log.into_inner();
+        // THE ordering property: discovery precedes every signal. If the first
+        // event were a signal, the links the discovery needs would already be
+        // being destroyed — that is the race this packet exists to close.
+        assert_eq!(
+            log.first(),
+            Some(&Ev::Snapshot),
+            "must snapshot BEFORE signalling anything: {log:?}"
+        );
+        let first_signal = log
+            .iter()
+            .position(|e| matches!(e, Ev::Signal(_)))
+            .expect("something must be signalled");
+        assert_eq!(
+            log.iter()
+                .take(first_signal)
+                .filter(|e| **e == Ev::Snapshot)
+                .count(),
+            1,
+            "exactly one snapshot must precede the first signal: {log:?}"
+        );
+
+        // Round 0 signals the group plus every pid discovered from the snapshot,
+        // and nothing else — 900 is unrelated, 500 is us.
+        assert_eq!(
+            log[first_signal..first_signal + 5],
+            [
+                Ev::Signal(-100),
+                Ev::Signal(100),
+                Ev::Signal(101),
+                Ev::Signal(102),
+                Ev::Signal(103)
+            ],
+            "round 0 kills the group and the snapshotted set: {log:?}"
+        );
+        assert!(
+            !log.contains(&Ev::Signal(900)) && !log.contains(&Ev::Signal(500)),
+            "signalled something outside the tree: {log:?}"
+        );
+
+        // The re-scan must catch 104, forked after the first snapshot — reachable
+        // only because the seed set carried 103 forward.
+        assert!(
+            log.contains(&Ev::Signal(104)),
+            "a child forked after the first snapshot was never signalled: {log:?}"
+        );
+
+        // And the loop must settle instead of spinning to MAX_KILL_ROUNDS: the
+        // third table adds nothing new, so that round breaks before signalling.
+        assert_eq!(
+            log.iter().filter(|e| **e == Ev::Snapshot).count(),
+            3,
+            "must stop re-scanning once the set is stable: {log:?}"
+        );
+    }
+
+    // ── bounded drain: an inherited pipe must not hang the caller ───────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_is_bounded_when_an_orphan_holds_the_pipe_open() {
+        // The command itself exits at once, but a backgrounded subshell
+        // inherited its stdout write end and lives on for 20s. The unbounded
+        // read used to block run_guarded for as long as that process felt like
+        // living; it must now give up after the grace period WITH the real
+        // output intact.
+        let mut s = spec("( sleep 20 ) & echo hi");
+        s.timeout = Duration::from_secs(30);
+
+        let start = std::time::Instant::now();
+        let out = run_guarded(&PlainUnixSpawn, &s)
+            .await
+            .expect("must not error");
+        let elapsed = start.elapsed();
+
+        assert_eq!(out.exit_code, Some(0), "the command itself exited cleanly");
+        assert!(!out.timed_out, "the command did not time out");
+        assert!(
+            out.stdout.contains("hi"),
+            "bytes read before the bound must be kept: {:?}",
+            out.stdout
+        );
+        assert!(
+            elapsed < DRAIN_GRACE + Duration::from_secs(5),
+            "drain was not bounded — returned after {elapsed:?}, with a 20s pipe holder"
+        );
+    }
+
+    // ── resource ceilings (rlimits) ─────────────────────────────────────────
+
+    /// A plain (non-Seatbelt) spawner that installs `ResourceCeilings` through
+    /// the SAME `apply_ceilings` hook the real spawner uses, so these tests
+    /// exercise the production path with values small enough to observe.
+    #[cfg(target_os = "macos")]
+    struct CeilingSpawn(ResourceCeilings);
+    #[cfg(target_os = "macos")]
+    impl SandboxedSpawn for CeilingSpawn {
+        fn spawn(
+            &self,
+            spec: &ExecSpec,
+        ) -> Result<(tokio::process::Child, Vec<PathBuf>), ExecError> {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg(&spec.command)
+                .current_dir(&spec.workspace_root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            cmd.process_group(0);
+            apply_ceilings(&mut cmd, self.0);
+            let child = cmd.spawn().map_err(|e| ExecError::Io(e.to_string()))?;
+            Ok((child, Vec::new()))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn soft_nofile() -> u64 {
+        // SAFETY: read-only getrlimit into a live, correctly-sized struct.
+        unsafe {
+            let mut r: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut r), 0);
+            r.rlim_cur as u64
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn resource_ceilings_reach_the_child_soft_and_hard() {
+        // Both halves must be lowered: a soft-only limit is theatre, since the
+        // child can raise it back to hard whenever it likes.
+        let ceilings = ResourceCeilings {
+            cpu_seconds: 77,
+            file_size_bytes: 512 * 1024,
+            open_files: 64,
+        };
+        let out = run_guarded(
+            &CeilingSpawn(ceilings),
+            &spec("ulimit -St; ulimit -Ht; ulimit -Sn; ulimit -Hn"),
+        )
+        .await
+        .expect("must run");
+        assert_eq!(out.exit_code, Some(0), "stderr: {}", out.stderr);
+        let seen: Vec<&str> = out.stdout.split_whitespace().collect();
+        assert_eq!(
+            seen,
+            vec!["77", "77", "64", "64"],
+            "child did not inherit the ceilings (soft AND hard): {:?}",
+            out.stdout
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn file_size_ceiling_stops_a_runaway_writer() {
+        // Not just reported — enforced. 64 KiB of output into a 4 KiB ceiling.
+        let dir = std::env::temp_dir().join(format!("lhp-exec-fsize-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ceilings = ResourceCeilings {
+            cpu_seconds: 30,
+            file_size_bytes: 4096,
+            open_files: 64,
+        };
+        let mut s = spec("head -c 65536 /dev/zero > big.bin 2>/dev/null; echo rc=$?");
+        s.workspace_root = dir.clone();
+        s.tmp_root = dir.clone();
+        let out = run_guarded(&CeilingSpawn(ceilings), &s)
+            .await
+            .expect("must run");
+        assert!(
+            out.stdout.contains("rc=") && !out.stdout.contains("rc=0"),
+            "the oversized write must fail: {:?}",
+            out.stdout
+        );
+        let written = std::fs::metadata(dir.join("big.bin"))
+            .expect("the file is created, just capped")
+            .len();
+        assert!(
+            written <= 4096,
+            "file grew past the ceiling: {written} bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_ceiling_looser_than_the_inherited_limit_never_raises_it() {
+        // "Tighten only": asking for more descriptors than we ourselves have
+        // must not hand the child more than we had.
+        let parent = soft_nofile();
+        let ceilings = ResourceCeilings {
+            cpu_seconds: 77,
+            file_size_bytes: 512 * 1024,
+            open_files: parent.saturating_mul(4).saturating_add(4096),
+        };
+        let out = run_guarded(&CeilingSpawn(ceilings), &spec("ulimit -Sn"))
+            .await
+            .expect("must run");
+        let child: u64 = out
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("expected a number, got {:?}", out.stdout));
+        assert!(
+            child <= parent,
+            "raised the child's soft limit from {parent} to {child}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cpu_ceiling_exceeds_what_the_wall_budget_can_legitimately_buy() {
+        // A ceiling a well-behaved command can hit is a bug: `timeout` seconds
+        // of wall clock can buy `timeout * cores` CPU-seconds.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1);
+        let c = ResourceCeilings::for_timeout(Duration::from_secs(60));
+        assert!(
+            c.cpu_seconds >= 60 * cores,
+            "{} CPU-seconds would kill legitimate parallel work on {cores} cores",
+            c.cpu_seconds
+        );
+        // …and it must still be finite and scale with the budget, not a constant.
+        assert!(
+            ResourceCeilings::for_timeout(Duration::from_secs(600)).cpu_seconds > c.cpu_seconds,
+            "the CPU ceiling must track the wall budget"
+        );
+    }
+
     // ── macOS-only: the real Seatbelt sandbox ────────────────────────────────
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_spawn_installs_the_resource_ceilings() {
+        // The ceilings must be wired into the REAL spawner, not merely
+        // available: this is what fails if `apply_ceilings` is dropped from
+        // MacSeatbeltSpawn::spawn.
+        let ws = std::env::temp_dir().join(format!("lhp-sb-rl-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("lhp-sb-rltmp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut s = spec("ulimit -Sn; ulimit -Hn; ulimit -St");
+        s.workspace_root = ws.clone();
+        s.tmp_root = tmp.clone();
+        s.timeout = Duration::from_secs(10);
+        let out = run_guarded(&MacSeatbeltSpawn, &s)
+            .await
+            .expect("must run under Seatbelt");
+        assert_eq!(out.exit_code, Some(0), "stderr: {}", out.stderr);
+
+        let expected = ResourceCeilings::for_timeout(Duration::from_secs(10));
+        let seen: Vec<&str> = out.stdout.split_whitespace().collect();
+        assert_eq!(
+            seen,
+            vec![
+                OPEN_FILES_CEILING.to_string(),
+                OPEN_FILES_CEILING.to_string(),
+                expected.cpu_seconds.to_string(),
+            ],
+            "the real spawner did not install the ceilings: {:?}",
+            out.stdout
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     // ── M-15: seatbelt_escape_path adversarial tests ──────────────────────
 
