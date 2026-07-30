@@ -16,6 +16,8 @@
 //!   - Skip comment lines starting with `:`.
 //!   - Skip empty `data:` lines (keep-alives).
 //!   - Skip lines whose payload is not valid JSON (treat as keep-alive).
+//!   - A line longer than `MAX_LINE_LENGTH` → `SseEvent::Error` and the stream
+//!     terminates. It is never skipped: one frame can carry the entire turn.
 //!   - `[DONE]` sentinel → `SseEvent::Done`, then `None`.
 //!   - `json.error` → `SseEvent::Error(msg)`. Stream continues after; the
 //!     caller decides whether to terminate.
@@ -80,10 +82,21 @@ pub struct SseStream {
     finished: bool,
 }
 
-/// Maximum length of a single SSE line (including the `data:` prefix and
-/// trailing newline). Lines beyond this are treated as malformed and
-/// skipped (M-01).
-const MAX_LINE_LENGTH: usize = 16 * 1024; // 16 KiB
+/// Maximum length of a single SSE line (including the `data:` prefix).
+///
+/// A line beyond this is a hard, surfaced FAILURE (`SseEvent::Error`, stream
+/// terminated) — never a silent skip. One SSE frame can legitimately carry an
+/// entire assistant turn (LiteLLM-style fake streaming, a buffering reverse
+/// proxy, several local OpenAI-shim servers) or a whole tool-call argument, so
+/// dropping an over-cap line as a keep-alive persists an empty reply and
+/// dispatches no tool call, with nothing the user can see. Loud failure only.
+///
+/// The value sits deliberately below `MAX_BUFFER_SIZE`: the buffer cap is what
+/// actually bounds our memory use, and it is checked before bytes are appended,
+/// so a line cap at or above it could never be reached. 256 KiB admits a
+/// realistic single-frame completion (16 KiB did not — it is roughly 4k tokens
+/// of text) while keeping the parse of any one line bounded (M-01).
+pub(crate) const MAX_LINE_LENGTH: usize = 256 * 1024; // 256 KiB
 
 /// Maximum total bytes the SSE buffer can accumulate before we refuse to
 /// append more data. Prevents OOM from a provider that streams an
@@ -190,11 +203,23 @@ impl SseStream {
         if line.ends_with('\r') {
             line.pop();
         }
-        // Enforce per-line length cap. Lines that exceed MAX_LINE_LENGTH
-        // are skipped (treated as a no-op keep-alive) rather than being
-        // parsed and potentially OOM-ing the caller (M-01).
+        // Enforce the per-line length cap (M-01). An over-cap line is a
+        // TERMINAL, SURFACED failure — never a silent skip: one frame can carry
+        // the entire assistant turn (single-frame `message.content`) or a whole
+        // tool call's `arguments`, so discarding it as a keep-alive persisted an
+        // empty assistant message and dispatched no tool call, with no error the
+        // user could see. Name the cap and the observed size so the diagnostic
+        // is actionable (HI3).
         if line.len() > MAX_LINE_LENGTH {
-            return Some(SseEvent::KeepAlive);
+            self.finished = true;
+            return Some(SseEvent::Error(format!(
+                "SSE line of {} bytes exceeds the {}-byte per-line cap ({} KiB) — \
+                 the provider sent one frame larger than this parser accepts, \
+                 so the reply was not delivered",
+                line.len(),
+                MAX_LINE_LENGTH,
+                MAX_LINE_LENGTH / 1024
+            )));
         }
         Some(self.parse_line(&line))
     }
