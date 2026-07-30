@@ -168,7 +168,12 @@ pub fn run() {
             // offsets). Both implement `Classifier`, so the message-level §7
             // gate and the tool gating chain classify identically either way.
             // Shared via Arc; a missing model dir never breaks boot.
+            // C-01: ONE shared health flag, read by every gate AND by the IPC
+            // layer (`get_classifier_health` → the UI's degraded banner). A
+            // degraded flag nobody can observe is not a fix, so this is
+            // deliberately shared state rather than a per-gate bool.
             let classifier_models = base_path.join("models").join("classifier");
+            let classifier_health: Arc<crate::classifier::ClassifierHealth>;
             let classifier: Arc<dyn crate::classifier::Classifier> =
                 match crate::classifier::EnsembleClassifier::load(&classifier_models) {
                     Ok(ensemble) => {
@@ -177,14 +182,17 @@ pub fn run() {
                             path = %classifier_models.display(),
                             "loaded trained ONNX ensemble classifier"
                         );
+                        classifier_health = crate::classifier::ClassifierHealth::healthy();
                         Arc::new(ensemble)
                     }
                     Err(e) => {
-                        tracing::info!(
+                        tracing::warn!(
                             target: "lhp::classifier",
                             reason = %e,
-                            "trained classifier unavailable — using rules-only classifier"
+                            "trained classifier unavailable — fail-closed (degraded mode)"
                         );
+                        classifier_health =
+                            crate::classifier::ClassifierHealth::degraded_with(e.to_string());
                         Arc::new(RulesClassifier::new())
                     }
                 };
@@ -213,8 +221,12 @@ pub fn run() {
                 });
             }
 
-            // §7 Privacy Gate for message egress.
-            let gate = PrivacyGate::new(Arc::clone(&classifier));
+            // §7 Privacy Gate for message egress. C-01: shares the boot health
+            // flag, so a failed trained-classifier load keeps Auto+cloud local.
+            let gate = PrivacyGate::with_health(
+                Arc::clone(&classifier),
+                Arc::clone(&classifier_health),
+            );
 
             // §3.5 approval spine: the shared grant ledger, the pending-prompt
             // registry, and the Tauri prompter that raises an in-app
@@ -259,6 +271,12 @@ pub fn run() {
             let tools = Arc::new(build_tool_dispatcher(
                 &base_path,
                 Arc::clone(&classifier),
+                // C-01 + H-12: the tool-hook chain's gate is a CLONE of the
+                // message gate, so it shares the degraded flag (otherwise the
+                // tool path silently bypasses fail-closed handling) AND the
+                // one-send confirmation store (otherwise a confirmation the user
+                // granted can never be consumed on the tool path).
+                gate.clone(),
                 Arc::clone(&ledger),
                 Some(Arc::clone(&prompter)),
                 (*storage).clone(),
@@ -294,6 +312,10 @@ pub fn run() {
             // C3: the live MCP runtime (spawned children, derived session state).
             let mcp_runtime = Arc::new(crate::tools::mcp_stdio::McpRuntime::new());
 
+            // Clone BEFORE the loop takes ownership — `PrivacyGate::clone` shares
+            // the health flag and the confirmation store, so `AppState.gate` and
+            // the loop's gate are the same gate for observation/confirmation.
+            let gate_for_state = gate.clone();
             let agent_loop = AgentLoop::new(
                 gate,
                 Arc::clone(&model_manager),
@@ -414,6 +436,9 @@ pub fn run() {
                 approvals,
                 ask_human,
                 classifier: Arc::clone(&classifier),
+                // C-01 / H-12: same gate the loop enforces with (Arc-shared
+                // health flag + one-send confirmation store).
+                gate: gate_for_state,
                 embedder,
                 // C4: the live dispatcher, for hot-(un)registering skill tools.
                 tools: Arc::clone(&tools),
@@ -555,6 +580,10 @@ pub fn run() {
             ipc::set_redaction_enabled,
             ipc::reset_classifier_settings,
             ipc::explain_classification,
+            // C-01 / H-12: the read side of the degraded flag + the one-send
+            // confirmation grant.
+            ipc::get_classifier_health,
+            ipc::confirm_public_send,
             ipc::list_memory,
             ipc::save_memory,
             ipc::delete_memory,
@@ -811,6 +840,12 @@ fn backfill_one_memory_db(
 fn build_tool_dispatcher(
     base_path: &std::path::Path,
     classifier: Arc<dyn crate::classifier::Classifier>,
+    // The tool-hook chain's gate. Pass a `clone()` of the message-egress gate,
+    // never a freshly constructed one: `PrivacyGate::clone` shares BOTH the
+    // C-01 health flag and the H-12 one-send confirmation store, so a degraded
+    // classifier degrades this path too and an `ipc::confirm_public_send` grant
+    // is consumable here.
+    gate: crate::agent::gate::PrivacyGate,
     ledger: Arc<crate::hooks::ApprovalLedger>,
     approver: Option<Arc<dyn crate::hooks::ApprovalPrompter>>,
     storage: crate::storage::Storage,
@@ -1057,7 +1092,12 @@ fn build_tool_dispatcher(
     );
 
     let mut chain = build_pretooluse_chain_full(
-        PrivacyGate::new(classifier),
+        // C-01 / H-12: the caller's gate — a `clone()` of the message-egress
+        // gate. It was `PrivacyGate::new(classifier)` (never degraded), then
+        // `PrivacyGate::with_health(...)` (degrades correctly, but with a FRESH
+        // confirmation store, so an IPC-granted one-send confirmation could
+        // never be consumed here). A clone shares both.
+        gate,
         Box::new(layered),
         &pre_trusted_refs,
         Arc::clone(&ledger),
@@ -1102,4 +1142,206 @@ fn build_tool_dispatcher(
         // C2: the durability journal — every mutating tool execution writes a
         // work_items row before the effect (idempotency-keyed, crash-reconciled).
         .with_journal(Arc::new(journal_storage))
+}
+
+// ── C-01: the TOOL path must degrade with the message path ──────────────────
+
+/// This module exists for exactly one reason: `build_tool_dispatcher` needs the
+/// TOOL path's `PrivacyGate` to be the message gate, not a look-alike. It used
+/// to build one with `PrivacyGate::new(classifier)` (never degraded — every tool
+/// call bypassed C-01's fail-closed rule while chat messages honoured it), then
+/// with `PrivacyGate::with_health(...)` (degrades correctly, but with a FRESH
+/// H-12 confirmation store, so a confirmation the user granted through
+/// `ipc::confirm_public_send` could never be consumed on the tool path). It now
+/// takes a `clone()` of the message gate, which shares both. The tests drive the
+/// REAL dispatcher (real registry, real hook chain) rather than asserting on a
+/// constructor, so re-introducing either bug fails the suite.
+#[cfg(test)]
+mod tool_path_degraded_tests {
+    use std::sync::Arc;
+
+    use crate::agent::gate::{Binding, PrivacyGate};
+    use crate::classifier::ClassifierHealth;
+    use crate::tools::calling::ToolCall;
+    use crate::tools::dispatch::ToolOutcome;
+    use crate::tools::ExecCtx;
+
+    fn dispatcher_with_gate(
+        gate: PrivacyGate,
+        ledger: Arc<crate::hooks::ApprovalLedger>,
+    ) -> (crate::tools::ToolDispatcher, std::path::PathBuf) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("lhp-tool-degraded-{}", uuid::Uuid::new_v4()));
+        let storage = crate::storage::Storage::open(&dir).expect("temp storage");
+        let d = super::build_tool_dispatcher(
+            &dir,
+            Arc::new(crate::classifier::RulesClassifier::new()),
+            gate,
+            ledger,
+            None,
+            storage,
+            None,
+            None,
+            None,
+            Arc::new(crate::models::ModelManager::new()),
+            Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+        );
+        (d, dir)
+    }
+
+    /// `system_status` is `RiskClass::Safe` (pre-trusted, no approval prompt) and
+    /// its args are benign, so the ONLY thing that can hold it back on a cloud
+    /// endpoint under `Auto` is the privacy filter's degraded fail-closed rule.
+    async fn status_outcome(health: Arc<ClassifierHealth>) -> ToolOutcome {
+        // Production shape: ONE message gate, and the tool path gets a clone.
+        let message_gate =
+            PrivacyGate::with_health(Arc::new(crate::classifier::RulesClassifier::new()), health);
+        let (d, _dir) = dispatcher_with_gate(
+            message_gate.clone(),
+            Arc::new(crate::hooks::ApprovalLedger::new()),
+        );
+        let call = ToolCall {
+            name: "system_status".to_string(),
+            args: serde_json::json!({}),
+        };
+        let ctx = ExecCtx {
+            conversation_id: "conv-degraded".to_string(),
+            profile: "personal".to_string(),
+            ..Default::default()
+        };
+        d.dispatch(&call, &ctx, Binding::Auto, true).await
+    }
+
+    #[tokio::test]
+    async fn a_degraded_classifier_holds_tool_calls_off_cloud_too() {
+        // CONTROL: healthy ⇒ the call runs on a cloud-endpoint turn.
+        let healthy = status_outcome(ClassifierHealth::healthy()).await;
+        assert!(
+            matches!(healthy, ToolOutcome::Ok(_)),
+            "control: a healthy classifier must let a Safe tool run, got {healthy:?}"
+        );
+
+        // C-01: degraded ⇒ the dispatcher reports the call must move on-device.
+        // `NeedsLocalReroute` (not `Denied`) is the correct shape: the tool was
+        // NOT run, and the caller may retry against a local endpoint.
+        let degraded = status_outcome(ClassifierHealth::degraded_with("models missing")).await;
+        assert!(
+            matches!(degraded, ToolOutcome::NeedsLocalReroute { .. }),
+            "a degraded classifier must not let the TOOL path egress, got {degraded:?}"
+        );
+    }
+
+    /// F3: the tool-hook gate must consume from the SAME
+    /// `PublicSendConfirmations` store the IPC command grants into. Driven
+    /// end-to-end through the real dispatcher, so it fails if
+    /// `build_tool_dispatcher` is ever handed a separately-constructed gate
+    /// (`PrivacyGate::new`/`with_health`) instead of a clone.
+    #[tokio::test]
+    async fn a_confirmation_granted_on_the_message_gate_is_consumable_on_the_tool_path() {
+        // `system_status` is Safe/pre-trusted and ignores its args, so the ONLY
+        // gate in play is the privacy filter. The IPv4 literal is an un-tunable
+        // rules-floor hit (`RuleCategory::PiiContact`), which under `Public`
+        // binding on a cloud turn is exactly the H-12 confirm case.
+        let args = serde_json::json!({ "note": "reach 10.0.0.26 for the box" });
+        let call = ToolCall {
+            name: "system_status".to_string(),
+            args: args.clone(),
+        };
+        let ctx = ExecCtx {
+            conversation_id: "conv-confirm".to_string(),
+            profile: "personal".to_string(),
+            ..Default::default()
+        };
+        // What `PrivacyFilterHook` feeds the gate — `dispatch_inner`'s canonical
+        // form of the call.
+        let canonical = format!("system_status {args}");
+
+        let message_gate = PrivacyGate::with_health(
+            Arc::new(crate::classifier::RulesClassifier::new()),
+            ClassifierHealth::healthy(),
+        );
+        let (d, _dir) = dispatcher_with_gate(
+            message_gate.clone(),
+            Arc::new(crate::hooks::ApprovalLedger::new()),
+        );
+
+        // CONTROL: no confirmation on file ⇒ the tool path asks for one. (No
+        // approver is wired in this dispatcher, so the Ask is surfaced.)
+        let unconfirmed = d.dispatch(&call, &ctx, Binding::Public, true).await;
+        match &unconfirmed {
+            ToolOutcome::Ask { by, .. } => assert_eq!(
+                by, "privacy_filter",
+                "the privacy floor must be what asks, got {unconfirmed:?}"
+            ),
+            other => panic!("expected an Ask from the privacy floor, got {other:?}"),
+        }
+
+        // The user confirms on the MESSAGE gate (what `ipc::confirm_public_send`
+        // does — it only has `AppState.gate`).
+        message_gate.confirm_public_send(&canonical);
+
+        // ...and the TOOL path consumes that grant.
+        let confirmed = d.dispatch(&call, &ctx, Binding::Public, true).await;
+        assert!(
+            matches!(confirmed, ToolOutcome::Ok(_)),
+            "a confirmation granted on the message gate must be consumable by the \
+             tool-hook gate, got {confirmed:?}"
+        );
+
+        // ...exactly once: the next identical call asks again.
+        let again = d.dispatch(&call, &ctx, Binding::Public, true).await;
+        assert!(
+            matches!(again, ToolOutcome::Ask { .. }),
+            "one confirmation authorises one call, got {again:?}"
+        );
+    }
+
+    /// F2: the privacy filter's `Ask` must be SETTLEABLE from the dispatcher's
+    /// shared `ApprovalLedger` — that is the whole recovery route, and it exists
+    /// only because `build_pretooluse_chain_full` threads the ledger into
+    /// `PrivacyFilterHook`. Driven through the real dispatcher so dropping that
+    /// wiring fails here, not just in the hook's own unit tests.
+    #[tokio::test]
+    async fn an_approval_recorded_by_the_dispatcher_settles_the_privacy_confirm() {
+        let args = serde_json::json!({ "note": "reach 10.0.0.26 for the box" });
+        let call = ToolCall {
+            name: "system_status".to_string(),
+            args: args.clone(),
+        };
+        let ctx = ExecCtx {
+            conversation_id: "conv-approve".to_string(),
+            profile: "personal".to_string(),
+            ..Default::default()
+        };
+        let ledger = Arc::new(crate::hooks::ApprovalLedger::new());
+        let gate = PrivacyGate::with_health(
+            Arc::new(crate::classifier::RulesClassifier::new()),
+            ClassifierHealth::healthy(),
+        );
+        let (d, _dir) = dispatcher_with_gate(gate, Arc::clone(&ledger));
+
+        // CONTROL: nothing granted ⇒ the floor asks.
+        let asked = d.dispatch(&call, &ctx, Binding::Public, true).await;
+        assert!(
+            matches!(asked, ToolOutcome::Ask { .. }),
+            "control: an ungranted floor hit must ask, got {asked:?}"
+        );
+
+        // What `ToolDispatcher` records when the human approves "just this
+        // action" (`resolve_grant` → `(Once, Fingerprint)`).
+        ledger.grant(
+            crate::hooks::approval::GrantTarget::Fingerprint(
+                crate::hooks::approval::ActionFingerprint::of(&call.name, &call.args),
+            ),
+            crate::hooks::approval::GrantScope::Once,
+        );
+
+        let approved = d.dispatch(&call, &ctx, Binding::Public, true).await;
+        assert!(
+            matches!(approved, ToolOutcome::Ok(_)),
+            "the approval must let the call through instead of looping to the \
+             round cap, got {approved:?}"
+        );
+    }
 }

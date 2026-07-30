@@ -36,8 +36,20 @@ export interface Message {
   streaming: boolean;
   /** Set when a stream:error landed for this message. */
   error?: string;
-  /** Source of the error: "gate" | "routing" | "model" | null. */
+  /**
+   * Source of the error: "gate" | "gate_confirm" | "routing" | "model" | null.
+   *
+   * H-12: `"gate_confirm"` is an ACTIONABLE hold, not a dead error — a
+   * `Public`-bound message hit the un-tunable structured-secret floor and the
+   * user may authorise one send (`confirmPublicSend` + re-send).
+   */
   error_source?: string | null;
+  /**
+   * H-12: the user text this turn was holding, kept only for a
+   * `"gate_confirm"` hold so the "send it once anyway" affordance can re-send
+   * byte-identical text (the confirmation is fingerprinted over it).
+   */
+  held_content?: string | null;
   /**
    * The §7 gate's decision for this turn: "allow" | "route_local" | "block".
    * `null`/undefined while a fresh send hasn't resolved yet. A `Block`
@@ -387,13 +399,18 @@ export async function sendMessage(
       // A gate-sourced stream:error IS the "block" decision — the backend
       // never persists a routing_decision for it (no row is written), so
       // this live flag is the only place that fact is ever recorded.
+      // H-12: `"gate_confirm"` is the same "nothing was sent" shape, but it is
+      // recoverable — stash the exact held text so the inline affordance can
+      // re-send it byte-identically after `confirmPublicSend` (the grant is
+      // fingerprinted over the text, so a re-typed variant would not match).
       finalizeMessage(
         conversationId,
         targetId,
         `⚠ ${error}`,
         error,
         source,
-        source === "gate" ? "block" : undefined,
+        source === "gate" || source === "gate_confirm" ? "block" : undefined,
+        source === "gate_confirm" ? content.trim() : undefined,
       );
     } else {
       // Success path. If no token stream established the id yet (e.g. an
@@ -550,6 +567,7 @@ function finalizeMessage(
   error?: string,
   errorSource?: string,
   routingDecision?: string,
+  heldContent?: string,
 ): void {
   conversations.update((list) =>
     list.map((c) =>
@@ -565,6 +583,7 @@ function finalizeMessage(
                     error: error ?? m.error,
                     error_source: errorSource ?? m.error_source,
                     routing_decision: routingDecision ?? m.routing_decision,
+                    held_content: heldContent ?? m.held_content,
                   }
                 : m,
             ),

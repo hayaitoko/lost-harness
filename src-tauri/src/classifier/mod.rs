@@ -129,8 +129,8 @@ impl ClassifierConfig {
     pub fn from_ui(strictness: u8, band: &str) -> Self {
         let s = strictness.min(100) as f32;
         // tau_band = DEFAULT * 10^((50 - s)/50): s=50→0.05, s=0→0.5, s=100→0.005.
-        let tau_band =
-            (Self::DEFAULT_TAU_BAND * 10f32.powf((50.0 - s) / 50.0)).clamp(Self::TAU_BAND_MIN, Self::TAU_BAND_MAX);
+        let tau_band = (Self::DEFAULT_TAU_BAND * 10f32.powf((50.0 - s) / 50.0))
+            .clamp(Self::TAU_BAND_MIN, Self::TAU_BAND_MAX);
         let frac = match band {
             "narrow" => Self::BAND_FRAC_NARROW,
             "wide" => Self::BAND_FRAC_WIDE,
@@ -205,7 +205,12 @@ impl ClassifierConfig {
                 fallback
             }
         };
-        let tau_band = in_range(self.tau_band, Self::TAU_BAND_MIN, Self::TAU_BAND_MAX, d.tau_band);
+        let tau_band = in_range(
+            self.tau_band,
+            Self::TAU_BAND_MIN,
+            Self::TAU_BAND_MAX,
+            d.tau_band,
+        );
         // tau_block must sit in [tau_band, TAU_BLOCK_MAX]; out of range → default,
         // then floored at tau_band so the ordering invariant always holds.
         let tau_block =
@@ -214,6 +219,68 @@ impl ClassifierConfig {
             tau_block,
             tau_band,
         }
+    }
+}
+
+/// C-01: observable health of the **active** classifier.
+///
+/// The gate can only fail closed if something can *see* that it is failing
+/// closed. This is that something: one `Arc<ClassifierHealth>` is created at
+/// boot (`lib.rs`), handed to **every** [`crate::agent::gate::PrivacyGate`] —
+/// the message-egress gate AND the tool-hook chain's gate — and held in
+/// `ipc::AppState` so `get_classifier_health` can report it to the UI banner.
+/// A flag nobody can read is not a fix, so `degraded` deliberately lives here
+/// (shared, observable) rather than as a private `bool` inside the gate.
+///
+/// `degraded == true` means "the trained ONNX ensemble is unavailable; only the
+/// deterministic rules fallback is screening egress". The gate's `Auto` binding
+/// then refuses cloud egress outright (see `PrivacyGate::check_detailed`).
+#[derive(Debug)]
+pub struct ClassifierHealth {
+    degraded: std::sync::atomic::AtomicBool,
+    /// Why it is degraded (the `EnsembleClassifier::load` error), for the UI.
+    reason: std::sync::Mutex<Option<String>>,
+}
+
+impl Default for ClassifierHealth {
+    fn default() -> Self {
+        Self {
+            degraded: std::sync::atomic::AtomicBool::new(false),
+            reason: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl ClassifierHealth {
+    /// The trained ensemble loaded — full screening.
+    pub fn healthy() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// The trained ensemble did NOT load — reduced screening, gate fails closed.
+    pub fn degraded_with(reason: impl Into<String>) -> std::sync::Arc<Self> {
+        let h = Self::default();
+        h.mark_degraded(reason);
+        std::sync::Arc::new(h)
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The recorded reason, if degraded.
+    pub fn reason(&self) -> Option<String> {
+        self.reason.lock().ok().and_then(|r| r.clone())
+    }
+
+    /// Flip to degraded (one-way — screening never silently "recovers" without
+    /// a restart that actually re-loads the models).
+    pub fn mark_degraded(&self, reason: impl Into<String>) {
+        if let Ok(mut slot) = self.reason.lock() {
+            *slot = Some(reason.into());
+        }
+        self.degraded
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -258,9 +325,18 @@ mod config_tests {
             "higher strictness must LOWER tau_band (more paranoid)"
         );
         // The log map puts the historical default 0.05 at the slider midpoint.
-        assert!((default_ish.tau_band - 0.05).abs() < 1e-4, "s=50 ⇒ tau_band≈0.05");
-        assert!((permissive.tau_band - 0.5).abs() < 1e-4, "s=0 ⇒ tau_band≈0.5");
-        assert!((paranoid.tau_band - 0.005).abs() < 1e-4, "s=100 ⇒ tau_band≈0.005");
+        assert!(
+            (default_ish.tau_band - 0.05).abs() < 1e-4,
+            "s=50 ⇒ tau_band≈0.05"
+        );
+        assert!(
+            (permissive.tau_band - 0.5).abs() < 1e-4,
+            "s=0 ⇒ tau_band≈0.5"
+        );
+        assert!(
+            (paranoid.tau_band - 0.005).abs() < 1e-4,
+            "s=100 ⇒ tau_band≈0.005"
+        );
     }
 
     #[test]
@@ -270,7 +346,10 @@ mod config_tests {
         let narrow = ClassifierConfig::from_ui(50, "narrow");
         let medium = ClassifierConfig::from_ui(50, "medium");
         let wide = ClassifierConfig::from_ui(50, "wide");
-        assert_eq!(narrow.tau_band, medium.tau_band, "band must not move the egress line");
+        assert_eq!(
+            narrow.tau_band, medium.tau_band,
+            "band must not move the egress line"
+        );
         assert_eq!(wide.tau_band, medium.tau_band);
         assert!(
             narrow.tau_block < medium.tau_block && medium.tau_block < wide.tau_block,
@@ -279,7 +358,10 @@ mod config_tests {
         // Default (medium) reproduces the historical tau_block 0.5.
         assert!((medium.tau_block - 0.5).abs() < 1e-4);
         // Unknown band falls back to medium.
-        assert_eq!(ClassifierConfig::from_ui(50, "bogus").tau_block, medium.tau_block);
+        assert_eq!(
+            ClassifierConfig::from_ui(50, "bogus").tau_block,
+            medium.tau_block
+        );
     }
 
     #[test]
@@ -301,7 +383,11 @@ mod config_tests {
 
         // NaN / negative → default (garbage, not a valid choice).
         assert_eq!(
-            ClassifierConfig { tau_block: f32::NAN, tau_band: -1.0 }.sanitized(),
+            ClassifierConfig {
+                tau_block: f32::NAN,
+                tau_band: -1.0
+            }
+            .sanitized(),
             ClassifierConfig::default()
         );
 
@@ -309,24 +395,53 @@ mod config_tests {
         // (legal floats, order satisfied) used to slip through and make the
         // filter far leakier than any legit setting. It must now reset to
         // default, NOT pass through.
-        let repro = ClassifierConfig { tau_block: 0.999, tau_band: 0.999 }.sanitized();
-        assert_eq!(repro, ClassifierConfig::default(), "leaky corrupt row must reset to default");
+        let repro = ClassifierConfig {
+            tau_block: 0.999,
+            tau_band: 0.999,
+        }
+        .sanitized();
+        assert_eq!(
+            repro,
+            ClassifierConfig::default(),
+            "leaky corrupt row must reset to default"
+        );
 
         // The 0.4-band repro likewise: tau_band 0.4 is within the reachable
         // range (≈ strictness 9), so it stays; tau_block 2.0 is garbage → default,
         // floored at tau_band. The result is never looser than strictness 0.
-        let partial = ClassifierConfig { tau_block: 2.0, tau_band: 0.4 }.sanitized();
-        assert!(partial.tau_band <= loosest.tau_band, "tau_band never looser than strictness 0");
-        assert!(partial.tau_block >= partial.tau_band, "ordering invariant holds");
+        let partial = ClassifierConfig {
+            tau_block: 2.0,
+            tau_band: 0.4,
+        }
+        .sanitized();
+        assert!(
+            partial.tau_band <= loosest.tau_band,
+            "tau_band never looser than strictness 0"
+        );
+        assert!(
+            partial.tau_block >= partial.tau_band,
+            "ordering invariant holds"
+        );
 
         // Property: NO sanitized output is looser (higher tau_band) than the
         // loosest legitimate config, for a spread of garbage inputs.
-        for (tb, tba) in [(2.0, 5.0), (0.999, 0.999), (-1.0, 0.7), (0.3, 0.8), (f32::INFINITY, 0.6)] {
-            let s = ClassifierConfig { tau_block: tb, tau_band: tba }.sanitized();
+        for (tb, tba) in [
+            (2.0, 5.0),
+            (0.999, 0.999),
+            (-1.0, 0.7),
+            (0.3, 0.8),
+            (f32::INFINITY, 0.6),
+        ] {
+            let s = ClassifierConfig {
+                tau_block: tb,
+                tau_band: tba,
+            }
+            .sanitized();
             assert!(
                 s.tau_band <= loosest.tau_band + 1e-6,
                 "sanitized {tb},{tba} → tau_band {} exceeds loosest legit {}",
-                s.tau_band, loosest.tau_band
+                s.tau_band,
+                loosest.tau_band
             );
             assert!(s.tau_band > 0.0 && s.tau_block >= s.tau_band && s.tau_block <= 0.95);
         }

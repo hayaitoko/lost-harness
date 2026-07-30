@@ -69,7 +69,7 @@ fn test_app() -> App<MockRuntime> {
     // shared between the loop and AppState (skill hot-registration commands).
     let tools = Arc::new(crate::tools::ToolDispatcher::empty());
     let agent_loop = Arc::new(AgentLoop::new(
-        gate,
+        gate.clone(),
         Arc::clone(&model_manager),
         Arc::clone(&storage),
         Arc::clone(&tools),
@@ -84,6 +84,7 @@ fn test_app() -> App<MockRuntime> {
         approvals: Arc::new(crate::ipc::approval::ApprovalRegistry::new()),
         ask_human: Arc::new(crate::ipc::ask_human::AskHumanRegistry::new()),
         classifier: Arc::new(HeuristicClassifier::new()),
+        gate,
         embedder: None,
         tools,
         mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new()),
@@ -177,6 +178,8 @@ fn test_app() -> App<MockRuntime> {
             ipc::set_google_task_completed,
             ipc::delete_google_task,
             ipc::explain_classification,
+            ipc::get_classifier_health,
+            ipc::confirm_public_send,
             ipc::list_memory,
             ipc::save_memory,
             ipc::delete_memory,
@@ -1301,4 +1304,105 @@ fn every_no_arg_command_dispatches() {
             );
         }
     }
+}
+
+// ── C-01 / H-12: the gate's state is reachable from the real IPC table ──────
+
+/// C-01's finding was that the degraded flag had **zero call sites**. This test
+/// is the structural answer: it drives `get_classifier_health` through the real
+/// `generate_handler!` table against the real `AppState`, and proves the value it
+/// reports tracks the shared `ClassifierHealth` arc the GATE enforces on — i.e.
+/// that flipping the gate's flag actually changes what the UI would be told.
+#[test]
+fn get_classifier_health_reports_the_gates_shared_degraded_flag() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    let before: Value = call(&webview, "get_classifier_health", json!({}))
+        .expect("get_classifier_health must dispatch")
+        .deserialize()
+        .expect("valid JSON");
+    assert_eq!(before["degraded"], false, "the harness gate starts healthy");
+    assert!(
+        before["confirm_ttl_secs"].as_u64().unwrap_or(0) > 0,
+        "the UI needs a real TTL to display: {before:?}"
+    );
+
+    // Flip the flag on the gate the agent loop enforces with.
+    app.state::<AppState>()
+        .gate
+        .health()
+        .mark_degraded("models dir missing");
+
+    let after: Value = call(&webview, "get_classifier_health", json!({}))
+        .expect("get_classifier_health must dispatch")
+        .deserialize()
+        .expect("valid JSON");
+    assert_eq!(
+        after["degraded"], true,
+        "the IPC read must observe the gate's flag, not a stale copy"
+    );
+    assert_eq!(after["reason"], "models dir missing");
+}
+
+/// H-12: the confirmation round trip, end to end through the command table.
+/// One `confirm_public_send` authorises exactly ONE subsequent send of that
+/// exact text, then the gate asks again.
+#[test]
+fn confirm_public_send_authorises_exactly_one_send_through_the_real_gate() {
+    use crate::agent::gate::{Binding, GateDecision};
+    use crate::classifier::ClassifierConfig;
+
+    let app = test_app();
+    let webview = test_webview(&app);
+    let gate = app.state::<AppState>().gate.clone();
+    let cfg = ClassifierConfig::default();
+    let text = "my SSN is 123-45-6789";
+
+    // Before any confirmation the gate holds the message.
+    assert!(matches!(
+        gate.check(&Binding::Public, text, true, &cfg),
+        GateDecision::ConfirmRequired { .. }
+    ));
+
+    let res: Value = call(
+        &webview,
+        "confirm_public_send",
+        json!({ "args": { "text": text } }),
+    )
+    .expect("confirm_public_send must dispatch with wrapped args")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(
+        res["fingerprint"].as_str().unwrap_or_default().len(),
+        64,
+        "a sha256 fingerprint: {res:?}"
+    );
+
+    // The grant landed on the SAME gate the loop uses → the send goes through...
+    assert_eq!(
+        gate.check(&Binding::Public, text, true, &cfg),
+        GateDecision::Allow
+    );
+    // ...exactly once.
+    assert!(
+        matches!(
+            gate.check(&Binding::Public, text, true, &cfg),
+            GateDecision::ConfirmRequired { .. }
+        ),
+        "one confirmation must not authorise a second send"
+    );
+}
+
+#[test]
+fn confirm_public_send_rejects_the_old_unwrapped_arg_shape() {
+    let app = test_app();
+    let webview = test_webview(&app);
+    let err = call(&webview, "confirm_public_send", json!({ "text": "x" }))
+        .expect_err("flat/unwrapped args must NOT dispatch");
+    let msg = err.as_str().unwrap_or_default();
+    assert!(
+        is_ipc_arg_rejection(msg),
+        "expected an IPC-level arg rejection, got: {msg}"
+    );
 }

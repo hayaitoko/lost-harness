@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
-use crate::classifier::{Classifier, ClassifierConfig};
+use crate::classifier::{Classifier, ClassifierConfig, ClassifierHealth};
 
 /// Whether a piece of speech (a TTS reply prefix, or raw STT audio) may be sent
 /// to a CLOUD speech service.
@@ -50,8 +50,22 @@ pub struct AudioEgressGate {
 }
 
 impl AudioEgressGate {
-    pub fn new(classifier: Arc<dyn Classifier>) -> Self {
-        Self { gate: PrivacyGate::new(classifier) }
+    /// `health` is the app's SHARED [`ClassifierHealth`] — the same `Arc` the
+    /// message-egress gate and the tool-hook gate hold.
+    ///
+    /// It is a required argument on purpose. This used to be
+    /// `new(classifier)` → `PrivacyGate::new(classifier)`, which builds a
+    /// permanently NON-degraded gate: C-01's fail-closed rule (a missing trained
+    /// ONNX ensemble must keep `Auto` + cloud on-device) could never fire at the
+    /// audio boundary. Nothing constructed this in production yet, so nothing was
+    /// bypassed — but wiring the voice loop up to a defaulted constructor would
+    /// have silently given the newest egress boundary the weakest gate. Passing
+    /// `ClassifierHealth::healthy()` is now an explicit, greppable choice rather
+    /// than the path of least resistance.
+    pub fn new(classifier: Arc<dyn Classifier>, health: Arc<ClassifierHealth>) -> Self {
+        Self {
+            gate: PrivacyGate::with_health(classifier, health),
+        }
     }
 
     /// Decide whether the reply text SO FAR (`cumulative_prefix` — a superset of
@@ -69,7 +83,11 @@ impl AudioEgressGate {
         if !is_cloud_tts {
             return AudioEgressDecision::Allow; // local TTS never crosses an egress boundary
         }
-        match self.gate.check_detailed(binding, cumulative_prefix, true, cfg).0 {
+        match self
+            .gate
+            .check_detailed(binding, cumulative_prefix, true, cfg)
+            .0
+        {
             GateDecision::Allow => {
                 // `Public` binding bypasses the tunable classifier in the text
                 // gate (the user chose cloud for TEXT). The un-tunable FLOOR
@@ -89,9 +107,22 @@ impl AudioEgressGate {
                     AudioEgressDecision::Allow
                 }
             }
+            // H-12: the TEXT gate now raises its own expiring one-send
+            // confirmation for a `Public`-bound structured-secret floor hit. That
+            // is the same verdict this boundary wants — but the confirmation must
+            // stay pinned to the AUDIO boundary's fingerprint domain and resolve
+            // through `ApprovalLedger` (B9), so a text-send confirmation can
+            // never double as a cloud-TTS authorisation. Re-mint accordingly.
+            GateDecision::ConfirmRequired { .. } => {
+                let fp = crate::hooks::approval::ActionFingerprint::of(
+                    "tts_cloud_egress",
+                    &serde_json::json!({ "text": cumulative_prefix }),
+                );
+                AudioEgressDecision::ConfirmRequired(fp)
+            }
             // Block / RouteLocal — the same verdict the text gate reached; a
             // cloud voice service must not see it either.
-            _ => AudioEgressDecision::Withhold,
+            GateDecision::Block(_) | GateDecision::RouteLocal => AudioEgressDecision::Withhold,
         }
     }
 
@@ -151,7 +182,10 @@ mod tests {
     use crate::classifier::RulesClassifier;
 
     fn gate() -> AudioEgressGate {
-        AudioEgressGate::new(Arc::new(RulesClassifier::new()))
+        AudioEgressGate::new(
+            Arc::new(RulesClassifier::new()),
+            ClassifierHealth::healthy(),
+        )
     }
     fn cfg() -> ClassifierConfig {
         ClassifierConfig::default()
@@ -171,13 +205,55 @@ mod tests {
         let g = gate();
         // Benign reply → cloud TTS ok.
         assert_eq!(
-            g.tts_egress("The weather looks clear today.", &Binding::Auto, true, &cfg()),
+            g.tts_egress(
+                "The weather looks clear today.",
+                &Binding::Auto,
+                true,
+                &cfg()
+            ),
             AudioEgressDecision::Allow
         );
         // Sensitive reply (structured PII the floor catches) → withheld from cloud.
         assert_eq!(
-            g.tts_egress("your account number is 4111 1111 1111 1111", &Binding::Auto, true, &cfg()),
+            g.tts_egress(
+                "your account number is 4111 1111 1111 1111",
+                &Binding::Auto,
+                true,
+                &cfg()
+            ),
             AudioEgressDecision::Withhold
+        );
+    }
+
+    /// F4 / C-01 at the AUDIO boundary: a degraded classifier (no trained ONNX
+    /// ensemble — the fresh-install shape) must keep `Auto` speech off a cloud
+    /// TTS even when the rules-only fallback finds nothing. This is the test the
+    /// old `PrivacyGate::new(classifier)` constructor made impossible to pass.
+    #[test]
+    fn a_degraded_classifier_withholds_cloud_tts_that_the_fallback_would_clear() {
+        let benign = "The weather looks clear today.";
+        // The fallback really does clear this text (so the assertion below is
+        // about the degraded flag, not about the classifier disagreeing).
+        assert_eq!(
+            gate().tts_egress(benign, &Binding::Auto, true, &cfg()),
+            AudioEgressDecision::Allow,
+            "control: a healthy audio gate speaks benign text to a cloud TTS"
+        );
+
+        let degraded = AudioEgressGate::new(
+            Arc::new(RulesClassifier::new()),
+            ClassifierHealth::degraded_with("classifier models missing"),
+        );
+        assert_eq!(
+            degraded.tts_egress(benign, &Binding::Auto, true, &cfg()),
+            AudioEgressDecision::Withhold,
+            "rules-only screening must not clear a cloud voice service"
+        );
+        // Local TTS is unaffected — fail-closed is about egress, not about
+        // bricking the voice loop.
+        assert_eq!(
+            degraded.tts_egress(benign, &Binding::Auto, false, &cfg()),
+            AudioEgressDecision::Allow
         );
     }
 
@@ -197,8 +273,15 @@ mod tests {
         // B9: Public bypasses the tunable text classifier, but the un-tunable
         // floor on a structured secret at the CLOUD voice boundary raises ONE
         // confirm (carrying a fingerprint of this exact text), not a silent block.
-        match g.tts_egress("the api key is sk-live-abcdef0123456789abcdef", &Binding::Public, true, &cfg()) {
-            AudioEgressDecision::ConfirmRequired(fp) => assert_eq!(fp.len(), 64, "a sha256 fingerprint"),
+        match g.tts_egress(
+            "the api key is sk-live-abcdef0123456789abcdef",
+            &Binding::Public,
+            true,
+            &cfg(),
+        ) {
+            AudioEgressDecision::ConfirmRequired(fp) => {
+                assert_eq!(fp.len(), 64, "a sha256 fingerprint")
+            }
             other => panic!("expected ConfirmRequired, got {other:?}"),
         }
         // A benign Public reply is allowed to cloud TTS with no confirm.
@@ -214,12 +297,27 @@ mod tests {
         // is no transcript yet) — it's binding-based.
         let g = gate();
         // Local STT never egresses, whatever the binding.
-        assert_eq!(g.stt_egress(&Binding::Auto, false), AudioEgressDecision::Allow);
-        assert_eq!(g.stt_egress(&Binding::Private, false), AudioEgressDecision::Allow);
+        assert_eq!(
+            g.stt_egress(&Binding::Auto, false),
+            AudioEgressDecision::Allow
+        );
+        assert_eq!(
+            g.stt_egress(&Binding::Private, false),
+            AudioEgressDecision::Allow
+        );
         // Cloud STT: only Public (explicit opt-in); Auto/Private keep it local.
-        assert_eq!(g.stt_egress(&Binding::Public, true), AudioEgressDecision::Allow);
-        assert_eq!(g.stt_egress(&Binding::Auto, true), AudioEgressDecision::Withhold);
-        assert_eq!(g.stt_egress(&Binding::Private, true), AudioEgressDecision::Withhold);
+        assert_eq!(
+            g.stt_egress(&Binding::Public, true),
+            AudioEgressDecision::Allow
+        );
+        assert_eq!(
+            g.stt_egress(&Binding::Auto, true),
+            AudioEgressDecision::Withhold
+        );
+        assert_eq!(
+            g.stt_egress(&Binding::Private, true),
+            AudioEgressDecision::Withhold
+        );
     }
 
     #[test]
@@ -241,7 +339,10 @@ mod tests {
         );
         // The user approves ONE confirm for this exact text.
         ledger.grant(GrantTarget::Fingerprint(fp.clone()), GrantScope::Once);
-        assert_eq!(AudioEgressGate::resolve_confirm(decision.clone(), &ledger), AudioEgressDecision::Allow);
+        assert_eq!(
+            AudioEgressGate::resolve_confirm(decision.clone(), &ledger),
+            AudioEgressDecision::Allow
+        );
         // ...and it's SINGLE-USE: the grant is consumed, so a second egress of
         // the identical text re-withholds until the user confirms again.
         assert_eq!(
@@ -254,12 +355,18 @@ mod tests {
         let ledger2 = ApprovalLedger::new();
         ledger2.grant(GrantTarget::Fingerprint(fp.clone()), GrantScope::Session);
         let d2 = g.tts_egress(secret, &Binding::Public, true, &cfg());
-        assert_eq!(AudioEgressGate::resolve_confirm(d2, &ledger2), AudioEgressDecision::Withhold);
+        assert_eq!(
+            AudioEgressGate::resolve_confirm(d2, &ledger2),
+            AudioEgressDecision::Withhold
+        );
 
         // The fingerprint pins THIS text — a different reply yields a different fp.
-        if let AudioEgressDecision::ConfirmRequired(fp2) =
-            g.tts_egress("api key is sk-live-9999999999999999999999", &Binding::Public, true, &cfg())
-        {
+        if let AudioEgressDecision::ConfirmRequired(fp2) = g.tts_egress(
+            "api key is sk-live-9999999999999999999999",
+            &Binding::Public,
+            true,
+            &cfg(),
+        ) {
             assert_ne!(fp, fp2, "the confirm fingerprint pins the exact reply text");
         }
     }
@@ -270,9 +377,17 @@ mod tests {
         // flips to Withhold — and the final prefix (the whole reply) is what the
         // text gate would see, so audio egress ≤ text egress.
         let g = gate();
-        assert_eq!(g.tts_egress("Here is the info:", &Binding::Auto, true, &cfg()), AudioEgressDecision::Allow);
         assert_eq!(
-            g.tts_egress("Here is the info: SSN 123-45-6789", &Binding::Auto, true, &cfg()),
+            g.tts_egress("Here is the info:", &Binding::Auto, true, &cfg()),
+            AudioEgressDecision::Allow
+        );
+        assert_eq!(
+            g.tts_egress(
+                "Here is the info: SSN 123-45-6789",
+                &Binding::Auto,
+                true,
+                &cfg()
+            ),
             AudioEgressDecision::Withhold,
             "once the growing prefix hits sensitive content, the caller latches local"
         );

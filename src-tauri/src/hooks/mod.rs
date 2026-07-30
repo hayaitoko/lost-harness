@@ -14,6 +14,7 @@
 //!   ▼
 //! [PrivacyFilterHook] ── wraps agent::gate::PrivacyGate::check()
 //!   │  Deny(reason)  ─────────────────────────────▶ short-circuit, stop
+//!   │  Ask (H-12 Public floor hit) ───────────────▶ short-circuit, stop
 //!   │  Continue (Allow, or RouteLocal annotated onto ctx.routing)
 //!   ▼
 //! [SandboxHook] ── non-overridable hardline denylist
@@ -35,18 +36,26 @@
 //! Continue ⇒ Tool::run() may proceed
 //! ```
 //!
-//! `SandboxHook` is deliberately positioned immediately after the (Deny-only,
-//! never-Ask) `PrivacyFilterHook` and ahead of every hook capable of
-//! returning `Ask` (`ProtectedPathHook`, `PermissionHook`,
-//! `FirstUseConfirmHook`). `run_gating` short-circuits on the first
-//! `Deny`/`Ask`, so if an Ask-capable hook ran before the hardline floor, a
+//! `SandboxHook` is deliberately positioned ahead of `ProtectedPathHook`,
+//! `PermissionHook` and `FirstUseConfirmHook` — every hook whose `Ask` can be
+//! *satisfied by a policy/permission answer*. `run_gating` short-circuits on the
+//! first `Deny`/`Ask`, so if one of those ran before the hardline floor, a
 //! whole-tool "ask" permission mode (or an "ask" pattern rule) could reach
 //! human confirmation — and eventually `Tool::run()` — without the
 //! non-overridable denylist ever being consulted. Putting `SandboxHook`
-//! first among the fallible hooks means it always runs on every
-//! `PreToolUse` event, regardless of what any later hook decides. See
+//! first among those means it always runs on every `PreToolUse` event,
+//! regardless of what any later hook decides. See
 //! `default_pretooluse_chain_is_in_spec_order` and
 //! `sandbox_runs_before_any_hook_that_can_ask` in `hooks::tests`.
+//!
+//! `PrivacyFilterHook` still runs FIRST, ahead of `SandboxHook`, and since
+//! H-12 it can also `Ask` (a `Public`-bound floor hit — see its module docs).
+//! That does NOT let anything skip the denylist: an approval makes
+//! `ToolDispatcher` re-run the whole chain from the top, where `SandboxHook`
+//! denies exactly as before, and `Tool::run()` is reached only from a
+//! `Continue` through every gate. The one real consequence is cosmetic-but-
+//! worth-knowing: a privacy confirmation can be raised for a call the sandbox
+//! floor is going to refuse anyway.
 //!
 //! `ProtectedPathHook` follows the same non-overridable invariant — its
 //! path list is hardcoded, no config can narrow or broaden it, and its
@@ -487,9 +496,9 @@ impl HookChain {
 /// Build the ordered chain:
 /// `[PrivacyFilterHook, SandboxHook, ProtectedPathHook, PermissionHook, FirstUseConfirmHook]`.
 ///
-/// `SandboxHook` runs immediately after the Deny-only `PrivacyFilterHook`
-/// and ahead of every hook capable of returning `Ask`
-/// (`ProtectedPathHook`, `PermissionHook`, `FirstUseConfirmHook`), so the
+/// `SandboxHook` runs immediately after `PrivacyFilterHook`
+/// and ahead of `ProtectedPathHook`, `PermissionHook` and
+/// `FirstUseConfirmHook` — every hook an `Ask` answer can satisfy — so the
 /// non-overridable hardline floor is always reached on every `PreToolUse`
 /// event — see the module docs above for why putting an Ask-capable hook
 /// before `SandboxHook` would let the floor be skipped once Ask-resume is
@@ -535,7 +544,8 @@ pub fn build_pretooluse_chain_with_confirmed(
 
 /// Same ordered chain as [`build_pretooluse_chain_with_confirmed`], but with a
 /// shared [`ApprovalLedger`] threaded into the ask-capable hooks
-/// (`ProtectedPathHook`, `PermissionHook`, `FirstUseConfirmHook`). An
+/// (`PrivacyFilterHook`, `ProtectedPathHook`, `PermissionHook`,
+/// `FirstUseConfirmHook`). An
 /// interactive approval recorded by `ToolDispatcher` (see
 /// `ToolDispatcher::with_approval`) turns their `Ask` into `Continue` on
 /// the re-run — a single grant satisfies every ask-capable hook because
@@ -569,7 +579,12 @@ pub fn build_pretooluse_chain_full(
     workspace_root: Option<std::path::PathBuf>,
 ) -> HookChain {
     let mut chain = HookChain::new();
-    chain.register_gating(Box::new(PrivacyFilterHook::new(gate)));
+    // H-12: the privacy filter's `Ask` (a `Public`-bound structured-secret floor
+    // hit on a tool action) is satisfied from this same ledger, so the
+    // dispatcher's approval settles it on the re-run instead of hard-denying.
+    chain.register_gating(Box::new(
+        PrivacyFilterHook::new(gate).with_ledger(Arc::clone(&ledger)),
+    ));
     chain.register_gating(Box::new(SandboxHook));
     let mut protected = ProtectedPathHook::new().with_ledger(Arc::clone(&ledger));
     if let Some(root) = workspace_root {

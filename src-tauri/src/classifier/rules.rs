@@ -233,7 +233,7 @@ fn luhn_ok(digits: &str) -> bool {
 /// `rules.py::_classify_digit_run` — what a bare N-digit run probably is.
 fn classify_digit_run(digits: &str) -> Option<RuleCategory> {
     match digits.len() {
-        9 => Some(RuleCategory::PiiId), // SSN / EIN / routing-ish
+        9 => Some(RuleCategory::PiiId),            // SSN / EIN / routing-ish
         10 | 11 => Some(RuleCategory::PiiContact), // phone
         13..=19 if luhn_ok(digits) => Some(RuleCategory::Financial), // card
         _ => None,
@@ -241,15 +241,24 @@ fn classify_digit_run(digits: &str) -> Option<RuleCategory> {
 }
 
 const LETTER_SWAP: &[(char, char)] = &[
-    ('o', '0'), ('O', '0'),
-    ('l', '1'), ('I', '1'), ('i', '1'),
+    ('o', '0'),
+    ('O', '0'),
+    ('l', '1'),
+    ('I', '1'),
+    ('i', '1'),
     ('B', '8'),
-    ('S', '5'), ('s', '5'),
-    ('Z', '2'), ('z', '2'),
+    ('S', '5'),
+    ('s', '5'),
+    ('Z', '2'),
+    ('z', '2'),
 ];
 
 fn letter_swap(c: char) -> char {
-    LETTER_SWAP.iter().find(|(k, _)| *k == c).map(|(_, v)| *v).unwrap_or(c)
+    LETTER_SWAP
+        .iter()
+        .find(|(k, _)| *k == c)
+        .map(|(_, v)| *v)
+        .unwrap_or(c)
 }
 
 // ── compiled patterns (built once) ─────────────────────────────────────
@@ -364,7 +373,12 @@ pub fn detect(text: &str) -> Vec<Span> {
     }
     for caps in p.labeled_secret.captures_iter(text) {
         if let Some(val) = caps.name("val") {
-            raw.push((val.start(), val.end(), RuleCategory::Credential, "labeled_secret"));
+            raw.push((
+                val.start(),
+                val.end(),
+                RuleCategory::Credential,
+                "labeled_secret",
+            ));
         }
     }
     for m in p.card_candidate.find_iter(text) {
@@ -375,7 +389,12 @@ pub fn detect(text: &str) -> Vec<Span> {
     }
     for cue in &p.cues {
         for m in cue.find_iter(text) {
-            raw.push((m.start(), m.end(), RuleCategory::Proprietary, "confidentiality_cue"));
+            raw.push((
+                m.start(),
+                m.end(),
+                RuleCategory::Proprietary,
+                "confidentiality_cue",
+            ));
         }
     }
     for m in p.spelled_run.find_iter(text) {
@@ -393,9 +412,10 @@ pub fn detect(text: &str) -> Vec<Span> {
         if let Some(cat) = classify_digit_run(&digits) {
             let start_char = folded[..m.start()].chars().count();
             let end_char = folded[..m.end()].chars().count();
-            if let (Some(&sb), Some(&eb)) =
-                (orig_char_bytes.get(start_char), orig_char_bytes.get(end_char))
-            {
+            if let (Some(&sb), Some(&eb)) = (
+                orig_char_bytes.get(start_char),
+                orig_char_bytes.get(end_char),
+            ) {
                 raw.push((sb, eb, cat, "obfuscated_digits"));
             }
         }
@@ -413,7 +433,12 @@ pub fn detect(text: &str) -> Vec<Span> {
         }
     }
     for m in p.email_obf.find_iter(text) {
-        raw.push((m.start(), m.end(), RuleCategory::PiiContact, "email_obfuscated"));
+        raw.push((
+            m.start(),
+            m.end(),
+            RuleCategory::PiiContact,
+            "email_obfuscated",
+        ));
     }
 
     // De-dup EXACT (start,end) duplicates only (e.g. two detectors firing on
@@ -486,9 +511,14 @@ impl Classifier for RulesClassifier {
             };
         }
 
+        // C-01: a rules MISS (nothing matched, no soft signal) was previously
+        // reported as Public@confidence-1.0, misleading callers into treating
+        // the fallback as authoritative. With no signal either way, confidence
+        // should be 0.0 — the caller must not treat a rules-only non-match as
+        // certainty that content is safe for cloud egress.
         Classification {
             label: Label::Public,
-            confidence: 1.0,
+            confidence: 0.0,
             raw_output: Vec::new(),
             spans: Vec::new(),
         }
@@ -500,24 +530,36 @@ mod tests {
     use super::*;
 
     fn cats(text: &str) -> Vec<(&'static str, String)> {
-        detect(text).into_iter().map(|s| (s.category.as_str(), s.text)).collect()
+        detect(text)
+            .into_iter()
+            .map(|s| (s.category.as_str(), s.text))
+            .collect()
     }
 
     // Direct translation of rules.py's __main__ smoke tests.
 
     #[test]
     fn email() {
-        assert_eq!(cats("email me at a.b@x.com"), vec![("PII_CONTACT", "a.b@x.com".into())]);
+        assert_eq!(
+            cats("email me at a.b@x.com"),
+            vec![("PII_CONTACT", "a.b@x.com".into())]
+        );
     }
 
     #[test]
     fn ssn() {
-        assert_eq!(cats("ssn 512-88-1029"), vec![("PII_ID", "512-88-1029".into())]);
+        assert_eq!(
+            cats("ssn 512-88-1029"),
+            vec![("PII_ID", "512-88-1029".into())]
+        );
     }
 
     #[test]
     fn phone() {
-        assert_eq!(cats("call 217-555-0142"), vec![("PII_CONTACT", "217-555-0142".into())]);
+        assert_eq!(
+            cats("call 217-555-0142"),
+            vec![("PII_CONTACT", "217-555-0142".into())]
+        );
     }
 
     #[test]
@@ -541,7 +583,10 @@ mod tests {
 
     #[test]
     fn ip_address() {
-        assert_eq!(cats("my ip is 73.42.19.8"), vec![("PII_CONTACT", "73.42.19.8".into())]);
+        assert_eq!(
+            cats("my ip is 73.42.19.8"),
+            vec![("PII_CONTACT", "73.42.19.8".into())]
+        );
     }
 
     #[test]

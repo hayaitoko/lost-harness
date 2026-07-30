@@ -73,6 +73,13 @@ pub struct AppState {
     /// shared with the §7 gate. Backs `explain_classification` for the
     /// annotated-redaction "why" sidebar (PLAN §11).
     pub classifier: Arc<dyn crate::classifier::Classifier>,
+    /// C-01 / H-12: the SAME `PrivacyGate` the agent loop enforces with (clone
+    /// shares its `Arc`s). Held so the UI can actually observe gate state:
+    /// `get_classifier_health` reads the degraded flag for the warning banner,
+    /// and `confirm_public_send` records a one-send confirmation the gate will
+    /// consume on the user's retry. Without this field the degraded flag had
+    /// zero call sites — nothing could react to it.
+    pub gate: crate::agent::gate::PrivacyGate,
     /// Memory's meaning-lane embedder handle (PLAN §9). Loads lazily + only
     /// when a profile has semantic search enabled (Wave 1.2); `None` ⇒ no model
     /// dir configured, saves stay keyword-indexed.
@@ -2035,6 +2042,73 @@ pub fn explain_classification(
     Ok(build_explanation(
         state.classifier.classify_with(&args.text, &cfg),
     ))
+}
+
+// ── C-01: observable classifier health (the degraded banner) ────────────────
+
+/// The wire shape of [`crate::classifier::ClassifierHealth`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifierHealthInfo {
+    /// `true` ⇒ the trained ONNX ensemble did not load; only the deterministic
+    /// rules fallback is screening egress, and `Auto` binding refuses cloud
+    /// endpoints outright. The UI MUST surface this — reduced screening that the
+    /// user cannot see is the C-01 finding.
+    pub degraded: bool,
+    /// Why (the `EnsembleClassifier::load` error), when degraded.
+    pub reason: Option<String>,
+    /// How long a one-send confirmation stays usable, in seconds — the UI shows
+    /// this on the confirmation affordance so "this expires" is visible.
+    pub confirm_ttl_secs: u64,
+}
+
+/// Report whether egress screening is degraded, for the persistent warning
+/// banner. C-01: the gate's fail-closed flag previously had zero readers; this
+/// is the read side, so the user learns that the trained classifier is missing
+/// instead of silently getting rules-only screening.
+#[tauri::command]
+pub fn get_classifier_health(state: State<'_, AppState>) -> ClassifierHealthInfo {
+    ClassifierHealthInfo {
+        degraded: state.gate.degraded(),
+        reason: state.gate.degraded_reason(),
+        confirm_ttl_secs: state.gate.confirmations().ttl().as_secs(),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfirmPublicSendArgs {
+    /// The EXACT message text the user is authorising. The grant is fingerprinted
+    /// over this text, so editing the message invalidates the confirmation.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfirmPublicSendResponse {
+    /// The fingerprint the grant was filed under (debug/telemetry; the frontend
+    /// does not need it — it simply re-sends the same text).
+    pub fingerprint: String,
+    /// Seconds until the confirmation expires.
+    pub expires_in_secs: u64,
+}
+
+/// H-12: record the user's "send this once anyway" for a `Public`-bound message
+/// the gate flagged with `GateDecision::ConfirmRequired`.
+///
+/// The authorisation is **one send** of **this exact text** and it **expires**:
+/// the gate consumes it atomically on the next matching send
+/// (`PublicSendConfirmations::take`), and an unused grant times out. It is
+/// therefore never a persistent "Public means anything goes" allow — calling
+/// this twice in a row does not authorise two sends of different content, and a
+/// second send of the same content re-prompts.
+#[tauri::command]
+pub fn confirm_public_send(
+    state: State<'_, AppState>,
+    args: ConfirmPublicSendArgs,
+) -> ConfirmPublicSendResponse {
+    let fingerprint = state.gate.confirm_public_send(&args.text);
+    ConfirmPublicSendResponse {
+        fingerprint,
+        expires_in_secs: state.gate.confirmations().ttl().as_secs(),
+    }
 }
 
 /// Load a profile's classifier thresholds from storage, defaulting on any

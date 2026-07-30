@@ -33,6 +33,7 @@
   import { activeProfileId } from "$lib/stores/profiles";
   import {
     explainClassification,
+    confirmPublicSend,
     onMemoryEvent,
     listWorkspaceFiles,
     type ClassificationExplanation,
@@ -449,7 +450,14 @@
   // targeted — local or cloud depends on that provider's kind, so allow
   // alone doesn't tell us the route; cross-reference providersStore.
   function messageRoute(m: Message): Route {
-    if (m.error_source === "gate" || m.routing_decision === "block") return "blocked";
+    // H-12: `gate_confirm` also means nothing left the machine (pending the
+    // user's one-send confirmation), so it reads as "held" too.
+    if (
+      m.error_source === "gate" ||
+      m.error_source === "gate_confirm" ||
+      m.routing_decision === "block"
+    )
+      return "blocked";
     if (m.routing_decision === "route_local") return "local";
     // redact_send: the safe remainder went to the cloud (sensitive spans stayed
     // local) — surface it as a cloud route; the event bar explains the redaction.
@@ -471,7 +479,12 @@
   // still-streaming turn, and never fabricated for a plain model/network
   // error (those aren't a privacy/routing outcome).
   function hasRoutingSignal(m: Message): boolean {
-    return !m.streaming && (m.routing_decision != null || m.error_source === "gate");
+    return (
+      !m.streaming &&
+      (m.routing_decision != null ||
+        m.error_source === "gate" ||
+        m.error_source === "gate_confirm")
+    );
   }
 
   // Split into paragraphs on blank lines; each <p> keeps internal newlines
@@ -505,6 +518,30 @@
     } finally {
       isSending = false;
       textareaEl?.focus();
+    }
+  }
+
+  // H-12: the user's answer to a `"gate_confirm"` hold — a `Public`-bound
+  // message that hit the un-tunable structured-secret floor. Records a
+  // single-use, expiring authorisation for THIS EXACT text and re-sends it.
+  // Deliberately re-sends `held_content` rather than the composer draft: the
+  // grant is fingerprinted over the held text, so anything else would (and
+  // should) re-prompt.
+  let confirming = $state(false);
+  async function confirmAndResend(heldContent: string) {
+    if (confirming || isSending) return;
+    confirming = true;
+    try {
+      await confirmPublicSend(heldContent);
+      await sendChatMessage(
+        heldContent,
+        providersStore.activeProviderId,
+        providersStore.activeModel,
+        $activeConversation ? undefined : binding,
+        mode,
+      );
+    } finally {
+      confirming = false;
     }
   }
 
@@ -639,6 +676,37 @@
                 Sensitive details were blacked out and kept on this Mac; only the
                 redacted remainder went to the cloud, and the reply was restored
                 locally. Open “Why” to see exactly what was held back.
+              </PrivacyEventBar>
+            {:else if m.error_source === "gate_confirm"}
+              <!-- H-12: an ACTIONABLE hold. This chat is set to Public, so the
+                   user already opted into cloud — but the un-tunable floor found
+                   a secret / identifier, and a deliberate one-time confirmation
+                   is required. The link authorises exactly ONE send of this text
+                   and expires; it never becomes a standing allow. -->
+              {#snippet confirmLinks()}
+                <button
+                  type="button"
+                  class="underline underline-offset-2 disabled:opacity-50"
+                  disabled={confirming || isSending}
+                  onclick={() => confirmAndResend(m.held_content ?? "")}
+                >
+                  {confirming ? "Sending…" : "Send it this once"}
+                </button>
+                <button
+                  type="button"
+                  class="underline underline-offset-2"
+                  onclick={toggleWhy}
+                >
+                  What tripped it
+                </button>
+              {/snippet}
+              <PrivacyEventBar
+                kind="stop"
+                title="Held — this looks like a secret"
+                links={m.held_content ? confirmLinks : undefined}
+              >
+                {m.error ??
+                  "The privacy gate wants your confirmation before this leaves the machine."}
               </PrivacyEventBar>
             {:else if m.error_source === "gate"}
               <PrivacyEventBar kind="stop" title="Held from leaving this machine">

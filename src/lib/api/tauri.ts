@@ -110,7 +110,13 @@ export interface StreamTokenPayload {
 
 /**
  * Payload of the `stream:error` event. Mirrors `StreamErrorPayload` in
- * loop_mod.rs. `source` is one of `"gate"`, `"routing"`, `"model"`.
+ * loop_mod.rs. `source` is one of `"gate"`, `"gate_confirm"`, `"routing"`,
+ * `"model"`.
+ *
+ * H-12: `"gate_confirm"` is NOT a dead end — the turn was held because a
+ * `Public`-bound message hit the un-tunable structured-secret floor, and the
+ * user may authorise ONE send with {@link confirmPublicSend} and re-send. Treat
+ * it as an actionable hold, not an error.
  */
 export interface StreamErrorPayload {
   error: string;
@@ -1238,6 +1244,66 @@ export async function explainClassification(
     });
   }
   return { label: "public", confidence: 0, spans: [] };
+}
+
+// ── C-01 / H-12: classifier health + the one-send confirmation ──────────────
+
+/** Mirrors `ClassifierHealthInfo` in `ipc/mod.rs`. */
+export interface ClassifierHealthInfo {
+  /**
+   * `true` ⇒ the trained ONNX ensemble did not load, so only the deterministic
+   * rules fallback is screening egress and `Auto` binding refuses cloud
+   * endpoints outright. Reduced screening the user cannot see IS the C-01
+   * finding, so this must be surfaced in the UI, not just logged.
+   */
+  degraded: boolean;
+  /** Why it's degraded (the load error), when degraded. */
+  reason: string | null;
+  /** Seconds a one-send confirmation stays usable. */
+  confirm_ttl_secs: number;
+}
+
+const HEALTHY_CLASSIFIER: ClassifierHealthInfo = {
+  degraded: false,
+  reason: null,
+  confirm_ttl_secs: 120,
+};
+
+/**
+ * Read the egress-screening health for the degraded banner. In browser dev mode
+ * (no Tauri shell) reports healthy — there is no real gate to degrade.
+ */
+export async function getClassifierHealth(): Promise<ClassifierHealthInfo> {
+  if (isTauri()) {
+    return tauriInvoke<ClassifierHealthInfo>("get_classifier_health");
+  }
+  return HEALTHY_CLASSIFIER;
+}
+
+/** Mirrors `ConfirmPublicSendResponse` in `ipc/mod.rs`. */
+export interface ConfirmPublicSendResponse {
+  fingerprint: string;
+  expires_in_secs: number;
+}
+
+/**
+ * H-12: authorise **one** send of `text` after the gate returned a
+ * `"gate_confirm"` hold.
+ *
+ * The grant is fingerprinted over this exact text, is consumed by the very next
+ * matching send, and expires — so it is a confirmation, never a standing "Public
+ * means anything goes" allow. Editing the message invalidates it; sending the
+ * same text twice re-prompts. Call this, then re-send the identical text.
+ */
+export async function confirmPublicSend(
+  text: string,
+): Promise<ConfirmPublicSendResponse> {
+  if (isTauri()) {
+    return tauriInvoke<ConfirmPublicSendResponse>("confirm_public_send", {
+      args: { text },
+    });
+  }
+  return { fingerprint: "", expires_in_secs: 0 };
 }
 
 // ── classifier settings (PLAN §11 — per-profile strictness) ─────────────────
