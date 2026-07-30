@@ -59,25 +59,44 @@ const SEARCH_MAX_FILE_BYTES: u64 = 256 * 1024;
 
 // ── path safety ────────────────────────────────────────────────────────────
 
-/// Resolve `rel` against `root`, rejecting anything that could escape the
-/// workspace. Requires the target to exist (uses `canonicalize`), which is
-/// correct for the read-only tools here.
-fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, String> {
+/// Split a workspace-relative path into its `Normal` components, rejecting
+/// every form that could climb out of the workspace. `.` segments are dropped.
+/// One place so the lexical rule can never drift between the pathname resolvers
+/// and the descriptor-relative walk.
+fn rel_components(rel: &str) -> Result<Vec<&std::ffi::OsStr>, String> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
         return Err(format!(
             "path must be relative to the workspace, got: {rel}"
         ));
     }
+    let mut out = Vec::new();
     for comp in rel_path.components() {
         match comp {
             Component::ParentDir => return Err("path may not contain '..'".to_string()),
             Component::Prefix(_) | Component::RootDir => {
                 return Err("path may not be absolute or contain a drive prefix".to_string())
             }
-            _ => {}
+            Component::CurDir => {}
+            Component::Normal(s) => out.push(s),
         }
     }
+    Ok(out)
+}
+
+/// Resolve `rel` against `root`, rejecting anything that could escape the
+/// workspace. Requires the target to exist (uses `canonicalize`).
+///
+/// This is the LEXICAL + canonical-path check, and on unix it is no longer what
+/// actually performs the I/O: it supplies the `..`/absolute rejection and the
+/// canonical path used as the read-before-write set key (which must carry the
+/// on-disk casing, so a case-insensitive FS doesn't falsely refuse a real
+/// read→write of one file). The authoritative resolution is the
+/// descriptor-relative walk in [`confined`], which cannot escape the root no
+/// matter what this function concluded.
+fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel_path = Path::new(rel);
+    rel_components(rel)?;
     let canon_root = root
         .canonicalize()
         .map_err(|e| format!("workspace root unavailable: {e}"))?;
@@ -186,6 +205,557 @@ async fn resolve_within_new_async(root: PathBuf, rel: String) -> Result<PathBuf,
     tokio::task::spawn_blocking(move || resolve_within_new(&root, &rel))
         .await
         .map_err(|e| format!("resolve task failed: {e}"))?
+}
+
+// ── descriptor-relative confinement ────────────────────────────────────────
+
+/// What a directory entry is, decided WITHOUT following a symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+impl EntryKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            EntryKind::Dir => "dir",
+            EntryKind::File => "file",
+            EntryKind::Symlink => "symlink",
+            EntryKind::Other => "other",
+        }
+    }
+}
+
+/// **The** confinement layer (M-04). Every byte an fs tool reads, writes or
+/// unlinks goes through here.
+///
+/// The old shape was check-then-use on a *pathname*: `canonicalize()` proved the
+/// resolved target was inside the workspace, and then a second, independent
+/// pathname resolution inside `open()` / `rename()` / `remove_file()` actually
+/// went to disk. Those are two different resolutions of the same string, and
+/// between them an attacker who can create names in the workspace (the agent
+/// itself, or a concurrently-running `shell_exec`) can swap an intermediate
+/// directory for a symlink — the check passes on the real directory, the use
+/// lands wherever the symlink points.
+///
+/// Here the *pinned descriptor is the identity*. We open the workspace root
+/// once, then walk `rel` one component at a time with `openat(2)` +
+/// `O_NOFOLLOW`, so:
+/// - each descriptor names a specific inode, not a string that gets re-resolved;
+/// - a component that is (or becomes) a symlink fails the `openat` with `ELOOP`
+///   instead of redirecting the walk;
+/// - the final operation is `openat` / `renameat` / `unlinkat` / `fstatat`
+///   **relative to the pinned parent descriptor**, so the object we checked is
+///   the object we act on. There is no window to swap because there is no second
+///   pathname resolution.
+///
+/// The workspace ROOT itself is opened by pathname and DOES follow symlinks —
+/// deliberately: on macOS `std::env::temp_dir()` lives under `/var`, which is a
+/// symlink to `/private/var`, and the user's own storage root may legitimately
+/// sit behind one. What must never be followed is anything *below* the root, and
+/// nothing below it is.
+#[cfg(unix)]
+mod confined {
+    use super::{rel_components, EntryKind};
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    /// Flags for every directory descriptor we hold. `O_CLOEXEC` matters: a
+    /// `shell_exec` subprocess must not inherit a live handle to a workspace
+    /// directory (that handle would itself be an escape hatch).
+    const DIR_FLAGS: libc::c_int =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    /// A workspace path resolved to a **pinned parent directory descriptor** plus
+    /// the leaf's name. Every operation on the leaf is `*at()`-relative to
+    /// `parent`.
+    pub(super) struct Confined {
+        pub parent: OwnedFd,
+        pub leaf: CString,
+    }
+
+    fn cname(name: &OsStr) -> Result<CString, String> {
+        CString::new(name.as_bytes())
+            .map_err(|_| "path component contains a NUL byte".to_string())
+    }
+
+    fn last_err(what: &str) -> String {
+        format!("{what}: {}", std::io::Error::last_os_error())
+    }
+
+    /// `openat(2)`, returning an owned descriptor.
+    fn openat(dirfd: BorrowedFd<'_>, name: &CStr, flags: libc::c_int) -> Result<OwnedFd, String> {
+        // SAFETY: `dirfd` is a live borrowed descriptor, `name` is a NUL-
+        // terminated C string that outlives the call, and the returned fd is
+        // immediately wrapped in `OwnedFd` so it is closed exactly once.
+        let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(last_err(&format!(
+                "open '{}'",
+                name.to_string_lossy()
+            )));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Open the workspace root. Symlinks in the ROOT's own path are followed on
+    /// purpose (see the module doc); nothing below it ever is.
+    fn open_root(root: &Path) -> Result<OwnedFd, String> {
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(root)
+            .map_err(|e| format!("workspace root unavailable: {e}"))?;
+        Ok(OwnedFd::from(dir))
+    }
+
+    /// Walk every component of `rel` from the root, `O_NOFOLLOW` per hop.
+    /// `keep_leaf = false` stops at the leaf's parent (the leaf is returned as a
+    /// name to be used `*at()`-relative); `keep_leaf = true` descends into the
+    /// leaf too, which is what `list_dir` / the search walk want.
+    fn walk(root: &Path, rel: &str, keep_leaf: bool) -> Result<(OwnedFd, Option<CString>), String> {
+        let comps = rel_components(rel)?;
+        let mut dirfd = open_root(root)?;
+        let split = if keep_leaf { comps.len() } else { comps.len().saturating_sub(1) };
+        for comp in &comps[..split] {
+            let name = cname(comp)?;
+            dirfd = openat(dirfd.as_fd(), &name, DIR_FLAGS).map_err(|e| {
+                format!(
+                    "cannot descend into '{}' (a symlinked or missing path component is refused): {e}",
+                    comp.to_string_lossy()
+                )
+            })?;
+        }
+        let leaf = if keep_leaf {
+            None
+        } else {
+            Some(cname(comps.last().copied().ok_or_else(|| {
+                format!("path has no filename: {rel}")
+            })?)?)
+        };
+        Ok((dirfd, leaf))
+    }
+
+    /// Resolve to (pinned parent descriptor, leaf name).
+    pub(super) fn resolve(root: &Path, rel: &str) -> Result<Confined, String> {
+        let (parent, leaf) = walk(root, rel, false)?;
+        Ok(Confined {
+            parent,
+            leaf: leaf.expect("keep_leaf = false always yields a leaf"),
+        })
+    }
+
+    /// Resolve all the way to a pinned DIRECTORY descriptor.
+    pub(super) fn resolve_dir(root: &Path, rel: &str) -> Result<OwnedFd, String> {
+        let (dirfd, _) = walk(root, rel, true)?;
+        Ok(dirfd)
+    }
+
+    /// `fstatat(..., AT_SYMLINK_NOFOLLOW)` on the leaf, relative to its pinned
+    /// parent — the race-free equivalent of an `lstat` on the pathname.
+    pub(super) fn lstat_leaf(c: &Confined) -> Option<libc::stat> {
+        // SAFETY: zeroed `stat` is a valid initial value for `fstatat` to fill;
+        // `parent`/`leaf` are live for the call.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                c.parent.as_raw_fd(),
+                c.leaf.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            Some(st)
+        } else {
+            None
+        }
+    }
+
+    fn kind_of_mode(mode: libc::mode_t) -> EntryKind {
+        match mode & libc::S_IFMT {
+            libc::S_IFDIR => EntryKind::Dir,
+            libc::S_IFREG => EntryKind::File,
+            libc::S_IFLNK => EntryKind::Symlink,
+            _ => EntryKind::Other,
+        }
+    }
+
+    /// Open the leaf for reading, `O_NOFOLLOW`, relative to its pinned parent.
+    pub(super) fn open_read(c: &Confined) -> Result<std::fs::File, String> {
+        let fd = openat(
+            c.parent.as_fd(),
+            &c.leaf,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    /// Atomically replace the leaf: create a fresh temp entry in the SAME pinned
+    /// directory with `O_CREAT | O_EXCL | O_NOFOLLOW`, write it, then
+    /// `renameat` it over the leaf — both sides of the rename resolved against
+    /// the same pinned descriptor, so neither can be redirected.
+    pub(super) fn atomic_replace(c: &Confined, content: &str) -> Result<(), String> {
+        use std::io::Write;
+        let tmp_name = cname(OsStr::new(&format!(
+            ".{}.tmp-{}",
+            c.leaf.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        )))?;
+        let fd = openat(
+            c.parent.as_fd(),
+            &tmp_name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        let mut file = std::fs::File::from(fd);
+        // On ANY failure clean the temp entry up, so a failed write leaves the
+        // workspace exactly as it was (no orphaned `.tmp` residue).
+        if let Err(e) = file.write_all(content.as_bytes()).and_then(|()| file.sync_all()) {
+            drop(file);
+            unlink_name(&c.parent, &tmp_name);
+            return Err(format!("write temp file: {e}"));
+        }
+        drop(file);
+        // SAFETY: both descriptors/names are live for the call.
+        let rc = unsafe {
+            libc::renameat(
+                c.parent.as_raw_fd(),
+                tmp_name.as_ptr(),
+                c.parent.as_raw_fd(),
+                c.leaf.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            let err = last_err("finalize write");
+            unlink_name(&c.parent, &tmp_name);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn unlink_name(parent: &OwnedFd, name: &CStr) {
+        // SAFETY: `parent` and `name` are live; failure is ignored on purpose
+        // (best-effort cleanup).
+        unsafe {
+            libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
+        }
+    }
+
+    /// `unlinkat` the leaf relative to its pinned parent.
+    pub(super) fn unlink(c: &Confined) -> Result<(), String> {
+        // SAFETY: `parent`/`leaf` are live for the call.
+        let rc = unsafe { libc::unlinkat(c.parent.as_raw_fd(), c.leaf.as_ptr(), 0) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+
+    /// Read the names + kinds of a pinned directory via `fdopendir`, so the
+    /// listing comes from the descriptor and never from a re-walked pathname.
+    pub(super) fn read_dir(dirfd: &OwnedFd) -> Result<Vec<(std::ffi::OsString, EntryKind)>, String> {
+        // `fdopendir` takes OWNERSHIP of the descriptor it is handed, so give it
+        // a dup and keep ours pinned for the caller's recursion.
+        // SAFETY: `dirfd` is live; the dup is either handed to `fdopendir`
+        // (which closes it via `closedir`) or closed here.
+        let dup = unsafe { libc::dup(dirfd.as_raw_fd()) };
+        if dup < 0 {
+            return Err(last_err("dup directory descriptor"));
+        }
+        let dirp = unsafe { libc::fdopendir(dup) };
+        if dirp.is_null() {
+            let err = last_err("fdopendir");
+            unsafe { libc::close(dup) };
+            return Err(err);
+        }
+        let mut out = Vec::new();
+        loop {
+            // SAFETY: `dirp` is a valid open DIR*; the returned dirent is owned
+            // by the DIR* and only read before the next `readdir` call.
+            let ent = unsafe { libc::readdir(dirp) };
+            if ent.is_null() {
+                // A NULL return is end-of-directory (or, rarely, a read error —
+                // treated the same: a short listing, never a wrong one).
+                break;
+            }
+            let (name, d_type) = unsafe { (CStr::from_ptr((*ent).d_name.as_ptr()), (*ent).d_type) };
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let kind = match d_type {
+                libc::DT_DIR => EntryKind::Dir,
+                libc::DT_REG => EntryKind::File,
+                libc::DT_LNK => EntryKind::Symlink,
+                // A filesystem that does not fill in `d_type` — ask the kernel,
+                // still without following the link.
+                _ => {
+                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                    let rc = unsafe {
+                        libc::fstatat(
+                            dirfd.as_raw_fd(),
+                            name.as_ptr(),
+                            &mut st,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    if rc == 0 {
+                        kind_of_mode(st.st_mode)
+                    } else {
+                        EntryKind::Other
+                    }
+                }
+            };
+            out.push((OsStr::from_bytes(bytes).to_os_string(), kind));
+        }
+        // SAFETY: `dirp` is valid and closed exactly once here (this also closes
+        // the duped descriptor).
+        unsafe { libc::closedir(dirp) };
+        Ok(out)
+    }
+
+    /// Descend one already-listed subdirectory of a pinned directory, refusing
+    /// to follow a symlink.
+    pub(super) fn open_subdir(dirfd: &OwnedFd, name: &OsStr) -> Result<OwnedFd, String> {
+        openat(dirfd.as_fd(), &cname(name)?, DIR_FLAGS)
+    }
+
+    /// Open one already-listed file of a pinned directory for reading, refusing
+    /// to follow a symlink.
+    pub(super) fn open_file_in(dirfd: &OwnedFd, name: &OsStr) -> Result<std::fs::File, String> {
+        let fd = openat(
+            dirfd.as_fd(),
+            &cname(name)?,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    pub(super) fn leaf_kind(c: &Confined) -> Option<EntryKind> {
+        lstat_leaf(c).map(|st| kind_of_mode(st.st_mode))
+    }
+
+    pub(super) fn leaf_size(c: &Confined) -> Option<u64> {
+        lstat_leaf(c).map(|st| st.st_size as u64)
+    }
+}
+
+// ── the tools' handle on a workspace target ─────────────────────────────────
+//
+// One API for the six tools; on unix it is backed by the descriptor-relative
+// walk above. On other platforms (Windows has no `openat`) it falls back to the
+// canonical-pathname resolution, which keeps the `..`/absolute/containment and
+// symlink-leaf checks but not the pinned-descriptor guarantee. Everything we
+// ship on today (macOS, Linux) takes the unix path.
+
+/// A single file target: its parent directory, pinned, plus the leaf name.
+struct Target {
+    #[cfg(unix)]
+    inner: confined::Confined,
+    #[cfg(not(unix))]
+    inner: PathBuf,
+}
+
+impl Target {
+    /// Pin `rel`'s parent inside `ws`. The leaf itself need not exist.
+    fn open(ws: &Path, rel: &str) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                inner: confined::resolve(ws, rel)?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                inner: resolve_within_new(ws, rel)?,
+            })
+        }
+    }
+
+    /// The leaf's kind, symlinks NOT followed. `None` = it does not exist.
+    fn kind(&self) -> Option<EntryKind> {
+        #[cfg(unix)]
+        {
+            confined::leaf_kind(&self.inner)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::symlink_metadata(&self.inner).ok().map(|m| {
+                let t = m.file_type();
+                if t.is_dir() {
+                    EntryKind::Dir
+                } else if t.is_file() {
+                    EntryKind::File
+                } else if t.is_symlink() {
+                    EntryKind::Symlink
+                } else {
+                    EntryKind::Other
+                }
+            })
+        }
+    }
+
+    /// The leaf's size in bytes, without following a symlink.
+    fn size(&self) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            confined::leaf_size(&self.inner)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::symlink_metadata(&self.inner).ok().map(|m| m.len())
+        }
+    }
+
+    /// Read the leaf as UTF-8 text, refusing to follow a symlink and refusing
+    /// anything over `max_bytes`.
+    fn read_to_string(&self, max_bytes: u64) -> Result<String, String> {
+        use std::io::Read;
+        match self.kind() {
+            Some(EntryKind::File) => {}
+            Some(EntryKind::Symlink) => {
+                return Err("is a symlink — refusing to read through it".to_string())
+            }
+            Some(_) => return Err("is not a file".to_string()),
+            None => return Err("no such file".to_string()),
+        }
+        if let Some(len) = self.size() {
+            if len > max_bytes {
+                return Err(format!("is {len} bytes, over the {max_bytes}-byte read limit"));
+            }
+        }
+        #[cfg(unix)]
+        let mut file = confined::open_read(&self.inner)?;
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::open(&self.inner).map_err(|e| e.to_string())?;
+        let mut content = String::new();
+        // `take(max + 1)` so a file that GREW past the cap between the stat and
+        // the read is still bounded.
+        file.by_ref()
+            .take(max_bytes + 1)
+            .read_to_string(&mut content)
+            .map_err(|e| format!("{e} (not UTF-8 text?)"))?;
+        if content.len() as u64 > max_bytes {
+            return Err(format!("is over the {max_bytes}-byte read limit"));
+        }
+        Ok(content)
+    }
+
+    /// Atomically replace the leaf's contents.
+    fn atomic_replace(&self, content: &str) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            confined::atomic_replace(&self.inner, content)
+        }
+        #[cfg(not(unix))]
+        {
+            atomic_write(&self.inner, content)
+        }
+    }
+
+    /// Remove the leaf.
+    fn unlink(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            confined::unlink(&self.inner)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_file(&self.inner).map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// A directory target: pinned on unix, a canonical path elsewhere.
+struct DirTarget {
+    #[cfg(unix)]
+    inner: std::os::fd::OwnedFd,
+    #[cfg(not(unix))]
+    inner: PathBuf,
+}
+
+impl DirTarget {
+    fn open(ws: &Path, rel: &str) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                inner: confined::resolve_dir(ws, rel)?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                inner: resolve_within(ws, rel)?,
+            })
+        }
+    }
+
+    /// The directory's entries, with each kind decided without following a link.
+    fn entries(&self) -> Result<Vec<(std::ffi::OsString, EntryKind)>, String> {
+        #[cfg(unix)]
+        {
+            confined::read_dir(&self.inner)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(&self.inner)
+                .map_err(|e| e.to_string())?
+                .flatten()
+            {
+                let kind = match entry.file_type() {
+                    Ok(t) if t.is_dir() => EntryKind::Dir,
+                    Ok(t) if t.is_file() => EntryKind::File,
+                    Ok(t) if t.is_symlink() => EntryKind::Symlink,
+                    _ => EntryKind::Other,
+                };
+                out.push((entry.file_name(), kind));
+            }
+            Ok(out)
+        }
+    }
+
+    /// Descend into one of this directory's own entries, refusing a symlink.
+    fn subdir(&self, name: &std::ffi::OsStr) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                inner: confined::open_subdir(&self.inner, name)?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                inner: self.inner.join(name),
+            })
+        }
+    }
+
+    /// Read one of this directory's own entries as text, refusing a symlink and
+    /// anything over `max_bytes`.
+    fn read_file(&self, name: &std::ffi::OsStr, max_bytes: u64) -> Result<String, String> {
+        use std::io::Read;
+        #[cfg(unix)]
+        let mut file = confined::open_file_in(&self.inner, name)?;
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::open(self.inner.join(name)).map_err(|e| e.to_string())?;
+        let mut content = String::new();
+        file.by_ref()
+            .take(max_bytes + 1)
+            .read_to_string(&mut content)
+            .map_err(|e| e.to_string())?;
+        if content.len() as u64 > max_bytes {
+            return Err("over the read limit".to_string());
+        }
+        Ok(content)
+    }
 }
 
 /// The filename that records the legacy-workspace migration already ran.
@@ -383,24 +953,24 @@ impl Tool for ReadFileTool {
                 Err(e) => return ToolResult::Err(e),
             };
             let _ = tokio::fs::create_dir_all(&ws).await;
+            // The canonical path is ONLY the read-before-write set key (it must
+            // carry the on-disk casing). The bytes come from the
+            // descriptor-relative walk below, which is what enforces
+            // confinement.
             let resolved = match resolve_within_async(ws.clone(), path.to_string()).await {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
-            let meta = match tokio::fs::metadata(&resolved).await {
-                Ok(m) => m,
-                Err(e) => return ToolResult::Err(format!("stat '{path}': {e}")),
+            let (ws2, path2) = (ws.clone(), path.to_string());
+            let read = tokio::task::spawn_blocking(move || {
+                Target::open(&ws2, &path2)?.read_to_string(MAX_READ_BYTES)
+            })
+            .await;
+            let read = match read {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(format!("read task failed: {e}")),
             };
-            if !meta.is_file() {
-                return ToolResult::Err(format!("'{path}' is not a file"));
-            }
-            if meta.len() > MAX_READ_BYTES {
-                return ToolResult::Err(format!(
-                    "'{path}' is {} bytes, over the {MAX_READ_BYTES}-byte read limit",
-                    meta.len()
-                ));
-            }
-            match tokio::fs::read_to_string(&resolved).await {
+            match read {
                 Ok(content) => {
                     // Read-before-write: remember we've seen this file (by its
                     // canonical path) so a later write_file/edit_file in the
