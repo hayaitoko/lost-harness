@@ -1291,14 +1291,18 @@ pub async fn register_mcp_server(
             ));
         }
     }
-    // H-07: for a stdio server, resolve the command to a concrete file and
-    // record its SHA-256 now — this registration IS the user approving that
-    // exact binary. HTTP endpoints have no local executable to pin.
+    // H-07: for a stdio server, resolve the command to a concrete file and pin
+    // the whole invocation now — the executable's contents, the argv vector, and
+    // any script file argv names. This registration IS the user approving that
+    // exact invocation, and for the common `node …` / `npx …` / `python …` shape
+    // the argv is where the actual server code lives, so pinning the interpreter
+    // alone would pin nothing that matters. HTTP endpoints have no local
+    // executable to pin.
     let (executable_path, executable_hash) = if is_http {
         (None, None)
     } else {
         let (path, hash) =
-            crate::tools::mcp_stdio::resolve_and_hash_executable(args.command.trim())
+            crate::tools::mcp_stdio::resolve_and_hash_executable(args.command.trim(), &args.args)
                 .map_err(|e| format!("couldn't pin the MCP server executable: {e}"))?;
         (Some(path), Some(hash))
     };

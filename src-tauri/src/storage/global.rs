@@ -94,8 +94,12 @@ pub struct McpServerRow {
     /// H-07: canonical absolute path the command resolved to at registration
     /// time. `None` on rows written before migration v9.
     pub executable_path: Option<String>,
-    /// H-07: hex SHA-256 of that file at registration time. `None` on rows
-    /// written before migration v9; bring-up refuses to spawn without it.
+    /// H-07: the invocation pin at registration time — a hex SHA-256 over the
+    /// executable's path AND contents, the `args` vector, and the contents of
+    /// any absolute script file `args` names (see
+    /// `tools::mcp_stdio::invocation_pin_digest`; it is NOT a bare file hash).
+    /// `None` on rows written before migration v9; bring-up refuses to spawn
+    /// without it.
     pub executable_hash: Option<String>,
 }
 

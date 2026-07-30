@@ -209,10 +209,14 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 9,
-        // H-07: pin the approved MCP server binary. Registration records the
-        // canonical resolved path + its SHA-256; every later bring-up (including
-        // the unattended auto-start at boot) re-measures and refuses to spawn on
-        // a mismatch, so a swapped binary can't ride the old consent.
+        // H-07: pin the approved MCP server invocation. Registration records the
+        // canonical resolved path plus a digest over the executable's contents,
+        // the argv vector, and any absolute script file argv names; every later
+        // bring-up (including the unattended auto-start at boot) re-measures and
+        // refuses to spawn on a mismatch, so neither a swapped binary NOR
+        // swapped args can ride the old consent. `executable_hash` is therefore
+        // an invocation pin, not a bare file hash — see
+        // `tools::mcp_stdio::invocation_pin_digest`.
         //
         // Rows written before v9 get NULL in both columns. That is NOT treated
         // as "trusted": `verify_pinned_executable` fails closed on a missing
