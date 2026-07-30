@@ -27,7 +27,7 @@ re-derive a design that already exists — read the pointer first.**
 >   Remainder is target-machine-gated native work, EXCEPT: M5 Slice 3's logic half and
 >   M6 Slice 4a are headless-buildable per their own designs.
 > - **Waves 6–7: not started.**
-> - Current gates: **542 tests**, GLOBAL schema **v7**, PROFILE schema **v10** (the baseline
+> - Current gates: **906 tests**, GLOBAL schema **v9**, PROFILE schema **v11** (the baseline
 >   figures further down are the historical 2026-07-17 snapshot).
 
 ## How the orchestrator should use this

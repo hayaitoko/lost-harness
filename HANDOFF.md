@@ -47,7 +47,32 @@ This is the **real product** — a Rust/Tauri/Svelte rewrite per the spec. The E
 | Memory system (curated summary + archive, sensitivity buckets, auto-injection) | **COMPLETE except packaging** (updated 2026-07-21): storage + Settings tab + recall/remember tools + endpoint-aware private recall + injection + non-silent events, PLUS the meaning lane (bge-small embedder + RRF hybrid search), snapshot-at-turn-1, all three write triggers (save-as-you-go / pre-compaction flush / new-chat nudge), and walled-profile DB routing. Only remaining: embedder bundling into the packaged app (Wave 7.1). |
 | Skills system (reusable playbooks, approve-first vs. autonomous) | **BUILT (updated 2026-07-23):** CRUD fail-closed to Pending, `search_skills`/`save_skill` (Dangerous), draft-first learning loop, Settings review pane, **+ the skill-as-Tool wrapper (C4)** — an APPROVED skill is a callable Tool (capability-derived risk, Write floor, storage re-check at every call, hot-registered on approval + lazily on a registry miss, unregistered on reject/delete). NOT built from PLAN §10 (deferred by the scope decision): teacher-escalation, curator rot-check, script exec, seed skills. |
 
-**Tests:** `cargo test --lib` → **726 passing**, 0 failed. Release-blocking `cargo clippy --all-targets -- -D clippy::correctness` clean; `cargo build --lib --no-default-features` clean. Frontend `npm run build` + `npm run check` clean. A real `npm run tauri build -- --debug` completes and produces both `Lost Harness.app` and `Lost Harness_0.1.0_aarch64.dmg`. Plus env-gated live tests (self-skip offline): `LHP_HF_LIVE=1` (HF search+tree+GGUF header) and `LHP_E2E_LIVE=1` (full search→download→verify→spawn→chat→teardown) — **both run GREEN 2026-07-22** against real Qwen3-0.6B bytes (52.9s); the MCP stdio transport is live-tested every run against a local `sh` fixture server. Schemas: GLOBAL v8 / PROFILE v11. (Last verified 2026-07-25 in the completion pass; see the entry below.)
+## Current state — authoritative (2026-07-30)
+
+This block is the single source of truth for current gate numbers. Every dated entry below it
+is an **archived snapshot**: each records the state on its own date and is deliberately left
+unedited, so the figures in those entries (726, 685, 683, 675, 564, 542 …) are history, not
+claims about today. If a number here disagrees with one below, this block wins.
+
+| Gate | Result |
+|------|--------|
+| `cargo test --lib` | **906 passed**, 0 failed, 1 ignored |
+| `cargo clippy --all-targets -- -D clippy::correctness` | clean (release-blocking) |
+| `cargo fmt --check` | clean |
+| `cargo audit` | clean — only the documented exceptions in `src-tauri/.cargo/audit.toml` |
+| `cargo build --lib --no-default-features` | clean |
+| `npm run check` | 126 files, 0 errors |
+| `npm test` | 6 files, **115 passed** |
+| `npm run build` | clean |
+| `npm audit` | 0 vulnerabilities |
+| Schemas | GLOBAL **v9**, PROFILE **v11** |
+
+Env-gated live tests self-skip offline: `LHP_HF_LIVE=1` (HF search + tree + GGUF header) and
+`LHP_E2E_LIVE=1` (search→download→verify→spawn→chat→teardown). The MCP stdio transport is
+live-tested every run against a local `sh` fixture server.
+
+State reached by the 24-packet review-fix campaign on branch `review-fixes/integration`
+(base `eb17b94`, which was itself 728 tests). See `PROGRESS-MAP.md` in the campaign root.
 
 **2026-07-24: EMAIL ROUND — Gmail, natively integrated (M7-Q2 DECIDED + BUILT).** The Gmail-first round is **complete** in four subagent-orchestrated stages (`a5f1263`→`4150d75`). **M7-Q2 DECISION (Lukas): per-USER OAuth client + guided in-app setup — NO vendor client, NO Lost Harness server in the loop.** Every user creates their OWN Google Cloud OAuth client through an in-app walkthrough; the pasted client id/secret are install-global, the Gmail connection (refresh token) is per-PROFILE; all secrets live in the OS keychain (F6 store), never SQLite. Rationale + the deferred alternative (a vendor one-click client, addable later with zero rework since the core treats client credentials as data) are recorded in `docs/PLAN.md` §M7 and `docs/plans/2026-07-24-email-round.md`.
 - **S1 core** (`a5f1263`, new `email/`): PKCE installed-app OAuth (loopback redirect, CSRF `state`, honest 3-way refresh classification — `NeedsReconnect`/`Misconfigured`/`Transient`) + a minimal Gmail REST client (multipart text extraction, RFC-822 build with header-injection refusal) behind fake-able seams. Google **Testing-status caveat is load-bearing**: refresh tokens expire ~7 days → `NeedsReconnect` is a NORMAL state (calm reconnect UI), not an error.
@@ -228,9 +253,9 @@ A fresh session needs these or it will lose time rediscovering them:
 
 **How to verify the whole thing is healthy:**
 ```bash
-cd /Users/hayai/Desktop/lost-harness-product/src-tauri && cargo test --lib   # expect: 564 passed
-cd /Users/hayai/Desktop/lost-harness-product && npm run build               # frontend build, should be clean
-cd /Users/hayai/Desktop/lost-harness-product && npm run check               # svelte-check, should be clean
+cd src-tauri && cargo test --lib   # expect: 906 passed, 0 failed, 1 ignored
+npm run build                                                              # frontend build, should be clean
+npm run check                                                              # svelte-check, should be clean
 ```
 
 ---
@@ -350,7 +375,7 @@ npm run build                 # Frontend only
 cd src-tauri && cargo build   # Rust only
 
 # Test
-cd src-tauri && cargo test --lib   # 683 tests
+cd src-tauri && cargo test --lib   # 906 tests
 npm run build                      # Frontend compile check
 npm run check                      # svelte-check
 
