@@ -15,9 +15,13 @@
 //! close. An `Unconstrained` requirement is refused for the same reason:
 //! see the invariant on `enforce_local_routing`.
 //!
-//! "Local" here uses the same definition `AgentLoop::find_local_provider`
-//! already uses in production (`Provider::is_local() && Provider::is_private()`)
-//! so this can't quietly diverge from what the loop actually calls.
+//! "Local" here means `Provider::is_local() && Provider::is_private()`, and
+//! `AgentLoop::find_local_provider` / `LocalModelExtractor::local_provider` no
+//! longer re-implement that test — they call `enforce_local_routing`, so there
+//! is exactly one definition in the tree and it cannot quietly diverge from
+//! what the loop actually calls. `enforce_local_routing`'s own docs name every
+//! call site and the (deliberately arbitrary, deliberately trust-zone-safe)
+//! rule it uses to choose among several local endpoints.
 
 use crate::hooks::RoutingRequirement;
 use crate::models::Provider;
@@ -48,17 +52,30 @@ impl std::error::Error for LocalRoutingViolation {}
 /// - `Unconstrained` — **also `Err`.** This function is a local-routing
 ///   *enforcer*, not an endpoint chooser. See the invariant below.
 ///
+/// # The `LocalRequired` selection rule, stated plainly
+///
+/// **First candidate satisfying `is_local() && is_private()`, in the order
+/// `candidates` arrives in.** In production `candidates` is
+/// `ModelManager::list_providers()`, which the storage layer emits
+/// `ORDER BY name` (`storage/global.rs`) — so in practice this is the
+/// *alphabetically first local private endpoint*.
+///
+/// That is arbitrary, and it is written down here rather than left implicit:
+/// with two local endpoints registered, which one serves a rerouted turn comes
+/// down to their names. What it is **not** arbitrary about is the trust zone.
+/// Every provider the predicate admits is private by base URL, so this can only
+/// ever move a turn *toward* the private zone — which is the whole reason it is
+/// an acceptable way to choose an endpoint, and `candidates.first()` was not.
+///
 /// # Invariant: this function never chooses an endpoint on its own
 ///
 /// The `Unconstrained` arm used to return `candidates.first()` — "pick
-/// whatever's configured". Nothing in production ever reached it (both call
-/// sites in `agent::loop_mod` build a `LocalRequired` themselves), but it sat
-/// one careless call site away from being live, and what it did is exactly
-/// what the endpoint-routing spec forbids: serving a turn from a provider the
-/// user did not pick. `candidates` here is `ModelManager::list_providers()`,
-/// whose order is the storage layer's `ORDER BY name` — so "first candidate"
-/// means *alphabetically first provider*, which is not a routing decision at
-/// all.
+/// whatever's configured". Nothing in production ever reached it (every call
+/// site builds a `LocalRequired`), but it sat one careless call site away from
+/// being live, and what it did is exactly what the endpoint-routing spec
+/// forbids: serving a turn from a provider the user did not pick. "First
+/// candidate" there meant *alphabetically first provider of any kind*, cloud
+/// included — not a routing decision at all.
 ///
 /// A turn's endpoint has exactly two legitimate sources:
 ///   1. the provider id the user explicitly selected, validated at the IPC
@@ -67,8 +84,29 @@ impl std::error::Error for LocalRoutingViolation {}
 ///      *overridden* that choice and the only acceptable answer is a local
 ///      endpoint.
 ///
-/// There is no third source. Handing `Unconstrained` to an enforcer is a
-/// caller bug, so it is reported as one rather than silently satisfied.
+/// There is no third source, and that is a claim about the code, so here is the
+/// full list of what reaches source 2 — every place the backend picks an
+/// endpoint the user did not name:
+///   - `agent::loop_mod::AgentLoop::find_local_provider` — the §7 gate returned
+///     `RouteLocal`, or a cloud send was refused because the conversation's
+///     history isn't cloud-safe.
+///   - `agent::loop_mod::resolve_reroute` / `lazy_start_then_retry` — a tool
+///     result forced the rest of the turn local, including the retry after the
+///     bundled sidecar is lazily started.
+///   - `agent::memory_flush::LocalModelExtractor::local_provider` — not a
+///     user turn at all, but it does send trimmed (possibly private) history to
+///     a model, so it is held to the same rule.
+///
+/// The first and last of those used to be hand-rolled
+/// `find(|p| p.is_local() && p.is_private())` loops over `list_providers()`.
+/// Same predicate, same order, same answer — but a third and fourth copy of
+/// "what counts as local", which is how two definitions drift apart and one of
+/// them stops matching what the enforcer would allow. They now call this
+/// function, so the list above is exhaustive by construction rather than by
+/// good intentions.
+///
+/// Handing `Unconstrained` to an enforcer is a caller bug, so it is reported as
+/// one rather than silently satisfied.
 pub fn enforce_local_routing<'a>(
     routing: &RoutingRequirement,
     candidates: &'a [Provider],
@@ -191,6 +229,62 @@ mod tests {
         let result = enforce_local_routing(&local_required("PII detected"), &candidates)
             .expect("a local candidate exists and must be selected");
         assert_eq!(result.id, "local-llama");
+    }
+
+    #[test]
+    fn local_required_picks_the_first_local_private_candidate_in_list_order() {
+        // The selection rule, pinned so the doc can't drift from it: FIRST
+        // candidate satisfying `is_local() && is_private()`, in the order given.
+        // Production passes `list_providers()`, which storage emits
+        // `ORDER BY name`, so this is "alphabetically first local private
+        // endpoint" — arbitrary in WHICH local box it lands on, never in the
+        // trust zone. `AgentLoop::find_local_provider` and the memory-flush
+        // extractor both route through here, so this is the one rule.
+        let first_alphabetically = Provider::new(
+            "aardvark-cloud",
+            "Aardvark",
+            "https://api.aardvark.example/v1",
+            Some("sk-test".to_string()),
+            ProviderKind::Cloud,
+        );
+        let box_a = Provider::new(
+            "box-a",
+            "Box A",
+            "http://10.0.0.5:8000/v1",
+            None,
+            ProviderKind::Local,
+        );
+        let box_b = Provider::new(
+            "box-b",
+            "Box B",
+            "http://10.0.0.6:8000/v1",
+            None,
+            ProviderKind::Local,
+        );
+        let candidates = vec![first_alphabetically, box_a, box_b];
+
+        let picked = enforce_local_routing(&local_required("PII detected"), &candidates)
+            .expect("two local candidates exist");
+        // The alphabetically-first provider overall is skipped because it is
+        // cloud — the predicate, not the position, is what gates the answer.
+        assert_eq!(picked.id, "box-a");
+        assert!(picked.is_local() && picked.is_private());
+    }
+
+    #[test]
+    fn local_required_skips_a_local_kind_provider_at_a_public_url() {
+        // `kind` is a user-typed label with no enforcement power; the base URL
+        // decides. A row someone tagged "Local" while pointing it at a public
+        // host must not be able to satisfy a local-only requirement.
+        let mislabelled = Provider::new(
+            "mislabelled",
+            "Definitely My Laptop",
+            "https://api.openai.com/v1",
+            Some("sk-test".to_string()),
+            ProviderKind::Local,
+        );
+        let candidates = vec![mislabelled];
+        assert!(enforce_local_routing(&local_required("PII detected"), &candidates).is_err());
     }
 
     #[test]

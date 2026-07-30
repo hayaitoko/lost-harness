@@ -1364,13 +1364,42 @@ impl AgentLoop {
 
     // ── helpers ─────────────────────────────────────────────────────────
 
-    /// Find the first registered provider that is both `Local` *and*
-    /// private by base URL. Returns `None` if no local model is set up.
+    /// The endpoint a privacy reroute lands on: a provider that is both
+    /// `ProviderKind::Local` *and* private by base URL. `None` if no local
+    /// model is set up (the caller then fails loudly — never onto cloud).
+    ///
+    /// # Selection rule, stated
+    ///
+    /// **The first `is_local() && is_private()` provider in
+    /// `ModelManager::list_providers()` order — which the storage layer emits
+    /// `ORDER BY name` (`storage/global.rs`). That is: alphabetically first
+    /// among the local private endpoints.**
+    ///
+    /// Say it out loud because it *is* arbitrary. With two local endpoints
+    /// registered, which one serves a rerouted turn is decided by their names,
+    /// not by anything the user asked for. What it is NOT arbitrary about is
+    /// the trust zone: every candidate the predicate admits is private by base
+    /// URL, so a reroute can only ever move a turn *toward* the private zone.
+    /// That is why this is a legitimate endpoint source and the user's
+    /// explicit picker choice being silently replaced by
+    /// `providers.first()` was not.
+    ///
+    /// Routed through [`enforce_local_routing`] rather than repeating the
+    /// predicate here. It was a hand-rolled `find(..)` over the same list —
+    /// same rule, but a second copy of it, which is how two "local" definitions
+    /// quietly drift apart. `hooks::routing` is the one place allowed to turn a
+    /// local-only requirement into an endpoint, and this is now genuinely that
+    /// one place; see the invariant on `enforce_local_routing`.
     fn find_local_provider(&self) -> Option<Provider> {
-        self.model_manager
-            .list_providers()
-            .into_iter()
-            .find(|p| p.is_local() && p.is_private())
+        let candidates = self.model_manager.list_providers();
+        enforce_local_routing(
+            &RoutingRequirement::LocalRequired {
+                reason: "privacy reroute: this turn must stay on a local endpoint".to_string(),
+            },
+            &candidates,
+        )
+        .ok()
+        .cloned()
     }
 
     /// The borrowed lazy-runner reference for the free-fn reroute path.

@@ -95,13 +95,25 @@ impl LocalModelExtractor {
         }
     }
 
-    /// The first registered provider that is both `Local` AND private by URL —
-    /// the same predicate `AgentLoop::find_local_provider` trusts.
+    /// The local endpoint this extraction runs on.
+    ///
+    /// Same rule as `AgentLoop::find_local_provider`, and now literally the
+    /// same code path: `enforce_local_routing` under a `LocalRequired`
+    /// requirement — first `is_local() && is_private()` provider in
+    /// `list_providers()` order (storage emits `ORDER BY name`). It was a
+    /// second hand-rolled copy of the predicate; two copies of "what counts as
+    /// local" is how they drift, and here that would mean trimmed private turns
+    /// going somewhere the routing enforcer would have refused.
     fn local_provider(&self) -> Option<Provider> {
-        self.model_manager
-            .list_providers()
-            .into_iter()
-            .find(|p| p.is_local() && p.is_private())
+        let candidates = self.model_manager.list_providers();
+        crate::hooks::enforce_local_routing(
+            &crate::hooks::RoutingRequirement::LocalRequired {
+                reason: "memory pre-compaction flush: trimmed turns may be private".to_string(),
+            },
+            &candidates,
+        )
+        .ok()
+        .cloned()
     }
 }
 
