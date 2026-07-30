@@ -4,6 +4,9 @@
   // accent/theme/appearance controls. Closing returns to the main screen.
   // Ported from the React Settings screen (templates/settings/Settings.dc.html).
   import { nav } from "../nav.svelte";
+  // Presets live in their own module so the "no endpoint this app cannot talk
+  // to" rule is testable — see src/tests/provider-presets.test.ts.
+  import { QUICK_PROVIDER_PRESETS } from "../provider-presets";
   import Button from "../components/Button.svelte";
   import IconButton from "../components/IconButton.svelte";
   import SegmentedControl from "../components/SegmentedControl.svelte";
@@ -118,26 +121,6 @@
     kind: "cloud",
     supportsNativeTools: false,
   };
-  const QUICK_PROVIDER_PRESETS: Array<{
-    id: string;
-    name: string;
-    baseUrl: string;
-    kind: ProviderKind;
-  }> = [
-    // NO "Anthropic" preset — deliberately removed, do not re-add.
-    // This app's model client speaks only the OpenAI-compatible surface:
-    // `GET {base_url}/models` and `POST {base_url}/chat/completions` with
-    // `Authorization: Bearer` (src-tauri/src/models/client.rs). Anthropic's
-    // native API needs `x-api-key` + `anthropic-version` and rejects a Bearer
-    // key, so `https://api.anthropic.com/v1/models` always came back empty —
-    // and with no free-text model entry anywhere in the app, that provider
-    // could never be selected at all. A preset a user can add but never use is
-    // a trap; relabelling it would not have made the request work.
-    { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", kind: "cloud" },
-    { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", kind: "cloud" },
-    { id: "lmstudio", name: "LM Studio", baseUrl: "http://localhost:1234/v1", kind: "local" },
-    { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434/v1", kind: "local" },
-  ];
   const PROVIDER_KIND_OPTIONS = [
     { value: "cloud", label: "Cloud (public endpoint)" },
     { value: "local", label: "Local (loopback / LAN / tailnet)" },
