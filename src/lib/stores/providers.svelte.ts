@@ -122,17 +122,28 @@ function loadFromStorage(): {
   providers: Provider[];
   active: ActiveSelection | null;
 } {
-  const empty = { providers: [], active: null };
-  if (typeof localStorage === "undefined") return empty;
+  if (typeof localStorage === "undefined") return { providers: [], active: null };
+  // Two INDEPENDENT blobs, so two independent try blocks. Sharing one meant a
+  // corrupt selection blob threw past the provider parse and discarded the
+  // whole provider list — the user's configured endpoints vanishing because a
+  // single unrelated key was malformed. Each failure now costs only its own
+  // value: unreadable providers → no providers, unreadable selection →
+  // disarmed composer (which then refuses to send, the correct fail-closed
+  // outcome), never one taking the other with it.
+  let providers: Provider[] = [];
   try {
     const rawProv = localStorage.getItem(STORAGE_KEY);
-    const providers: Provider[] = rawProv
-      ? migrateProviders(JSON.parse(rawProv))
-      : [];
-    return { providers, active: loadActiveSelection() };
+    if (rawProv) providers = migrateProviders(JSON.parse(rawProv));
   } catch {
-    return empty;
+    providers = [];
   }
+  let active: ActiveSelection | null = null;
+  try {
+    active = loadActiveSelection();
+  } catch {
+    active = null;
+  }
+  return { providers, active };
 }
 
 const initial = loadFromStorage();
@@ -323,8 +334,14 @@ export async function hydrateProviders(): Promise<void> {
     const prior = providersStore.active;
     if (prior && !merged.some((p) => p.id === prior.providerId)) {
       const priorName = localById.get(prior.providerId)?.name ?? prior.providerId;
-      providersStore.active = null;
-      providersStore.activeSelectionLost = `The endpoint you had selected (${priorName}) is no longer configured. Pick a model before sending.`;
+      // Through `clearActiveSelection`, not by hand: this module's own rule is
+      // that the pair is only ever written by `setActiveModel` /
+      // `clearActiveSelection`, and a hand-written `active = null` here both
+      // broke that rule and skipped the `persistActive()` the clear does — the
+      // disarm lived only in memory until some later call happened to persist.
+      clearActiveSelection(
+        `The endpoint you had selected (${priorName}) is no longer configured. Pick a model before sending.`,
+      );
     }
 
     persistProviders();
@@ -581,11 +598,12 @@ export function clearActiveSelection(reason: string | null = null): void {
 /** Reset everything — used in tests / future "clear all" UI. */
 export function resetProviders(): void {
   providersStore.providers = [];
-  providersStore.active = null;
-  providersStore.activeSelectionLost = null;
   modelCache.clear();
   persistProviders();
-  persistActive();
+  // Same rule as everywhere else in this module: the pair is written through
+  // `clearActiveSelection`, never by hand. (No reason — this clear IS the
+  // caller's own doing.)
+  clearActiveSelection();
 }
 
 // Quick lookup for the UI; pure derived data off the runes state.

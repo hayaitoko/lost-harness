@@ -837,6 +837,27 @@
     return modelsByProvider[p.id] ?? [];
   }
 
+  /**
+   * Arm an endpoint from the Settings list, honouring the store's answer.
+   *
+   * `setActiveModel` returns `false` when the provider is no longer configured
+   * or the model is blank, and it is documented as "deliberately not a silent
+   * no-op" for a reason: a caller that discards the result leaves the PREVIOUS
+   * endpoint armed while this row's Select visibly moves to the new model. The
+   * user then reads one endpoint off the screen and sends to another — the
+   * same UI-says-one-thing / send-does-another shape this whole fix exists to
+   * close. So: say so, and leave the row honest.
+   */
+  function armProviderModel(providerId: string, model: string): void {
+    if (model.trim() === "") return; // the Select's own empty placeholder
+    if (!setActiveModel(providerId, model)) {
+      providerError =
+        "Couldn't select that model — the endpoint is no longer configured. Reload settings and try again.";
+      return;
+    }
+    providerError = null;
+  }
+
   function providerDotColor(kind: ProviderKind): string {
     if (kind === "local") return "var(--local)";
     if (kind === "cloud") return "var(--cloud)";
@@ -1421,7 +1442,7 @@
                       <Select
                         items={models.map((m) => ({ value: m, label: m }))}
                         value={isActive ? (providersStore.activeModel ?? "") : ""}
-                        onchange={(v) => setActiveModel(p.id, v)}
+                        onchange={(v) => armProviderModel(p.id, v)}
                         placeholder={models.length > 0
                           ? "Select model"
                           : listError

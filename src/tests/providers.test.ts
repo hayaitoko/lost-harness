@@ -762,6 +762,38 @@ describe("providers store — persisted selection shape", () => {
 
     expect(fresh.providersStore.active).toBeNull();
   });
+
+  it("a corrupt selection blob does not take the PROVIDER LIST down with it", async () => {
+    // The two blobs are independent values under independent keys, and used to
+    // be parsed inside one shared try: a throw from the selection parse escaped
+    // past the already-parsed providers and returned the `empty` fallback, so
+    // one malformed key made every configured endpoint vanish. Each failure
+    // must cost only its own value.
+    localStorage.setItem(
+      "lh.providers.v1",
+      JSON.stringify([
+        {
+          id: "keep-me",
+          name: "My box",
+          baseUrl: "http://10.0.0.5:8000/v1",
+          hasApiKey: false,
+          kind: "custom",
+          isPrivate: true,
+          supportsNativeTools: true,
+          trustedByName: false,
+        },
+      ]),
+    );
+    localStorage.setItem("lh.providers.active.v2", "{not json");
+
+    vi.resetModules();
+    const fresh = await import("$lib/stores/providers.svelte");
+
+    expect(fresh.providersStore.providers.map((p) => p.id)).toEqual(["keep-me"]);
+    // The selection alone was lost — the composer is disarmed (fail closed),
+    // not repointed at the surviving provider.
+    expect(fresh.providersStore.active).toBeNull();
+  });
 });
 
 // ── H-01 (P04) ──────────────────────────────────────────────────────────────
