@@ -15,7 +15,19 @@
   /** One provider's section of the popover. A group is listed even when it has
    *  no items, so a provider can never quietly disappear from the picker. */
   export interface ModelGroup {
-    /** Display name — the provider's name. */
+    /**
+     * Stable identity for this section: the PROVIDER ID, never the name.
+     * REQUIRED, and the only thing the each-block may key on.
+     *
+     * Provider names are not unique — ids are backend UUIDs, the `endpoints`
+     * table has no `UNIQUE(name)`, and nothing stops a user (or a
+     * double-clicked quick-add preset) from registering two providers both
+     * called "Ollama". Keying the section list by name made that a
+     * `each_key_duplicate` throw, and because this popover is always mounted
+     * the throw took down the whole composer — not just the list.
+     */
+    id: string;
+    /** Display name — the provider's name. Presentation only. */
     group: string;
     kind: "local" | "cloud";
     items: ModelOption[];
@@ -179,7 +191,11 @@
       />
     </div>
     <div class="max-h-[250px] overflow-y-auto p-[5px]">
-      {#each visibleGroups as g (g.group)}
+      <!-- Keyed by the provider ID. Two providers may legitimately share a
+           display name; keying by that name throws `each_key_duplicate` and,
+           since this popover is always in the DOM, takes the whole composer
+           down with it. -->
+      {#each visibleGroups as g (g.id)}
         <div>
           <div
             class="flex items-center gap-[7px] px-2 pt-2 pb-1 text-[10px] font-[650] uppercase tracking-[0.05em] text-text-3"

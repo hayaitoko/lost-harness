@@ -306,11 +306,20 @@
     const groups: ModelGroup[] = [];
     const owner = new Map<string, { providerId: string; name: string }>();
     for (const { provider, result } of perProvider) {
-      const models = result.ok ? result.models : [];
+      // De-duplicate within one endpoint's listing: `key` is
+      // `providerId::name`, so an endpoint that returns the same model name
+      // twice would produce two identical keys and throw `each_key_duplicate`
+      // in the (always-mounted) popover — the same crash class as a duplicate
+      // group key, one level down.
+      const models = result.ok ? [...new Set(result.models)] : [];
       for (const name of models) {
         owner.set(modelKey(provider.id, name), { providerId: provider.id, name });
       }
       groups.push({
+        // Identity is the provider ID. Two providers may share a display
+        // name (nothing enforces uniqueness — see ModelGroup.id), and a
+        // name-keyed list would crash the whole composer when they do.
+        id: provider.id,
         group: provider.name,
         kind: provider.kind === "cloud" ? "cloud" : "local",
         items: models.map((name) => ({ name, key: modelKey(provider.id, name) })),
