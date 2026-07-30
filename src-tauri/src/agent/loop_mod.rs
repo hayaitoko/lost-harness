@@ -43,7 +43,7 @@ use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
 use crate::agent::result_sink::ResultSink;
 use crate::hooks::{enforce_local_routing, RoutingRequirement};
-use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider};
+use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider, TrustZone};
 use crate::storage::{MemoryBucket, MemoryFact, Message, ProfileDb, Storage, TrmLog};
 use crate::tools::{ExecCtx, ToolDispatcher, TurnOutcome};
 
@@ -680,6 +680,15 @@ impl AgentLoop {
                     .await;
             }
         }
+    }
+
+    /// This loop's provider registry. Exposed so the work runner can stamp the
+    /// trust zone of a helper's endpoint onto the note it posts back into the
+    /// parent conversation — a zone must come from the endpoint that actually
+    /// ran, at the time it ran, never from whatever the registry holds when the
+    /// transcript is later rendered.
+    pub(crate) fn model_manager(&self) -> &ModelManager {
+        &self.model_manager
     }
 
     /// Wave 4.3c — run one bounded, one-shot "helper" sub-agent. This is the
@@ -1470,6 +1479,9 @@ impl AgentLoop {
             model: Some(model.clone()),
             provider_id: Some(provider.id.clone()),
             routing_decision: Some(routing_decision.to_string()),
+            // Stamp the zone this turn ran in, from the SAME `is_cloud` the
+            // gate was given — never recomputed later from the live registry.
+            endpoint_zone: Some(TrustZone::from_is_cloud(is_cloud).as_str().to_string()),
             thinking_content: None,
             error: None,
             aborted: false,
@@ -1817,6 +1829,13 @@ impl AgentLoop {
                 model: Some(model.clone()),
                 provider_id: Some(provider.id.clone()),
                 routing_decision: Some(routing_decision.to_string()),
+                // The trust zone THIS round ran in, taken from the live
+                // `is_cloud` that governed it — so a mid-turn reroute to a
+                // local endpoint is recorded as local, and a cloud turn stays
+                // cloud forever regardless of what happens to the provider
+                // afterwards. This is the value the route badge renders; it is
+                // never re-derived frontend-side.
+                endpoint_zone: Some(TrustZone::from_is_cloud(is_cloud).as_str().to_string()),
                 thinking_content: None,
                 error: None,
                 // C7: a cancelled turn is ALSO marked aborted (distinguishable
@@ -1941,6 +1960,11 @@ impl AgentLoop {
                         model: Some(model.clone()),
                         provider_id: Some(provider.id.clone()),
                         routing_decision: Some(routing_decision.to_string()),
+                        // Post-reroute `is_cloud`, matching the provider on
+                        // this same row.
+                        endpoint_zone: Some(
+                            TrustZone::from_is_cloud(is_cloud).as_str().to_string(),
+                        ),
                         thinking_content: None,
                         error: None,
                         aborted: false,

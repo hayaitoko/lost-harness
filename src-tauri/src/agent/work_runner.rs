@@ -429,6 +429,13 @@ async fn run_one_item(
             model: Some(model.clone()),
             provider_id: Some(provider_id.clone()),
             routing_decision: Some("delegated".to_string()),
+            // The trust zone the HELPER ran in, read off the endpoint it used
+            // while that run is still the present. `None` (→ rendered as
+            // UNKNOWN, never as "local") if the provider went away mid-run.
+            endpoint_zone: agent_loop
+                .model_manager()
+                .get_provider(&provider_id)
+                .map(|p| p.trust_zone().as_str().to_string()),
             thinking_content: None,
             error: None,
             aborted: false,

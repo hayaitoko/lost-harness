@@ -431,6 +431,27 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
             updated_at INTEGER NOT NULL
         );",
     },
+    Migration {
+        version: 12,
+        // The per-turn TRUST ZONE, stamped when the turn ran: 'local' | 'cloud'
+        // (models::TrustZone). Persisted history, like `provider_id` beside it.
+        //
+        // Without it, the route badge had to re-derive the zone from the LIVE
+        // provider registry at render time — so a turn genuinely served by a
+        // public cloud endpoint rendered as a green "Local" badge once that
+        // provider was removed or its kind edited. The zone of a past turn is a
+        // fact about the past; it does not get to change.
+        //
+        // NULL on every row written before this migration, and the UI must
+        // render that as UNKNOWN. Backfilling it from today's registry would
+        // manufacture exactly the lie this column removes.
+        //
+        // Like v5 (and global v2's `pinned`), ADD COLUMN has no IF-NOT-EXISTS,
+        // so this lives ONLY here and NOT in PROFILE_SCHEMA_SQL: a fresh DB
+        // runs v1 (column absent) then v12 adds it, matching the upgrade path.
+        name: "messages_endpoint_zone",
+        sql: "ALTER TABLE messages ADD COLUMN endpoint_zone TEXT;",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.
@@ -532,6 +553,66 @@ mod tests {
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, PROFILE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgrading_an_existing_profile_db_adds_the_trust_zone_column_without_backfilling() {
+        // v12 is an ALTER TABLE, so it must work on a DB that already holds
+        // messages — and it must leave those pre-existing rows with a NULL
+        // zone. Backfilling them from today's provider registry would
+        // manufacture exactly the lie the column exists to remove: a turn
+        // served months ago by a cloud endpoint would be re-labelled from
+        // whatever that provider looks like now.
+        let conn = Connection::open_in_memory().unwrap();
+        let v11 = &PROFILE_MIGRATIONS[..11];
+        assert_eq!(v11.last().unwrap().version, 11, "slice must stop at v11");
+        run_migrations(&conn, v11, "profile-v11").unwrap();
+
+        conn.execute(
+            "INSERT INTO conversations (id, name, pinned, binding, created_at, updated_at)
+             VALUES ('c1', 'old chat', 0, 'auto', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Written by the pre-v12 code path: no zone column existed at all.
+        conn.execute(
+            "INSERT INTO messages
+             (id, conversation_id, role, content, model, provider_id,
+              routing_decision, thinking_content, error, aborted, created_at)
+             VALUES ('m1', 'c1', 'assistant', 'hi', 'gpt-x', 'cloudco',
+                     'allow', NULL, NULL, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate_profile(&conn).unwrap();
+
+        let v: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, PROFILE_SCHEMA_VERSION);
+
+        let zone: Option<String> = conn
+            .query_row(
+                "SELECT endpoint_zone FROM messages WHERE id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            zone, None,
+            "a pre-v12 row must read back as UNKNOWN — never backfilled, and \
+             never defaulted to 'local'"
+        );
+        // The row it belongs to is otherwise untouched.
+        let provider: String = conn
+            .query_row(
+                "SELECT provider_id FROM messages WHERE id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "cloudco");
     }
 
     #[test]

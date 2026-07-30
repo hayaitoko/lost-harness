@@ -36,6 +36,16 @@ pub struct Message {
     pub model: Option<String>,
     pub provider_id: Option<String>,
     pub routing_decision: Option<String>,
+    /// The trust zone this turn ACTUALLY ran in, stamped when it ran:
+    /// `"local"` | `"cloud"` (see `models::TrustZone`).
+    ///
+    /// Persisted history, exactly like `provider_id`. The zone of a past turn
+    /// is a historical fact, and re-deriving it later from the live provider
+    /// registry is how a turn served by a public cloud endpoint ends up
+    /// wearing a green "Local" badge once that provider is edited or removed.
+    /// `None` on a row written before v12 — which the UI must render as
+    /// UNKNOWN, never as "local".
+    pub endpoint_zone: Option<String>,
     /// Reasoning/thinking output (spec §5). None for non-thinking models.
     pub thinking_content: Option<String>,
     pub error: Option<String>,
@@ -383,8 +393,9 @@ impl ProfileDb {
         self.conn.lock().execute(
             "INSERT INTO messages
              (id, conversation_id, role, content, model, provider_id,
-              routing_decision, thinking_content, error, aborted, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              routing_decision, endpoint_zone, thinking_content, error, aborted,
+              created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 m.id,
                 m.conversation_id,
@@ -393,6 +404,7 @@ impl ProfileDb {
                 m.model,
                 m.provider_id,
                 m.routing_decision,
+                m.endpoint_zone,
                 m.thinking_content,
                 m.error,
                 m.aborted as i64,
@@ -408,7 +420,8 @@ impl ProfileDb {
             .lock()
             .query_row(
                 "SELECT id, conversation_id, role, content, model, provider_id,
-                        routing_decision, thinking_content, error, aborted, created_at
+                        routing_decision, endpoint_zone, thinking_content, error,
+                        aborted, created_at
                  FROM messages WHERE id = ?1",
                 params![id],
                 row_to_message,
@@ -425,7 +438,8 @@ impl ProfileDb {
             // string. rowid preserves insertion order, which the transcript
             // and send_message's "last assistant row" lookup rely on.
             "SELECT id, conversation_id, role, content, model, provider_id,
-                    routing_decision, thinking_content, error, aborted, created_at
+                    routing_decision, endpoint_zone, thinking_content, error,
+                    aborted, created_at
              FROM messages WHERE conversation_id = ?1
              ORDER BY created_at ASC, rowid ASC",
         )?;
@@ -1767,10 +1781,11 @@ fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         model: r.get(4)?,
         provider_id: r.get(5)?,
         routing_decision: r.get(6)?,
-        thinking_content: r.get(7)?,
-        error: r.get(8)?,
-        aborted: r.get::<_, i64>(9)? != 0,
-        created_at: r.get(10)?,
+        endpoint_zone: r.get(7)?,
+        thinking_content: r.get(8)?,
+        error: r.get(9)?,
+        aborted: r.get::<_, i64>(10)? != 0,
+        created_at: r.get(11)?,
     })
 }
 

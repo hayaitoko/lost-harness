@@ -208,6 +208,7 @@ impl<R: Runtime> TestLoop<R> {
                 GateDecision::Block(_) => "block".to_string(),
                 GateDecision::ConfirmRequired { .. } => "confirm_required".to_string(),
             }),
+            endpoint_zone: Some(provider.trust_zone().as_str().to_string()),
             thinking_content: None,
             error: None,
             aborted: false,
@@ -269,6 +270,7 @@ impl<R: Runtime> TestLoop<R> {
             model: Some("m".to_string()),
             provider_id: Some(provider.id),
             routing_decision: None,
+            endpoint_zone: None,
             thinking_content: None,
             error: None,
             aborted: false,
@@ -840,6 +842,7 @@ fn conversation_is_cloud_safe_blocks_on_a_prior_private_turn() {
         model: None,
         provider_id: None,
         routing_decision: None,
+        endpoint_zone: None,
         thinking_content: None,
         error: None,
         aborted: false,
@@ -876,6 +879,7 @@ fn conversation_is_cloud_safe_blocks_on_a_prior_private_turn() {
         provider_id: None,
         routing_decision: Some("allow".to_string()), // was fine on a LOCAL endpoint
         thinking_content: None,
+        endpoint_zone: None,
         error: None,
         aborted: false,
         created_at: 1,
@@ -946,6 +950,7 @@ fn cloud_safe_cache_flips_to_unsafe_when_a_private_turn_is_appended() {
             model: None,
             provider_id: None,
             routing_decision: Some("allow".to_string()),
+            endpoint_zone: None,
             thinking_content: None,
             error: None,
             aborted: false,
@@ -1430,6 +1435,7 @@ async fn b7_allow_on_cloud_refuses_when_prior_history_is_private_and_no_local_ex
             model: None,
             provider_id: None,
             routing_decision: None,
+            endpoint_zone: None,
             thinking_content: None,
             error: None,
             aborted: false,
@@ -1522,6 +1528,7 @@ async fn b6_delegated_helper_result_is_guard_wrapped_never_replayed_as_trusted_a
             model: None,
             provider_id: None,
             routing_decision: Some("delegated".to_string()),
+            endpoint_zone: None,
             thinking_content: None,
             error: None,
             aborted: false,
@@ -1587,6 +1594,7 @@ async fn b6_ordinary_assistant_turn_is_replayed_unwrapped() {
             model: None,
             provider_id: None,
             routing_decision: Some("allow".to_string()),
+            endpoint_zone: None,
             thinking_content: None,
             error: None,
             aborted: false,
@@ -1965,6 +1973,119 @@ async fn a_privacy_reroute_stamps_the_local_provider_on_the_persisted_row() {
         assistant.routing_decision.as_deref(),
         Some("route_local"),
         "the override must be labelled, so the UI can show it"
+    );
+    assert_eq!(
+        assistant.endpoint_zone.as_deref(),
+        Some("local"),
+        "the reroute landed on a loopback endpoint, so the stamped zone is local"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_cloud_served_turn_stamps_cloud_on_the_row_and_never_local() {
+    // The badge's whole job. A turn that egressed must carry `endpoint_zone =
+    // "cloud"` in the transcript FOREVER — the frontend renders that stamp and
+    // nothing else, so it can no longer re-derive a green "Local" out of the
+    // live provider list (or out of a provider that has since been deleted).
+    let cloud = cloud_provider("cloudco");
+    let fake = Arc::new(FakeStreamer::new(
+        cloud.clone(),
+        sse_chunks_for("answered off-box"),
+    ));
+    let (agent, storage, dir) = b7_loop_with(Arc::clone(&fake), &[]);
+    b7_seed_conversation(&storage, "cz");
+
+    agent
+        .process_message(
+            "what is the capital of France".into(),
+            "cz".into(),
+            Binding::Public,
+            cloud.id.clone(),
+            "gpt-x".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .expect("a clean public turn completes");
+
+    let rows = storage
+        .open_profile("personal")
+        .unwrap()
+        .list_messages_by_conversation("cz")
+        .unwrap();
+    let assistant = rows
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .expect("the turn persisted an assistant row");
+    assert_eq!(assistant.provider_id.as_deref(), Some("cloudco"));
+    assert_eq!(
+        assistant.endpoint_zone.as_deref(),
+        Some("cloud"),
+        "a turn served by a public endpoint must be stamped cloud, never local"
+    );
+    // The user's own prompt row carries the same zone — it is the text that
+    // left the machine, so "where did this go?" must be answerable from it too.
+    let user = rows
+        .iter()
+        .find(|m| m.role == "user")
+        .expect("the turn persisted a user row");
+    assert_eq!(user.endpoint_zone.as_deref(), Some("cloud"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn the_stamped_zone_follows_the_endpoint_not_the_declared_kind() {
+    // `kind` is a user-typed label with no enforcement power. A provider the
+    // user tagged `Cloud` that actually points at loopback never egressed, and
+    // labelling it by `kind` would tell the user their local turn went to the
+    // cloud — the same class of lie in the other direction. The zone follows
+    // `is_private()` (the base URL), which is exactly what the privacy gate
+    // itself consumes.
+    let mislabelled = Provider::new(
+        "mislabelled",
+        "Cloud-Tagged Loopback",
+        "http://127.0.0.1:1234/v1",
+        None,
+        ProviderKind::Cloud,
+    );
+    let fake = Arc::new(FakeStreamer::new(
+        mislabelled.clone(),
+        sse_chunks_for("stayed on the box"),
+    ));
+    let (agent, storage, dir) = b7_loop_with(Arc::clone(&fake), &[]);
+    b7_seed_conversation(&storage, "ck");
+
+    agent
+        .process_message(
+            "hello".into(),
+            "ck".into(),
+            Binding::Public,
+            mislabelled.id.clone(),
+            "m".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .expect("the turn completes");
+
+    let rows = storage
+        .open_profile("personal")
+        .unwrap()
+        .list_messages_by_conversation("ck")
+        .unwrap();
+    let assistant = rows
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .expect("the turn persisted an assistant row");
+    assert_eq!(
+        assistant.endpoint_zone.as_deref(),
+        Some("local"),
+        "kind=Cloud on a loopback base_url is still a local turn"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -31,5 +31,5 @@ mod tests;
 
 pub use client::{ChatMessage, ModelClient, OwnOutput};
 pub use manager::ModelManager;
-pub use provider::{Provider, ProviderKind};
+pub use provider::{Provider, ProviderKind, TrustZone};
 pub use seat::resolve_seat;

@@ -625,6 +625,7 @@ mod tests {
             model: None,
             provider_id: None,
             routing_decision: None,
+            endpoint_zone: None,
             thinking_content: None,
             error: None,
             aborted: false,

@@ -13,7 +13,7 @@ use tokio_stream;
 
 use super::client::ChatMessage;
 use super::manager::ModelManager;
-use super::provider::{Provider, ProviderKind};
+use super::provider::{Provider, ProviderKind, TrustZone};
 use super::sse::{SseEvent, SseStream, MAX_LINE_LENGTH};
 
 // ── Provider ───────────────────────────────────────────────────────────────
@@ -118,6 +118,97 @@ fn provider_is_private_uses_egress_check() {
         !unparseable.is_private(),
         "unparseable URL is treated as public (refuse)"
     );
+}
+
+#[test]
+fn trust_zone_follows_the_endpoint_not_the_declared_kind() {
+    // The deliberate choice recorded on `TrustZone`: zone == !is_private(),
+    // because that is the value the privacy gate itself consumes
+    // (`loop_mod`'s `is_cloud`). `kind` is a user-typed label with no
+    // enforcement power, and both of the pairs below are states the app can
+    // genuinely be in — labelling by `kind` gets each of them backwards.
+    let cloud_tagged_loopback = Provider::new(
+        "p1",
+        "Mislabelled",
+        "http://127.0.0.1:1234/v1",
+        None,
+        ProviderKind::Cloud,
+    );
+    let local_tagged_public = Provider::new(
+        "p2",
+        "Also mislabelled",
+        "https://api.openai.com/v1",
+        None,
+        ProviderKind::Local,
+    );
+    let custom_on_the_lan = Provider::new(
+        "p3",
+        "Tadashi",
+        "http://10.0.0.100:8000/v1",
+        None,
+        ProviderKind::Custom,
+    );
+    let custom_off_box = Provider::new(
+        "p4",
+        "Someone else's server",
+        "https://api.example.com/v1",
+        None,
+        ProviderKind::Custom,
+    );
+
+    assert_eq!(
+        cloud_tagged_loopback.trust_zone(),
+        TrustZone::Local,
+        "nothing left the machine, whatever the label says"
+    );
+    assert_eq!(
+        local_tagged_public.trust_zone(),
+        TrustZone::Cloud,
+        "a `Local`-tagged provider pointed at a public API still egresses — \
+         calling this local is the exact privacy lie the badge must never tell"
+    );
+    assert_eq!(
+        custom_on_the_lan.trust_zone(),
+        TrustZone::Local,
+        "the user's own LAN box did not leave the network they control"
+    );
+    assert_eq!(custom_off_box.trust_zone(), TrustZone::Cloud);
+}
+
+#[test]
+fn trust_zone_agrees_with_the_gate_s_own_is_cloud() {
+    // `agent::loop_mod` computes `is_cloud = !is_private_endpoint(base_url)`
+    // and feeds THAT into the gate, into `allow_private_memory`, and into the
+    // cost ledger. The stamped zone must be the same bit — a badge that can
+    // disagree with the enforcement is worse than no badge.
+    for url in [
+        "http://127.0.0.1:1234/v1",
+        "http://10.0.0.100:8000/v1",
+        "http://100.85.52.127:8000/v1",
+        "https://api.openai.com/v1",
+        "https://api.anthropic.com/v1",
+        "not a url",
+    ] {
+        let p = Provider::new("p", "p", url, None, ProviderKind::Custom);
+        let is_cloud = !crate::agent::egress::is_private_endpoint(url);
+        assert_eq!(
+            p.trust_zone(),
+            TrustZone::from_is_cloud(is_cloud),
+            "zone disagreed with the gate's is_cloud for {url}"
+        );
+    }
+}
+
+#[test]
+fn trust_zone_parses_only_what_it_writes() {
+    assert_eq!(TrustZone::Local.as_str(), "local");
+    assert_eq!(TrustZone::Cloud.as_str(), "cloud");
+    assert_eq!(TrustZone::parse("local"), Some(TrustZone::Local));
+    assert_eq!(TrustZone::parse("cloud"), Some(TrustZone::Cloud));
+    // Anything else is UNKNOWN, never coerced to a reassuring default.
+    for junk in ["", "Local", "LOCAL", "custom", "private", "unknown"] {
+        assert_eq!(TrustZone::parse(junk), None, "coerced {junk:?}");
+    }
 }
 
 #[test]

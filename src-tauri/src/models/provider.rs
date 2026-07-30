@@ -27,6 +27,72 @@ pub enum ProviderKind {
     Custom,
 }
 
+/// The trust zone one turn actually ran in: did the prompt leave the user's
+/// own machine/network, or not?
+///
+/// **This is `!Provider::is_private()`, NOT `kind == Cloud`.** That choice is
+/// load-bearing, so it is spelled out here rather than left to a call site:
+///
+/// * `is_private()` parses the `base_url` the bytes are actually sent to. It
+///   is the same predicate the privacy gate itself consumes — `agent::loop_mod`
+///   computes `let is_cloud = !is_private_endpoint(&provider.base_url)` and
+///   feeds exactly that into `gate.check_detailed(..)`, into
+///   `allow_private_memory: !is_cloud`, and into the cost ledger. If the
+///   route badge used a different predicate, the badge and the enforcement
+///   would be free to disagree — which is the entire failure class the
+///   endpoint-routing spec exists to eliminate.
+/// * `kind` is a user-typed label with no enforcement power whatsoever.
+///   Nothing stops a `Local`-kind provider pointing at `api.openai.com`, and a
+///   `Custom`-kind provider pointing at `http://10.0.0.26:8000` is genuinely on
+///   the user's own network. Labelling by `kind` gets both of those backwards.
+///
+/// (`enforce_local_routing` uses the *stricter* `is_local() && is_private()`,
+/// but that answers a different question — which providers are ELIGIBLE to be
+/// forced-local — not where a turn's bytes went. For "did this leave the
+/// house?", `is_private()` alone is the honest answer.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustZone {
+    /// The endpoint is loopback / RFC1918 / tailnet — nothing left the
+    /// user's own machine or network.
+    Local,
+    /// The endpoint is reachable off-box — the prompt egressed.
+    Cloud,
+}
+
+impl TrustZone {
+    /// Build from the agent loop's own `is_cloud` flag — the value that
+    /// actually governed the turn (including a mid-turn reroute to local).
+    /// Preferred over recomputing from a provider, so the stamped zone can
+    /// never drift from the zone the gate enforced.
+    pub fn from_is_cloud(is_cloud: bool) -> Self {
+        if is_cloud {
+            Self::Cloud
+        } else {
+            Self::Local
+        }
+    }
+
+    /// Wire/DB form. Matches the `serde` representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Cloud => "cloud",
+        }
+    }
+
+    /// Parse a persisted zone. `None` for anything unrecognised (including a
+    /// legacy row that never stored one) — the caller must render that as
+    /// UNKNOWN, never as a reassuring "local".
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "local" => Some(Self::Local),
+            "cloud" => Some(Self::Cloud),
+            _ => None,
+        }
+    }
+}
+
 /// C5 (Q6): where a `Local`-kind provider came from — descriptive metadata only,
 /// so the UI (and future backend logic) can tell a user-typed local endpoint
 /// from the app's own bundled sidecar WITHOUT string-sniffing the id. Never a
@@ -126,6 +192,16 @@ impl Provider {
     /// is not, even though the user added it manually.
     pub fn is_private(&self) -> bool {
         crate::agent::egress::is_private_endpoint(&self.base_url)
+    }
+
+    /// The trust zone a turn served by this endpoint runs in. See
+    /// [`TrustZone`] for why this is `is_private()` and not `kind`.
+    ///
+    /// Use [`TrustZone::from_is_cloud`] instead wherever the agent loop's own
+    /// `is_cloud` is in scope; this is for the paths that only have a
+    /// `Provider`.
+    pub fn trust_zone(&self) -> TrustZone {
+        TrustZone::from_is_cloud(!self.is_private())
     }
 }
 
