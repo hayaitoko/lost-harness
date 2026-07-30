@@ -2792,7 +2792,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let partial = dir.join("model.gguf.partial");
         let gguf = dir.join("model.gguf");
-        crate::models::download::download_to_partial(&file.url, &partial, |_, _| {})
+        crate::models::download::download_to_partial(&file.url, &partial, file.size_bytes, |_, _| {})
             .await
             .expect("download");
         crate::models::download::verify_and_install(&partial, &gguf, &file.sha256)
