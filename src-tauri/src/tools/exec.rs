@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
@@ -91,36 +91,146 @@ pub trait SandboxedSpawn: Send + Sync {
 
 #[cfg(unix)]
 mod platform {
+    use std::collections::HashSet;
     use std::process::ExitStatus;
 
-    /// Kill the whole process group (`pgid == child pid`) AND walk the
-    /// process tree to catch any descendant that escaped via `setsid(2)`.
-    /// One `kill(-pgid)` reaps `sandbox-exec` → its fork → any grandchild
-    /// that stayed in the group; the tree walk catches the rest.
-    pub fn kill_group(pgid: i32) {
-        // SAFETY: `kill(2)` with a negative pid targets the process group. A
-        // missing group (already-exited) just returns ESRCH, which we ignore.
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
-        // Catch any descendant that escaped the group kill via setsid(2).
-        kill_descendants(pgid);
+    /// One row of a process-table snapshot — exactly the links a tree walk
+    /// needs. Kept as plain data so the expansion below is a pure function
+    /// (unit-testable without spawning anything).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ProcRow {
+        pub pid: i32,
+        pub ppid: i32,
+        pub pgid: i32,
     }
 
-    /// Walk the process tree from `leader_pid` and SIGKILL every descendant.
-    /// This defeats `setsid(2)` escape: the descendant still has a parent
-    /// link back to the leader even after creating a new session.
+    /// Safety stop on the snapshot→signal→re-scan loop. Not a budget: a round
+    /// only runs if the previous one discovered a NEW pid, so a quiescent tree
+    /// costs two rounds.
+    const MAX_KILL_ROUNDS: usize = 8;
+
+    /// Kill the leader's whole process tree: the process group, plus every
+    /// descendant that left the group via `setsid(2)`.
+    ///
+    /// **Order is the fix (M-14).** The descendant set is SNAPSHOT BEFORE
+    /// anything is signalled. `kill(-pgid)` destroys the very links a tree walk
+    /// needs: each intermediate in the group dies, and the kernel reparents its
+    /// children to `launchd` as it exits, so a grandchild that had called
+    /// `setsid(2)` (new session, out of the group) becomes unreachable the
+    /// instant its parent is reaped. Kill-then-enumerate therefore races
+    /// against signal delivery — and loses whenever the enumeration is slower
+    /// than the kernel (e.g. a wide tree, which makes the walk expensive).
+    /// Enumerate-then-kill cannot lose that race.
+    ///
+    /// After signalling we re-scan and re-signal until a round finds nothing
+    /// new, so a child forked in the window between the snapshot and signal
+    /// delivery is caught too.
+    ///
+    /// Known limit: this is a ppid/pgid walk — the only process-tree primitive
+    /// macOS offers (no PID namespace, no cgroup). A process that orphans
+    /// itself *before* the snapshot leaves no link to follow.
+    pub fn kill_group(pgid: i32) {
+        // SAFETY: getpid/getpgrp are always-succeeding syscalls.
+        let (self_pid, self_pgid) = unsafe { (libc::getpid(), libc::getpgrp()) };
+
+        // Every pid we have ever believed to be in the tree. Used only as BFS
+        // *seeds* on later rounds (a pid that has since died and been reused
+        // must not be signalled), so a child of an already-dead intermediate
+        // is still reachable while that intermediate lingers in the table.
+        let mut seeds: HashSet<i32> = HashSet::new();
+        seeds.insert(pgid);
+
+        for round in 0..MAX_KILL_ROUNDS {
+            let table = snapshot_processes();
+            let found = expand_tree(&table, &seeds, self_pid, self_pgid);
+            let discovered = found.difference(&seeds).count();
+            seeds.extend(found.iter().copied());
+            if round > 0 && discovered == 0 {
+                // Nothing new since the previous round's signal: the set is
+                // stable, and SIGKILL cannot be blocked or handled, so
+                // re-signalling would be pure noise.
+                break;
+            }
+            // SAFETY: `kill(2)` with a negative pid targets the process group;
+            // a missing target just returns ESRCH, which we ignore. SIGKILL is
+            // idempotent, so re-signalling across rounds is harmless.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+            for &pid in &found {
+                // Never signal pid 0 (our own group), pid 1, or ourselves.
+                if pid > 1 && pid != self_pid {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Expand `seeds` into every pid in `table` that belongs to the seeded
+    /// tree, transitively, by TWO links:
+    ///
+    /// * `ppid` — the ordinary parent chain.
+    /// * `pgid` whose **leader is itself an in-tree pid** — this is what
+    ///   catches the children of a `setsid(2)` escapee: the escapee's new
+    ///   process group is led by the escapee, so anything it forks is still
+    ///   attributable even if the escapee itself is already gone. Requiring
+    ///   the group *leader* to be in-tree is what keeps this from ever
+    ///   capturing an unrelated group: a hostile descendant that `setpgid`s
+    ///   into some other group in our session names a group we do not lead,
+    ///   so it is not followed.
+    ///
+    /// `protect_pid` / `protect_pgid` (our own pid and process group) are never
+    /// returned — the walk must not be able to turn into a self-kill.
+    ///
+    /// Pure function over a snapshot: no syscalls, so the caller pays for
+    /// exactly one process-table read per round.
+    pub fn expand_tree(
+        table: &[ProcRow],
+        seeds: &HashSet<i32>,
+        protect_pid: i32,
+        protect_pgid: i32,
+    ) -> HashSet<i32> {
+        let mut known: HashSet<i32> = seeds.clone();
+        // pgids whose group LEADER is a known in-tree pid.
+        let mut groups: HashSet<i32> = seeds.clone();
+        loop {
+            let mut grew = false;
+            for row in table {
+                if row.pid <= 1 || row.pid == protect_pid || known.contains(&row.pid) {
+                    continue;
+                }
+                let by_parent = known.contains(&row.ppid);
+                let by_group = row.pgid != protect_pgid && groups.contains(&row.pgid);
+                if by_parent || by_group {
+                    known.insert(row.pid);
+                    // If this pid leads a group, that group is in-tree too.
+                    groups.insert(row.pid);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        known.remove(&protect_pid);
+        known
+    }
+
+    /// Read the whole process table once: `(pid, ppid, pgid)` for every process
+    /// we can query.
     #[cfg(target_os = "macos")]
-    fn kill_descendants(leader_pid: i32) {
-        // Use libproc(3) to list all PIDs and query each for its BSD info.
-        // proc_listallpids returns the full pid list; proc_pidinfo with
-        // PROC_PIDTBSDINFO fills proc_bsdinfo which has pbi_ppid + pbi_pgid.
-        // BFS from the leader to find every descendant — catches setsid(2)
-        // escapees because the parent chain is intact at enumeration time.
+    fn snapshot_processes() -> Vec<ProcRow> {
+        // libproc(3): proc_listallpids gives the pid list (called with a null
+        // buffer it returns just the count, so we never truncate the way a
+        // hardcoded ceiling would); proc_pidinfo/PROC_PIDTBSDINFO fills
+        // proc_bsdinfo, which carries pbi_ppid and pbi_pgid.
         use libc::c_int;
         use std::mem;
 
         const PROC_PIDTBSDINFO: c_int = 3;
+        const INFO_SIZE: usize = mem::size_of::<libc::proc_bsdinfo>();
 
         extern "C" {
             fn proc_listallpids(buffer: *mut c_int, buffersize: c_int) -> c_int;
@@ -134,61 +244,56 @@ mod platform {
         }
 
         unsafe {
-            let max_pids = 4096;
-            let mut pids: Vec<c_int> = vec![0; max_pids];
-            let count = proc_listallpids(
-                pids.as_mut_ptr(),
-                (max_pids * mem::size_of::<c_int>()) as c_int,
-            );
+            // Ask for the count first, then over-allocate: the table can grow
+            // between the two calls (that is exactly what a fork bomb does).
+            let probed = proc_listallpids(std::ptr::null_mut(), 0);
+            let cap = if probed > 0 {
+                (probed as usize).saturating_mul(2).saturating_add(256)
+            } else {
+                8192
+            };
+            let mut pids: Vec<c_int> = vec![0; cap];
+            let count =
+                proc_listallpids(pids.as_mut_ptr(), (cap * mem::size_of::<c_int>()) as c_int);
             if count <= 0 {
-                return;
+                return Vec::new();
             }
-            let count = count as usize;
+            let count = (count as usize).min(cap);
 
-            // BFS: every process whose parent pid is in the worklist
-            // is a descendant.
-            let mut to_kill: Vec<i32> = vec![leader_pid];
-            let mut i = 0;
-            while i < to_kill.len() {
-                let parent = to_kill[i];
-                for &pid in &pids[..count] {
-                    if pid <= 0 {
-                        continue;
-                    }
-                    let mut info: libc::proc_bsdinfo = mem::zeroed();
-                    let ret = proc_pidinfo(
-                        pid,
-                        PROC_PIDTBSDINFO,
-                        0,
-                        &mut info as *mut _ as *mut libc::c_void,
-                        mem::size_of::<libc::proc_bsdinfo>() as c_int,
-                    );
-                    // proc_pidinfo returns the number of bytes written.
-                    if ret as usize == mem::size_of::<libc::proc_bsdinfo>() {
-                        if info.pbi_ppid as i32 == parent {
-                            let child = info.pbi_pid as i32;
-                            if child != leader_pid && !to_kill.contains(&child) {
-                                to_kill.push(child);
-                            }
-                        }
-                    }
+            let mut rows = Vec::with_capacity(count);
+            for &pid in &pids[..count] {
+                if pid <= 0 {
+                    continue;
                 }
-                i += 1;
-            }
-
-            // Kill every descendant (leader was already signalled above).
-            for &pid in &to_kill {
-                if pid != leader_pid {
-                    libc::kill(pid, libc::SIGKILL);
+                let mut info: libc::proc_bsdinfo = mem::zeroed();
+                let ret = proc_pidinfo(
+                    pid,
+                    PROC_PIDTBSDINFO,
+                    0,
+                    &mut info as *mut _ as *mut libc::c_void,
+                    INFO_SIZE as c_int,
+                );
+                // proc_pidinfo returns the number of bytes written.
+                if ret as usize == INFO_SIZE {
+                    rows.push(ProcRow {
+                        pid: info.pbi_pid as i32,
+                        ppid: info.pbi_ppid as i32,
+                        pgid: info.pbi_pgid as i32,
+                    });
                 }
             }
+            rows
         }
     }
 
-    /// Stub for non-macOS unices.  No portable tree-walk; group kill suffices.
-    /// A Linux sandbox backend should use /proc or PID-cgroup iteration.
+    /// Stub for non-macOS unices. With an empty table `expand_tree` yields only
+    /// the leader, so `kill_group` degrades to the plain group kill it always
+    /// was there. A Linux backend should read `/proc/*/stat` (or iterate the
+    /// PID cgroup) here.
     #[cfg(not(target_os = "macos"))]
-    fn kill_descendants(_leader_pid: i32) {}
+    fn snapshot_processes() -> Vec<ProcRow> {
+        Vec::new()
+    }
 
     /// Distinguish a sandbox-APPLY failure from the command's own result. Two
     /// forms, both verified empirically on macOS 15 (see the module spec): the
@@ -267,24 +372,77 @@ impl HeadTail {
     }
 }
 
-/// Drain a piped child stream fully into a bounded collector. Runs as its own
-/// task so stdout+stderr are consumed concurrently with the process running
-/// (never letting a full pipe buffer deadlock the child).
-async fn drain_reader<R>(reader: Option<R>) -> HeadTail
+/// Grace, after the child has exited or been killed, for its pipes to reach
+/// EOF before we abandon them and return what we already have. A pipe is only
+/// still open at that point because some process INHERITED the write end and
+/// outlived the child, which is precisely the case that used to hang the
+/// caller for as long as that process felt like living.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Drain a piped child stream into `sink` until EOF, error, or `budget`
+/// expires. Bounded on purpose: an unbounded read lets any process holding the
+/// write end keep this task — and, through it, `run_guarded` — alive forever.
+/// Bytes are pushed into the shared sink as they arrive, so whatever arrived
+/// before the bound is still reported.
+async fn drain_reader<R>(reader: Option<R>, sink: Arc<Mutex<HeadTail>>, budget: Duration)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut ht = HeadTail::default();
-    if let Some(mut r) = reader {
-        let mut buf = [0u8; 8192];
-        loop {
-            match r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => ht.push_chunk(&buf[..n]),
+    let Some(mut r) = reader else { return };
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut buf = [0u8; 8192];
+    loop {
+        match tokio::time::timeout_at(deadline, r.read(&mut buf)).await {
+            // Budget exhausted: someone is holding the pipe open. Stop.
+            Err(_elapsed) => break,
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => {
+                // The guard is never held across an await, so an abort can
+                // neither poison the mutex nor strand it locked.
+                lock_sink(&sink).push_chunk(&buf[..n]);
             }
         }
     }
-    ht
+}
+
+/// Lock the sink, tolerating poisoning: a partially-pushed chunk is still
+/// usable output, and a panicking drain must not turn into a panicking caller.
+fn lock_sink(sink: &Arc<Mutex<HeadTail>>) -> std::sync::MutexGuard<'_, HeadTail> {
+    sink.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A running drain task plus the sink it fills. Runs as its own task so
+/// stdout+stderr are consumed concurrently with the process running (never
+/// letting a full pipe buffer deadlock the child), and holds the sink
+/// separately so the caller can take the collected bytes even when the task is
+/// still blocked on a pipe an escaped descendant is holding open.
+struct Drain {
+    sink: Arc<Mutex<HeadTail>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drain {
+    fn spawn<R>(reader: Option<R>, budget: Duration) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let sink = Arc::new(Mutex::new(HeadTail::default()));
+        let into = Arc::clone(&sink);
+        let task = tokio::spawn(drain_reader(reader, into, budget));
+        Self { sink, task }
+    }
+
+    /// Wait at most `grace` for the drain to reach EOF, then abort it and
+    /// render whatever it collected. Never waits unboundedly, whoever holds
+    /// the write end.
+    async fn finish(self, grace: Duration) -> String {
+        let abort = self.task.abort_handle();
+        if tokio::time::timeout(grace, self.task).await.is_err() {
+            abort.abort();
+        }
+        let collected = std::mem::take(&mut *lock_sink(&self.sink));
+        collected.render()
+    }
 }
 
 // ── run_guarded ───────────────────────────────────────────────────────────────
@@ -305,9 +463,13 @@ pub async fn run_guarded(
         .map(|p| p as i32)
         .ok_or_else(|| ExecError::Io("spawned child has no pid".to_string()))?;
 
-    // Drain both pipes concurrently while the process runs.
-    let out_handle = tokio::spawn(drain_reader(child.stdout.take()));
-    let err_handle = tokio::spawn(drain_reader(child.stderr.take()));
+    // Drain both pipes concurrently while the process runs. The per-task
+    // budget is a backstop in case this future is dropped before `finish`:
+    // nothing may read a pipe for longer than the command's own budget plus
+    // the grace period.
+    let drain_budget = spec.timeout.saturating_add(DRAIN_GRACE);
+    let out_drain = Drain::spawn(child.stdout.take(), drain_budget);
+    let err_drain = Drain::spawn(child.stderr.take(), drain_budget);
 
     let mut timed_out = false;
     let mut wait_err: Option<String> = None;
@@ -338,10 +500,13 @@ pub async fn run_guarded(
 
     // ── cleanup (L-05 fix: runs on EVERY exit path, including wait_err) ──
     // stdout/stderr pipes close when the process exits (even on a wait(2)
-    // error like ECHILD), and sandbox-exec read the profile at exec time so
-    // deleting it after wait/close is race-free.
-    let stdout = out_handle.await.unwrap_or_default().render();
-    let stderr = err_handle.await.unwrap_or_default().render();
+    // error like ECHILD) UNLESS something inherited the write end and outlived
+    // it — hence the bounded `finish`, which gives up after DRAIN_GRACE and
+    // keeps the bytes already collected instead of hanging here. sandbox-exec
+    // read the profile at exec time, so deleting it after wait/close is
+    // race-free.
+    let (stdout, stderr) =
+        tokio::join!(out_drain.finish(DRAIN_GRACE), err_drain.finish(DRAIN_GRACE));
     let duration_ms = start.elapsed().as_millis();
 
     for p in &cleanup_paths {
@@ -377,6 +542,122 @@ pub async fn run_guarded(
             duration_ms,
         }),
     }
+}
+
+// ── resource ceilings (rlimits) ──────────────────────────────────────────────
+
+/// Per-child kernel resource ceilings, installed with `setrlimit(2)` between
+/// `fork` and `exec` so they are inherited by `sandbox-exec` and everything it
+/// runs. The wall-clock timeout and the process-tree kill bound *time*; these
+/// bound what a single process can consume while it has it.
+///
+/// Scope of the guarantee: rlimits are PER PROCESS, not per tree, so N children
+/// get N budgets — this narrows a runaway, it does not cap the tree. What it
+/// does buy is a hard stop for a descendant that outlives the tree kill (see
+/// `platform::kill_group`'s known limit): it cannot burn CPU forever or fill
+/// the disk with one file after we have stopped watching.
+///
+/// macOS-only, alongside the only real spawner. A Linux backend must install
+/// the equivalent when it lands (its `setrlimit` resource argument is a
+/// different type, so the code is not shared blindly).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceCeilings {
+    /// `RLIMIT_CPU` — CPU-seconds; exceeding it is SIGKILL.
+    pub cpu_seconds: u64,
+    /// `RLIMIT_FSIZE` — bytes any single file may reach; exceeding it is
+    /// SIGXFSZ (which by default terminates the writer).
+    pub file_size_bytes: u64,
+    /// `RLIMIT_NOFILE` — simultaneously open descriptors.
+    pub open_files: u64,
+}
+
+/// 4 GiB. A ceiling, not a quota: no legitimate in-workspace artifact reaches
+/// it, while a `yes > file` runaway stops there instead of at "disk full".
+#[cfg(target_os = "macos")]
+const FILE_SIZE_CEILING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// The conventional POSIX default. This machine's login shell may be far more
+/// generous; a sandboxed one-shot command has no business needing more.
+#[cfg(target_os = "macos")]
+const OPEN_FILES_CEILING: u64 = 1024;
+
+#[cfg(target_os = "macos")]
+impl ResourceCeilings {
+    /// Derive the ceilings for a command whose wall-clock budget is `timeout`.
+    ///
+    /// CPU is deliberately generous: `timeout` seconds on every core, plus
+    /// slack. Anything less would kill legitimate parallel work that the wall
+    /// budget still permits (a `-j8` build spends up to 8 CPU-seconds per wall
+    /// second) — a ceiling that a well-behaved command can hit is a bug, not
+    /// hardening. What it forbids is spending CPU *after* the wall budget is
+    /// gone, which is the escapee case.
+    pub fn for_timeout(timeout: Duration) -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1);
+        Self {
+            cpu_seconds: timeout.as_secs().saturating_mul(cores).saturating_add(30),
+            file_size_bytes: FILE_SIZE_CEILING_BYTES,
+            open_files: OPEN_FILES_CEILING,
+        }
+    }
+}
+
+/// Install `ceilings` on `cmd`'s child via a post-fork/pre-exec hook.
+///
+/// Fails CLOSED: a `setrlimit` that does not take makes `spawn()` fail with
+/// `ExecError::Io`, so a command never runs with the ceilings silently absent.
+#[cfg(target_os = "macos")]
+fn apply_ceilings(cmd: &mut tokio::process::Command, ceilings: ResourceCeilings) {
+    // SAFETY: the closure runs in the forked child before exec, so it must be
+    // async-signal-safe: get/setrlimit are bare syscalls, and it neither
+    // allocates nor takes locks.
+    unsafe {
+        cmd.pre_exec(move || {
+            tighten_rlimit(libc::RLIMIT_CPU, ceilings.cpu_seconds)?;
+            tighten_rlimit(libc::RLIMIT_FSIZE, ceilings.file_size_bytes)?;
+            tighten_rlimit(libc::RLIMIT_NOFILE, ceilings.open_files)?;
+            Ok(())
+        });
+    }
+}
+
+/// Clamp one rlimit to `desired`, lowering the SOFT and the HARD limit
+/// together — soft alone would be theatre, since the process could raise it
+/// straight back up to hard. Only ever tightens: an existing limit stricter
+/// than `desired` is left alone, and neither half is ever raised.
+///
+/// Address space is NOT among the limits we set: macOS rejects `RLIMIT_AS`
+/// (== `RLIMIT_RSS`) with EINVAL for any value small enough to be a meaningful
+/// ceiling — see the deferral recorded in `review-fixes/progress/P11.md`.
+#[cfg(target_os = "macos")]
+fn tighten_rlimit(resource: libc::c_int, desired: u64) -> std::io::Result<()> {
+    let desired = desired as libc::rlim_t;
+    // SAFETY: both calls take a pointer to a live, correctly-sized rlimit.
+    unsafe {
+        let mut cur: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(resource, &mut cur) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let clamp = |v: libc::rlim_t| -> libc::rlim_t {
+            if v == libc::RLIM_INFINITY {
+                desired
+            } else {
+                std::cmp::min(v, desired)
+            }
+        };
+        let next = libc::rlimit {
+            rlim_cur: clamp(cur.rlim_cur),
+            rlim_max: clamp(cur.rlim_max),
+        };
+        if next.rlim_cur == cur.rlim_cur && next.rlim_max == cur.rlim_max {
+            return Ok(()); // already at least this tight
+        }
+        if libc::setrlimit(resource, &next) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 // ── MacSeatbeltSpawn ─────────────────────────────────────────────────────────
@@ -426,6 +707,9 @@ impl SandboxedSpawn for MacSeatbeltSpawn {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         cmd.process_group(0);
+        // Kernel resource ceilings, inherited through sandbox-exec into the
+        // command itself. A failure to install them fails the spawn.
+        apply_ceilings(&mut cmd, ResourceCeilings::for_timeout(spec.timeout));
         let child = cmd
             .spawn()
             .map_err(|e| ExecError::Io(format!("spawning sandbox-exec: {e}")))?;
