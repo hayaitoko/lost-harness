@@ -17,17 +17,41 @@
 //!                 Uncertain + cloud → `RouteLocal` (spec Risk 4:
 //!                 "when uncertain, route to private tree").
 //!  - `Public`  — the user explicitly opted in. Always runs detection
-//!                 (H-12); non-sensitive content passes, while high-confidence
-//!                 PII/credential hits require explicit confirmation.
+//!                 (H-12); non-sensitive content passes, while a hit on the
+//!                 **un-tunable rules floor** yields `ConfirmRequired` — ONE
+//!                 send the user must authorise explicitly, which then expires.
 //!  - `Private` — the user explicitly opted in. Cloud endpoints are
 //!                 always `Block`ed.
 //!
 //! The `GateDecision::RouteLocal` outcome is enforced by `is_private_endpoint`
 //! in `egress.rs` at the actual HTTP boundary.
+//!
+//! ## C-01 — fail closed when the trained classifier is missing
+//!
+//! The gate holds a shared [`crate::classifier::ClassifierHealth`]. When the
+//! trained ONNX ensemble did not load (`degraded`), `Auto` + a cloud endpoint is
+//! `RouteLocal` **regardless of the fallback's label** — a rules-only miss is no
+//! evidence that content is cloud-safe. The same `Arc` is read by
+//! `ipc::get_classifier_health` so the UI can tell the user screening is reduced.
+//!
+//! ## H-12 — the expiring one-send confirmation
+//!
+//! `Public` used to be a blanket bypass. It now runs the deterministic rules
+//! floor on every message. A floor hit returns
+//! [`GateDecision::ConfirmRequired`], carrying a fingerprint that pins *this
+//! exact text*. The frontend asks the user, calls `confirm_public_send`, and
+//! re-sends; [`PublicSendConfirmations`] then authorises **exactly one** send of
+//! that text and drops the grant. Grants also time out
+//! ([`PublicSendConfirmations::DEFAULT_TTL`]), so an un-used confirmation cannot
+//! sit around as a standing allow. This mirrors the audio boundary's
+//! `AudioEgressGate::resolve_confirm` (`Once`-scope, single-use) rather than
+//! inventing a second policy.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use crate::classifier::{Classification, Classifier, ClassifierConfig};
+use crate::classifier::{Classification, Classifier, ClassifierConfig, ClassifierHealth};
 
 /// Per-conversation routing binding (spec §12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -51,6 +75,90 @@ pub enum GateDecision {
     /// The gate's classifier said "private" or "uncertain"; the caller must
     /// re-route to a local model / private endpoint instead of failing.
     RouteLocal,
+    /// H-12: `Public` binding, but the un-tunable rules floor found a structured
+    /// secret / PII in the text. NOT a block and NOT an allow — the user must
+    /// authorise this ONE send. The caller surfaces `reason`, and on the user's
+    /// "send anyway" records the grant via
+    /// [`PrivacyGate::confirm_public_send`] (or `ipc::confirm_public_send`) and
+    /// retries. The grant is single-use and time-limited, so it can never
+    /// degrade into a persistent allow.
+    ConfirmRequired {
+        /// Pins THIS exact text (sha256 over a domain-separated canonical form).
+        fingerprint: String,
+        /// User-safe explanation for the confirmation prompt.
+        reason: String,
+    },
+}
+
+/// H-12: the store of outstanding one-send confirmations, keyed by the
+/// fingerprint of the exact text the user authorised.
+///
+/// Two properties make this a *confirmation* rather than an *allow-list*:
+///  1. **Single use** — [`take`](Self::take) removes the grant under the same
+///     lock acquisition that checks it, so two concurrent sends of identical
+///     text cannot both consume one confirmation.
+///  2. **Expiring** — a grant older than the TTL is refused (and swept), so a
+///     confirmation the user never followed through on does not linger.
+#[derive(Debug)]
+pub struct PublicSendConfirmations {
+    granted: Mutex<HashMap<String, Instant>>,
+    ttl: Duration,
+}
+
+impl Default for PublicSendConfirmations {
+    fn default() -> Self {
+        Self::with_ttl(Self::DEFAULT_TTL)
+    }
+}
+
+impl PublicSendConfirmations {
+    /// How long a confirmation stays usable. Long enough for the round trip
+    /// (banner → click → re-send), short enough that it isn't a standing allow.
+    pub const DEFAULT_TTL: Duration = Duration::from_secs(120);
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            granted: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Record the user's authorisation for one send of `fingerprint`.
+    pub fn grant(&self, fingerprint: &str) {
+        let mut g = match self.granted.lock() {
+            Ok(g) => g,
+            // A poisoned lock must not become an implicit allow; drop the grant.
+            Err(_) => return,
+        };
+        let ttl = self.ttl;
+        g.retain(|_, at| at.elapsed() < ttl);
+        g.insert(fingerprint.to_string(), Instant::now());
+    }
+
+    /// Atomically check-and-consume. `true` iff a **fresh** grant existed; it is
+    /// gone afterwards either way (an expired grant is swept, not honoured).
+    pub fn take(&self, fingerprint: &str) -> bool {
+        let mut g = match self.granted.lock() {
+            Ok(g) => g,
+            Err(_) => return false, // fail closed
+        };
+        match g.remove(fingerprint) {
+            Some(at) => at.elapsed() < self.ttl,
+            None => false,
+        }
+    }
+
+    /// Test/introspection helper: is a fresh grant present (without consuming)?
+    pub fn holds(&self, fingerprint: &str) -> bool {
+        self.granted
+            .lock()
+            .map(|g| g.get(fingerprint).is_some_and(|at| at.elapsed() < self.ttl))
+            .unwrap_or(false)
+    }
 }
 
 /// The §7 privacy gate. Owns a `Box<dyn Classifier>` so the trained classifier
@@ -58,15 +166,20 @@ pub enum GateDecision {
 /// cheap (an `Arc` bump) — a Wave-4.3 delegated sub-agent runs as a fresh
 /// `AgentLoop` built with a clone of the parent's gate (same classifier).
 ///
-/// C-01: when the trained ONNX classifier is unavailable (`degraded = true`),
-/// the gate fails closed — cloud egress under `Auto` binding is always blocked.
-/// The frontend can read [`degraded()`] to surface a warning banner.
+/// C-01: when the trained ONNX classifier is unavailable (`health.is_degraded()`),
+/// the gate fails closed — cloud egress under `Auto` binding is always kept
+/// local. `health` is a shared `Arc`, so the IPC layer / UI banner observe the
+/// same flag the gate enforces on.
 #[derive(Clone)]
 pub struct PrivacyGate {
     classifier: Arc<dyn Classifier>,
-    /// When true, the trained ONNX ensemble is unavailable; only the rules-only
-    /// fallback is active. Cloud egress under `Auto` is blocked (C-01).
-    degraded: bool,
+    /// Shared, observable classifier health. When degraded, only the rules
+    /// fallback is screening and cloud egress under `Auto` is refused (C-01).
+    health: Arc<ClassifierHealth>,
+    /// H-12: outstanding one-send confirmations. Shared across `clone()` — a
+    /// delegated sub-agent's gate and the tool-hook gate consume from the same
+    /// store the IPC command grants into.
+    confirms: Arc<PublicSendConfirmations>,
 }
 
 impl std::fmt::Debug for PrivacyGate {
@@ -81,26 +194,75 @@ impl PrivacyGate {
     /// The gate starts in normal (non-degraded) mode. Use [`new_degraded`] when
     /// the trained ONNX classifier is unavailable (C-01).
     pub fn new(classifier: Arc<dyn Classifier>) -> Self {
+        Self::with_health(classifier, ClassifierHealth::healthy())
+    }
+
+    /// Build a gate around `classifier` sharing an existing health flag. This is
+    /// the constructor `lib.rs` uses for **both** gates (message egress and the
+    /// tool-hook chain), so a degraded classifier degrades every path.
+    pub fn with_health(classifier: Arc<dyn Classifier>, health: Arc<ClassifierHealth>) -> Self {
         Self {
             classifier,
-            degraded: false,
+            health,
+            confirms: Arc::new(PublicSendConfirmations::default()),
         }
     }
 
     /// Build a gate in degraded mode — the trained ONNX classifier is
     /// unavailable and the rules-only fallback is active. Cloud egress under
-    /// `Auto` binding is blocked (fail-closed, C-01).
+    /// `Auto` binding is kept local (fail-closed, C-01).
     pub fn new_degraded(classifier: Arc<dyn Classifier>) -> Self {
-        Self {
+        Self::with_health(
             classifier,
-            degraded: true,
-        }
+            ClassifierHealth::degraded_with("trained classifier unavailable"),
+        )
+    }
+
+    /// Replace the confirmation store (tests use a short TTL to prove expiry).
+    pub fn with_confirmations(mut self, confirms: Arc<PublicSendConfirmations>) -> Self {
+        self.confirms = confirms;
+        self
     }
 
     /// Whether the gate is operating in degraded mode (trained classifier
-    /// unavailable). The frontend can surface this as a warning banner.
+    /// unavailable). The frontend surfaces this as a warning banner via
+    /// `ipc::get_classifier_health`.
     pub fn degraded(&self) -> bool {
-        self.degraded
+        self.health.is_degraded()
+    }
+
+    /// Why the classifier is degraded, if it is.
+    pub fn degraded_reason(&self) -> Option<String> {
+        self.health.reason()
+    }
+
+    /// The shared health flag (so `AppState` / IPC can report it).
+    pub fn health(&self) -> &Arc<ClassifierHealth> {
+        &self.health
+    }
+
+    /// The shared one-send confirmation store.
+    pub fn confirmations(&self) -> &Arc<PublicSendConfirmations> {
+        &self.confirms
+    }
+
+    /// The fingerprint that pins one exact piece of text for a `Public`-binding
+    /// confirmation. Domain-separated from tool-action fingerprints so a tool
+    /// approval can never be replayed as a message-send confirmation.
+    pub fn public_send_fingerprint(text: &str) -> String {
+        crate::hooks::approval::ActionFingerprint::of(
+            "privacy_gate.public_send",
+            &serde_json::json!({ "text": text }),
+        )
+    }
+
+    /// Record the user's "send this once anyway" for `text`. Called by
+    /// `ipc::confirm_public_send` after the confirmation banner is accepted.
+    /// Returns the fingerprint the grant was filed under.
+    pub fn confirm_public_send(&self, text: &str) -> String {
+        let fp = Self::public_send_fingerprint(text);
+        self.confirms.grant(&fp);
+        fp
     }
 
     /// Decide whether `text` may be sent to a cloud endpoint under `binding`.
@@ -136,26 +298,26 @@ impl PrivacyGate {
     ) -> (GateDecision, Option<Classification>) {
         match binding {
             // H-12: always run detection on Public binding and surface the
-            // classification so callers can warn the user. On a high-confidence
-            // PII or credential hit, require explicit confirmation instead of
-            // silently allowing — the gate blocks with an actionable message.
+            // classification so callers can warn the user. A hit on the
+            // un-tunable rules floor requires ONE explicit confirmation instead
+            // of silently allowing (see `floor_hit` for why the check does not
+            // read `classification.spans`).
             Binding::Public => {
                 let classification = self.classifier.classify_with(text, cfg);
-                let has_sensitive = classification.label == crate::classifier::Label::Private
-                    && classification.confidence >= 0.9
-                    && classification.spans.iter().any(|s| {
-                        matches!(
-                            s.category,
-                            crate::classifier::rules::RuleCategory::Credential
-                                | crate::classifier::rules::RuleCategory::PiiId
-                                | crate::classifier::rules::RuleCategory::PiiContact
-                                | crate::classifier::rules::RuleCategory::Financial
-                        )
-                    });
-                let d = if has_sensitive {
-                    GateDecision::Block(
-                        "PII or credential detected — explicit confirmation required".to_string(),
-                    )
+                let d = if floor_hit(text) {
+                    let fingerprint = Self::public_send_fingerprint(text);
+                    // A confirmation the user already gave for THIS text
+                    // authorises exactly one send, and is consumed here.
+                    if self.confirms.take(&fingerprint) {
+                        GateDecision::Allow
+                    } else {
+                        GateDecision::ConfirmRequired {
+                            fingerprint,
+                            reason: "This message contains a secret or personal identifier. \
+                                     Confirm to send it to the cloud provider this once."
+                                .to_string(),
+                        }
+                    }
                 } else {
                     GateDecision::Allow
                 };
@@ -183,7 +345,7 @@ impl PrivacyGate {
             // gate fails closed.
             Binding::Auto => {
                 let classification = self.classifier.classify_with(text, cfg);
-                let d = if self.degraded && is_cloud_endpoint {
+                let d = if self.health.is_degraded() && is_cloud_endpoint {
                     GateDecision::RouteLocal
                 } else {
                     match classification.label {
@@ -212,6 +374,7 @@ impl PrivacyGate {
             GateDecision::Allow => "allow",
             GateDecision::Block(_) => "block",
             GateDecision::RouteLocal => "route_local",
+            GateDecision::ConfirmRequired { .. } => "confirm_required",
         };
         tracing::info!(
             target: "lhp::classifier",
@@ -221,4 +384,35 @@ impl PrivacyGate {
             "privacy_gate.decision"
         );
     }
+}
+
+/// H-12: does `text` hit the **un-tunable structured-secret floor**?
+///
+/// This deliberately runs [`crate::classifier::rules::detect`] directly instead
+/// of inspecting `classification.spans`. The spans route was the hole the review
+/// flagged: `HeuristicClassifier` (and the `EnsembleClassifier` stub) return an
+/// EMPTY `spans` vec by contract — see `Classification::spans` — so a
+/// spans-based floor check silently never fired whenever those classifiers were
+/// active, which is exactly the fresh-install / degraded configuration H-12 is
+/// about. Calling the rules layer directly makes the floor **classifier-
+/// independent**: it fires identically under the ensemble, the rules classifier,
+/// and the heuristic. `AudioEgressGate::tts_egress` already reaches for
+/// `rules::detect` at the voice boundary for the same reason.
+///
+/// Only *structured* categories count. `RuleCategory::Proprietary` (the
+/// "confidential" / "do not share" keyword cues) is deliberately EXCLUDED here:
+/// under an explicit `Public` binding, prompting on the mere word
+/// "confidential" would train the user to click through confirmations, which
+/// destroys the value of the prompt. The stricter audio boundary keeps the cues.
+fn floor_hit(text: &str) -> bool {
+    use crate::classifier::rules::RuleCategory;
+    crate::classifier::rules::detect(text).iter().any(|s| {
+        matches!(
+            s.category,
+            RuleCategory::Credential
+                | RuleCategory::PiiId
+                | RuleCategory::PiiContact
+                | RuleCategory::Financial
+        )
+    })
 }

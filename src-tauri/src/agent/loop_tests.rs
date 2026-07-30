@@ -164,6 +164,19 @@ impl<R: Runtime> TestLoop<R> {
                 );
                 return Ok(reason.clone());
             }
+            // H-12: mirrors `process_message` — the turn stops without egress
+            // and the UI is told to offer the one-send confirmation.
+            GateDecision::ConfirmRequired { reason, .. } => {
+                let _ = self.app.emit(
+                    "stream:error",
+                    StreamErrorPayload {
+                        error: reason.clone(),
+                        conversation_id: conversation_id.clone(),
+                        source: "gate_confirm",
+                    },
+                );
+                return Ok(reason.clone());
+            }
             GateDecision::Allow | GateDecision::RouteLocal => {
                 // TestLoop always streams via the supplied `provider`.
                 // The gate's RouteLocal decision is still logged; the
@@ -191,6 +204,7 @@ impl<R: Runtime> TestLoop<R> {
                 GateDecision::Allow => "allow".to_string(),
                 GateDecision::RouteLocal => "route_local".to_string(),
                 GateDecision::Block(_) => "block".to_string(),
+                GateDecision::ConfirmRequired { .. } => "confirm_required".to_string(),
             }),
             thinking_content: None,
             error: None,
@@ -277,7 +291,9 @@ impl<R: Runtime> TestLoop<R> {
             message_hash: message_hash.to_string(),
             decision: match decision {
                 GateDecision::Allow => "public".to_string(),
-                GateDecision::Block(_) | GateDecision::RouteLocal => "private".to_string(),
+                GateDecision::Block(_)
+                | GateDecision::RouteLocal
+                | GateDecision::ConfirmRequired { .. } => "private".to_string(),
             },
             confidence: 1.0,
             created_at: chrono::Utc::now().timestamp(),

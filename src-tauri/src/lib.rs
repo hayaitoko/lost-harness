@@ -168,8 +168,12 @@ pub fn run() {
             // offsets). Both implement `Classifier`, so the message-level §7
             // gate and the tool gating chain classify identically either way.
             // Shared via Arc; a missing model dir never breaks boot.
+            // C-01: ONE shared health flag, read by every gate AND by the IPC
+            // layer (`get_classifier_health` → the UI's degraded banner). A
+            // degraded flag nobody can observe is not a fix, so this is
+            // deliberately shared state rather than a per-gate bool.
             let classifier_models = base_path.join("models").join("classifier");
-            let classifier_degraded: bool;
+            let classifier_health: Arc<crate::classifier::ClassifierHealth>;
             let classifier: Arc<dyn crate::classifier::Classifier> =
                 match crate::classifier::EnsembleClassifier::load(&classifier_models) {
                     Ok(ensemble) => {
@@ -178,7 +182,7 @@ pub fn run() {
                             path = %classifier_models.display(),
                             "loaded trained ONNX ensemble classifier"
                         );
-                        classifier_degraded = false;
+                        classifier_health = crate::classifier::ClassifierHealth::healthy();
                         Arc::new(ensemble)
                     }
                     Err(e) => {
@@ -187,7 +191,8 @@ pub fn run() {
                             reason = %e,
                             "trained classifier unavailable — fail-closed (degraded mode)"
                         );
-                        classifier_degraded = true;
+                        classifier_health =
+                            crate::classifier::ClassifierHealth::degraded_with(e.to_string());
                         Arc::new(RulesClassifier::new())
                     }
                 };
@@ -216,14 +221,12 @@ pub fn run() {
                 });
             }
 
-            // §7 Privacy Gate for message egress.
-            // C-01: when the trained classifier couldn't load, create the gate
-            // in degraded mode — cloud egress under Auto is blocked.
-            let gate = if classifier_degraded {
-                PrivacyGate::new_degraded(Arc::clone(&classifier))
-            } else {
-                PrivacyGate::new(Arc::clone(&classifier))
-            };
+            // §7 Privacy Gate for message egress. C-01: shares the boot health
+            // flag, so a failed trained-classifier load keeps Auto+cloud local.
+            let gate = PrivacyGate::with_health(
+                Arc::clone(&classifier),
+                Arc::clone(&classifier_health),
+            );
 
             // §3.5 approval spine: the shared grant ledger, the pending-prompt
             // registry, and the Tauri prompter that raises an in-app
@@ -268,6 +271,10 @@ pub fn run() {
             let tools = Arc::new(build_tool_dispatcher(
                 &base_path,
                 Arc::clone(&classifier),
+                // C-01: the tool-hook chain's gate must degrade with the same
+                // flag as the message gate — otherwise the tool path silently
+                // bypasses fail-closed handling.
+                Arc::clone(&classifier_health),
                 Arc::clone(&ledger),
                 Some(Arc::clone(&prompter)),
                 (*storage).clone(),
@@ -303,6 +310,10 @@ pub fn run() {
             // C3: the live MCP runtime (spawned children, derived session state).
             let mcp_runtime = Arc::new(crate::tools::mcp_stdio::McpRuntime::new());
 
+            // Clone BEFORE the loop takes ownership — `PrivacyGate::clone` shares
+            // the health flag and the confirmation store, so `AppState.gate` and
+            // the loop's gate are the same gate for observation/confirmation.
+            let gate_for_state = gate.clone();
             let agent_loop = AgentLoop::new(
                 gate,
                 Arc::clone(&model_manager),
@@ -423,6 +434,9 @@ pub fn run() {
                 approvals,
                 ask_human,
                 classifier: Arc::clone(&classifier),
+                // C-01 / H-12: same gate the loop enforces with (Arc-shared
+                // health flag + one-send confirmation store).
+                gate: gate_for_state,
                 embedder,
                 // C4: the live dispatcher, for hot-(un)registering skill tools.
                 tools: Arc::clone(&tools),
@@ -564,6 +578,10 @@ pub fn run() {
             ipc::set_redaction_enabled,
             ipc::reset_classifier_settings,
             ipc::explain_classification,
+            // C-01 / H-12: the read side of the degraded flag + the one-send
+            // confirmation grant.
+            ipc::get_classifier_health,
+            ipc::confirm_public_send,
             ipc::list_memory,
             ipc::save_memory,
             ipc::delete_memory,
@@ -820,6 +838,8 @@ fn backfill_one_memory_db(
 fn build_tool_dispatcher(
     base_path: &std::path::Path,
     classifier: Arc<dyn crate::classifier::Classifier>,
+    // C-01: the SAME health flag the message-egress gate holds.
+    classifier_health: Arc<crate::classifier::ClassifierHealth>,
     ledger: Arc<crate::hooks::ApprovalLedger>,
     approver: Option<Arc<dyn crate::hooks::ApprovalPrompter>>,
     storage: crate::storage::Storage,
@@ -1066,7 +1086,9 @@ fn build_tool_dispatcher(
     );
 
     let mut chain = build_pretooluse_chain_full(
-        PrivacyGate::new(classifier),
+        // C-01: previously `PrivacyGate::new(classifier)` — a fresh NON-degraded
+        // gate, so the tool path never participated in fail-closed handling.
+        PrivacyGate::with_health(classifier, classifier_health),
         Box::new(layered),
         &pre_trusted_refs,
         Arc::clone(&ledger),

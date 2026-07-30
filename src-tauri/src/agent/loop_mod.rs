@@ -489,6 +489,17 @@ impl AgentLoop {
                 sink.error(&conversation_id, &reason, "gate");
                 return Ok(reason);
             }
+            // H-12: a `Public`-bound message that hit the structured-secret
+            // floor. The turn stops here WITHOUT egress; the `"gate_confirm"`
+            // source tells the UI to render the one-send confirmation affordance
+            // instead of a plain error. On "send anyway" the frontend calls
+            // `confirm_public_send(text)` (which grants a single-use, expiring
+            // authorisation for this exact text) and re-sends the message; the
+            // gate consumes the grant and the retry proceeds.
+            GateDecision::ConfirmRequired { reason, .. } => {
+                sink.error(&conversation_id, &reason, "gate_confirm");
+                return Ok(reason);
+            }
             GateDecision::RouteLocal => {
                 // ── Partial delegation (PLAN §11): before forcing the whole
                 // turn local, try to black out the sensitive VALUE spans and
@@ -1875,7 +1886,12 @@ impl AgentLoop {
             // "private" (the gate refused egress); Allow → "public".
             decision: match decision {
                 GateDecision::Allow => "public".to_string(),
-                GateDecision::Block(_) | GateDecision::RouteLocal => "private".to_string(),
+                // H-12 `ConfirmRequired` did NOT egress — it is a refusal
+                // pending the user's one-send confirmation, so it logs
+                // "private" like the other refusals.
+                GateDecision::Block(_)
+                | GateDecision::RouteLocal
+                | GateDecision::ConfirmRequired { .. } => "private".to_string(),
             },
             // Confidence is the gate's confidence in its decision. The
             // gate doesn't surface a number directly, so we report 1.0
@@ -1883,7 +1899,9 @@ impl AgentLoop {
             // classifier's underlying confidence via the tracing layer
             // (see `gate.log_decision`).
             confidence: match decision {
-                GateDecision::Allow | GateDecision::Block(_) => 1.0,
+                GateDecision::Allow
+                | GateDecision::Block(_)
+                | GateDecision::ConfirmRequired { .. } => 1.0,
                 GateDecision::RouteLocal => 0.8,
             },
             created_at: chrono::Utc::now().timestamp(),

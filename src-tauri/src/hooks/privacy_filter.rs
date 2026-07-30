@@ -52,10 +52,19 @@ impl GatingHook for PrivacyFilterHook {
         ) {
             GateDecision::Allow => HookResult::Continue,
             GateDecision::Block(reason) => HookResult::Deny(reason),
+            // H-12: a `Public`-bound TOOL action whose content hits the
+            // structured-secret floor. The one-send confirmation round trip is a
+            // MESSAGE-path affordance (banner → `confirm_public_send` → re-send);
+            // a tool call has no equivalent user-visible retry here, and mapping
+            // this to `HookResult::Ask` would loop — the dispatcher's re-run of
+            // the chain records a grant against the TOOL's fingerprint, not the
+            // gate's text fingerprint, so this hook would Ask again forever.
+            // Deny is therefore the fail-closed mapping (strictly safer than the
+            // pre-H-12 behaviour, which allowed it silently).
+            GateDecision::ConfirmRequired { reason, .. } => HookResult::Deny(reason),
             GateDecision::RouteLocal => {
                 ctx.routing = RoutingRequirement::LocalRequired {
-                    reason: "privacy filter: content must not leave this device"
-                        .to_string(),
+                    reason: "privacy filter: content must not leave this device".to_string(),
                 };
                 HookResult::Continue
             }
@@ -108,7 +117,11 @@ mod tests {
             .with_content("my SSN is 123-45-6789")
             .with_cloud(true);
         let result = h.on_event(&mut ctx);
-        assert_eq!(result, HookResult::Continue, "RouteLocal must not become Deny");
+        assert_eq!(
+            result,
+            HookResult::Continue,
+            "RouteLocal must not become Deny"
+        );
         assert!(
             ctx.routing.is_local_required(),
             "RouteLocal must annotate ctx.routing, not silently allow, got {:?}",
@@ -168,12 +181,26 @@ mod tests {
         struct ConfigSpyClassifier;
         impl Classifier for ConfigSpyClassifier {
             fn classify(&self, _t: &str) -> Classification {
-                Classification { label: Label::Public, confidence: 1.0, raw_output: vec![], spans: vec![] }
+                Classification {
+                    label: Label::Public,
+                    confidence: 1.0,
+                    raw_output: vec![],
+                    spans: vec![],
+                }
             }
             fn classify_with(&self, _t: &str, cfg: &ClassifierConfig) -> Classification {
                 // A "strict" profile (tiny tau_band) → Private; otherwise Public.
-                let label = if cfg.tau_band < 0.01 { Label::Private } else { Label::Public };
-                Classification { label, confidence: 1.0, raw_output: vec![], spans: vec![] }
+                let label = if cfg.tau_band < 0.01 {
+                    Label::Private
+                } else {
+                    Label::Public
+                };
+                Classification {
+                    label,
+                    confidence: 1.0,
+                    raw_output: vec![],
+                    spans: vec![],
+                }
             }
         }
 
@@ -185,16 +212,27 @@ mod tests {
             .with_content("anything")
             .with_cloud(true);
         assert_eq!(h.on_event(&mut lax), HookResult::Continue);
-        assert_eq!(lax.routing, RoutingRequirement::Unconstrained, "default config allows");
+        assert_eq!(
+            lax.routing,
+            RoutingRequirement::Unconstrained,
+            "default config allows"
+        );
 
         // A STRICTER profile config → Private → RouteLocal (routing annotated).
-        let strict = ClassifierConfig { tau_band: 0.005, ..Default::default() };
+        let strict = ClassifierConfig {
+            tau_band: 0.005,
+            ..Default::default()
+        };
         let mut ctx = EventContext::pre_tool_use("shell_exec")
             .with_binding(Binding::Auto)
             .with_content("anything")
             .with_cloud(true)
             .with_classifier_config(strict);
-        assert_eq!(h.on_event(&mut ctx), HookResult::Continue, "RouteLocal maps to Continue");
+        assert_eq!(
+            h.on_event(&mut ctx),
+            HookResult::Continue,
+            "RouteLocal maps to Continue"
+        );
         assert!(
             ctx.routing.is_local_required(),
             "the profile's stricter config must route the tool action local, got {:?}",

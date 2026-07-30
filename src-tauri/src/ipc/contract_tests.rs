@@ -69,7 +69,7 @@ fn test_app() -> App<MockRuntime> {
     // shared between the loop and AppState (skill hot-registration commands).
     let tools = Arc::new(crate::tools::ToolDispatcher::empty());
     let agent_loop = Arc::new(AgentLoop::new(
-        gate,
+        gate.clone(),
         Arc::clone(&model_manager),
         Arc::clone(&storage),
         Arc::clone(&tools),
@@ -84,6 +84,7 @@ fn test_app() -> App<MockRuntime> {
         approvals: Arc::new(crate::ipc::approval::ApprovalRegistry::new()),
         ask_human: Arc::new(crate::ipc::ask_human::AskHumanRegistry::new()),
         classifier: Arc::new(HeuristicClassifier::new()),
+        gate,
         embedder: None,
         tools,
         mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new()),
