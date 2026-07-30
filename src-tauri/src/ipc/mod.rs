@@ -151,6 +151,23 @@ enum RoutingLookup {
     Unavailable(RoutingUnavailable),
 }
 
+impl RoutingLookup {
+    /// The three `SendMessageResponse` fields this outcome authorizes:
+    /// `(message_id, routing_decision, routing_unavailable)`. `send_message`
+    /// builds its payload through here rather than matching inline, so the
+    /// unit tests below exercise the mapping the command actually uses —
+    /// there is no second copy of it to drift.
+    fn into_parts(self) -> (Option<String>, Option<String>, Option<RoutingUnavailable>) {
+        match self {
+            RoutingLookup::Resolved {
+                message_id,
+                routing_decision,
+            } => (Some(message_id), Some(routing_decision), None),
+            RoutingLookup::Unavailable(why) => (None, None, Some(why)),
+        }
+    }
+}
+
 /// Map the outcome of the post-turn profile-db read onto what we are willing
 /// to tell the frontend. Pure so it stays unit-tested: the bug this replaced
 /// substituted `("", "unknown")` into an otherwise-successful payload, which
@@ -930,13 +947,7 @@ pub async fn send_message(
             db.list_messages_by_conversation(&conversation_id)
                 .map_err(|_| RoutingUnavailable::MessageQueryFailed)
         });
-    let (message_id, routing_decision, routing_unavailable) = match routing_lookup(rows) {
-        RoutingLookup::Resolved {
-            message_id,
-            routing_decision,
-        } => (Some(message_id), Some(routing_decision), None),
-        RoutingLookup::Unavailable(why) => (None, None, Some(why)),
-    };
+    let (message_id, routing_decision, routing_unavailable) = routing_lookup(rows).into_parts();
 
     Ok(SendMessageResponse {
         message_id,
@@ -3881,17 +3892,11 @@ mod tests {
         );
     }
 
-    /// Build the response the way `send_message` does, from a lookup outcome.
-    /// Mirrors the command's own `match` so the serialized shape below is the
-    /// shape the frontend actually receives.
+    /// Build the response exactly the way `send_message` does — same
+    /// `into_parts` call, not a re-implementation of it — so the serialized
+    /// shapes asserted below are the shapes the frontend actually receives.
     fn response_for(lookup: RoutingLookup) -> SendMessageResponse {
-        let (message_id, routing_decision, routing_unavailable) = match lookup {
-            RoutingLookup::Resolved {
-                message_id,
-                routing_decision,
-            } => (Some(message_id), Some(routing_decision), None),
-            RoutingLookup::Unavailable(why) => (None, None, Some(why)),
-        };
+        let (message_id, routing_decision, routing_unavailable) = lookup.into_parts();
         SendMessageResponse {
             message_id,
             content: "hi".to_string(),
@@ -3958,8 +3963,10 @@ mod tests {
             "http://100.64.evil.com/v1",
             "http://evil.com/127.0.0.1/v1",
         ] {
-            let err = validate_base_url(hostile)
-                .expect_err("hostile lookalike host must be rejected: {hostile}");
+            let err = match validate_base_url(hostile) {
+                Ok(()) => panic!("hostile lookalike host was ACCEPTED: {hostile}"),
+                Err(e) => e,
+            };
             assert!(
                 err.contains("cleartext"),
                 "expected the cleartext refusal for {hostile}, got: {err}"
