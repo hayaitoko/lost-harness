@@ -201,7 +201,7 @@ impl HttpMcpTransport {
                 include_protocol,
             )
             .await?;
-        self.capture_session(&mut response).await;
+        self.capture_session(&response).await;
         let status = response.status();
         let content_type = response
             .headers()
@@ -502,10 +502,13 @@ fn check_hop_transition(from: &url::Url, to: &url::Url) -> Result<(), String> {
 /// classified; IPv4-mapped IPv6 forms such as `::ffff:10.0.0.1` are unwrapped by
 /// [`addr_permitted`], so an internal IPv4 cannot slip through as a v6 literal.
 ///
-/// Exported as a request-free predicate (registration-form validation, tests).
-/// The live request path calls [`vet_hop`] instead — it answers the same
-/// question through the same `addr_permitted` gate but also returns the
-/// addresses to pin, so the two can never disagree.
+/// Kept as a request-free predicate for registration-time validation (and
+/// covered by tests), but the live request path deliberately does NOT call it:
+/// `post` calls [`vet_hop`], which answers the same question through the same
+/// `addr_permitted` gate AND returns the addresses to pin, so there is exactly
+/// one resolution per hop and the two can never disagree. Asking twice is the
+/// TOCTOU this packet closed.
+#[allow(dead_code)] // no in-crate caller by design; see above
 pub async fn is_private_destination(url: &url::Url) -> Result<bool, String> {
     let addrs = resolve_addrs(url).await?;
     Ok(addrs.iter().any(|a| !addr_permitted(a.ip(), false)))
