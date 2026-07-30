@@ -849,15 +849,26 @@ fn set_provider_api_key_inner(state: &AppState, args: SetProviderApiKeyArgs) -> 
     // Compensating on failure, the same shape `add_provider`/`update_provider`
     // use: an orphaned keychain entry with no marker is exactly the state that
     // produced this bug, so undo the secret rather than leave it dangling.
-    if let Err(e) = state
+    // `mark_endpoint_secret_in_keychain` returns Ok(false) when the UPDATE
+    // matched zero rows — a provider live in `ModelManager` with no `endpoints`
+    // row (the bundled local sidecar is registered exactly that way). Treating
+    // that as success would recreate the very state this fix exists to prevent:
+    // a secret in the keychain with no marker. `secrets.rs` already matches on
+    // `Ok(true)` for the same reason; do the same here.
+    let marked = state
         .storage
         .global()
-        .mark_endpoint_secret_in_keychain(&args.provider_id)
-    {
+        .mark_endpoint_secret_in_keychain(&args.provider_id);
+    let failure = match marked {
+        Ok(true) => None,
+        Ok(false) => Some("it has no stored endpoint row".to_string()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(why) = failure {
         let _ = state.provider_secrets.delete(&args.provider_id);
         return Err(format!(
-            "stored the key but could not record it on the provider row, so it \
-             would not survive a restart; the key was removed again: {e}"
+            "stored the key but could not record it on the provider row ({why}), \
+             so it would not survive a restart; the key was removed again"
         ));
     }
     // Rotation must take effect NOW, not after a restart. The keychain is only
@@ -4653,6 +4664,46 @@ mod tests {
                 .as_deref(),
             Some("sk-live"),
             "the API key must survive a restart"
+        );
+    }
+
+    /// HI-1 follow-up. `mark_endpoint_secret_in_keychain` returns `Ok(false)`
+    /// when the UPDATE matches no row — a provider that lives only in
+    /// `ModelManager` with no `endpoints` row (the bundled local sidecar is
+    /// registered that way). Treating that as success would leave a secret in
+    /// the credential store with no marker: exactly the HI-1 end state, on a
+    /// command whose whole job is to prevent it. It must fail and compensate.
+    #[test]
+    fn setting_a_key_on_a_provider_with_no_stored_row_fails_and_leaves_no_orphan() {
+        let (state, secrets) = test_state();
+
+        // In ModelManager only — never persisted to `endpoints`.
+        state
+            .model_manager
+            .add_provider(crate::models::Provider::new(
+                "local-runner:ghost",
+                "Ghost",
+                "http://127.0.0.1:9/v1",
+                None,
+                crate::models::ProviderKind::Local,
+            ));
+
+        let err = set_provider_api_key_inner(
+            &state,
+            SetProviderApiKeyArgs {
+                provider_id: "local-runner:ghost".to_string(),
+                api_key: "sk-orphan".to_string(),
+            },
+        )
+        .expect_err("a key that cannot be marked must not report success");
+        assert!(
+            err.contains("no stored endpoint row"),
+            "the error should say why, got: {err}"
+        );
+        assert_eq!(
+            secrets.get("local-runner:ghost").unwrap(),
+            None,
+            "the secret must be rolled back, not orphaned in the keychain"
         );
     }
 }
