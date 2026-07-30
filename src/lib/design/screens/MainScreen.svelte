@@ -320,7 +320,13 @@
         // name-keyed list would crash the whole composer when they do.
         id: provider.id,
         group: provider.name,
-        kind: provider.kind === "cloud" ? "cloud" : "local",
+        // Same predicate the backend stamps turns with: `isPrivate` (the
+        // base URL), NOT `kind` (a user-typed label with no enforcement
+        // power). `kind === "cloud" ? cloud : local` painted a Custom
+        // provider at https://api.example.com green and labelled it "on
+        // device" — a trust-zone claim about an endpoint that egresses, made
+        // at exactly the moment the user is choosing where to send.
+        kind: provider.isPrivate ? "local" : "cloud",
         items: models.map((name) => ({ name, key: modelKey(provider.id, name) })),
         // Every empty group says why it is empty — a failed listing and an
         // endpoint with no models are different problems with different fixes.
@@ -376,7 +382,10 @@
   const sendRoute = $derived.by((): SendRoute => {
     if (!providersStore.active || !activeProvider) return "unset";
     if (binding === "auto") return "filter";
-    if (binding === "private" || activeProvider.kind !== "cloud") return "local";
+    // `isPrivate`, not `kind` — same reason as the picker groups above. A
+    // Custom-kind provider pointed at a public API would otherwise turn the
+    // Send button green and read "Send via local model".
+    if (binding === "private" || activeProvider.isPrivate) return "local";
     return "public";
   });
   const canSend = $derived(sendRoute !== "unset");

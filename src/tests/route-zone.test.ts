@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/svelte";
+import { render, screen, waitFor, fireEvent } from "@testing-library/svelte";
 import RoutingBadge from "$lib/design/components/RoutingBadge.svelte";
 import MainScreen from "$lib/design/screens/MainScreen.svelte";
 import {
@@ -234,6 +234,97 @@ describe("route badge — trust zone comes from the backend", () => {
       document.body.querySelectorAll("[title]"),
     ).some((el) => /can't be confirmed/.test(el.getAttribute("title") ?? ""));
     expect(explained).toBe(true);
+  });
+});
+
+describe("pre-send indicators use the same trust-zone predicate", () => {
+  // The composer's picker dot/tag and its Send button are claims about where
+  // the NEXT turn will go. They legitimately read live config — but they must
+  // read the same bit the backend stamps turns with (`is_private`, the base
+  // URL), not `kind`, which is a user-typed label with no enforcement power.
+  const PUBLIC_CUSTOM = [
+    {
+      id: "public-custom",
+      // Kind "custom", so the old `kind === "cloud" ? cloud : local` rule
+      // called this LOCAL — green dot, "on device" tag, green Send button —
+      // for an endpoint on the public internet.
+      name: "Someone else's server",
+      base_url: "https://api.example.com/v1",
+      kind: "custom",
+      is_private: false,
+      trusted_by_name: false,
+      supports_native_tools: false,
+    },
+  ];
+
+  beforeEach(async () => {
+    resetProviders();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_providers":
+          return PUBLIC_CUSTOM;
+        case "list_models":
+          return ["some-model"];
+        case "list_conversations":
+          return [];
+        case "get_messages":
+          return [];
+        case "get_app_version":
+          return "0.1.0-test";
+        case "get_active_profile":
+          return "personal";
+        default:
+          return null;
+      }
+    });
+    await hydrateProviders();
+  });
+
+  it("labels a public custom endpoint as cloud in the picker, not 'on device'", async () => {
+    render(MainScreen);
+    const openPicker = await screen.findByRole("button", {
+      name: /thinking strength/i,
+    });
+    openPicker.click();
+
+    await waitFor(() => {
+      const group = Array.from(document.body.querySelectorAll("div")).find((d) =>
+        /Someone else's server/.test(d.textContent ?? ""),
+      );
+      expect(group?.textContent).toContain("cloud");
+      expect(group?.textContent).not.toContain("on device");
+    });
+  });
+
+  it("does not offer to 'Send via local model' to a public custom endpoint", async () => {
+    render(MainScreen);
+
+    // Arm the composer on that endpoint.
+    const openPicker = await screen.findByRole("button", {
+      name: /thinking strength/i,
+    });
+    await fireEvent.click(openPicker);
+    const option = await screen.findByRole("option");
+    await fireEvent.click(option);
+
+    // Leave Auto (which is honestly "privacy filter") and switch the binding
+    // to Public, where the composer commits to a route before sending.
+    const bindingBtn = screen.getByLabelText(
+      "Conversation binding — click to switch",
+    );
+    for (let i = 0; i < 3; i++) {
+      if (/public/i.test(bindingBtn.textContent ?? "")) break;
+      await fireEvent.click(bindingBtn);
+    }
+    expect(bindingBtn.textContent?.toLowerCase()).toContain("public");
+
+    const send = await screen.findByRole("button", { name: /^Send via/ });
+    expect(send.getAttribute("aria-label") ?? send.textContent).toContain(
+      "public model",
+    );
+    expect(send.getAttribute("aria-label") ?? send.textContent).not.toContain(
+      "local model",
+    );
   });
 });
 
