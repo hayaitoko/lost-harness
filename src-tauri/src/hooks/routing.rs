@@ -12,7 +12,8 @@
 //! exists, `enforce_local_routing` returns a named `LocalRoutingViolation`
 //! — it never falls back to picking the first (possibly cloud) candidate,
 //! which is exactly the silent-fallthrough failure mode this exists to
-//! close.
+//! close. An `Unconstrained` requirement is refused for the same reason:
+//! see the invariant on `enforce_local_routing`.
 //!
 //! "Local" here uses the same definition `AgentLoop::find_local_provider`
 //! already uses in production (`Provider::is_local() && Provider::is_private()`)
@@ -40,23 +41,47 @@ impl std::error::Error for LocalRoutingViolation {}
 
 /// Pick the endpoint `candidates` that satisfies `routing`.
 ///
-/// - `Unconstrained` — returns the first candidate (existing "pick
-///   whatever's configured" behavior), or a violation if there are none
-///   at all.
 /// - `LocalRequired` — returns the first candidate that is both
 ///   `ProviderKind::Local` and resolves to a private/loopback `base_url`.
 ///   If none exists, returns `Err` — this is the loud failure; it is
 ///   structurally impossible for this branch to return a cloud provider.
+/// - `Unconstrained` — **also `Err`.** This function is a local-routing
+///   *enforcer*, not an endpoint chooser. See the invariant below.
+///
+/// # Invariant: this function never chooses an endpoint on its own
+///
+/// The `Unconstrained` arm used to return `candidates.first()` — "pick
+/// whatever's configured". Nothing in production ever reached it (both call
+/// sites in `agent::loop_mod` build a `LocalRequired` themselves), but it sat
+/// one careless call site away from being live, and what it did is exactly
+/// what the endpoint-routing spec forbids: serving a turn from a provider the
+/// user did not pick. `candidates` here is `ModelManager::list_providers()`,
+/// whose order is the storage layer's `ORDER BY name` — so "first candidate"
+/// means *alphabetically first provider*, which is not a routing decision at
+/// all.
+///
+/// A turn's endpoint has exactly two legitimate sources:
+///   1. the provider id the user explicitly selected, validated at the IPC
+///      boundary and resolved by `ModelManager::get_provider`; or
+///   2. this function, on a `LocalRequired` turn, where the privacy gate has
+///      *overridden* that choice and the only acceptable answer is a local
+///      endpoint.
+///
+/// There is no third source. Handing `Unconstrained` to an enforcer is a
+/// caller bug, so it is reported as one rather than silently satisfied.
 pub fn enforce_local_routing<'a>(
     routing: &RoutingRequirement,
     candidates: &'a [Provider],
 ) -> Result<&'a Provider, LocalRoutingViolation> {
     match routing {
-        RoutingRequirement::Unconstrained => {
-            candidates.first().ok_or_else(|| LocalRoutingViolation {
-                reason: "no endpoint candidates available".to_string(),
-            })
-        }
+        RoutingRequirement::Unconstrained => Err(LocalRoutingViolation {
+            reason: "enforce_local_routing was called with an Unconstrained requirement — it \
+                     enforces local-only routing, it does not choose endpoints. An unconstrained \
+                     turn goes to the provider the user explicitly selected; picking the first \
+                     configured candidate instead is the silent-fallback bug this module exists \
+                     to prevent."
+                .to_string(),
+        }),
         RoutingRequirement::LocalRequired { reason } => candidates
             .iter()
             .find(|p| p.is_local() && p.is_private())
@@ -169,11 +194,21 @@ mod tests {
     }
 
     #[test]
-    fn unconstrained_returns_first_candidate() {
+    fn unconstrained_never_picks_an_endpoint() {
+        // REGRESSION (endpoint-routing spec): this arm used to return
+        // `candidates.first()`. `list_providers()` is ordered `ORDER BY name`,
+        // so "first" meant *alphabetically first* — with the stock presets,
+        // "Anthropic". A turn must go to the provider the USER picked; an
+        // enforcer handing back an arbitrary endpoint is the exact silent
+        // fallback this module exists to prevent.
         let candidates = vec![cloud_provider(), local_provider()];
-        let result = enforce_local_routing(&RoutingRequirement::Unconstrained, &candidates)
-            .expect("candidates are non-empty");
-        assert_eq!(result.id, "openai");
+        let err = enforce_local_routing(&RoutingRequirement::Unconstrained, &candidates)
+            .expect_err("Unconstrained must never yield an endpoint");
+        assert!(
+            err.reason.contains("does not choose endpoints"),
+            "the refusal must name why, got: {}",
+            err.reason
+        );
     }
 
     #[test]

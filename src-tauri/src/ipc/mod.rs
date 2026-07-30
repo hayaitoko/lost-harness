@@ -137,7 +137,55 @@ pub struct SendMessageResponse {
     /// `routing_decision` are `null`. Absent from the JSON on the happy path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_unavailable: Option<RoutingUnavailable>,
+    /// Which endpoint ACTUALLY served this turn, read back off the persisted
+    /// assistant row. `null` when there is no assistant row to read (same
+    /// cases as `message_id`).
+    ///
+    /// Not redundant with the composer's own selection: a `route_local` or
+    /// `redact_send` turn is served by a *different* provider than the one the
+    /// picker shows, and the picker is exactly what the user would otherwise
+    /// trust. This is the per-turn half of the endpoint-routing spec's "the UI
+    /// must show, per turn, which provider+endpoint actually served it".
+    pub served_by: Option<ServedBy>,
     pub completed_at: i64,
+}
+
+/// The endpoint that served one turn.
+///
+/// Two layers on purpose. `provider_id` is *persisted history* — stamped on
+/// the message row when the turn ran, so it is true forever. `provider_name`
+/// and `base_url` are resolved from the LIVE registry at read time, so they
+/// are `null` once that provider is removed. Reporting them as unknown is the
+/// honest answer; inventing a name for a deleted endpoint would be the same
+/// class of lie as a fabricated routing decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServedBy {
+    /// Provider id stamped on the persisted row.
+    pub provider_id: String,
+    /// Display name of that provider, if it is still registered.
+    pub provider_name: Option<String>,
+    /// Base URL of that provider, if it is still registered — the "endpoint"
+    /// half of the route indicator.
+    pub base_url: Option<String>,
+}
+
+/// Resolve a persisted `provider_id` into a [`ServedBy`], filling in name and
+/// endpoint from the live registry when the provider still exists.
+///
+/// The single place this join happens, so `send_message` (live turn) and
+/// `get_messages` (reloaded transcript) can never disagree about what served
+/// a turn.
+fn resolve_served_by(
+    model_manager: &crate::models::ModelManager,
+    provider_id: Option<String>,
+) -> Option<ServedBy> {
+    let provider_id = provider_id?;
+    let registered = model_manager.get_provider(&provider_id);
+    Some(ServedBy {
+        provider_id,
+        provider_name: registered.as_ref().map(|p| p.name.clone()),
+        base_url: registered.map(|p| p.base_url),
+    })
 }
 
 /// Why a completed `send_message` has no persisted routing decision to
@@ -160,23 +208,47 @@ enum RoutingLookup {
     Resolved {
         message_id: String,
         routing_decision: String,
+        /// Provider id stamped on that row — the endpoint that actually
+        /// served the turn. `None` on a legacy row written before the field
+        /// was persisted.
+        served_by_id: Option<String>,
     },
     Unavailable(RoutingUnavailable),
 }
 
+/// The `SendMessageResponse` fields a read-back outcome authorizes. A named
+/// struct rather than a tuple: four same-typed `Option`s in a row are one
+/// careless reorder away from reporting a provider id as a routing decision.
+struct RoutingParts {
+    message_id: Option<String>,
+    routing_decision: Option<String>,
+    served_by_id: Option<String>,
+    routing_unavailable: Option<RoutingUnavailable>,
+}
+
 impl RoutingLookup {
-    /// The three `SendMessageResponse` fields this outcome authorizes:
-    /// `(message_id, routing_decision, routing_unavailable)`. `send_message`
-    /// builds its payload through here rather than matching inline, so the
-    /// unit tests below exercise the mapping the command actually uses —
-    /// there is no second copy of it to drift.
-    fn into_parts(self) -> (Option<String>, Option<String>, Option<RoutingUnavailable>) {
+    /// Map this outcome onto the response fields it authorizes.
+    /// `send_message` builds its payload through here rather than matching
+    /// inline, so the unit tests below exercise the mapping the command
+    /// actually uses — there is no second copy of it to drift.
+    fn into_parts(self) -> RoutingParts {
         match self {
             RoutingLookup::Resolved {
                 message_id,
                 routing_decision,
-            } => (Some(message_id), Some(routing_decision), None),
-            RoutingLookup::Unavailable(why) => (None, None, Some(why)),
+                served_by_id,
+            } => RoutingParts {
+                message_id: Some(message_id),
+                routing_decision: Some(routing_decision),
+                served_by_id,
+                routing_unavailable: None,
+            },
+            RoutingLookup::Unavailable(why) => RoutingParts {
+                message_id: None,
+                routing_decision: None,
+                served_by_id: None,
+                routing_unavailable: Some(why),
+            },
         }
     }
 }
@@ -189,9 +261,10 @@ fn routing_lookup(rows: Result<Vec<Message>, RoutingUnavailable>) -> RoutingLook
     match rows {
         Err(why) => RoutingLookup::Unavailable(why),
         Ok(rows) => match latest_assistant_routing(&rows) {
-            Some((message_id, routing_decision)) => RoutingLookup::Resolved {
+            Some((message_id, routing_decision, served_by_id)) => RoutingLookup::Resolved {
                 message_id,
                 routing_decision,
+                served_by_id,
             },
             None => RoutingLookup::Unavailable(RoutingUnavailable::NoAssistantRow),
         },
@@ -276,10 +349,21 @@ pub struct MessageInfo {
     pub error: Option<String>,
     pub aborted: bool,
     pub created_at: i64,
+    /// The endpoint this row was served by, with the provider's name and
+    /// base URL joined in from the live registry. Same shape (and same
+    /// resolver) as `SendMessageResponse::served_by`, so a reloaded transcript
+    /// renders the per-turn route indicator identically to a live send.
+    pub served_by: Option<ServedBy>,
 }
 
-impl From<Message> for MessageInfo {
-    fn from(m: Message) -> Self {
+impl MessageInfo {
+    /// Build a transcript row, resolving its endpoint provenance.
+    ///
+    /// Deliberately not a `From<Message>` impl: `served_by` needs the registry,
+    /// and a bare `.into()` that silently produced `served_by: None` would make
+    /// the route indicator quietly disappear from whichever call site forgot.
+    fn resolved(m: Message, model_manager: &crate::models::ModelManager) -> Self {
+        let served_by = resolve_served_by(model_manager, m.provider_id.clone());
         Self {
             id: m.id,
             conversation_id: m.conversation_id,
@@ -292,6 +376,7 @@ impl From<Message> for MessageInfo {
             error: m.error,
             aborted: m.aborted,
             created_at: m.created_at,
+            served_by,
         }
     }
 }
@@ -535,7 +620,11 @@ pub fn get_messages(
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
     db.list_messages_by_conversation(&args.conversation_id)
-        .map(|rows| rows.into_iter().map(Into::into).collect())
+        .map(|rows| {
+            rows.into_iter()
+                .map(|m| MessageInfo::resolved(m, &state.model_manager))
+                .collect()
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -900,23 +989,52 @@ pub async fn list_models(
 
 // ── send_message ─────────────────────────────────────────────────────────
 
+/// Reject a turn that arrives with no endpoint selected.
+///
+/// `provider_id` + `model` are one selection, not two independent strings: the
+/// composer picks a model *on* a provider. If either half arrives blank the
+/// turn has no endpoint at all, and the cause is upstream selection state (a
+/// picker whose pair came apart), not a bad id.
+///
+/// Caught here it reads as what it is — "pick a model". Left to fall through,
+/// a blank id reached `AgentLoop::process_message`'s provider lookup and
+/// surfaced as `unknown provider id: ` with nothing after the colon: a
+/// sentence that reads like an internal bug and tells the user nothing they
+/// can act on. The loop keeps its own guard for the same case (it has callers
+/// besides this command); this one exists so the boundary refuses the turn
+/// before any db is opened or any transcript row is written.
+///
+/// Pure so it is unit-tested directly — `send_message` takes a bare
+/// `AppHandle` and so is excluded from the IPC contract-test harness.
+fn validate_endpoint_selection(provider_id: &str, model: &str) -> Result<(), String> {
+    if provider_id.trim().is_empty() {
+        return Err(crate::agent::loop_mod::NO_ENDPOINT_SELECTED.to_string());
+    }
+    if model.trim().is_empty() {
+        return Err(crate::agent::loop_mod::NO_MODEL_SELECTED.to_string());
+    }
+    Ok(())
+}
+
 /// From a conversation's persisted rows, pick the `(message_id,
-/// routing_decision)` to report to the frontend: the most recent
+/// routing_decision, provider_id)` to report to the frontend: the most recent
 /// `assistant` row's real gate decision (what `process_message` stamped —
 /// "allow" / "route_local"), defaulting to `"allow"` only when that row
-/// carries no decision. Returns `None` when there is no assistant row yet,
-/// leaving the caller to mint a fallback id.
+/// carries no decision, plus the provider that row was actually served by.
+/// Returns `None` when there is no assistant row yet, leaving the caller to
+/// mint a fallback id.
 ///
 /// Extracted as a pure function so this stays covered by a unit test — a
 /// refactor that silently re-hardcoded the decision back to `"allow"` (the
 /// bug this replaced) would fail the test instead of shipping green.
-fn latest_assistant_routing(rows: &[Message]) -> Option<(String, String)> {
+fn latest_assistant_routing(rows: &[Message]) -> Option<(String, String, Option<String>)> {
     rows.iter().rev().find(|m| m.role == "assistant").map(|m| {
         (
             m.id.clone(),
             m.routing_decision
                 .clone()
                 .unwrap_or_else(|| "allow".to_string()),
+            m.provider_id.clone(),
         )
     })
 }
@@ -936,6 +1054,10 @@ pub async fn send_message(
     // the one command that uses `args.profile` (for routing/labels) before it
     // reaches `open_profile`, so a padded/confusable name must be rejected here.
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
+    // Endpoint-routing spec: a turn goes to the provider the user picked, or
+    // it fails loudly. "No selection at all" is its own, user-actionable
+    // failure — never a cue to serve the turn from some other provider.
+    validate_endpoint_selection(&args.provider_id, &args.model)?;
     let binding = parse_binding(&args.binding)
         .map_err(|e| format!("invalid binding {:?}: {e}", args.binding))?;
     let session_mode = args
@@ -993,15 +1115,22 @@ pub async fn send_message(
             db.list_messages_by_conversation(&conversation_id)
                 .map_err(|_| RoutingUnavailable::MessageQueryFailed)
         });
-    let (message_id, routing_decision, routing_unavailable) = routing_lookup(rows).into_parts();
+    let parts = routing_lookup(rows).into_parts();
+    // Join the persisted provider id against the live registry so the route
+    // indicator can name the endpoint, not just its uuid. Resolved here rather
+    // than by the frontend: after a `route_local` reroute the served provider
+    // is NOT the one the composer has selected, and the frontend has no other
+    // way to learn that for the turn it just sent.
+    let served_by = resolve_served_by(&state.model_manager, parts.served_by_id);
 
     Ok(SendMessageResponse {
-        message_id,
+        message_id: parts.message_id,
         content,
         conversation_id,
         profile,
-        routing_decision,
-        routing_unavailable,
+        routing_decision: parts.routing_decision,
+        routing_unavailable: parts.routing_unavailable,
+        served_by,
         completed_at: chrono::Utc::now().timestamp_millis().max(started),
     })
 }
@@ -4086,13 +4215,23 @@ mod tests {
     // ── latest_assistant_routing (send_message's routing-decision source) ──
 
     fn msg(id: &str, role: &str, routing: Option<&str>) -> Message {
+        msg_served_by(id, role, routing, None)
+    }
+
+    /// `msg`, plus the provider id the row was served by.
+    fn msg_served_by(
+        id: &str,
+        role: &str,
+        routing: Option<&str>,
+        provider_id: Option<&str>,
+    ) -> Message {
         Message {
             id: id.to_string(),
             conversation_id: "c1".to_string(),
             role: role.to_string(),
             content: String::new(),
             model: None,
-            provider_id: None,
+            provider_id: provider_id.map(str::to_string),
             routing_decision: routing.map(str::to_string),
             thinking_content: None,
             error: None,
@@ -4109,7 +4248,7 @@ mod tests {
             msg("u1", "user", None),
             msg("a1", "assistant", Some("route_local")),
         ];
-        let (id, decision) = latest_assistant_routing(&rows).expect("assistant present");
+        let (id, decision, _) = latest_assistant_routing(&rows).expect("assistant present");
         assert_eq!(id, "a1");
         assert_eq!(decision, "route_local");
     }
@@ -4117,7 +4256,7 @@ mod tests {
     #[test]
     fn latest_assistant_routing_defaults_to_allow_when_unset() {
         let rows = vec![msg("a1", "assistant", None)];
-        let (_, decision) = latest_assistant_routing(&rows).unwrap();
+        let (_, decision, _) = latest_assistant_routing(&rows).unwrap();
         assert_eq!(decision, "allow");
     }
 
@@ -4128,12 +4267,26 @@ mod tests {
             msg("t1", "tool", None),
             msg("a2", "assistant", Some("route_local")),
         ];
-        let (id, decision) = latest_assistant_routing(&rows).unwrap();
+        let (id, decision, _) = latest_assistant_routing(&rows).unwrap();
         assert_eq!(
             id, "a2",
             "must pick the newest assistant row, not the first"
         );
         assert_eq!(decision, "route_local");
+    }
+
+    #[test]
+    fn latest_assistant_routing_reports_the_provider_that_actually_served_the_turn() {
+        // Endpoint-routing spec: a rerouted turn is served by a DIFFERENT
+        // provider than the composer has selected, so the read-back has to
+        // report the row's own provider — the picker cannot be trusted for it.
+        let rows = vec![
+            msg_served_by("u1", "user", Some("route_local"), Some("cloudco")),
+            msg_served_by("a1", "assistant", Some("route_local"), Some("local-llm")),
+        ];
+        let (_, decision, served_by) = latest_assistant_routing(&rows).unwrap();
+        assert_eq!(decision, "route_local");
+        assert_eq!(served_by.as_deref(), Some("local-llm"));
     }
 
     #[test]
@@ -4146,12 +4299,18 @@ mod tests {
 
     #[test]
     fn routing_lookup_resolves_a_persisted_assistant_row() {
-        let rows = vec![msg("a1", "assistant", Some("route_local"))];
+        let rows = vec![msg_served_by(
+            "a1",
+            "assistant",
+            Some("route_local"),
+            Some("local-llm"),
+        )];
         assert_eq!(
             routing_lookup(Ok(rows)),
             RoutingLookup::Resolved {
                 message_id: "a1".to_string(),
                 routing_decision: "route_local".to_string(),
+                served_by_id: Some("local-llm".to_string()),
             }
         );
     }
@@ -4179,14 +4338,19 @@ mod tests {
     /// `into_parts` call, not a re-implementation of it — so the serialized
     /// shapes asserted below are the shapes the frontend actually receives.
     fn response_for(lookup: RoutingLookup) -> SendMessageResponse {
-        let (message_id, routing_decision, routing_unavailable) = lookup.into_parts();
+        let parts = lookup.into_parts();
+        // An empty registry stands in for "the provider is gone": name and
+        // base_url resolve to null while the persisted id survives, which is
+        // exactly the degraded shape the frontend has to handle.
+        let served_by = resolve_served_by(&crate::models::ModelManager::new(), parts.served_by_id);
         SendMessageResponse {
-            message_id,
+            message_id: parts.message_id,
             content: "hi".to_string(),
             conversation_id: "c1".to_string(),
             profile: "personal".to_string(),
-            routing_decision,
-            routing_unavailable,
+            routing_decision: parts.routing_decision,
+            routing_unavailable: parts.routing_unavailable,
+            served_by,
             completed_at: 0,
         }
     }
@@ -4218,6 +4382,7 @@ mod tests {
         let json = serde_json::to_value(response_for(RoutingLookup::Resolved {
             message_id: "a1".to_string(),
             routing_decision: "route_local".to_string(),
+            served_by_id: Some("local-llm".to_string()),
         }))
         .unwrap();
         assert_eq!(json["message_id"], "a1");
@@ -4226,6 +4391,82 @@ mod tests {
             json.get("routing_unavailable").is_none(),
             "happy path must not carry a failure field: {json}"
         );
+    }
+
+    // ── endpoint-routing spec: per-turn route provenance ────────────────
+
+    #[test]
+    fn a_send_response_names_the_endpoint_that_served_the_turn() {
+        // The spec's route indicator needs the provider's NAME and BASE_URL,
+        // not just its uuid — and it must be the provider from the persisted
+        // row, so a rerouted turn is labelled by where it actually went.
+        let mm = crate::models::ModelManager::new();
+        mm.add_provider(Provider::new(
+            "local-llm",
+            "Local Llama",
+            "http://127.0.0.1:11434/v1",
+            None,
+            ProviderKind::Local,
+        ));
+        let served = resolve_served_by(&mm, Some("local-llm".to_string()))
+            .expect("a persisted provider id resolves");
+        assert_eq!(served.provider_id, "local-llm");
+        assert_eq!(served.provider_name.as_deref(), Some("Local Llama"));
+        assert_eq!(served.base_url.as_deref(), Some("http://127.0.0.1:11434/v1"));
+    }
+
+    #[test]
+    fn a_removed_provider_is_reported_as_unknown_never_guessed() {
+        // The id is history and survives; the name/endpoint are live lookups.
+        // Substituting some other configured provider's name here would be the
+        // same lie as the fabricated routing decision M-22 removed.
+        let mm = crate::models::ModelManager::new();
+        mm.add_provider(Provider::new(
+            "anthropic",
+            "Anthropic",
+            "https://api.anthropic.com/v1",
+            None,
+            ProviderKind::Cloud,
+        ));
+        let served = resolve_served_by(&mm, Some("deleted-endpoint".to_string()))
+            .expect("the persisted id is still reported");
+        assert_eq!(served.provider_id, "deleted-endpoint");
+        assert_eq!(served.provider_name, None);
+        assert_eq!(served.base_url, None);
+    }
+
+    #[test]
+    fn a_row_with_no_provider_id_has_no_served_by_block() {
+        let mm = crate::models::ModelManager::new();
+        assert_eq!(resolve_served_by(&mm, None), None);
+    }
+
+    // ── endpoint selection is validated at the IPC boundary ─────────────
+
+    #[test]
+    fn a_blank_endpoint_selection_is_refused_with_an_actionable_message() {
+        // The frontend bug this catches leaves provider_id and/or model empty.
+        // Falling through produced `unknown provider id: ` — a dangling
+        // sentence that reads as an internal fault and names no fix.
+        for (provider_id, model) in [("", "gpt-4o"), ("   ", "gpt-4o"), ("", "")] {
+            let err = validate_endpoint_selection(provider_id, model)
+                .expect_err("a blank provider id must be refused");
+            assert_eq!(err, crate::agent::loop_mod::NO_ENDPOINT_SELECTED);
+            assert!(
+                !err.ends_with(':') && !err.contains("unknown provider id"),
+                "the dangling internal message is back: {err}"
+            );
+        }
+        for model in ["", "  "] {
+            let err = validate_endpoint_selection("openai", model)
+                .expect_err("a blank model must be refused");
+            assert_eq!(err, crate::agent::loop_mod::NO_MODEL_SELECTED);
+        }
+    }
+
+    #[test]
+    fn a_complete_endpoint_selection_passes_the_boundary() {
+        assert!(validate_endpoint_selection("openai", "gpt-4o").is_ok());
     }
 
     // ── H-06: cleartext is gated on the ADDRESS, not on a string prefix ──
@@ -4322,22 +4563,10 @@ mod tests {
 
     // ── H-06 (client side): a redirect must never carry the bearer key ──
 
-    /// One-shot HTTP server on an ephemeral loopback port. Answers the first
-    /// request with `raw` and closes. Returns the bound port.
-    fn one_shot_server(raw: &'static str) -> u16 {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf);
-                let _ = sock.write_all(raw.as_bytes());
-                let _ = sock.flush();
-            }
-        });
-        port
-    }
+    // The loopback one-shot servers live in `crate::test_support` — the
+    // endpoint-routing tests in `agent::loop_tests` need the same fake, and a
+    // second copy would drift from this one.
+    use crate::test_support::{one_shot_server, one_shot_server_redirecting_to};
 
     #[tokio::test]
     async fn the_model_client_does_not_follow_redirects() {
@@ -4372,26 +4601,6 @@ mod tests {
             !msg.contains("redirected"),
             "the redirect was followed to its destination: {msg}"
         );
-    }
-
-    /// A server that 302s to `port`. Separate from `one_shot_server` because
-    /// the Location header is built at runtime.
-    fn one_shot_server_redirecting_to(port: u16) -> u16 {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let hop = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf);
-                let resp = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/models\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                let _ = sock.write_all(resp.as_bytes());
-                let _ = sock.flush();
-            }
-        });
-        hop
     }
 
     // ── M-05 / rotation: provider mutations against a real AppState ─────

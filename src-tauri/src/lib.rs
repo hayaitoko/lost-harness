@@ -25,6 +25,8 @@ mod platform; // M5: cross-platform computer use (cfg'd submodules)
 mod queue; // M4 (Wave 4.4): the one-queue-model substrate (deferred work)
 mod secrets; // provider credentials: OS keychain + test seam + legacy migration
 mod storage; // M1+: SQLite, sqlite-vec, sled/redb
+#[cfg(test)]
+mod test_support; // shared test fakes (loopback HTTP one-shot servers)
 mod tools; // M3: Tool registry + implementations
 
 use std::path::PathBuf;

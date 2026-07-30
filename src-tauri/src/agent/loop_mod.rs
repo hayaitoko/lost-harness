@@ -47,6 +47,23 @@ use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider}
 use crate::storage::{MemoryBucket, MemoryFact, Message, ProfileDb, Storage, TrmLog};
 use crate::tools::{ExecCtx, ToolDispatcher, TurnOutcome};
 
+// ── Endpoint-selection errors ─────────────────────────────────────────────
+//
+// A turn carries the endpoint the user picked. When that selection arrives
+// empty the cause is upstream state (the composer's picker lost its pair),
+// not a bad provider id — so it gets its own user-actionable wording instead
+// of the internal-sounding `unknown provider id: `. These live here, next to
+// the invariant they describe, and the IPC boundary reuses them so the user
+// sees one sentence no matter which layer catches it.
+
+/// No provider id at all was supplied for the turn.
+pub(crate) const NO_ENDPOINT_SELECTED: &str =
+    "no model endpoint is selected — pick a model in the composer";
+
+/// A provider was supplied but no model name with it.
+pub(crate) const NO_MODEL_SELECTED: &str =
+    "no model is selected for this endpoint — pick a model in the composer";
+
 // ── Event payloads ────────────────────────────────────────────────────────
 
 /// Payload of the `stream:token` event. Mirrors what the Svelte frontend
@@ -475,10 +492,24 @@ impl AgentLoop {
         }
 
         // ── 1. Resolve provider + classify endpoint ──────────────────────
+        //
+        // Two distinct failures, deliberately worded differently. A blank id
+        // means the caller never had a selection to send (the composer's
+        // provider/model pair came apart upstream) — a state the USER can
+        // fix, and one that used to render as the dangling, internal-looking
+        // `unknown provider id: `. A non-blank id that isn't registered stays
+        // loud and unchanged: it is never a cue to substitute some other
+        // provider (see `hooks::routing::enforce_local_routing`).
         let provider = self
             .model_manager
             .get_provider(&provider_id)
-            .ok_or_else(|| anyhow!("unknown provider id: {provider_id}"))?;
+            .ok_or_else(|| {
+                if provider_id.trim().is_empty() {
+                    anyhow!("{NO_ENDPOINT_SELECTED}")
+                } else {
+                    anyhow!("unknown provider id: {provider_id}")
+                }
+            })?;
         let is_cloud = !is_private_endpoint(&provider.base_url);
 
         // ── 2. Privacy gate ──────────────────────────────────────────────
