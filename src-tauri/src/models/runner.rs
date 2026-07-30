@@ -53,10 +53,48 @@ const DEFAULT_CTX_SIZE: u32 = 4096;
 
 /// A fully-resolved sidecar invocation. Pure data — [`build_args`] constructs
 /// it, the spawner executes it, tests assert on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `api_key` is the per-spawn bearer token (H-04). It is BOTH in `args` (as
+/// `--api-key <token>`, which is how llama-server learns it) and carried here
+/// as a field, because everything on OUR side that talks to the sidecar needs
+/// it: the health check, and — the part that makes it actually useful — the
+/// registered provider client. `Debug` redacts it (argv is logged in places).
+#[derive(Clone, PartialEq, Eq)]
 pub struct SidecarCommand {
     pub bin: PathBuf,
     pub args: Vec<String>,
+    /// The bearer token this sidecar was started with, `None` for an
+    /// unauthenticated sidecar (only tests / an external runner).
+    pub api_key: Option<String>,
+}
+
+/// Hand-written so a token never reaches a log line: the field prints as
+/// `<redacted>` and the argv value following `--api-key` is elided.
+impl std::fmt::Debug for SidecarCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut args: Vec<&str> = Vec::with_capacity(self.args.len());
+        let mut redact_next = false;
+        for a in &self.args {
+            if std::mem::take(&mut redact_next) {
+                args.push("<redacted>");
+            } else {
+                args.push(a.as_str());
+            }
+            redact_next = a == "--api-key";
+        }
+        f.debug_struct("SidecarCommand")
+            .field("bin", &self.bin)
+            .field("args", &args)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// A fresh per-spawn bearer token (H-04): 128 random bits, lowercase hex. Long
+/// enough that [`redact_stderr_line`]'s hex rule scrubs it from any captured
+/// stderr, and unguessable by a process racing us for the port.
+pub fn new_spawn_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// llama.cpp `--cache-type-k/v` argument for a KV-cache quant.
@@ -73,6 +111,11 @@ fn cache_type_arg(q: KvCacheQuant) -> &'static str {
 /// (a sidecar on all interfaces is LAN-reachable regardless of how we route our
 /// own calls). The calculator's chosen context size and KV-cache quant pass
 /// through here (design §D + the 22b redirect's S4 note).
+///
+/// H-04: `api_key` is passed to llama-server as `--api-key`, which makes the
+/// server reject every request that doesn't present it. That is what turns the
+/// health check from "something answers on this port" into "the process WE
+/// started answers on this port".
 pub fn build_args(
     bin: &Path,
     model_path: &Path,
@@ -80,6 +123,7 @@ pub fn build_args(
     threads: u32,
     ctx_size: Option<u32>,
     kv_quant: Option<KvCacheQuant>,
+    api_key: Option<&str>,
 ) -> SidecarCommand {
     let mut args = vec![
         "--model".to_string(),
@@ -103,11 +147,22 @@ pub fn build_args(
         args.push("--cache-type-v".to_string());
         args.push(cache_type_arg(q).to_string());
     }
-    SidecarCommand { bin: bin.to_path_buf(), args }
+    if let Some(key) = api_key {
+        args.push("--api-key".to_string());
+        args.push(key.to_string());
+    }
+    SidecarCommand {
+        bin: bin.to_path_buf(),
+        args,
+        api_key: api_key.map(str::to_string),
+    }
 }
 
 /// A free loopback port, picked by binding port 0 and reading what the OS
-/// assigned. Tiny TOCTOU between drop and spawn — the health check is the net.
+/// assigned. There is an unavoidable TOCTOU window between dropping the probe
+/// listener and the sidecar binding it — H-04: the net is no longer "some HTTP
+/// server answers" but "the server answering enforces the per-spawn token we
+/// just generated" (see [`HttpHealthCheck::is_healthy`]).
 pub fn pick_free_port() -> Result<u16> {
     let l = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     Ok(l.local_addr()?.port())
@@ -117,6 +172,73 @@ pub fn pick_free_port() -> Result<u16> {
 // Seams: process + health (fake-testable, no real binary)
 // ---------------------------------------------------------------------------
 
+/// L-02 — how many stderr lines we keep, and how long a single line may be.
+/// Bounded on BOTH axes: a sidecar that loops on an error must not grow our
+/// memory, and llama.cpp can emit very long single lines.
+const STDERR_TAIL_LINES: usize = 40;
+const STDERR_LINE_MAX: usize = 400;
+/// Cap on what we paste into an error message (below any log-line limit).
+const STDERR_TAIL_CHARS: usize = 2000;
+
+/// A size-bounded, already-redacted tail of a sidecar's stderr (L-02). Shared
+/// (`Arc`) between the reader task and whoever reports the failure.
+#[derive(Default)]
+pub struct StderrTail {
+    lines: Mutex<std::collections::VecDeque<String>>,
+}
+
+impl StderrTail {
+    /// Redact, truncate, and append one line, evicting the oldest beyond the cap.
+    pub fn push_redacted(&self, line: &str) {
+        let mut line = redact_stderr_line(line);
+        if line.chars().count() > STDERR_LINE_MAX {
+            line = line.chars().take(STDERR_LINE_MAX).collect::<String>() + "…";
+        }
+        let mut lines = self.lines.lock();
+        if lines.len() == STDERR_TAIL_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    /// The captured tail as text, newest last, capped at [`STDERR_TAIL_CHARS`]
+    /// (keeping the END — the failure is at the bottom). Empty if nothing was
+    /// captured.
+    pub fn snapshot(&self) -> String {
+        let joined = self
+            .lines
+            .lock()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let n = joined.chars().count();
+        if n <= STDERR_TAIL_CHARS {
+            joined
+        } else {
+            joined.chars().skip(n - STDERR_TAIL_CHARS).collect()
+        }
+    }
+}
+
+/// Scrub a stderr line before it is stored (L-02): absolute filesystem paths
+/// (which carry the account name and the user's directory layout) and long hex
+/// runs (our per-spawn bearer token, sha256 digests) are replaced. Applied on
+/// the way IN, so the buffer never holds the sensitive form.
+pub fn redact_stderr_line(line: &str) -> String {
+    use std::sync::OnceLock;
+    static HEX: OnceLock<regex::Regex> = OnceLock::new();
+    static PATH: OnceLock<regex::Regex> = OnceLock::new();
+    let hex = HEX.get_or_init(|| regex::Regex::new(r"\b[0-9a-fA-F]{32,}\b").expect("static regex"));
+    // A leading `/` plus at least one more segment — `/Users/x/m.gguf`, but not
+    // a bare `/` or an option like `--host`.
+    let path = PATH.get_or_init(|| {
+        regex::Regex::new(r"/[A-Za-z0-9._+@\-]+(?:/[A-Za-z0-9._+@\-]*)+").expect("static regex")
+    });
+    let no_hex = hex.replace_all(line, "<redacted>");
+    path.replace_all(&no_hex, "<path>").into_owned()
+}
+
 /// A spawned sidecar process — the minimal surface supervision needs.
 pub trait SpawnedProcess: Send {
     fn id(&self) -> Option<u32>;
@@ -125,6 +247,10 @@ pub trait SpawnedProcess: Send {
     /// Begin killing (SIGKILL). Idempotence is the SUPERVISOR's job — this may
     /// error if called twice.
     fn start_kill(&mut self) -> Result<()>;
+    /// L-02 — the process's captured stderr tail, when the spawner captures one.
+    fn stderr_tail(&self) -> Option<Arc<StderrTail>> {
+        None
+    }
 }
 
 /// Spawns sidecar processes. The real impl shells `tokio::process`; tests
@@ -133,42 +259,69 @@ pub trait ProcessSpawner: Send + Sync {
     fn spawn(&self, cmd: &SidecarCommand) -> Result<Box<dyn SpawnedProcess>>;
 }
 
-/// Answers "is the server at `base_url` serving?" — the real impl GETs
-/// `{base_url}/models` (llama-server's `/v1/models`). Boxed-future shape so the
-/// trait stays object-safe.
+/// Answers "is the server at `base_url` the sidecar WE started?" — the real
+/// impl GETs `{base_url}/models` (llama-server's `/v1/models`) and, when a
+/// per-spawn token was issued, requires the server to enforce it. Boxed-future
+/// shape so the trait stays object-safe.
 pub trait HealthCheck: Send + Sync {
-    fn is_healthy<'a>(&'a self, base_url: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+    fn is_healthy<'a>(
+        &'a self,
+        base_url: &'a str,
+        api_key: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 }
 
-/// The real spawner: `tokio::process::Command`, stdio nulled, `kill_on_drop`
-/// as the last-resort teardown net.
+/// The real spawner: `tokio::process::Command`, stdin/stdout nulled, **stderr
+/// piped** into a bounded redacted tail (L-02 — a sidecar that refuses to start
+/// used to fail with nothing to read), `kill_on_drop` as the last-resort
+/// teardown net.
 pub struct TokioSpawner;
 
-struct TokioChild(tokio::process::Child);
+struct TokioChild {
+    child: tokio::process::Child,
+    stderr: Arc<StderrTail>,
+}
 
 impl SpawnedProcess for TokioChild {
     fn id(&self) -> Option<u32> {
-        self.0.id()
+        self.child.id()
     }
     fn try_wait(&mut self) -> Result<Option<i32>> {
-        Ok(self.0.try_wait()?.map(|s| s.code().unwrap_or(-1)))
+        Ok(self.child.try_wait()?.map(|s| s.code().unwrap_or(-1)))
     }
     fn start_kill(&mut self) -> Result<()> {
-        Ok(self.0.start_kill()?)
+        Ok(self.child.start_kill()?)
+    }
+    fn stderr_tail(&self) -> Option<Arc<StderrTail>> {
+        Some(Arc::clone(&self.stderr))
     }
 }
 
 impl ProcessSpawner for TokioSpawner {
     fn spawn(&self, cmd: &SidecarCommand) -> Result<Box<dyn SpawnedProcess>> {
-        let child = tokio::process::Command::new(&cmd.bin)
+        let mut child = tokio::process::Command::new(&cmd.bin)
             .args(&cmd.args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning sidecar {:?}", cmd.bin))?;
-        Ok(Box::new(TokioChild(child)))
+        let tail = Arc::new(StderrTail::default());
+        // Drain for as long as the child lives: an unread pipe fills up and then
+        // BLOCKS the writer, so once stderr is piped this reader is mandatory,
+        // not a diagnostic nicety. The task ends at EOF (process exit).
+        if let Some(pipe) = child.stderr.take() {
+            let sink = Arc::clone(&tail);
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(pipe).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    sink.push_redacted(&line);
+                }
+            });
+        }
+        Ok(Box::new(TokioChild { child, stderr: tail }))
     }
 }
 
@@ -195,11 +348,78 @@ impl Default for HttpHealthCheck {
     }
 }
 
+/// The endpoint used to prove IDENTITY (H-04), as opposed to readiness.
+///
+/// This is deliberately not `/v1/models`: llama-server keeps `/health`,
+/// `/models` and `/v1/models` **public**, exempt from `--api-key` enforcement, so
+/// their answers say nothing about who is listening. `/props` IS enforced, and it
+/// answers as soon as the server is up. Both halves of that claim are measured
+/// against the pinned vendored binary by
+/// `the_vendored_sidecar_enforces_the_api_key_on_props_but_not_on_models` — if a
+/// re-vendor ever changes the auth surface, that test fails instead of this check
+/// silently degrading (or refusing every legitimate start).
+const IDENTITY_PATH: &str = "/props";
+
+/// The server root for a `.../v1`-style base URL — `/props` lives at the root,
+/// not under `/v1`.
+fn server_root(base_url: &str) -> &str {
+    let trimmed = base_url.trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed)
+}
+
 impl HealthCheck for HttpHealthCheck {
-    fn is_healthy<'a>(&'a self, base_url: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+    /// H-04 — when a per-spawn token was issued, three things must hold before
+    /// this port may become a PRIVATE provider:
+    ///
+    /// 1. **An unauthenticated request to a protected endpoint is refused.** A
+    ///    squatter that already owned the port and answers everything cannot be
+    ///    enforcing a token it has never seen. (Any non-2xx counts as a refusal —
+    ///    the exact status is llama.cpp's business, not ours.)
+    /// 2. **The same endpoint accepts OUR token.** A server enforcing somebody
+    ///    else's key fails here, as does a wrong/absent token on our side.
+    /// 3. **`/v1/models` answers with a models list**, not merely an HTTP 2xx —
+    ///    the readiness half, as before.
+    ///
+    /// Residual (documented, not closed): an ADAPTIVE attacker holding the port
+    /// can refuse step 1, read our token out of step 2, and then answer step 3.
+    /// Closing that needs a challenge-response the sidecar does not offer; what
+    /// this does close is the realistic case — a process already serving an
+    /// OpenAI-compatible endpoint on the port we were handed.
+    fn is_healthy<'a>(
+        &'a self,
+        base_url: &'a str,
+        api_key: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(key) = api_key {
+                let probe = format!("{}{IDENTITY_PATH}", server_root(base_url));
+                match self.client.get(&probe).send().await {
+                    // Served a protected endpoint to an anonymous caller → it is
+                    // not enforcing our key, so it is not our sidecar.
+                    Ok(r) if r.status().is_success() => return false,
+                    Ok(_) => {}             // refused, as our own sidecar must
+                    Err(_) => return false, // nothing there yet — poll again
+                }
+                match self.client.get(&probe).bearer_auth(key).send().await {
+                    Ok(r) if r.status().is_success() => {}
+                    // Refuses our token too → somebody else's server.
+                    _ => return false,
+                }
+            }
             let url = format!("{base_url}/models");
-            matches!(self.client.get(&url).send().await, Ok(r) if r.status().is_success())
+            let mut req = self.client.get(&url);
+            if let Some(key) = api_key {
+                req = req.bearer_auth(key);
+            }
+            match req.send().await {
+                Ok(r) if r.status().is_success() => {
+                    matches!(
+                        r.json::<serde_json::Value>().await,
+                        Ok(v) if v.get("data").is_some_and(|d| d.is_array())
+                    )
+                }
+                _ => false,
+            }
         })
     }
 }
@@ -294,6 +514,10 @@ pub struct LocalRunnerSupervisor {
     /// the "not running" check and each spawn a sidecar (review finding #1). One
     /// lock per id ever started; bounded by the (tiny) model count.
     start_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// M-10: catalog ids whose bytes have been sha256-verified during THIS app
+    /// run. First use of a model hashes it (before any spawn); later uses in the
+    /// same run trust that result, so the cost is paid once, not per request.
+    hash_verified: RwLock<std::collections::HashSet<String>>,
 }
 
 impl LocalRunnerSupervisor {
@@ -309,7 +533,25 @@ impl LocalRunnerSupervisor {
             running: RwLock::new(HashMap::new()),
             states: RwLock::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
+            hash_verified: RwLock::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// M-10: has this model's sha256 already been checked in this app run?
+    pub fn is_hash_verified(&self, catalog_id: &str) -> bool {
+        self.hash_verified.read().contains(catalog_id)
+    }
+
+    /// M-10: record that this model's bytes matched, so the (expensive) hash is
+    /// computed once per run. Forgotten on restart, and cleared by
+    /// [`Self::forget_hash_verification`] when the file could have changed.
+    pub fn mark_hash_verified(&self, catalog_id: &str) {
+        self.hash_verified.write().insert(catalog_id.to_string());
+    }
+
+    /// Drop a cached verification (a re-download replaces the bytes).
+    pub fn forget_hash_verification(&self, catalog_id: &str) {
+        self.hash_verified.write().remove(catalog_id);
     }
 
     /// The production supervisor: real spawner, real HTTP health check.
@@ -454,13 +696,37 @@ impl LocalRunnerSupervisor {
         base_url: &str,
     ) -> Result<Arc<RunnerHandle>> {
         let mut process = self.spawner.spawn(cmd)?;
+        // L-02: the child's redacted stderr tail, so both failure exits below
+        // report WHY instead of just "it didn't come up".
+        let stderr = process.stderr_tail();
+        let diagnostics = |tail: &Option<Arc<StderrTail>>| match tail {
+            Some(t) => match t.snapshot() {
+                s if s.is_empty() => String::from(" (sidecar stderr: empty)"),
+                s => format!(" — sidecar stderr:\n{s}"),
+            },
+            None => String::new(),
+        };
         let deadline = Instant::now() + self.config.health_timeout;
         loop {
             // Early-exit: a dead child never becomes healthy.
             if let Ok(Some(code)) = process.try_wait() {
-                bail!("sidecar exited (code {code}) before becoming healthy");
+                // Let the reader task drain what the child wrote just before
+                // dying — otherwise the most useful lines race the exit report.
+                // Bounded: at most ~100 ms, and it stops as soon as anything
+                // arrived. Under tokio's paused clock this costs no real time.
+                for _ in 0..10 {
+                    match stderr.as_ref() {
+                        Some(t) if t.snapshot().is_empty() => {}
+                        _ => break,
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                bail!(
+                    "sidecar exited (code {code}) before becoming healthy{}",
+                    diagnostics(&stderr)
+                );
             }
-            if self.health.is_healthy(base_url).await {
+            if self.health.is_healthy(base_url, cmd.api_key.as_deref()).await {
                 let port = base_url
                     .rsplit(':')
                     .next()
@@ -481,7 +747,11 @@ impl LocalRunnerSupervisor {
             if Instant::now() >= deadline {
                 // Health window exhausted — kill this child before retrying.
                 let _ = process.start_kill();
-                bail!("health check did not pass within {:?}", self.config.health_timeout);
+                bail!(
+                    "health check did not pass within {:?}{}",
+                    self.config.health_timeout,
+                    diagnostics(&stderr)
+                );
             }
             tokio::time::sleep(self.config.health_poll).await;
         }
@@ -655,7 +925,8 @@ impl LocalRunnerSupervisor {
             let _ = std::fs::create_dir_all(dir);
         }
         // "PID START_EPOCH BOOT_ID" — the reaper verifies liveness + process
-        // identity (comm name) AND that the boot id still matches before killing.
+        // identity (the kernel's executable path) + that the process started when
+        // START_EPOCH says (M-11) AND that the boot id still matches, before killing.
         // The boot id closes cross-reboot PID reuse (finding #5): after a reboot
         // the PID space resets, so a matching PID belongs to an unrelated
         // process and must never be killed.
@@ -677,10 +948,14 @@ impl LocalRunnerSupervisor {
 // ---------------------------------------------------------------------------
 
 /// Reap sidecars orphaned by a hard crash of OUR process (macOS has no
-/// `PR_SET_PDEATHSIG`): for each recorded pidfile, if the PID is alive AND
-/// still looks like our sidecar (`ps -o comm=` names `llama-server` — the
-/// PID-reuse guard), kill it; remove the pidfile either way. Best-effort,
-/// never bricks boot. Returns how many processes were killed.
+/// `PR_SET_PDEATHSIG`): for each recorded pidfile, kill the PID only when ALL
+/// of the recorded identity still checks out — same boot, the kernel says the
+/// PID's executable really is `llama-server` ([`process_exe_path`], not a
+/// truncated `ps -o comm=` suffix match), and the process started when the
+/// pidfile says it did ([`process_start_epoch_matches`], M-11: the epoch used to
+/// be parsed and thrown away). Anything indeterminate ⇒ do not kill. The
+/// pidfile is removed either way. Best-effort, never bricks boot. Returns how
+/// many processes were killed.
 pub fn reap_orphan_sidecars(pidfile_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(pidfile_dir) else { return 0 };
     let current_boot = current_boot_id();
@@ -693,7 +968,7 @@ pub fn reap_orphan_sidecars(pidfile_dir: &Path) -> usize {
         if let Ok(content) = std::fs::read_to_string(&path) {
             let mut fields = content.split_whitespace();
             let pid = fields.next().and_then(|p| p.parse::<i32>().ok());
-            let _epoch = fields.next();
+            let epoch = fields.next().and_then(|e| e.parse::<i64>().ok());
             let file_boot = fields.next(); // Option<&str>; absent in legacy pidfiles
             // Cross-reboot PID-reuse guard (finding #5): if the pidfile recorded
             // a boot id and it differs from the current boot, the PID space has
@@ -705,13 +980,28 @@ pub fn reap_orphan_sidecars(pidfile_dir: &Path) -> usize {
                 (Some(fb), Some(cb)) if fb != cb
             );
             if let Some(pid) = pid {
-                if pid > 0 && !stale_boot && process_is_our_sidecar(pid) {
+                // M-11: the recorded epoch is now USED. A PID that is alive and
+                // whose executable is llama-server but which started at a
+                // different time than we recorded is a different process (PID
+                // reuse within this boot) — leave it alone.
+                if pid > 0
+                    && !stale_boot
+                    && process_is_our_sidecar(pid)
+                    && process_start_epoch_matches(pid, epoch)
+                {
                     #[cfg(unix)]
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                     }
                     killed += 1;
                     tracing::warn!(target: "lhp::runner", pid, "reaped orphaned sidecar from a previous run");
+                } else {
+                    tracing::debug!(
+                        target: "lhp::runner",
+                        pid,
+                        stale_boot,
+                        "pidfile not reaped — identity did not check out"
+                    );
                 }
             }
         }
@@ -748,20 +1038,89 @@ fn current_boot_id() -> Option<String> {
     None
 }
 
-/// Is `pid` alive and running our sidecar binary? Checks the process comm name
-/// via `ps` (macOS/unix). A dead PID, a reused PID running something else, or
-/// any lookup failure → `false` (never kill on uncertainty).
-fn process_is_our_sidecar(pid: i32) -> bool {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-    else {
-        return false;
+/// The executable path the KERNEL reports for `pid` (M-11). On macOS this is
+/// `proc_pidpath(2)`: the full, untruncated path of the running image — unlike
+/// `ps -o comm=`, which is truncated to 16 characters and was only suffix-matched
+/// (so any process whose truncated name happened to end in `llama-server` looked
+/// like ours). `None` for a dead PID, a PID we may not inspect, or a
+/// non-macOS build.
+#[cfg(target_os = "macos")]
+fn process_exe_path(pid: i32) -> Option<PathBuf> {
+    // PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN).
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe {
+        libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
     };
-    if !out.status.success() {
-        return false;
+    if n <= 0 {
+        return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().ends_with("llama-server")
+    buf.truncate(n as usize);
+    Some(PathBuf::from(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_exe_path(_pid: i32) -> Option<PathBuf> {
+    None
+}
+
+/// Is `pid` alive and running OUR sidecar executable? The file name of the
+/// kernel-reported executable path must be exactly `llama-server`. A dead PID, a
+/// reused PID running something else, or any lookup failure → `false` (never
+/// kill on uncertainty).
+fn process_is_our_sidecar(pid: i32) -> bool {
+    match process_exe_path(pid) {
+        Some(p) => p.file_name().and_then(|f| f.to_str()) == Some("llama-server"),
+        // Nothing authoritative to go on (non-macOS, or the PID is gone) — the
+        // reaper must not guess.
+        None => false,
+    }
+}
+
+/// How far a process's real start time may sit from the epoch recorded in the
+/// pidfile and still be considered the same process. The pidfile is written
+/// immediately after the health check passes, so the two are seconds apart in
+/// practice; the window only has to be wider than a slow model load.
+const START_EPOCH_TOLERANCE_SECS: i64 = 300;
+
+/// Does `pid`'s actual start time match the epoch the pidfile recorded (M-11)?
+/// This is the in-boot PID-reuse guard: a recycled PID running a *different*
+/// `llama-server` (the user's own, started later) has a start time nowhere near
+/// our record. A pidfile with no epoch (legacy) can't be checked ⇒ `true`, the
+/// prior behaviour. A process whose start time we cannot read ⇒ `false`.
+fn process_start_epoch_matches(pid: i32, recorded: Option<i64>) -> bool {
+    let Some(recorded) = recorded else {
+        return true; // legacy pidfile — identity rests on the exe-path check
+    };
+    match process_start_epoch(pid) {
+        Some(actual) => (actual - recorded).abs() <= START_EPOCH_TOLERANCE_SECS,
+        None => false,
+    }
+}
+
+/// A process's start time in unix seconds, from the kernel's own BSD info
+/// (`proc_pidinfo(PROC_PIDTBSDINFO)`). `None` when unavailable.
+#[cfg(target_os = "macos")]
+fn process_start_epoch(pid: i32) -> Option<i64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n != size {
+        return None;
+    }
+    Some(info.pbi_start_tvsec as i64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_start_epoch(_pid: i32) -> Option<i64> {
+    None
 }
 
 /// Report from the boot integrity sweep.
@@ -780,6 +1139,21 @@ pub struct SweepReport {
 /// catches the common cases. Best-effort/logged/never-bricks (crash-recovery
 /// discipline). Does NOT spawn anything — spawn stays lazy.
 pub fn sweep_local_model_integrity_at_boot(storage: &Storage, rehash: bool) -> SweepReport {
+    verify_model_rows(storage, rehash, None)
+}
+
+/// **The manual verify (M-10).** A full re-hash of the local catalog — one model
+/// (`only_id`) or all of them — quarantining anything whose bytes no longer match
+/// the recorded sha256. This is the reachable counterpart to the deliberately
+/// cheap boot sweep: boot stays existence+size (multi-GB hashing every launch is
+/// not acceptable), and this is what an operator (or the app, at
+/// [`ensure_running`]) runs when the answer has to be authoritative. Exposed to
+/// the UI as the `verify_local_models` IPC command.
+pub fn verify_local_models_now(storage: &Storage, only_id: Option<&str>) -> SweepReport {
+    verify_model_rows(storage, true, only_id)
+}
+
+fn verify_model_rows(storage: &Storage, rehash: bool, only_id: Option<&str>) -> SweepReport {
     let mut report = SweepReport::default();
     let rows = match storage.global().list_models() {
         Ok(r) => r,
@@ -790,6 +1164,9 @@ pub fn sweep_local_model_integrity_at_boot(storage: &Storage, rehash: bool) -> S
     };
     for row in rows {
         if row.status == "quarantined" {
+            continue;
+        }
+        if only_id.is_some_and(|id| id != row.id) {
             continue;
         }
         report.checked += 1;
@@ -907,18 +1284,77 @@ pub async fn ensure_running(
         );
     }
 
+    // M-10 — FIRST-USE INTEGRITY. The boot sweep runs with `rehash=false`
+    // (existence + size), so a same-size tampered file survives it; this is the
+    // check that catches it, and it runs BEFORE the process is launched — a
+    // tampered GGUF is never handed to llama-server, never becomes a provider,
+    // and never sees a private prompt. Hashed once per app run (multi-GB), on a
+    // blocking thread so the UI's runtime keeps moving. A mismatch quarantines.
+    if !supervisor.is_hash_verified(&row.id) {
+        let path_owned = model_path.to_path_buf();
+        let expected = row.sha256.to_ascii_lowercase();
+        let actual = tokio::task::spawn_blocking(move || {
+            crate::models::download::file_sha256(&path_owned)
+        })
+        .await
+        .context("hashing the model file panicked")?;
+        match actual {
+            Ok(actual) if actual == expected => supervisor.mark_hash_verified(&row.id),
+            Ok(_) => {
+                let _ = storage.global().set_model_status(&row.id, "quarantined");
+                tracing::error!(
+                    target: "lhp::runner",
+                    model = %row.id,
+                    "first-use integrity check FAILED — model quarantined before launch"
+                );
+                bail!(
+                    "local model \"{}\" failed its integrity check (sha256 mismatch) — \
+                     quarantined before launch; re-download it",
+                    row.id
+                );
+            }
+            Err(e) => {
+                let _ = storage.global().set_model_status(&row.id, "quarantined");
+                bail!(
+                    "local model \"{}\" could not be read for its integrity check ({e}) — \
+                     quarantined; re-download it",
+                    row.id
+                );
+            }
+        }
+    }
+
     let port = pick_free_port()?;
     let base_url = format!("http://127.0.0.1:{port}/v1");
     let threads = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(4);
-    let cmd = build_args(&paths.bin, model_path, port, threads, ctx_size, kv_quant);
+    // H-04: one fresh token per spawn. It goes to llama-server (`--api-key`),
+    // to the health check, AND — load-bearing — to the provider client below.
+    // A token that only guards startup is worthless: every private prompt after
+    // it would go out unauthenticated, and whoever holds the port would answer.
+    let token = new_spawn_token();
+    let cmd = build_args(
+        &paths.bin,
+        model_path,
+        port,
+        threads,
+        ctx_size,
+        kv_quant,
+        Some(&token),
+    );
     supervisor
         .ensure_started(&row.id, cmd, base_url.clone())
         .await?;
 
-    let provider = Provider::new(&provider_id, &row.name, &base_url, None, ProviderKind::Local)
-        .with_local_origin(crate::models::provider::LocalOrigin::BundledRunner);
+    let provider = Provider::new(
+        &provider_id,
+        &row.name,
+        &base_url,
+        Some(token),
+        ProviderKind::Local,
+    )
+    .with_local_origin(crate::models::provider::LocalOrigin::BundledRunner);
     mm.add_provider(provider.clone());
     tracing::info!(
         target: "lhp::runner",
@@ -953,6 +1389,14 @@ mod tests {
         spawns: Mutex<Vec<(SidecarCommand, Instant)>>,
         healthy: AtomicBool,
         kill_calls: AtomicUsize,
+        /// H-04: the token the thing answering the port will accept. Normally
+        /// set at spawn from the argv `--api-key` (i.e. a real llama-server
+        /// enforcing OUR token); [`Self::pin_server_token`] freezes it to model
+        /// a different server on that port.
+        server_token: Mutex<Option<String>>,
+        server_token_pinned: AtomicBool,
+        /// Stderr the fake process reports (L-02).
+        stderr: Mutex<Option<Arc<StderrTail>>>,
     }
 
     impl FakeWorld {
@@ -962,10 +1406,26 @@ mod tests {
                 spawns: Mutex::new(Vec::new()),
                 healthy: AtomicBool::new(false),
                 kill_calls: AtomicUsize::new(0),
+                server_token: Mutex::new(None),
+                server_token_pinned: AtomicBool::new(false),
+                stderr: Mutex::new(None),
             })
         }
         fn spawn_count(&self) -> usize {
             self.spawns.lock().len()
+        }
+        /// Freeze what the port-holder accepts, ignoring whatever we spawn with.
+        fn pin_server_token(&self, token: Option<&str>) {
+            *self.server_token.lock() = token.map(str::to_string);
+            self.server_token_pinned.store(true, Ordering::SeqCst);
+        }
+        /// Give the fake process a stderr tail with these lines already in it.
+        fn with_stderr(self: &Arc<Self>, lines: &[&str]) {
+            let tail = Arc::new(StderrTail::default());
+            for l in lines {
+                tail.push_redacted(l);
+            }
+            *self.stderr.lock() = Some(tail);
         }
     }
 
@@ -1000,6 +1460,9 @@ mod tests {
             }
             Ok(())
         }
+        fn stderr_tail(&self) -> Option<Arc<StderrTail>> {
+            self.world.stderr.lock().clone()
+        }
     }
 
     struct FakeSpawner(Arc<FakeWorld>);
@@ -1009,6 +1472,9 @@ mod tests {
                 let mut b = self.0.behaviors.lock();
                 if b.len() > 1 { b.pop_front().unwrap() } else { *b.front().expect("behavior") }
             };
+            if !self.0.server_token_pinned.load(Ordering::SeqCst) {
+                *self.0.server_token.lock() = cmd.api_key.clone();
+            }
             self.0.spawns.lock().push((cmd.clone(), Instant::now()));
             self.0.healthy.store(
                 matches!(
@@ -1030,9 +1496,22 @@ mod tests {
 
     struct FakeHealth(Arc<FakeWorld>);
     impl HealthCheck for FakeHealth {
-        fn is_healthy<'a>(&'a self, _base_url: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-            let v = self.0.healthy.load(Ordering::SeqCst);
-            Box::pin(async move { v })
+        /// Models a server that enforces `server_token`: the presented token
+        /// must match exactly (and a no-auth server only answers a no-auth
+        /// probe). This is what makes the token threading testable — a
+        /// supervisor that stopped passing the token would go unhealthy.
+        fn is_healthy<'a>(
+            &'a self,
+            _base_url: &'a str,
+            api_key: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            let up = self.0.healthy.load(Ordering::SeqCst);
+            let expected = self.0.server_token.lock().clone();
+            let authed = match expected {
+                Some(t) => api_key == Some(t.as_str()),
+                None => api_key.is_none(),
+            };
+            Box::pin(async move { up && authed })
         }
     }
 
@@ -1056,7 +1535,14 @@ mod tests {
         ))
     }
 
+    /// The token the fake sidecar is started with in most tests.
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
     fn cmd() -> SidecarCommand {
+        cmd_with_token(Some(TEST_TOKEN))
+    }
+
+    fn cmd_with_token(token: Option<&str>) -> SidecarCommand {
         build_args(
             Path::new("/fake/llama-server"),
             Path::new("/fake/model.gguf"),
@@ -1064,6 +1550,7 @@ mod tests {
             8,
             Some(8192),
             Some(KvCacheQuant::Q8_0),
+            token,
         )
     }
 
@@ -1083,10 +1570,42 @@ mod tests {
         assert!(joined.contains("--parallel 2"));
         assert!(joined.contains("-ngl 999"));
         // Defaults: no kv flag when unspecified; ctx falls back to 4096.
-        let d = build_args(Path::new("/b"), Path::new("/m"), 1, 4, None, None);
+        let d = build_args(Path::new("/b"), Path::new("/m"), 1, 4, None, None, None);
         let dj = d.args.join(" ");
         assert!(dj.contains("--ctx-size 4096"));
         assert!(!dj.contains("--cache-type-k"));
+        assert!(!dj.contains("--api-key"), "no token asked for, none passed");
+        assert_eq!(d.api_key, None);
+    }
+
+    // ── H-04: the per-spawn bearer token ───────────────────────────────
+
+    #[test]
+    fn build_args_passes_the_token_to_llama_server_and_keeps_it_for_our_own_calls() {
+        let c = cmd_with_token(Some("tok-abc"));
+        let joined = c.args.join(" ");
+        // llama-server learns the token here — this is what makes it reject
+        // everyone who doesn't know it.
+        assert!(joined.contains("--api-key tok-abc"), "argv carries the key: {joined}");
+        // ...and OUR side keeps it, because the health check AND the provider
+        // client both have to present it.
+        assert_eq!(c.api_key.as_deref(), Some("tok-abc"));
+    }
+
+    #[test]
+    fn spawn_tokens_are_high_entropy_and_unique_and_never_debug_printed() {
+        let a = new_spawn_token();
+        let b = new_spawn_token();
+        assert_ne!(a, b, "a token is per-spawn, not per-process");
+        assert_eq!(a.len(), 32, "128 bits of hex");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // A token long enough to be scrubbed by the stderr hex rule.
+        assert_eq!(redact_stderr_line(&a), "<redacted>");
+        // Debug is the log path: neither the field nor the argv value may appear.
+        let dbg = format!("{:?}", cmd_with_token(Some(&a)));
+        assert!(!dbg.contains(&a), "token leaked into Debug output: {dbg}");
+        assert!(dbg.contains("--api-key"), "the flag itself still shows: {dbg}");
+        assert!(dbg.contains("<redacted>"));
     }
 
     // ── lifecycle ──────────────────────────────────────────────────────
@@ -1294,6 +1813,319 @@ mod tests {
         assert_eq!(sup.state("m1"), None);
     }
 
+    // ── H-04 adversarial: who is actually answering the port? ──────────
+    //
+    // These drive the REAL `HttpHealthCheck` against a REAL socket, because the
+    // whole finding is about what an HTTP response is allowed to prove.
+
+    /// What the thing squatting on / serving the port does. `EnforcesToken`
+    /// reproduces the REAL llama-server split measured in
+    /// `the_vendored_sidecar_enforces_the_api_key_on_props_but_not_on_models`:
+    /// `/v1/models` is PUBLIC, `/props` is protected.
+    #[derive(Clone, Copy)]
+    enum FakeServer {
+        /// A real llama-server started with `--api-key <token>`.
+        EnforcesToken(&'static str),
+        /// The H-04 attacker: it won the port race and answers everything
+        /// happily, hoping to be registered as the private provider.
+        OpenToAnyone,
+        /// Rejects everything (e.g. a server holding a DIFFERENT key).
+        RejectsEverything,
+        /// Enforces the token but `/v1/models` is not a models list — a generic 2xx.
+        WrongShape(&'static str),
+    }
+
+    /// Bind a loopback port and serve `kind` until the test drops the handle.
+    /// Returns the `/v1` base_url.
+    async fn spawn_fake_server(kind: FakeServer) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    // Read the request head (one request per connection — every
+                    // reply says `Connection: close`).
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf).to_string();
+                    let presented = req
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("authorization")
+                                .then(|| v.trim().trim_start_matches("Bearer ").to_string())
+                        })
+                        .unwrap_or_default();
+                    // The requested path (first line: "GET /props HTTP/1.1").
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    const DENY: (&str, &str) = ("401 Unauthorized", r#"{"error":"no"}"#);
+                    const MODELS: (&str, &str) = ("200 OK", r#"{"data":[{"id":"m"}]}"#);
+                    const PROPS: (&str, &str) = ("200 OK", r#"{"default_generation_settings":{}}"#);
+                    let (status, body) = match kind {
+                        FakeServer::OpenToAnyone => {
+                            // Answers anything to anyone — including the models
+                            // list, which is what made the old check fall for it.
+                            if path.ends_with("/models") { MODELS } else { PROPS }
+                        }
+                        FakeServer::RejectsEverything => DENY,
+                        FakeServer::EnforcesToken(t) => {
+                            if path.ends_with("/models") {
+                                MODELS // public on the real binary, token or not
+                            } else if presented == t {
+                                PROPS
+                            } else {
+                                DENY
+                            }
+                        }
+                        FakeServer::WrongShape(t) => {
+                            if path.ends_with("/models") {
+                                ("200 OK", r#"{"ok":true}"#)
+                            } else if presented == t {
+                                PROPS
+                            } else {
+                                DENY
+                            }
+                        }
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    #[tokio::test]
+    async fn health_check_rejects_a_port_squatter_that_does_not_enforce_our_token() {
+        // H-04: the attack. Something already owns the port and answers
+        // /v1/models to anyone — under the old "any 2xx is healthy" rule it
+        // would have been registered as the PRIVATE provider and handed private
+        // prompts. Note that answering the models list is NOT what gives it away
+        // (the real sidecar serves that publicly too): what gives it away is
+        // serving a PROTECTED endpoint to an anonymous caller.
+        let (base_url, server) = spawn_fake_server(FakeServer::OpenToAnyone).await;
+        let health = HttpHealthCheck::new();
+        assert!(
+            !health.is_healthy(&base_url, Some("our-secret-token")).await,
+            "a server that serves anyone is NOT the sidecar we started"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn the_identity_probe_is_taken_from_the_server_root_not_the_v1_prefix() {
+        assert_eq!(server_root("http://127.0.0.1:9/v1"), "http://127.0.0.1:9");
+        assert_eq!(server_root("http://127.0.0.1:9/v1/"), "http://127.0.0.1:9");
+        assert_eq!(server_root("http://127.0.0.1:9"), "http://127.0.0.1:9");
+        assert_eq!(IDENTITY_PATH, "/props", "an endpoint the api-key DOES cover");
+    }
+
+    #[tokio::test]
+    async fn health_check_requires_exactly_our_token_and_a_models_body() {
+        let (base_url, server) = spawn_fake_server(FakeServer::EnforcesToken("right-token")).await;
+        let health = HttpHealthCheck::new();
+        // The token we spawned with → healthy.
+        assert!(health.is_healthy(&base_url, Some("right-token")).await);
+        // A wrong token → the server rejects us, so we are not talking to a
+        // sidecar we control.
+        assert!(!health.is_healthy(&base_url, Some("wrong-token")).await);
+        // No token issued → nothing to prove identity WITH, so the check degrades
+        // to the old readiness-only behaviour (a public models list is enough).
+        // This is exactly why `ensure_running` always issues one; the assertion is
+        // here to state the degradation rather than let it be discovered later.
+        assert!(
+            health.is_healthy(&base_url, None).await,
+            "tokenless startup is readiness-only — no identity guarantee"
+        );
+        server.abort();
+
+        // A server that rejects even the right token is not healthy either.
+        let (base_url, server) = spawn_fake_server(FakeServer::RejectsEverything).await;
+        assert!(!health.is_healthy(&base_url, Some("right-token")).await);
+        server.abort();
+
+        // Authenticated 2xx is not enough — the body must be a models list.
+        let (base_url, server) = spawn_fake_server(FakeServer::WrongShape("right-token")).await;
+        assert!(
+            !health.is_healthy(&base_url, Some("right-token")).await,
+            "a generic 2xx must not pass for /v1/models"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn health_check_on_a_dead_port_is_not_healthy() {
+        // Nothing listening at all: neither probe connects.
+        let port = pick_free_port().unwrap();
+        let health = HttpHealthCheck::new();
+        assert!(
+            !health
+                .is_healthy(&format!("http://127.0.0.1:{port}/v1"), Some("tok"))
+                .await
+        );
+    }
+
+    /// The load-bearing assumption behind [`IDENTITY_PATH`], measured against the
+    /// REAL vendored `llama-server` — no GGUF and no network needed, because
+    /// router mode (`--models-dir <empty>`) starts a server with no model.
+    ///
+    /// Two things are pinned:
+    ///   * `/v1/models` is **public** — an unauthenticated GET succeeds even with
+    ///     `--api-key` set. So requiring "/v1/models refuses anonymous callers"
+    ///     would refuse EVERY legitimate sidecar. (This is not hypothetical: it is
+    ///     the bug this test was written after finding.)
+    ///   * `/props` is **protected** — anonymous and wrong-key requests are
+    ///     refused, ours is accepted — which is what makes it usable as identity.
+    ///
+    /// If a re-vendor changes either, this fails loudly instead of the health
+    /// check quietly refusing to start local models (or quietly accepting a
+    /// squatter).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_vendored_sidecar_enforces_the_api_key_on_props_but_not_on_models() {
+        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/llama-cpp/macos-arm64/llama-server");
+        assert!(bin.is_file(), "the vendored sidecar must be present: {}", bin.display());
+        let empty = tmp_dir(); // no models in it — router mode needs no GGUF
+        let port = pick_free_port().unwrap();
+        let token = new_spawn_token();
+        let mut child = tokio::process::Command::new(&bin)
+            .args([
+                "--models-dir".to_string(),
+                empty.to_string_lossy().into_owned(),
+                "--port".to_string(),
+                port.to_string(),
+                "--api-key".to_string(),
+                token.clone(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the vendored llama-server in router mode");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let root = format!("http://127.0.0.1:{port}");
+        // Wait for the port (it listens in well under a second here).
+        let mut up = false;
+        for _ in 0..100 {
+            if client.get(format!("{root}/health")).send().await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(up, "the vendored server never started listening");
+
+        let status = |path: &'static str, key: Option<String>| {
+            let client = client.clone();
+            let root = root.clone();
+            async move {
+                let mut req = client.get(format!("{root}{path}"));
+                if let Some(k) = key {
+                    req = req.bearer_auth(k);
+                }
+                req.send().await.expect("request").status().as_u16()
+            }
+        };
+
+        // /v1/models is PUBLIC — this is why it cannot be the identity probe.
+        assert_eq!(
+            status("/v1/models", None).await,
+            200,
+            "llama-server exempts /v1/models from --api-key; the identity probe \
+             must not rely on it refusing anonymous callers"
+        );
+        // /props is PROTECTED, and answers with no model loaded.
+        assert_eq!(status(IDENTITY_PATH, None).await, 401, "anonymous must be refused");
+        assert_eq!(
+            status(IDENTITY_PATH, Some("not-the-token".into())).await,
+            401,
+            "a wrong key must be refused"
+        );
+        assert_eq!(
+            status(IDENTITY_PATH, Some(token.clone())).await,
+            200,
+            "our own token must be accepted"
+        );
+
+        // And the full check agrees, against the real binary.
+        let health = HttpHealthCheck::new();
+        let base_url = format!("{root}/v1");
+        assert!(
+            health.is_healthy(&base_url, Some(&token)).await,
+            "the real sidecar with our token must be healthy"
+        );
+        assert!(
+            !health.is_healthy(&base_url, Some("not-the-token")).await,
+            "the real sidecar with the wrong token must NOT be healthy"
+        );
+
+        let _ = child.kill().await;
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sidecar_that_rejects_our_token_is_never_registered() {
+        // The same finding one layer up: the supervisor must pass the token to
+        // the health check, and a port-holder that doesn't honour OUR token must
+        // never reach the provider registry. `pin_server_token` makes the
+        // port-holder enforce a token we were not started with.
+        let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
+        world.pin_server_token(Some("some-other-processes-token"));
+        let sup = supervisor_with(&world);
+        let err = sup
+            .ensure_started("m1", cmd(), "http://127.0.0.1:8080/v1".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("runner_failed"), "{err}");
+        assert!(!sup.is_running("m1"), "never registered");
+        assert!(matches!(sup.state("m1"), Some(RunnerState::Failed(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unauthenticated_startup_is_refused_by_a_token_enforcing_sidecar() {
+        // Missing bearer: we spawn WITHOUT a token while the server on the port
+        // enforces one. Proves the token we build the command with is the token
+        // the health check presents — nothing else can bridge the two.
+        let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
+        world.pin_server_token(Some(TEST_TOKEN));
+        let sup = supervisor_with(&world);
+        let err = sup
+            .ensure_started("m1", cmd_with_token(None), "http://127.0.0.1:8080/v1".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("runner_failed"), "{err}");
+        assert!(!sup.is_running("m1"));
+    }
+
     // ── boot passes ────────────────────────────────────────────────────
 
     fn tmp_dir() -> PathBuf {
@@ -1381,12 +2213,113 @@ mod tests {
         assert!(dir.join("not-a-pidfile.txt").exists(), "non-pidfiles untouched");
     }
 
+    // ── M-11: reaper identity (PID reuse) ──────────────────────────────
+
+    /// Is `pid` still alive? (`kill(pid, 0)` — signal 0 only checks.)
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_reaper_never_kills_a_live_pid_that_is_not_our_binary() {
+        // The M-11 hazard, in the harshest form available: point a pidfile at a
+        // process that is alive, on the current boot, with a start epoch that
+        // matches — but whose executable is NOT llama-server. It happens to be
+        // this test binary, so if the identity check ever weakens to "the PID is
+        // alive", this test dies by SIGKILL instead of failing politely.
+        let dir = tmp_dir();
+        let me = std::process::id() as i32;
+        let start = super::process_start_epoch(me).expect("own start time is readable");
+        let boot = super::current_boot_id().unwrap_or_default();
+        std::fs::write(dir.join("m1.pid"), format!("{me} {start} {boot}")).unwrap();
+
+        // The kernel reports this process's own executable, not `llama-server`.
+        let exe = super::process_exe_path(me).expect("proc_pidpath works on self");
+        assert!(exe.is_absolute(), "a real path from the kernel: {}", exe.display());
+        assert_ne!(exe.file_name().and_then(|f| f.to_str()), Some("llama-server"));
+        assert!(!super::process_is_our_sidecar(me));
+
+        let killed = reap_orphan_sidecars(&dir);
+        assert_eq!(killed, 0, "a live stranger PID is never killed");
+        assert!(pid_alive(me), "…and we are still here");
+        assert!(!dir.join("m1.pid").exists(), "pidfile cleaned up anyway");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_reaper_honours_the_recorded_start_epoch_against_pid_reuse() {
+        // A process whose executable really is named `llama-server` — the old
+        // `ps -o comm=` suffix check would have killed it on sight. What must
+        // decide is the epoch: PID reuse means a *different* process now holds
+        // the PID we recorded, and its start time gives that away.
+        let dir = tmp_dir();
+        let fake_bin = dir.join("llama-server");
+        std::fs::copy("/bin/sleep", &fake_bin).expect("copy a real binary");
+        let mut child = std::process::Command::new(&fake_bin)
+            .arg("60")
+            .spawn()
+            .expect("spawn the stand-in sidecar");
+        let pid = child.id() as i32;
+        // Identity by executable path passes for this one.
+        assert!(
+            super::process_is_our_sidecar(pid),
+            "the kernel path names llama-server: {:?}",
+            super::process_exe_path(pid)
+        );
+        let real_start = super::process_start_epoch(pid).expect("start time");
+        let boot = super::current_boot_id().unwrap_or_default();
+
+        // 1. A pidfile whose epoch does NOT match: this PID was recycled, so the
+        //    process running under it now is somebody else's. Do not kill.
+        let stale_epoch = real_start - (START_EPOCH_TOLERANCE_SECS + 60);
+        std::fs::write(dir.join("m1.pid"), format!("{pid} {stale_epoch} {boot}")).unwrap();
+        assert_eq!(reap_orphan_sidecars(&dir), 0, "epoch mismatch ⇒ no kill");
+        assert!(pid_alive(pid), "the reused-PID process survives");
+        assert!(child.try_wait().unwrap().is_none(), "still running");
+
+        // 2. The epoch we actually recorded ⇒ this IS our orphan. Reap it.
+        std::fs::write(dir.join("m2.pid"), format!("{pid} {real_start} {boot}")).unwrap();
+        assert_eq!(reap_orphan_sidecars(&dir), 1, "our own orphan is reaped");
+        let status = child.wait().expect("reap the zombie");
+        assert!(!status.success(), "killed, not exited normally: {status:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn epoch_matching_rejects_the_unknowable_and_allows_legacy_pidfiles() {
+        // A dead PID has no start time, so nothing can vouch for it.
+        assert!(!super::process_start_epoch_matches(2_147_483_647, Some(0)));
+        // A legacy pidfile (no epoch field) can't be epoch-checked; identity then
+        // rests on the executable-path check alone — the pre-M-11 behaviour, kept
+        // so an upgrade doesn't leak the previous run's sidecar forever.
+        let me = std::process::id() as i32;
+        assert!(super::process_start_epoch_matches(me, None));
+        // Our own PID with a wildly wrong epoch must not match.
+        assert!(!super::process_start_epoch_matches(me, Some(0)));
+    }
+
     // ── ensure_running (the seam) ──────────────────────────────────────
 
     fn seeded_storage(dir: &Path) -> Storage {
+        seeded_storage_with_sha(dir, None)
+    }
+
+    /// Seed one `ready` model. `sha_override` records a DIFFERENT digest than the
+    /// bytes actually hash to — the M-10 tamper fixture; `None` records the true
+    /// digest, which is what a real verified download leaves behind.
+    fn seeded_storage_with_sha(dir: &Path, sha_override: Option<&str>) -> Storage {
         let storage = Storage::open(dir).unwrap();
         let model_path = dir.join("tiny.gguf");
         std::fs::write(&model_path, b"GGUFfake").unwrap();
+        let sha = match sha_override {
+            Some(s) => s.to_string(),
+            None => crate::models::download::file_sha256(&model_path).unwrap(),
+        };
         storage
             .global()
             .insert_model(&crate::storage::ModelEntry {
@@ -1396,7 +2329,7 @@ mod tests {
                 size_bytes: 8,
                 quantization: Some("Q8_0".into()),
                 added_at: 1,
-                sha256: "e".repeat(64),
+                sha256: sha,
                 status: "ready".into(),
             })
             .unwrap();
@@ -1465,6 +2398,272 @@ mod tests {
         assert_eq!(world.spawn_count(), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn the_registered_provider_carries_the_same_token_the_sidecar_was_started_with() {
+        // THE H-04 defect that sank the first P03 attempt: the sidecar was
+        // started with a bearer token and the health check presented it, but the
+        // provider was registered with `None` credentials — so every actual
+        // request after startup went out unauthenticated and any process holding
+        // the port would answer it. Startup passed; real use was broken.
+        let dir = tmp_dir();
+        let storage = seeded_storage(&dir);
+        let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
+        let sup = supervisor_with(&world);
+        let mm = ModelManager::new();
+        let paths = SidecarPaths { bin: PathBuf::from("/fake/llama-server") };
+
+        let provider = ensure_running(&sup, &mm, &storage, &paths, None, Some(4096), None)
+            .await
+            .unwrap();
+
+        // The token llama-server was actually told to enforce.
+        let spawned = world.spawns.lock()[0].0.clone();
+        let argv = spawned.args.join(" ");
+        let token = spawned.api_key.clone().expect("a token was minted per spawn");
+        assert!(argv.contains(&format!("--api-key {token}")), "argv: {argv}");
+        assert_eq!(token.len(), 32, "a real 128-bit token, not a placeholder");
+
+        // ...must be the credential the provider client will present.
+        assert_eq!(
+            provider.api_key.as_deref(),
+            Some(token.as_str()),
+            "the registered provider MUST carry the sidecar's token — a token that \
+             only guards startup authenticates nothing"
+        );
+        // And the copy in the manager (what the agent loop actually fetches).
+        assert_eq!(
+            mm.get_provider("local-runner:tiny")
+                .expect("registered")
+                .api_key
+                .as_deref(),
+            Some(token.as_str())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_running_refuses_and_quarantines_a_same_size_tampered_file_before_launch() {
+        // M-10: the boot sweep runs with rehash=false, so a file that was
+        // modified WITHOUT changing its size passes it. First use must catch it,
+        // and must do so BEFORE the process is launched — a tampered GGUF is
+        // never executed and never becomes a provider.
+        let dir = tmp_dir();
+        // sha256 of "GGUFfake" is not this; the size on disk is untouched.
+        let storage = seeded_storage_with_sha(&dir, Some(&"a".repeat(64)));
+        let recorded = storage.global().get_model("tiny").unwrap().unwrap();
+        assert_eq!(
+            std::fs::metadata(&recorded.path).unwrap().len(),
+            recorded.size_bytes as u64,
+            "the fixture is a SAME-SIZE tamper — the cheap sweep cannot see it"
+        );
+        assert!(
+            sweep_local_model_integrity_at_boot(&storage, false)
+                .quarantined
+                .is_empty(),
+            "precondition: the boot sweep lets this through"
+        );
+
+        let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
+        let sup = supervisor_with(&world);
+        let mm = ModelManager::new();
+        let paths = SidecarPaths { bin: PathBuf::from("/fake/llama-server") };
+        let err = ensure_running(&sup, &mm, &storage, &paths, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("integrity check"), "{err}");
+        assert_eq!(world.spawn_count(), 0, "quarantine happens BEFORE any spawn");
+        assert!(mm.get_provider("local-runner:tiny").is_none(), "never a provider");
+        assert_eq!(
+            storage.global().get_model("tiny").unwrap().unwrap().status,
+            "quarantined"
+        );
+        assert!(!sup.is_hash_verified("tiny"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_matching_file_is_hashed_once_per_run_then_trusted() {
+        // M-10's cost control: the hash is per-run, not per-request. Proven by
+        // deleting the file after the first (successful) verification — a second
+        // hash attempt would fail to read it, so if the second call still gets
+        // through the spawn path, the result was cached.
+        let dir = tmp_dir();
+        let storage = seeded_storage(&dir);
+        let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
+        let sup = supervisor_with(&world);
+        let mm = ModelManager::new();
+        let paths = SidecarPaths { bin: PathBuf::from("/fake/llama-server") };
+        ensure_running(&sup, &mm, &storage, &paths, None, None, None)
+            .await
+            .unwrap();
+        assert!(sup.is_hash_verified("tiny"), "verified on first use");
+        // Warm path returns the running provider without re-hashing.
+        sup.stop("tiny").await;
+        mm.remove_provider("local-runner:tiny");
+        ensure_running(&sup, &mm, &storage, &paths, None, None, None)
+            .await
+            .expect("second start reuses the first run's verification");
+        assert_eq!(world.spawn_count(), 2);
+        // The cache can be dropped (a re-download replaces the bytes).
+        sup.forget_hash_verification("tiny");
+        assert!(!sup.is_hash_verified("tiny"));
+    }
+
+    #[test]
+    fn the_manual_verify_catches_what_the_cheap_boot_sweep_misses() {
+        // M-10's operator half (`local_integrity::verify_local_models` delegates
+        // straight to this): a full re-hash, and it can be scoped to one model.
+        let dir = tmp_dir();
+        let storage = seeded_storage_with_sha(&dir, Some(&"b".repeat(64)));
+        // A second, intact model to prove `only_id` scoping is real.
+        let other = dir.join("other.gguf");
+        std::fs::write(&other, b"other-bytes").unwrap();
+        storage
+            .global()
+            .insert_model(&crate::storage::ModelEntry {
+                id: "other".into(),
+                name: "Other".into(),
+                path: other.to_string_lossy().into_owned(),
+                size_bytes: 11,
+                quantization: None,
+                added_at: 2,
+                sha256: crate::models::download::file_sha256(&other).unwrap(),
+                status: "ready".into(),
+            })
+            .unwrap();
+
+        // Scoped to the intact one: nothing is quarantined, and it really only
+        // looked at that row.
+        let scoped = verify_local_models_now(&storage, Some("other"));
+        assert_eq!(scoped.checked, 1, "only the requested model was hashed");
+        assert!(scoped.quarantined.is_empty());
+        assert_eq!(
+            storage.global().get_model("tiny").unwrap().unwrap().status,
+            "ready",
+            "a scoped verify must not touch other rows"
+        );
+
+        // Whole catalog: the tampered one is quarantined, the intact one is not.
+        let all = verify_local_models_now(&storage, None);
+        assert_eq!(all.checked, 2);
+        assert_eq!(all.quarantined, vec!["tiny"]);
+        assert_eq!(
+            storage.global().get_model("tiny").unwrap().unwrap().status,
+            "quarantined"
+        );
+        assert_eq!(
+            storage.global().get_model("other").unwrap().unwrap().status,
+            "ready"
+        );
+    }
+
+    // ── L-02: a failure you can read ───────────────────────────────────
+
+    #[test]
+    fn redaction_scrubs_absolute_paths_and_long_hex_before_storage() {
+        let line = redact_stderr_line(
+            "error loading model /Users/someone/Documents/Lost-Harness/models/x.gguf",
+        );
+        assert!(!line.contains("someone"), "account name must not survive: {line}");
+        assert!(!line.contains(".gguf"), "the path is gone entirely: {line}");
+        assert!(line.starts_with("error loading model "), "the message survives: {line}");
+        assert!(line.contains("<path>"));
+
+        // A bearer token / sha256 in a log line.
+        let tok = "deadbeefcafebabe0123456789abcdef";
+        let line = redact_stderr_line(&format!("server: key={tok} ok"));
+        assert!(!line.contains(tok), "token must not survive: {line}");
+        assert_eq!(line, "server: key=<redacted> ok");
+
+        // Short hex and relative words are untouched — redaction is not a
+        // wholesale scrub of anything that looks technical.
+        assert_eq!(redact_stderr_line("ctx=4096 abc123"), "ctx=4096 abc123");
+    }
+
+    #[test]
+    fn the_stderr_tail_is_bounded_on_lines_and_line_length() {
+        let tail = StderrTail::default();
+        for i in 0..(STDERR_TAIL_LINES + 25) {
+            tail.push_redacted(&format!("line {i}"));
+        }
+        let snap = tail.snapshot();
+        assert_eq!(
+            snap.lines().count(),
+            STDERR_TAIL_LINES,
+            "the ring never grows past its cap"
+        );
+        assert!(snap.contains(&format!("line {}", STDERR_TAIL_LINES + 24)), "keeps the newest");
+        assert!(!snap.contains("line 0\n"), "drops the oldest");
+
+        let long = StderrTail::default();
+        long.push_redacted(&"x".repeat(5000));
+        let snap = long.snapshot();
+        assert!(
+            snap.chars().count() <= STDERR_LINE_MAX + 1,
+            "a single huge line is truncated, got {} chars",
+            snap.chars().count()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_startup_failure_reports_the_sidecars_stderr() {
+        // L-02: stderr used to go to /dev/null, so "it didn't come up" was the
+        // whole diagnosis. The captured tail must reach the error the caller sees.
+        let world = FakeWorld::new(vec![FakeBehavior::NeverHealthy]);
+        world.with_stderr(&["ggml_metal_init: failed to allocate", "srv: exiting"]);
+        let sup = supervisor_with(&world);
+        let err = sup
+            .ensure_started("m1", cmd(), "http://127.0.0.1:8080/v1".into())
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ggml_metal_init: failed to allocate"),
+            "the stderr tail must be in the error: {msg}"
+        );
+        assert!(msg.contains("srv: exiting"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn the_real_spawner_captures_a_dying_processes_stderr() {
+        // The same path with the REAL spawner and a REAL process: a "sidecar"
+        // that writes to stderr and exits non-zero. Proves the pipe, the reader
+        // task, the redaction and the error plumbing work together — no fake in
+        // the loop. Real clock (a real process is involved).
+        let world_free_config = SupervisorConfig {
+            health_timeout: Duration::from_millis(500),
+            health_poll: Duration::from_millis(50),
+            backoff: vec![], // one attempt: this test is about the message
+            idle_shutdown: Duration::from_secs(600),
+            kill_grace: Duration::from_millis(200),
+            monitor_poll: Duration::from_millis(100),
+            pidfile_dir: None,
+        };
+        let sup = Arc::new(LocalRunnerSupervisor::new(
+            Arc::new(TokioSpawner),
+            Arc::new(HttpHealthCheck::new()),
+            world_free_config,
+        ));
+        let cmd = SidecarCommand {
+            bin: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "echo 'error: unable to load model /Users/nobody/x.gguf' >&2; exit 3".to_string(),
+            ],
+            api_key: Some("tok".to_string()),
+        };
+        let port = pick_free_port().unwrap();
+        let err = sup
+            .ensure_started("sh", cmd, format!("http://127.0.0.1:{port}/v1"))
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("error: unable to load model"), "{msg}");
+        assert!(msg.contains("exited (code 3)"), "{msg}");
+        // Redaction happened on the way into the buffer, so the error the user
+        // sees (and any log of it) has no absolute path in it.
+        assert!(!msg.contains("/Users/nobody"), "path leaked into the error: {msg}");
+        assert!(msg.contains("<path>"), "{msg}");
+    }
+
     // ── vendor manifest (verified-before-runnable echo for our own binary) ──
 
     #[test]
@@ -1513,13 +2712,18 @@ mod tests {
         ));
         let port = pick_free_port().unwrap();
         let base_url = format!("http://127.0.0.1:{port}/v1");
-        let cmd = build_args(&bin, Path::new(&gguf), port, 4, Some(2048), None);
+        // H-04 on the real binary: a per-spawn token that the real llama-server
+        // must enforce (the health check requires an unauthenticated probe to be
+        // refused) and that the real client must present on every call.
+        let token = new_spawn_token();
+        let cmd = build_args(&bin, Path::new(&gguf), port, 4, Some(2048), None, Some(&token));
         sup.ensure_started("live-test", cmd, base_url.clone())
             .await
             .expect("sidecar becomes healthy");
 
         // One real chat round-trip through the existing ModelClient.
-        let provider = Provider::new("live-test", "Live", &base_url, None, ProviderKind::Local);
+        let provider =
+            Provider::new("live-test", "Live", &base_url, Some(token), ProviderKind::Local);
         let client = crate::models::ModelClient::new(provider).unwrap();
         let models = client.list_models().await.expect("GET /v1/models");
         assert!(!models.is_empty(), "the served model is listed");
@@ -1600,13 +2804,22 @@ mod tests {
         ));
         let port = pick_free_port().unwrap();
         let base_url = format!("http://127.0.0.1:{port}/v1");
-        let cmd = build_args(&bin, &gguf, port, 4, Some(2048), Some(KvCacheQuant::F16));
+        let token = new_spawn_token();
+        let cmd = build_args(
+            &bin,
+            &gguf,
+            port,
+            4,
+            Some(2048),
+            Some(KvCacheQuant::F16),
+            Some(&token),
+        );
         sup.ensure_started("e2e", cmd, base_url.clone())
             .await
             .expect("sidecar becomes healthy");
 
         // 5. Real chat round-trip through the ModelClient.
-        let provider = Provider::new("e2e", "E2E", &base_url, None, ProviderKind::Local);
+        let provider = Provider::new("e2e", "E2E", &base_url, Some(token), ProviderKind::Local);
         let client = crate::models::ModelClient::new(provider).unwrap();
         let models = client.list_models().await.expect("GET /v1/models");
         assert!(!models.is_empty());

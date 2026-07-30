@@ -41,6 +41,59 @@ use crate::storage::Storage;
 use crate::tools::ToolDispatcher;
 use crate::classifier::RulesClassifier;
 
+/// M-10 — the manual local-model integrity verify, in its own module
+/// because `#[tauri::command]` macro-exports helper macros to the crate
+/// root and so cannot itself live at the crate root.
+pub mod local_integrity {
+    use crate::ipc::AppState;
+
+    /// **M-10 — the manual integrity verify.** The boot sweep is deliberately cheap
+    /// (existence + size: re-hashing multi-GB models on every launch is not
+    /// acceptable), so a same-size tampered file survives it. This command is the
+    /// authoritative counterpart: a full sha256 re-hash of the local catalog —
+    /// `id: Some(..)` for one model, `None` for all — quarantining anything whose
+    /// bytes no longer match what was recorded at download. Returns the ids that were
+    /// quarantined (empty = everything verified).
+    ///
+    /// It is the OPERATOR's half of the fix; the app's own half is the first-use
+    /// verification inside `models::runner::ensure_running`, which quarantines before
+    /// a tampered file is ever launched.
+    #[tauri::command]
+    pub fn verify_local_models(
+        state: tauri::State<'_, AppState>,
+        id: Option<String>,
+    ) -> Result<Vec<String>, String> {
+        #[cfg(feature = "local-runner")]
+        {
+            let report =
+                crate::models::runner::verify_local_models_now(&state.storage, id.as_deref());
+            if !report.quarantined.is_empty() {
+                tracing::warn!(
+                    quarantined = ?report.quarantined,
+                    "manual integrity verify quarantined local model(s)"
+                );
+                // A quarantined model must not keep a cached "already verified"
+                // stamp, or a later re-download would inherit the pass.
+                if let Some(ctx) = &state.local_runner {
+                    for qid in &report.quarantined {
+                        ctx.supervisor.forget_hash_verification(qid);
+                    }
+                }
+            }
+            tracing::info!(
+                checked = report.checked,
+                "manual integrity verify finished"
+            );
+            Ok(report.quarantined)
+        }
+        #[cfg(not(feature = "local-runner"))]
+        {
+            let _ = (state, id);
+            Err("this build has no local-runner support".to_string())
+        }
+    }
+}
+
 /// Tauri entry point. Runs once on launch.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -117,9 +170,14 @@ pub fn run() {
             // as crash-recovery): reap sidecars orphaned by a hard crash of the
             // previous run, then integrity-sweep the model catalog — a missing
             // or truncated model file is quarantined, never silently served
-            // (verified-before-runnable corollary 3). Cheap existence+size
-            // checks only; full re-hash is an opt-in Settings action. Does NOT
-            // spawn anything — spawn stays lazy. Best-effort, never bricks boot.
+            // (verified-before-runnable corollary 3). Boot stays CHEAP
+            // (existence+size): hashing multi-GB models on every launch is not
+            // acceptable. M-10 covers what that misses — a same-size tampered
+            // file — in the two places where it actually matters:
+            // `runner::ensure_running` sha256-verifies before the FIRST spawn of
+            // a run, and `local_integrity::verify_local_models` re-hashes the
+            // catalog on demand. Does NOT spawn anything — spawn stays lazy.
+            // Best-effort, never bricks boot.
             #[cfg(feature = "local-runner")]
             {
                 let pid_dir = base_path.join("models").join("local");
@@ -554,6 +612,7 @@ pub fn run() {
             ipc::download_model,
             ipc::list_local_models,
             ipc::remove_local_model,
+            local_integrity::verify_local_models,
             ipc::list_tool_rules,
             ipc::delete_tool_rule,
             ipc::list_cron_jobs,
