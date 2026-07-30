@@ -1579,6 +1579,50 @@ impl AgentLoop {
         let native_spec = self.tools.native_tools_spec();
 
         for round in 0..=MAX_TOOL_ROUNDS {
+            // M-09 (mid-run ceiling): an UNATTENDED run re-checks the cap at the
+            // TOP OF EVERY ROUND, not just once before dispatch.
+            //
+            // `work_runner`'s pre-dispatch check-and-reserve only bounds how many
+            // helpers START; it says nothing about how much ONE helper spends
+            // once it is running. Cost is booked per round further down this same
+            // loop, so re-reading the ledger here is what actually stops a single
+            // background helper from running the profile past its cap for the
+            // whole `HELPER_DEADLINE` window.
+            //
+            // The residual overrun is therefore ONE round's cost (the round that
+            // crosses the cap is already paid for by the time we can see it) —
+            // bounded, not zero. A true zero-overrun cap needs pre-call cost
+            // RESERVATION, which the provider APIs don't offer.
+            //
+            // Attended turns are untouched: a human is only WARNED (above),
+            // never hard-blocked mid-thought. Fail-closed on a ledger read error,
+            // matching `work_runner::budget_check_and_reserve`'s direction — an
+            // unattended run whose spend can't be verified stops.
+            if !self.tools.is_attended() {
+                let since = crate::hooks::budget::month_start_ts(chrono::Utc::now());
+                let verdict = match (
+                    profile_db.budget_cap(),
+                    profile_db.usage_summary_since(since),
+                ) {
+                    (Ok(cap), Ok(sum)) => crate::hooks::budget::evaluate(cap, &sum, false),
+                    _ => crate::hooks::budget::BudgetVerdict::Halt(
+                        "budget check unavailable (couldn't read the spend ledger) — \
+                             halting to fail closed"
+                            .to_string(),
+                    ),
+                };
+                if let crate::hooks::budget::BudgetVerdict::Halt(reason) = verdict {
+                    tracing::warn!(
+                        target: "lhp::budget",
+                        profile = %profile,
+                        conversation = %conversation_id,
+                        round,
+                        reason = %reason,
+                        "unattended run halted mid-loop by the budget governor"
+                    );
+                    anyhow::bail!("budget: {reason}");
+                }
+            }
             let assistant_id = Uuid::new_v4().to_string();
             // Per-round transport: native structured tool calls when this
             // round's endpoint supports them (and any tools exist), the
