@@ -18,6 +18,7 @@ import type {
   StreamErrorPayload,
   ConversationInfo,
   MessageInfo,
+  ServedBy,
 } from "../api/tauri";
 import { getActiveProfileId } from "./profiles";
 
@@ -62,6 +63,16 @@ export interface Message {
   model?: string | null;
   /** Provider id that served this turn — cross-reference providersStore for its kind (local/cloud). */
   provider_id?: string | null;
+  /**
+   * The endpoint that ACTUALLY served this turn (provider id + name +
+   * base URL), from the persisted assistant row.
+   *
+   * Until the send resolves this is undefined and `provider_id` holds the
+   * composer's pre-send prediction. Per docs/TECH-DEBT.md §1 the final
+   * authoritative state wins: on a privacy reroute the serving endpoint is a
+   * DIFFERENT provider than the composer picked, and this is what says so.
+   */
+  served_by?: ServedBy | null;
 }
 
 export interface Conversation {
@@ -285,6 +296,21 @@ export async function sendMessage(
 ): Promise<void> {
   if (!content.trim()) return;
 
+  // Fail closed on the endpoint, BEFORE anything is written to the store or
+  // sent anywhere. This used to coerce a missing selection to `""` and let the
+  // backend reject it — which meant a half-configured composer produced a
+  // turn, a message row, and an error, instead of simply refusing.
+  //
+  // Wording mirrors `NO_ENDPOINT_SELECTED` / `NO_MODEL_SELECTED` in
+  // src-tauri/src/agent/loop_mod.rs so the user reads one sentence regardless
+  // of which layer caught it.
+  if (!providerId || !providerId.trim()) {
+    throw new Error("no model endpoint is selected — pick a model in the composer");
+  }
+  if (!model || !model.trim()) {
+    throw new Error("no model is selected for this endpoint — pick a model in the composer");
+  }
+
   // Ensure we have an active conversation.
   let activeId = get(activeConversationId);
   if (!activeId) {
@@ -300,11 +326,11 @@ export async function sendMessage(
   // Resolve profile.
   const profile = getActiveProfileId();
 
-  // Resolve provider/model — fall back to empty strings if unset. The
-  // backend will error and emit a stream:error if these are missing, which
-  // the UI will surface.
-  const providerIdArg = providerId ?? "";
-  const modelArg = model ?? "";
+  // Guaranteed non-blank by the precondition above — passed through verbatim,
+  // never substituted, so what the picker selected is exactly what the IPC
+  // call carries.
+  const providerIdArg = providerId;
+  const modelArg = model;
 
   // Append the user message + a pending assistant message.
   const userMsg: Message = {
@@ -321,8 +347,10 @@ export async function sendMessage(
     content: "",
     created_at: Date.now() + 1,
     streaming: true,
-    model: modelArg || null,
-    provider_id: providerIdArg || null,
+    model: modelArg,
+    // The composer's PREDICTION of where this turn will go. Replaced by the
+    // authoritative `served_by` the moment the send resolves.
+    provider_id: providerIdArg,
   };
 
   conversations.update((list) =>
@@ -441,6 +469,10 @@ export async function sendMessage(
         undefined,
         undefined,
         response.routing_decision,
+        undefined,
+        // ...and the endpoint that actually served it, which overrides the
+        // composer's pre-send prediction.
+        response.served_by,
       );
     }
   } catch (err) {
@@ -506,6 +538,7 @@ function msgFromInfo(info: MessageInfo): Message {
     routing_decision: info.routing_decision,
     model: info.model,
     provider_id: info.provider_id,
+    served_by: info.served_by ?? null,
   };
 }
 
@@ -568,6 +601,7 @@ function finalizeMessage(
   errorSource?: string,
   routingDecision?: string,
   heldContent?: string,
+  servedBy?: ServedBy | null,
 ): void {
   conversations.update((list) =>
     list.map((c) =>
@@ -584,6 +618,7 @@ function finalizeMessage(
                     error_source: errorSource ?? m.error_source,
                     routing_decision: routingDecision ?? m.routing_decision,
                     held_content: heldContent ?? m.held_content,
+                    ...endpointPatch(m, servedBy),
                   }
                 : m,
             ),
@@ -592,6 +627,30 @@ function finalizeMessage(
     ),
   );
   streamingMessage.update((s) => (s ? null : s));
+}
+
+/**
+ * docs/TECH-DEBT.md §1: the FINAL authoritative route state wins over the
+ * pre-send prediction.
+ *
+ * When the backend reports which endpoint served the turn, that replaces the
+ * composer's guess. If it names a DIFFERENT provider than the composer picked
+ * — a privacy reroute or a redacted send — the predicted model name is
+ * dropped too: it was the model on the other endpoint, and displaying it
+ * beside the real provider would be a small, confident lie. The reloaded
+ * transcript carries the true persisted model.
+ */
+function endpointPatch(
+  m: Message,
+  servedBy: ServedBy | null | undefined,
+): Partial<Message> {
+  if (!servedBy) return {};
+  const rerouted = servedBy.provider_id !== m.provider_id;
+  return {
+    served_by: servedBy,
+    provider_id: servedBy.provider_id,
+    ...(rerouted ? { model: null } : {}),
+  };
 }
 
 function defaultName(): string {

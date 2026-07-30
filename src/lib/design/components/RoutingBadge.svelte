@@ -8,11 +8,14 @@
     route: Route;
     /** Override the label (defaults: Local / Cloud / Held). */
     label?: string;
+    /** Hover/assistive detail — e.g. the full endpoint URL behind a
+     *  shortened "provider (host)" label. */
+    title?: string;
     /** When set, the badge is an interactive button. */
     onclick?: () => void;
   }
 
-  let { route, label, onclick }: Props = $props();
+  let { route, label, title, onclick }: Props = $props();
 
   const DEFAULTS: Record<Route, string> = {
     local: "Local",
@@ -34,11 +37,11 @@
 {/snippet}
 
 {#if onclick}
-  <button type="button" {onclick} class="{base} {tone[route]} cursor-pointer hover:brightness-110">
+  <button type="button" {onclick} {title} class="{base} {tone[route]} cursor-pointer hover:brightness-110">
     {@render inner()}
   </button>
 {:else}
-  <span class="{base} {tone[route]} cursor-default">
+  <span {title} class="{base} {tone[route]} cursor-default">
     {@render inner()}
   </span>
 {/if}

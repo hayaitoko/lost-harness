@@ -6,7 +6,7 @@
   // `.lh-ghost-btn` prototype helpers for hover.
   import ChatMessage from "../components/ChatMessage.svelte";
   import IconButton from "../components/IconButton.svelte";
-  import ModelPicker from "../components/ModelPicker.svelte";
+  import ModelPicker, { type ModelGroup } from "../components/ModelPicker.svelte";
   import PrivacyEventBar from "../components/PrivacyEventBar.svelte";
   import RoutingBadge from "../components/RoutingBadge.svelte";
   import Sidebar from "../components/Sidebar.svelte";
@@ -28,6 +28,7 @@
     setActiveModel,
     getProvider,
     fetchModels,
+    type Provider,
   } from "$lib/stores/providers.svelte";
   import { sendOnEnter } from "$lib/stores/settings";
   import { activeProfileId } from "$lib/stores/profiles";
@@ -44,7 +45,12 @@
   // Nav honesty: only tabs with real backing data. The mock tasks/agents/
   // terminal tabs were removed with the other fiction surfaces (2026-07-24).
   type PanelTab = "routing" | "files";
-  type ModelOption = { name: string; kind: "local" | "cloud"; group: string; key: string };
+
+  /** Shown when the composer has no endpoint armed. Mirrors the backend's
+   *  `NO_ENDPOINT_SELECTED` (agent/loop_mod.rs) so the user reads one
+   *  sentence no matter which layer catches it. */
+  const NO_ENDPOINT_SELECTED =
+    "no model endpoint is selected — pick a model in the composer";
 
   const BINDING_LABEL: Record<Binding, string> = {
     auto: "Auto",
@@ -273,9 +279,11 @@
     public: "Nothing sensitive detected",
   };
 
-  // ── Model picker: build the design's flat ModelOption[] from the real
-  // provider list, fetching each provider's models (cached by the store).
-  let modelOptions = $state<ModelOption[]>([]);
+  // ── Model picker: one group per configured provider, built from the real
+  // provider list. A provider whose listing FAILED still gets a group, carrying
+  // the reason — never dropped, because a provider missing from the popover is
+  // what leaves a different one armed and serving every turn.
+  let modelGroups = $state<ModelGroup[]>([]);
   // Keyed by the composite `providerId::name` so two providers that expose an
   // identically-named model don't collide (the old name-keyed map let the
   // last-registered provider silently shadow the others).
@@ -283,76 +291,110 @@
 
   const modelKey = (providerId: string, name: string) => `${providerId}::${name}`;
 
-  $effect(() => {
-    const provs = providersStore.providers;
-    let cancelled = false;
-    (async () => {
-      const perProvider = await Promise.all(
-        provs.map(async (p) => ({ provider: p, models: await fetchModels(p.id) })),
-      );
-      if (cancelled) return;
-      const opts: ModelOption[] = [];
-      const owner = new Map<string, { providerId: string; name: string }>();
-      for (const { provider, models } of perProvider) {
-        for (const name of models) {
-          const key = modelKey(provider.id, name);
-          opts.push({
-            name,
-            kind: provider.kind === "cloud" ? "cloud" : "local",
-            group: provider.name,
-            key,
-          });
-          owner.set(key, { providerId: provider.id, name });
-        }
+  // `modelSeq` drops a slow listing that lands after a newer one, so the
+  // groups can never be rebuilt from a stale round.
+  let modelSeq = 0;
+  async function loadModelGroups(providers: Provider[], refresh: boolean) {
+    const token = ++modelSeq;
+    const perProvider = await Promise.all(
+      providers.map(async (p) => ({
+        provider: p,
+        result: await fetchModels(p.id, { refresh }),
+      })),
+    );
+    if (token !== modelSeq) return;
+    const groups: ModelGroup[] = [];
+    const owner = new Map<string, { providerId: string; name: string }>();
+    for (const { provider, result } of perProvider) {
+      const models = result.ok ? result.models : [];
+      for (const name of models) {
+        owner.set(modelKey(provider.id, name), { providerId: provider.id, name });
       }
-      modelOptions = opts;
-      modelOwner = owner;
-    })();
-    return () => {
-      cancelled = true;
-    };
+      groups.push({
+        group: provider.name,
+        kind: provider.kind === "cloud" ? "cloud" : "local",
+        items: models.map((name) => ({ name, key: modelKey(provider.id, name) })),
+        // Every empty group says why it is empty — a failed listing and an
+        // endpoint with no models are different problems with different fixes.
+        notice: result.ok
+          ? models.length === 0
+            ? "This endpoint listed no models."
+            : null
+          : `Couldn't list models — check the endpoint or key. (${result.error})`,
+      });
+    }
+    modelGroups = groups;
+    modelOwner = owner;
+  }
+
+  $effect(() => {
+    void loadModelGroups(providersStore.providers, false);
   });
 
   function handleModelChange(key: string) {
     const owner = modelOwner.get(key);
-    if (owner) setActiveModel(owner.providerId, owner.name);
+    if (!owner) {
+      composerError = "That model is no longer listed — pick another.";
+      return;
+    }
+    // setActiveModel reports whether the selection actually took. Believing a
+    // silent no-op would leave the PREVIOUS endpoint armed while the picker
+    // appeared to have moved.
+    if (!setActiveModel(owner.providerId, owner.name)) {
+      composerError = "That endpoint is no longer configured — pick another model.";
+      return;
+    }
+    composerError = null;
   }
 
   // The picker's selection identity: the active provider+model as a composite
   // key, or "" when nothing is selected (the picker then shows its placeholder).
   const activeModelKey = $derived(
-    providersStore.activeProviderId && providersStore.activeModel
-      ? modelKey(providersStore.activeProviderId, providersStore.activeModel)
+    providersStore.active
+      ? modelKey(providersStore.active.providerId, providersStore.active.model)
       : "",
   );
 
   // The send color reflects the actual route commitment we can make before a
-  // turn starts: explicit local/cloud models get their own colors, while Auto
-  // (or an unset model) stays amber because the privacy filter decides.
-  type SendRoute = "local" | "public" | "filter";
+  // turn starts: explicit local/cloud models get their own colors, Auto stays
+  // amber because the privacy filter decides — and "nothing selected" is its
+  // OWN state, never folded into the amber filter state. An unarmed composer
+  // is not a routing decision waiting to happen; it is a turn that cannot go
+  // anywhere, and it must look different from one that can.
+  type SendRoute = "local" | "public" | "filter" | "unset";
   const activeProvider = $derived(
     providersStore.providers.find((provider) => provider.id === providersStore.activeProviderId),
   );
   const sendRoute = $derived.by((): SendRoute => {
-    if (binding === "auto" || !activeProvider) return "filter";
+    if (!providersStore.active || !activeProvider) return "unset";
+    if (binding === "auto") return "filter";
     if (binding === "private" || activeProvider.kind !== "cloud") return "local";
     return "public";
   });
+  const canSend = $derived(sendRoute !== "unset");
   const SEND_ROUTE_LABEL: Record<SendRoute, string> = {
     local: "local model",
     public: "public model",
     filter: "privacy filter",
+    unset: "no model selected",
   };
   const SEND_ROUTE_CLASS: Record<SendRoute, string> = {
     local: "bg-local text-white hover:brightness-110",
     public: "bg-cloud text-white hover:brightness-110",
     filter: "bg-warn text-[#231f16] hover:brightness-110",
+    unset: "bg-surface-2 text-text-3 cursor-not-allowed",
   };
   const knotState = $derived.by((): KnotState => {
     if (sendRoute === "local") return "local";
     if (sendRoute === "public") return "cloud";
+    if (sendRoute === "unset") return "idle";
     return "filter";
   });
+
+  // A refusal or a lost selection, shown right under the composer. Cleared as
+  // soon as the user makes a valid choice.
+  let composerError = $state<string | null>(null);
+  const composerNotice = $derived(composerError ?? providersStore.activeSelectionLost);
 
   // The backend does not expose full token accounting yet. The context panel
   // therefore reports only a clearly-labelled estimate for text already in the
@@ -463,16 +505,51 @@
     // local) — surface it as a cloud route; the event bar explains the redaction.
     if (m.routing_decision === "redact_send") return "cloud";
     if (m.routing_decision === "allow") {
-      const provider = getProvider(m.provider_id ?? null);
+      // served_by is the AUTHORITATIVE endpoint read back off the persisted
+      // row; m.provider_id is the composer's pre-send guess until it lands.
+      const provider = getProvider(m.served_by?.provider_id ?? m.provider_id ?? null);
       if (provider) return provider.kind === "cloud" ? "cloud" : "local";
     }
     return "local";
   }
 
+  /** The endpoint that actually served a turn: provider name + host.
+   *  Falls back to the persisted provider id when the provider has since been
+   *  removed — an id the user can still recognise beats inventing a name. */
+  function servedByLabel(m: Message): string | null {
+    const served = m.served_by;
+    if (!served) return null;
+    const host = served.base_url ? hostOf(served.base_url) : null;
+    if (served.provider_name && host) return `${served.provider_name} (${host})`;
+    return served.provider_name ?? served.provider_id;
+  }
+
+  function hostOf(baseUrl: string): string {
+    try {
+      return new URL(baseUrl).host;
+    } catch {
+      return baseUrl;
+    }
+  }
+
+  // Spec: "the UI must show, per turn, which provider+endpoint actually served
+  // it". The model string alone never says WHERE it ran — and on a reroute or
+  // a redacted send the serving endpoint is a different one than the composer
+  // shows, which is exactly the case worth surfacing.
   function routeLabel(m: Message): string {
     const route = messageRoute(m);
     const prefix = route === "local" ? "Local" : route === "cloud" ? "Cloud" : "Held";
-    return m.model ? `${prefix} · ${m.model}` : prefix;
+    const parts = [prefix];
+    const served = servedByLabel(m);
+    if (served) parts.push(served);
+    if (m.model) parts.push(m.model);
+    return parts.join(" · ");
+  }
+
+  /** Full endpoint URL for the badge tooltip — the detail that doesn't fit in
+   *  a calm chip but settles "where did this go?" outright. */
+  function routeTitle(m: Message): string | undefined {
+    return m.served_by?.base_url ?? undefined;
   }
 
   // Only show a routing badge once a real decision exists — never on a
@@ -504,17 +581,34 @@
   async function handleSend() {
     const content = draft.trim();
     if (!content || isSending) return;
+    // Fail closed. The composer used to read the store and send whatever was
+    // there, including `provider_id: ""` / `model: ""`. A turn goes to the
+    // endpoint the user picked, or it does not go — it is never guessed.
+    const selection = providersStore.active;
+    if (!selection) {
+      composerError = NO_ENDPOINT_SELECTED;
+      return; // draft is deliberately kept — nothing was sent
+    }
+    composerError = null;
     isSending = true;
     draft = "";
     autoresize();
     try {
       await sendChatMessage(
         content,
-        providersStore.activeProviderId,
-        providersStore.activeModel,
+        selection.providerId,
+        selection.model,
         $activeConversation ? undefined : binding,
         mode,
       );
+    } catch (err) {
+      // sendMessage surfaces model/gate failures inline on the assistant row
+      // and does not throw; reaching here means nothing was sent at all (the
+      // store's own endpoint precondition, or a failed conversation create).
+      // Give the user their text back rather than swallowing it.
+      composerError = err instanceof Error ? err.message : String(err);
+      draft = content;
+      autoresize();
     } finally {
       isSending = false;
       textareaEl?.focus();
@@ -530,16 +624,26 @@
   let confirming = $state(false);
   async function confirmAndResend(heldContent: string) {
     if (confirming || isSending) return;
+    // Same fail-closed rule as handleSend. A confirmed send is still a send,
+    // and the endpoint it goes to is exactly what the user is confirming.
+    const selection = providersStore.active;
+    if (!selection) {
+      composerError = NO_ENDPOINT_SELECTED;
+      return;
+    }
+    composerError = null;
     confirming = true;
     try {
       await confirmPublicSend(heldContent);
       await sendChatMessage(
         heldContent,
-        providersStore.activeProviderId,
-        providersStore.activeModel,
+        selection.providerId,
+        selection.model,
         $activeConversation ? undefined : binding,
         mode,
       );
+    } catch (err) {
+      composerError = err instanceof Error ? err.message : String(err);
     } finally {
       confirming = false;
     }
@@ -718,6 +822,7 @@
               <RoutingBadge
                 route={messageRoute(m)}
                 label={routeLabel(m)}
+                title={routeTitle(m)}
                 onclick={toggleWhy}
               />
             {/snippet}
@@ -752,6 +857,23 @@
     {/if}
 
     <div class="flex-shrink-0 px-5 pb-4 pt-2">
+      {#if composerNotice}
+        <!-- A refused send, or an endpoint that went away under the user.
+             Never silent: the alternative to saying this out loud is a
+             message going somewhere they didn't choose. -->
+        <div class="mx-auto mb-1.5 max-w-[700px]">
+          <p
+            role="status"
+            class="flex items-start gap-1.5 rounded-[var(--r)] bg-warn-soft px-2.5 py-1.5 text-[11.5px] leading-[1.35] text-warn"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" class="mt-[1px] shrink-0">
+              <path d="M12 8v5M12 16.5v.1" stroke-linecap="round" />
+              <circle cx="12" cy="12" r="9" />
+            </svg>
+            {composerNotice}
+          </p>
+        </div>
+      {/if}
       <div
         class="mx-auto flex max-w-[700px] flex-col rounded-[24px] border border-border-strong bg-surface px-[15px] py-1.5 shadow-[var(--shadow)] transition-colors duration-100 focus-within:border-[color-mix(in_srgb,var(--accent)_55%,var(--border-strong))]"
       >
@@ -897,12 +1019,15 @@
             </div>
 
             <ModelPicker
-              models={modelOptions}
+              groups={modelGroups}
               value={activeModelKey}
               onchange={handleModelChange}
               onopen={() => {
                 composerPopover = null;
                 permissionOpen = false;
+                // Re-ask each endpoint past the cache, so a model added on a
+                // live endpoint shows up without restarting the app.
+                void loadModelGroups(providersStore.providers, true);
               }}
             />
 
@@ -946,10 +1071,15 @@
             {:else}
               <button
                 type="button"
-                aria-label={`Send via ${SEND_ROUTE_LABEL[sendRoute]}`}
-                title={`Send via ${SEND_ROUTE_LABEL[sendRoute]}`}
+                disabled={!canSend}
+                aria-label={canSend
+                  ? `Send via ${SEND_ROUTE_LABEL[sendRoute]}`
+                  : "Can't send — pick a model first"}
+                title={canSend
+                  ? `Send via ${SEND_ROUTE_LABEL[sendRoute]}`
+                  : "Pick a model in the picker before sending"}
                 onclick={handleSend}
-                class="grid h-[36px] w-[36px] place-items-center rounded-full transition-[transform,filter] hover:scale-[1.03] {SEND_ROUTE_CLASS[sendRoute]}"
+                class="grid h-[36px] w-[36px] place-items-center rounded-full transition-[transform,filter] enabled:hover:scale-[1.03] {SEND_ROUTE_CLASS[sendRoute]}"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M12 19V5M5 12l7-7 7 7" stroke-linecap="round" stroke-linejoin="round" />

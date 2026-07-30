@@ -124,8 +124,16 @@
     baseUrl: string;
     kind: ProviderKind;
   }> = [
+    // NO "Anthropic" preset — deliberately removed, do not re-add.
+    // This app's model client speaks only the OpenAI-compatible surface:
+    // `GET {base_url}/models` and `POST {base_url}/chat/completions` with
+    // `Authorization: Bearer` (src-tauri/src/models/client.rs). Anthropic's
+    // native API needs `x-api-key` + `anthropic-version` and rejects a Bearer
+    // key, so `https://api.anthropic.com/v1/models` always came back empty —
+    // and with no free-text model entry anywhere in the app, that provider
+    // could never be selected at all. A preset a user can add but never use is
+    // a trap; relabelling it would not have made the request work.
     { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", kind: "cloud" },
-    { id: "anthropic", name: "Anthropic", baseUrl: "https://api.anthropic.com/v1", kind: "cloud" },
     { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", kind: "cloud" },
     { id: "lmstudio", name: "LM Studio", baseUrl: "http://localhost:1234/v1", kind: "local" },
     { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434/v1", kind: "local" },
@@ -155,6 +163,8 @@
   let providerError = $state<string | null>(null);
   // Fetched model lists per provider id (populated lazily below).
   let modelsByProvider = $state<Record<string, string[]>>({});
+  // Why a provider's list is empty, when the listing itself failed.
+  let modelListErrors = $state<Record<string, string | null>>({});
   // memory — real facts for the active profile (PLAN §9)
   let memoryMode = $state("walled");
   let semanticSearchEnabled = $state(true);
@@ -349,8 +359,18 @@
   $effect(() => {
     for (const p of providersStore.providers) {
       if (p.id in modelsByProvider) continue;
-      fetchModels(p.id).then((models) => {
-        modelsByProvider = { ...modelsByProvider, [p.id]: models };
+      fetchModels(p.id).then((result) => {
+        modelsByProvider = {
+          ...modelsByProvider,
+          [p.id]: result.ok ? result.models : [],
+        };
+        // A failed listing is reported, not silently shown as "no models" —
+        // an unreachable endpoint and an endpoint with nothing on it need
+        // different fixes.
+        modelListErrors = {
+          ...modelListErrors,
+          [p.id]: result.ok ? null : result.error,
+        };
       });
     }
   });
@@ -1380,6 +1400,7 @@
             {:else if providersStore.providers.length > 0}
               {#each providersStore.providers as p (p.id)}
                 {@const models = modelsFor(p)}
+                {@const listError = modelListErrors[p.id] ?? null}
                 {@const isActive = p.id === providersStore.activeProviderId}
                 <SettingRow
                   title={p.name}
@@ -1387,7 +1408,7 @@
                     p.trustedByName
                       ? " · trusted by name — only use on a network you control"
                       : ""
-                  }`}
+                  }${listError ? ` · couldn't list models — check the endpoint or key (${listError})` : ""}`}
                   dotColor={providerDotColor(p.kind)}
                   tag={isActive
                     ? { label: "active", bg: "var(--accent-soft)", color: "var(--accent)" }
@@ -1401,7 +1422,11 @@
                         items={models.map((m) => ({ value: m, label: m }))}
                         value={isActive ? (providersStore.activeModel ?? "") : ""}
                         onchange={(v) => setActiveModel(p.id, v)}
-                        placeholder={models.length > 0 ? "Select model" : "No models"}
+                        placeholder={models.length > 0
+                          ? "Select model"
+                          : listError
+                            ? "Can't list models"
+                            : "No models"}
                         disabled={models.length === 0}
                       />
                       <Button variant="ghost" onclick={() => startEditProvider(p)}>
