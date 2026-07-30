@@ -58,7 +58,10 @@ pub enum CuError {
 impl std::fmt::Display for CuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CuError::NotFound => write!(f, "target not found on a fresh snapshot (moved or vanished)"),
+            CuError::NotFound => write!(
+                f,
+                "target not found on a fresh snapshot (moved or vanished)"
+            ),
             CuError::PermissionDenied(why) => write!(f, "OS permission denied: {why}"),
             CuError::Unavailable => write!(
                 f,
@@ -139,7 +142,8 @@ impl MockComputerBackend {
     }
     /// Simulate every target vanishing (a window closed, the app quit).
     pub fn vanish_all(&self) {
-        self.vanished.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.vanished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -169,9 +173,10 @@ impl ComputerBackend for MockComputerBackend {
         action: &crate::tools::computer_use::ComputerAction,
         elem: &ResolvedElement,
     ) -> Result<(), CuError> {
-        self.synthesized
-            .lock()
-            .push(format!("{action:?} on {}/{}/{}", elem.app, elem.role, elem.label));
+        self.synthesized.lock().push(format!(
+            "{action:?} on {}/{}/{}",
+            elem.app, elem.role, elem.label
+        ));
         Ok(())
     }
 }
@@ -183,20 +188,40 @@ mod tests {
     #[test]
     fn mock_resolves_by_semantic_tuple_and_vanish_makes_targets_disappear() {
         let mock = MockComputerBackend::with_elements(vec![("Mail", "button", "Reply")]);
-        let target = ActionTarget { app: "Mail".into(), role: "button".into(), label: "Reply".into() };
-        assert!(mock.resolve(&target).unwrap().is_some(), "present target resolves");
-        let missing =
-            ActionTarget { app: "Mail".into(), role: "button".into(), label: "Nope".into() };
-        assert!(mock.resolve(&missing).unwrap().is_none(), "absent target doesn't");
+        let target = ActionTarget {
+            app: "Mail".into(),
+            role: "button".into(),
+            label: "Reply".into(),
+        };
+        assert!(
+            mock.resolve(&target).unwrap().is_some(),
+            "present target resolves"
+        );
+        let missing = ActionTarget {
+            app: "Mail".into(),
+            role: "button".into(),
+            label: "Nope".into(),
+        };
+        assert!(
+            mock.resolve(&missing).unwrap().is_none(),
+            "absent target doesn't"
+        );
         mock.vanish_all();
-        assert!(mock.resolve(&target).unwrap().is_none(), "a vanished target stops resolving");
+        assert!(
+            mock.resolve(&target).unwrap().is_none(),
+            "a vanished target stops resolving"
+        );
     }
 
     #[test]
     fn unavailable_backend_refuses_everything_loudly() {
         let b = UnavailableBackend;
         assert_eq!(b.ui_tree().unwrap_err(), CuError::Unavailable);
-        let t = ActionTarget { app: "X".into(), role: "button".into(), label: "Y".into() };
+        let t = ActionTarget {
+            app: "X".into(),
+            role: "button".into(),
+            label: "Y".into(),
+        };
         assert_eq!(b.resolve(&t).unwrap_err(), CuError::Unavailable);
     }
 }

@@ -182,7 +182,10 @@ mod tests {
         let h = vec![sized("system", 100), sized("user", 100)];
         let budget = estimate_chars(&h); // exactly at budget
         let c = compact_history(&h, budget, 8);
-        assert!(c.trimmed.is_empty(), "strict > boundary: == budget is a no-op");
+        assert!(
+            c.trimmed.is_empty(),
+            "strict > boundary: == budget is a no-op"
+        );
         assert_eq!(c.sent, h);
     }
 
@@ -204,7 +207,10 @@ mod tests {
         // The last 3 turns are always kept (tail protection).
         let last3: Vec<_> = h[h.len() - 3..].to_vec();
         let sent_tail: Vec<_> = c.sent[c.sent.len() - 3..].to_vec();
-        assert_eq!(sent_tail, last3, "the most-recent keep_recent turns survive");
+        assert_eq!(
+            sent_tail, last3,
+            "the most-recent keep_recent turns survive"
+        );
         // trimmed = the dropped middle, oldest-first, disjoint from sent.
         assert!(!c.trimmed.is_empty());
         assert_eq!(c.trimmed[0], h[2], "oldest dropped first");
@@ -229,7 +235,10 @@ mod tests {
         let mut rebuilt = c.trimmed.clone();
         rebuilt.extend(kept_body);
         let original_body: Vec<_> = h[1..].to_vec();
-        assert_eq!(rebuilt, original_body, "no message lost, duplicated, or reordered");
+        assert_eq!(
+            rebuilt, original_body,
+            "no message lost, duplicated, or reordered"
+        );
     }
 
     #[test]
@@ -237,7 +246,10 @@ mod tests {
         // A single huge recent turn bigger than the budget must be kept intact.
         let h = vec![sys("s"), sized("user", 100_000)];
         let c = compact_history(&h, 1_000, 8);
-        assert!(c.trimmed.is_empty(), "recent turn is protected, nothing to drop");
+        assert!(
+            c.trimmed.is_empty(),
+            "recent turn is protected, nothing to drop"
+        );
         // Content never sliced.
         assert_eq!(c.sent, h);
         assert_eq!(c.sent[1].content.chars().count(), 100_000);
@@ -249,7 +261,10 @@ mod tests {
         let h = vec![sys("s"), sized("user", 50_000), sized("assistant", 50_000)];
         let c = compact_history(&h, 1_000, 8);
         assert!(c.trimmed.is_empty());
-        assert!(!c.sent.iter().any(|m| m.content.contains("omitted")), "no misleading marker");
+        assert!(
+            !c.sent.iter().any(|m| m.content.contains("omitted")),
+            "no misleading marker"
+        );
         assert_eq!(c.sent, h);
     }
 

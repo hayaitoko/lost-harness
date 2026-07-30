@@ -202,8 +202,7 @@ pub fn probe() -> HardwareProfile {
         .as_ref()
         .and_then(|g| g.first())
         .and_then(|g| g.core_count);
-    let mem_bandwidth_gbps =
-        apple_chip_family.map(|f| bandwidth_gbps_estimate(f, gpu_cores));
+    let mem_bandwidth_gbps = apple_chip_family.map(|f| bandwidth_gbps_estimate(f, gpu_cores));
 
     HardwareProfile {
         total_ram_bytes,
@@ -304,7 +303,12 @@ mod macos {
         let vram_str = entry.get("spdisplays_vram").and_then(|v| v.as_str());
         let is_unified = vram_str.is_none();
         let vram_bytes = vram_str.and_then(parse_vram_mb);
-        GpuInfo { name, is_unified, vram_bytes, core_count }
+        GpuInfo {
+            name,
+            is_unified,
+            vram_bytes,
+            core_count,
+        }
     }
 
     /// Parse an Apple `"<N> MB"` / `"<N> GB"` VRAM string into bytes. Returns
@@ -446,21 +450,38 @@ mod tests {
             arch: "x86_64".into(),
             ..Default::default()
         };
-        assert_eq!(fits(GB, &unknown), Fit::TooLarge, "unknown RAM never claims a fit");
+        assert_eq!(
+            fits(GB, &unknown),
+            Fit::TooLarge,
+            "unknown RAM never claims a fit"
+        );
     }
 
     #[test]
     fn fake_hardware_source_returns_injected_profile() {
         let p = profile(48);
         let src = FakeHardwareSource(p.clone());
-        assert_eq!(src.snapshot(), p, "DI returns the injected profile bit-for-bit");
+        assert_eq!(
+            src.snapshot(),
+            p,
+            "DI returns the injected profile bit-for-bit"
+        );
     }
 
     #[test]
     fn bandwidth_lookup_disambiguates_binned_variants_by_core_count() {
-        assert_eq!(bandwidth_gbps_estimate(AppleChipFamily::M3Max, Some(30)), 300.0);
-        assert_eq!(bandwidth_gbps_estimate(AppleChipFamily::M3Max, Some(40)), 400.0);
-        assert_eq!(bandwidth_gbps_estimate(AppleChipFamily::M4Max, Some(40)), 546.0);
+        assert_eq!(
+            bandwidth_gbps_estimate(AppleChipFamily::M3Max, Some(30)),
+            300.0
+        );
+        assert_eq!(
+            bandwidth_gbps_estimate(AppleChipFamily::M3Max, Some(40)),
+            400.0
+        );
+        assert_eq!(
+            bandwidth_gbps_estimate(AppleChipFamily::M4Max, Some(40)),
+            546.0
+        );
     }
 
     #[test]
@@ -500,8 +521,16 @@ mod tests {
 
     #[test]
     fn chip_family_parse_returns_none_for_unmapped_or_non_apple() {
-        assert_eq!(parse_brand_string("Apple M5 Max"), None, "future chip → None, not a guess");
-        assert_eq!(parse_brand_string("Apple M4 Ultra"), None, "unshipped SKU → None");
+        assert_eq!(
+            parse_brand_string("Apple M5 Max"),
+            None,
+            "future chip → None, not a guess"
+        );
+        assert_eq!(
+            parse_brand_string("Apple M4 Ultra"),
+            None,
+            "unshipped SKU → None"
+        );
         assert_eq!(parse_brand_string("Intel(R) Core(TM) i9-9980HK"), None);
         assert_eq!(parse_brand_string("M3 Max"), None, "no Apple prefix → None");
         assert_eq!(parse_brand_string(""), None);
@@ -530,8 +559,14 @@ mod tests {
         unknown.gpus = None;
         let mut confirmed_none = profile(16);
         confirmed_none.gpus = Some(vec![]);
-        assert!(!gpu_enumeration_known(&unknown), "None = not-probed, not 'no GPU'");
-        assert!(gpu_enumeration_known(&confirmed_none), "Some(vec![]) = probed, reported nothing");
+        assert!(
+            !gpu_enumeration_known(&unknown),
+            "None = not-probed, not 'no GPU'"
+        );
+        assert!(
+            gpu_enumeration_known(&confirmed_none),
+            "Some(vec![]) = probed, reported nothing"
+        );
     }
 
     #[test]
@@ -577,7 +612,10 @@ mod tests {
         )
         .unwrap();
         let g = macos::parse_gpu_entry(&entry);
-        assert!(g.is_unified, "a shared-VRAM key must not mark the GPU discrete");
+        assert!(
+            g.is_unified,
+            "a shared-VRAM key must not mark the GPU discrete"
+        );
         assert_eq!(g.vram_bytes, None, "no dedicated VRAM must be fabricated");
     }
 

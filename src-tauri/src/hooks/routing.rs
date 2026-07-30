@@ -154,7 +154,10 @@ mod tests {
         // candidate in the list.
         let candidates = vec![cloud_provider()];
         let result = enforce_local_routing(&local_required("uncertain content"), &candidates);
-        assert!(result.is_err(), "must never silently return a cloud provider");
+        assert!(
+            result.is_err(),
+            "must never silently return a cloud provider"
+        );
     }
 
     #[test]
@@ -207,10 +210,16 @@ mod tests {
         // Under Public the text gate yields `Unconstrained` (base), yet an image
         // must still force local until a cloud-vision consent toggle ships.
         let routing = routing_for_turn(RoutingRequirement::Unconstrained, true);
-        assert!(routing.is_local_required(), "an image overrides a Public text opt-in");
+        assert!(
+            routing.is_local_required(),
+            "an image overrides a Public text opt-in"
+        );
         let candidates = [cloud_provider()];
         let result = enforce_local_routing(&routing, &candidates);
-        assert!(result.is_err(), "an unvetted screenshot must never fail over to cloud");
+        assert!(
+            result.is_err(),
+            "an unvetted screenshot must never fail over to cloud"
+        );
     }
 
     #[test]

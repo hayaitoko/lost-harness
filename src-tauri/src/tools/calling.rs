@@ -92,7 +92,11 @@ pub fn assemble_native_calls(
                 };
             };
             // An empty arguments stream means "no args" — normalize to {}.
-            let args_src = if raw_args.trim().is_empty() { "{}" } else { raw_args.as_str() };
+            let args_src = if raw_args.trim().is_empty() {
+                "{}"
+            } else {
+                raw_args.as_str()
+            };
             match serde_json::from_str::<serde_json::Value>(args_src) {
                 Ok(args) if args.is_object() => ParsedToolCall::Call(ToolCall { name, args }),
                 Ok(_) => ParsedToolCall::Malformed {
@@ -172,7 +176,10 @@ fn parse_one(raw: &str) -> ParsedToolCall {
         }
     };
     // `args` is optional; default to null so a no-arg tool call is legal.
-    let args = value.get("args").cloned().unwrap_or(serde_json::Value::Null);
+    let args = value
+        .get("args")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     ParsedToolCall::Call(ToolCall { name, args })
 }
 
@@ -227,7 +234,8 @@ pub fn render_tool_catalog(tools: &[&dyn Tool]) -> String {
 /// the crash-recovery boot pass to detect "this turn asked for a tool
 /// call" without touching the parse-and-dispatch path at all.
 pub(crate) fn contains_open_tool_fence(text: &str) -> bool {
-    text.lines().any(|l| l.trim().eq_ignore_ascii_case(FENCE_OPEN))
+    text.lines()
+        .any(|l| l.trim().eq_ignore_ascii_case(FENCE_OPEN))
 }
 
 /// Neutralize the structural tokens untrusted or model-controlled text could
@@ -389,7 +397,10 @@ mod tests {
             parse_tool_calls(&own(&wrapped)).is_empty(),
             "a forged ```tool block inside guard-wrapped content must not parse"
         );
-        assert!(!wrapped.contains("```"), "triple-backticks must be neutralized");
+        assert!(
+            !wrapped.contains("```"),
+            "triple-backticks must be neutralized"
+        );
     }
 
     #[test]
@@ -414,11 +425,26 @@ mod tests {
     fn guard_wrap_stable_is_deterministic_but_still_neutralizes() {
         // Same (source, body, seed) ⇒ byte-identical (the cache-shaped-prefix
         // property). This is what makes the curated-summary block reusable.
-        let a = guard_wrap_stable("your saved memory", "the deploy key is in the vault", "conv-123");
-        let b = guard_wrap_stable("your saved memory", "the deploy key is in the vault", "conv-123");
-        assert_eq!(a, b, "deterministic wrap must be byte-identical for the same seed");
+        let a = guard_wrap_stable(
+            "your saved memory",
+            "the deploy key is in the vault",
+            "conv-123",
+        );
+        let b = guard_wrap_stable(
+            "your saved memory",
+            "the deploy key is in the vault",
+            "conv-123",
+        );
+        assert_eq!(
+            a, b,
+            "deterministic wrap must be byte-identical for the same seed"
+        );
         // A different conversation seed ⇒ a different nonce (different bytes).
-        let c = guard_wrap_stable("your saved memory", "the deploy key is in the vault", "conv-999");
+        let c = guard_wrap_stable(
+            "your saved memory",
+            "the deploy key is in the vault",
+            "conv-999",
+        );
         assert_ne!(a, c, "a different seed yields a different nonce");
         // The random-nonce variant is NOT byte-stable (documents the split:
         // summary uses stable wrap, snippets use this).
@@ -490,7 +516,9 @@ mod tests {
         assert!(!contains_open_tool_fence("```"));
         // Empty / plain prose.
         assert!(!contains_open_tool_fence(""));
-        assert!(!contains_open_tool_fence("Just a normal answer with no fences."));
+        assert!(!contains_open_tool_fence(
+            "Just a normal answer with no fences."
+        ));
         // `tool` mentioned in prose, NOT as a fence marker.
         assert!(!contains_open_tool_fence(
             "I considered using a tool here, but decided not to."

@@ -141,7 +141,11 @@ fn agent_types_crud_and_builtin_seed() {
     let after_first = db.list_agent_types().unwrap();
     assert_eq!(after_first.len(), 2, "two built-ins seeded");
     db.ensure_builtin_agent_types(200).unwrap();
-    assert_eq!(db.list_agent_types().unwrap().len(), 2, "re-seed is a no-op");
+    assert_eq!(
+        db.list_agent_types().unwrap().len(),
+        2,
+        "re-seed is a no-op"
+    );
     // Built-ins are approved + source=builtin, with a non-empty allowlist.
     let reviewer = db.get_agent_type("builtin-code-reviewer").unwrap().unwrap();
     assert_eq!(reviewer.approval_status, AgentTypeApproval::Approved);
@@ -164,8 +168,14 @@ fn agent_types_crud_and_builtin_seed() {
     })
     .unwrap();
     assert_eq!(db.list_agent_types().unwrap().len(), 3);
-    assert_eq!(db.list_approved_agent_types().unwrap().len(), 2, "pending is excluded");
-    assert!(db.set_agent_type_approval("u1", AgentTypeApproval::Approved).unwrap());
+    assert_eq!(
+        db.list_approved_agent_types().unwrap().len(),
+        2,
+        "pending is excluded"
+    );
+    assert!(db
+        .set_agent_type_approval("u1", AgentTypeApproval::Approved)
+        .unwrap());
     assert_eq!(db.list_approved_agent_types().unwrap().len(), 3);
     assert!(db.delete_agent_type("u1").unwrap());
     assert_eq!(db.list_agent_types().unwrap().len(), 2);
@@ -187,7 +197,10 @@ fn schema_version_is_eleven_after_init_profile() {
 
     // sandbox_config round-trips (M7 Tier-K Slice 2): unset → None; set → Some.
     use crate::hooks::{SandboxConfig, SandboxNetworkConfig};
-    assert!(db.get_sandbox_config().unwrap().is_none(), "no row → None (unconstrained default)");
+    assert!(
+        db.get_sandbox_config().unwrap().is_none(),
+        "no row → None (unconstrained default)"
+    );
     let cfg = SandboxConfig {
         enabled: true,
         auto_allow_if_sandboxed: false,
@@ -199,15 +212,26 @@ fn schema_version_is_eleven_after_init_profile() {
         },
     };
     db.set_sandbox_config(&cfg).unwrap();
-    assert_eq!(db.get_sandbox_config().unwrap(), Some(cfg.clone()), "set → get round-trips exactly");
+    assert_eq!(
+        db.get_sandbox_config().unwrap(),
+        Some(cfg.clone()),
+        "set → get round-trips exactly"
+    );
     // permits_shell_network: a non-empty allowlist lifts the ceiling.
     assert!(cfg.permits_shell_network());
     // A fully locked-down config denies shell network.
     let locked = SandboxConfig {
-        network: SandboxNetworkConfig { allowed_domains: vec![], allow_localhost: false, allow_unix_sockets: vec![] },
+        network: SandboxNetworkConfig {
+            allowed_domains: vec![],
+            allow_localhost: false,
+            allow_unix_sockets: vec![],
+        },
         ..cfg
     };
-    assert!(!locked.permits_shell_network(), "no localhost + no domains → shell network denied");
+    assert!(
+        !locked.permits_shell_network(),
+        "no localhost + no domains → shell network denied"
+    );
 }
 
 #[test]
@@ -230,7 +254,10 @@ fn model_catalog_carries_sha256_and_status() {
     assert_eq!(got.status, "ready");
     // Quarantine flips the status (integrity re-check failed) without deleting.
     assert!(db.set_model_status("qwen-3b", "quarantined").unwrap());
-    assert_eq!(db.get_model("qwen-3b").unwrap().unwrap().status, "quarantined");
+    assert_eq!(
+        db.get_model("qwen-3b").unwrap().unwrap().status,
+        "quarantined"
+    );
     assert_eq!(db.list_models().unwrap().len(), 1);
 }
 
@@ -240,19 +267,28 @@ fn seat_bindings_crud_roundtrip() {
     assert!(db.list_seat_bindings().unwrap().is_empty());
     assert!(db.get_seat_binding("Coding").unwrap().is_none());
 
-    db.set_seat_binding("Coding", "lmstudio", "qwen3-14b").unwrap();
+    db.set_seat_binding("Coding", "lmstudio", "qwen3-14b")
+        .unwrap();
     db.set_seat_binding("Reviewer", "cloudco", "gpt-x").unwrap();
     // Upsert: re-binding replaces, doesn't duplicate.
-    db.set_seat_binding("Coding", "lmstudio", "qwen3-30b").unwrap();
+    db.set_seat_binding("Coding", "lmstudio", "qwen3-30b")
+        .unwrap();
 
     let all = db.list_seat_bindings().unwrap();
-    assert_eq!(all.len(), 2, "two distinct seats, Coding upserted not duplicated");
+    assert_eq!(
+        all.len(),
+        2,
+        "two distinct seats, Coding upserted not duplicated"
+    );
     let coding = db.get_seat_binding("  Coding  ").unwrap().unwrap(); // name trimmed
     assert_eq!(coding.model, "qwen3-30b");
     assert_eq!(coding.provider_id, "lmstudio");
 
     assert!(db.delete_seat_binding("Coding").unwrap());
-    assert!(!db.delete_seat_binding("Coding").unwrap(), "second delete is a no-op");
+    assert!(
+        !db.delete_seat_binding("Coding").unwrap(),
+        "second delete is a no-op"
+    );
     assert!(db.get_seat_binding("Coding").unwrap().is_none());
     assert_eq!(db.list_seat_bindings().unwrap().len(), 1);
 }
@@ -268,7 +304,10 @@ fn redaction_toggle_is_independent_of_thresholds() {
     // Setting thresholds must NOT flip redaction.
     let strict = ClassifierConfig::from_ui(90, "wide");
     db.set_classifier_config(&strict).unwrap();
-    assert!(db.redaction_enabled().unwrap(), "threshold change preserved redaction");
+    assert!(
+        db.redaction_enabled().unwrap(),
+        "threshold change preserved redaction"
+    );
 
     // Disabling redaction must NOT change thresholds.
     db.set_redaction_enabled(false).unwrap();
@@ -280,14 +319,21 @@ fn redaction_toggle_is_independent_of_thresholds() {
     );
 
     // Another threshold change must NOT re-enable redaction.
-    db.set_classifier_config(&ClassifierConfig::from_ui(10, "narrow")).unwrap();
-    assert!(!db.redaction_enabled().unwrap(), "redaction stayed off across a threshold change");
+    db.set_classifier_config(&ClassifierConfig::from_ui(10, "narrow"))
+        .unwrap();
+    assert!(
+        !db.redaction_enabled().unwrap(),
+        "redaction stayed off across a threshold change"
+    );
 
     // Setting redaction on a fresh profile (no row yet) uses default thresholds.
     let fresh = ProfileDb::open_in_memory("work").unwrap();
     fresh.set_redaction_enabled(false).unwrap();
     assert!(!fresh.redaction_enabled().unwrap());
-    assert_eq!(fresh.classifier_config().unwrap(), ClassifierConfig::default());
+    assert_eq!(
+        fresh.classifier_config().unwrap(),
+        ClassifierConfig::default()
+    );
 
     // Reset clears both back to defaults (redaction on).
     db.reset_classifier_config().unwrap();
@@ -663,8 +709,10 @@ fn tool_rules_round_trip_and_delete() {
     let db = ProfileDb::open_in_memory("personal").unwrap();
     assert!(db.list_tool_rules().unwrap().is_empty());
 
-    db.add_tool_rule(&rule("r1", "write_file", "*", "allow")).unwrap();
-    db.add_tool_rule(&rule("r2", "read_file", "secrets/*", "deny")).unwrap();
+    db.add_tool_rule(&rule("r1", "write_file", "*", "allow"))
+        .unwrap();
+    db.add_tool_rule(&rule("r2", "read_file", "secrets/*", "deny"))
+        .unwrap();
 
     let wf = db.list_tool_rules_for("write_file").unwrap();
     assert_eq!(wf.len(), 1);
@@ -672,8 +720,14 @@ fn tool_rules_round_trip_and_delete() {
     assert_eq!(db.list_tool_rules_for("read_file").unwrap().len(), 1);
     assert_eq!(db.list_tool_rules().unwrap().len(), 2);
 
-    assert!(db.delete_tool_rule("r1").unwrap(), "deleting an existing rule returns true");
-    assert!(!db.delete_tool_rule("r1").unwrap(), "deleting a gone rule returns false");
+    assert!(
+        db.delete_tool_rule("r1").unwrap(),
+        "deleting an existing rule returns true"
+    );
+    assert!(
+        !db.delete_tool_rule("r1").unwrap(),
+        "deleting a gone rule returns false"
+    );
     assert!(db.list_tool_rules_for("write_file").unwrap().is_empty());
     assert_eq!(db.list_tool_rules().unwrap().len(), 1);
 }
@@ -728,8 +782,10 @@ fn tool_rules_upsert_is_idempotent_on_tool_and_pattern() {
     // Re-adding the same (tool, pattern) updates the action instead of piling
     // a duplicate row (UNIQUE(tool_name, pattern) + INSERT OR REPLACE).
     let db = ProfileDb::open_in_memory("personal").unwrap();
-    db.add_tool_rule(&rule("r1", "write_file", "*", "allow")).unwrap();
-    db.add_tool_rule(&rule("r2", "write_file", "*", "deny")).unwrap();
+    db.add_tool_rule(&rule("r1", "write_file", "*", "allow"))
+        .unwrap();
+    db.add_tool_rule(&rule("r2", "write_file", "*", "deny"))
+        .unwrap();
     let rows = db.list_tool_rules_for("write_file").unwrap();
     assert_eq!(rows.len(), 1, "same (tool, pattern) must not duplicate");
     assert_eq!(rows[0].action, "deny", "re-add updates the action");
@@ -749,7 +805,12 @@ fn tool_rules_are_isolated_per_profile() {
         .unwrap();
 
     assert_eq!(
-        storage.open_profile("work").unwrap().list_tool_rules().unwrap().len(),
+        storage
+            .open_profile("work")
+            .unwrap()
+            .list_tool_rules()
+            .unwrap()
+            .len(),
         1
     );
     assert!(
@@ -778,7 +839,10 @@ fn tool_rules_survive_a_real_disk_reopen() {
         .add_tool_rule(&rule("r1", "write_file", "notes/*", "allow"))
         .unwrap();
 
-    assert!(storage.close_profile("personal"), "handle should have been cached");
+    assert!(
+        storage.close_profile("personal"),
+        "handle should have been cached"
+    );
     let reopened = storage.open_profile("personal").unwrap();
     let rows = reopened.list_tool_rules_for("write_file").unwrap();
     assert_eq!(rows.len(), 1, "the rule must survive a real on-disk reopen");
@@ -803,15 +867,15 @@ fn storage_open_profile_rejects_whitespace_padding_and_confusables() {
     let dir = tempdir();
     let storage = Storage::open(&dir).unwrap();
     for bad in [
-        " work",        // leading space
-        "work ",        // trailing space
-        "wo\trk",       // internal tab
-        "wo rk",        // internal space
-        "work\n",       // trailing newline
-        "wоrk",         // Cyrillic 'о' homoglyph
-        "wo\u{200b}rk", // zero-width space
-        "café",         // non-ASCII (combining/accent)
-        &"x".repeat(65),// too long
+        " work",         // leading space
+        "work ",         // trailing space
+        "wo\trk",        // internal tab
+        "wo rk",         // internal space
+        "work\n",        // trailing newline
+        "wоrk",          // Cyrillic 'о' homoglyph
+        "wo\u{200b}rk",  // zero-width space
+        "café",          // non-ASCII (combining/accent)
+        &"x".repeat(65), // too long
     ] {
         assert!(storage.open_profile(bad).is_err(), "must reject {bad:?}");
     }
@@ -860,7 +924,10 @@ fn memory_settings_round_trip_and_default() {
 
     // Default (no row): semantic on, not walled.
     let d = db.memory_settings().unwrap();
-    assert!(d.semantic_search_enabled && !d.walled, "defaults: semantic on, shared");
+    assert!(
+        d.semantic_search_enabled && !d.walled,
+        "defaults: semantic on, shared"
+    );
 
     db.set_memory_settings(&MemorySettings {
         semantic_search_enabled: false,
@@ -868,7 +935,10 @@ fn memory_settings_round_trip_and_default() {
     })
     .unwrap();
     let s = db.memory_settings().unwrap();
-    assert!(!s.semantic_search_enabled && s.walled, "round-trips both flags");
+    assert!(
+        !s.semantic_search_enabled && s.walled,
+        "round-trips both flags"
+    );
 }
 
 #[test]
@@ -882,10 +952,17 @@ fn walled_profile_memory_is_physically_separate_and_survives_toggle_back() {
     // A shared (default) profile routes to global.db.
     let shared = storage.memory_db_for_profile("personal").unwrap();
     shared
-        .insert_memory_fact_in(MemoryBucket::Shared, &walled_fact("s1", "alpha personal reminder", "personal"))
+        .insert_memory_fact_in(
+            MemoryBucket::Shared,
+            &walled_fact("s1", "alpha personal reminder", "personal"),
+        )
         .unwrap();
     assert_eq!(
-        storage.global().search_memory("alpha personal reminder", true, 10).unwrap().len(),
+        storage
+            .global()
+            .search_memory("alpha personal reminder", true, 10)
+            .unwrap()
+            .len(),
         1,
         "a shared profile's writes land in global.db"
     );
@@ -894,22 +971,35 @@ fn walled_profile_memory_is_physically_separate_and_survives_toggle_back() {
     storage
         .open_profile("work")
         .unwrap()
-        .set_memory_settings(&MemorySettings { semantic_search_enabled: true, walled: true })
+        .set_memory_settings(&MemorySettings {
+            semantic_search_enabled: true,
+            walled: true,
+        })
         .unwrap();
     let walled = storage.memory_db_for_profile("work").unwrap();
     walled
-        .insert_memory_fact_in(MemoryBucket::Shared, &walled_fact("w1", "bravo confidential dossier", "work"))
+        .insert_memory_fact_in(
+            MemoryBucket::Shared,
+            &walled_fact("w1", "bravo confidential dossier", "work"),
+        )
         .unwrap();
 
     // The fact is in the walled DB...
     assert_eq!(
-        walled.search_memory("bravo confidential dossier", true, 10).unwrap().len(),
+        walled
+            .search_memory("bravo confidential dossier", true, 10)
+            .unwrap()
+            .len(),
         1,
         "the walled write is readable from the walled DB"
     );
     // ...and NEVER in global.db.
     assert!(
-        storage.global().search_memory("bravo confidential dossier", true, 10).unwrap().is_empty(),
+        storage
+            .global()
+            .search_memory("bravo confidential dossier", true, 10)
+            .unwrap()
+            .is_empty(),
         "a walled profile's fact must never enter global.db"
     );
     // The walled memory DB is a separate physical file.
@@ -922,21 +1012,35 @@ fn walled_profile_memory_is_physically_separate_and_survives_toggle_back() {
     storage
         .open_profile("work")
         .unwrap()
-        .set_memory_settings(&MemorySettings { semantic_search_enabled: true, walled: false })
+        .set_memory_settings(&MemorySettings {
+            semantic_search_enabled: true,
+            walled: false,
+        })
         .unwrap();
 
     // The walled-era fact STILL isn't in global — the wall survived the toggle.
     assert!(
-        storage.global().search_memory("bravo confidential dossier", true, 10).unwrap().is_empty(),
+        storage
+            .global()
+            .search_memory("bravo confidential dossier", true, 10)
+            .unwrap()
+            .is_empty(),
         "toggling the wall off must not retroactively spill walled data into global"
     );
     // And routing now goes to the shared store: a fresh write lands in global.
     let mem_now = storage.memory_db_for_profile("work").unwrap();
     mem_now
-        .insert_memory_fact_in(MemoryBucket::Shared, &walled_fact("w2", "gamma unwalled entry", "work"))
+        .insert_memory_fact_in(
+            MemoryBucket::Shared,
+            &walled_fact("w2", "gamma unwalled entry", "work"),
+        )
         .unwrap();
     assert_eq!(
-        storage.global().search_memory("gamma unwalled entry", true, 10).unwrap().len(),
+        storage
+            .global()
+            .search_memory("gamma unwalled entry", true, 10)
+            .unwrap()
+            .len(),
         1,
         "after un-walling, writes route to the shared global store"
     );
@@ -954,12 +1058,20 @@ fn memory_routing_fails_closed_when_wall_status_is_unreadable() {
 
     // A profile that opens fine and IS walled routes to its own DB.
     let db = storage.open_profile("locked").unwrap();
-    db.set_memory_settings(&MemorySettings { semantic_search_enabled: true, walled: true })
-        .unwrap();
-    assert!(storage.memory_db_for_profile("locked").is_ok(), "readable walled status resolves");
+    db.set_memory_settings(&MemorySettings {
+        semantic_search_enabled: true,
+        walled: true,
+    })
+    .unwrap();
+    assert!(
+        storage.memory_db_for_profile("locked").is_ok(),
+        "readable walled status resolves"
+    );
 
     // Now make the wall status unreadable (drop the table on the same cached conn).
-    db.raw().execute_batch("DROP TABLE memory_settings").unwrap();
+    db.raw()
+        .execute_batch("DROP TABLE memory_settings")
+        .unwrap();
     assert!(
         storage.memory_db_for_profile("locked").is_err(),
         "an unreadable wall status must fail closed, never route to the shared store"
@@ -970,7 +1082,10 @@ fn memory_routing_fails_closed_when_wall_status_is_unreadable() {
     // that path is a different, safe case (no island exists to protect).
     let shared = storage.memory_db_for_profile("../evil").unwrap();
     assert!(
-        std::sync::Arc::ptr_eq(&shared, &storage.memory_db_for_profile("also-fresh-shared").unwrap()),
+        std::sync::Arc::ptr_eq(
+            &shared,
+            &storage.memory_db_for_profile("also-fresh-shared").unwrap()
+        ),
         "a degenerate name uses the one shared global store"
     );
 }
@@ -997,7 +1112,10 @@ fn global_endpoints_and_memory_round_trip() {
     let eps = g.list_endpoints().unwrap();
     assert_eq!(eps.len(), 1);
     assert_eq!(eps[0].name, "Anthropic");
-    assert!(eps[0].supports_native_tools, "the native-tools flag must round-trip through storage");
+    assert!(
+        eps[0].supports_native_tools,
+        "the native-tools flag must round-trip through storage"
+    );
     assert_eq!(
         eps[0].api_key_marker.as_deref(),
         Some(b"legacy-plaintext-bytes".as_slice())
@@ -1052,7 +1170,11 @@ fn active_profile_defaults_to_none_and_round_trips() {
 
     // Fresh db: nothing stored yet. `get_active_profile` maps this None to
     // "personal", but the storage layer reports the honest absence.
-    assert_eq!(g.active_profile(), None, "a fresh db has no stored active profile");
+    assert_eq!(
+        g.active_profile(),
+        None,
+        "a fresh db has no stored active profile"
+    );
 
     // Persist a choice and read it back.
     g.set_active_profile("work").unwrap();
@@ -1084,12 +1206,22 @@ fn memory_search_keyword_and_bucket_isolation() {
 
     g.insert_memory_fact_in(
         MemoryBucket::Shared,
-        &mem_fact("s1", "Lukas prefers concise, direct replies", "personal", false),
+        &mem_fact(
+            "s1",
+            "Lukas prefers concise, direct replies",
+            "personal",
+            false,
+        ),
     )
     .unwrap();
     g.insert_memory_fact_in(
         MemoryBucket::Shared,
-        &mem_fact("s2", "The payments service is written in Rust", "work", false),
+        &mem_fact(
+            "s2",
+            "The payments service is written in Rust",
+            "work",
+            false,
+        ),
     )
     .unwrap();
     g.insert_memory_fact_in(
@@ -1130,7 +1262,12 @@ fn search_memory_scoped_restricts_to_one_profile() {
     let g = GlobalDb::open_in_memory().unwrap();
     g.insert_memory_fact_in(
         MemoryBucket::Shared,
-        &mem_fact("s1", "the deploy runbook lives in the wiki", "personal", false),
+        &mem_fact(
+            "s1",
+            "the deploy runbook lives in the wiki",
+            "personal",
+            false,
+        ),
     )
     .unwrap();
     g.insert_memory_fact_in(
@@ -1142,7 +1279,9 @@ fn search_memory_scoped_restricts_to_one_profile() {
     // Unscoped search sees both profiles' shared facts (recall_memory behavior).
     assert_eq!(g.search_memory("deploy", false, 10).unwrap().len(), 2);
     // Scoped search sees only the named profile's facts.
-    let personal = g.search_memory_scoped("deploy", "personal", false, 10).unwrap();
+    let personal = g
+        .search_memory_scoped("deploy", "personal", false, 10)
+        .unwrap();
     assert_eq!(personal.len(), 1);
     assert_eq!(personal[0].fact.id, "s1");
     let work = g.search_memory_scoped("deploy", "work", false, 10).unwrap();
@@ -1152,16 +1291,25 @@ fn search_memory_scoped_restricts_to_one_profile() {
     // Scoped search still honors the private wall on a cloud-bound (false) call.
     g.insert_memory_fact_in(
         MemoryBucket::PrivateLocal,
-        &mem_fact("p1", "deploy key is 123 Oak Street vault", "personal", false),
+        &mem_fact(
+            "p1",
+            "deploy key is 123 Oak Street vault",
+            "personal",
+            false,
+        ),
     )
     .unwrap();
     assert_eq!(
-        g.search_memory_scoped("deploy", "personal", false, 10).unwrap().len(),
+        g.search_memory_scoped("deploy", "personal", false, 10)
+            .unwrap()
+            .len(),
         1,
         "cloud-bound scoped search must not surface the private-local fact"
     );
     assert_eq!(
-        g.search_memory_scoped("deploy", "personal", true, 10).unwrap().len(),
+        g.search_memory_scoped("deploy", "personal", true, 10)
+            .unwrap()
+            .len(),
         2,
         "local scoped search reaches the private-local fact"
     );
@@ -1170,10 +1318,16 @@ fn search_memory_scoped_restricts_to_one_profile() {
 #[test]
 fn curated_summary_pins_first_and_gates_private() {
     let g = GlobalDb::open_in_memory().unwrap();
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("a", "oldest note", "personal", false))
-        .unwrap();
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("b", "pinned note", "personal", true))
-        .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("a", "oldest note", "personal", false),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("b", "pinned note", "personal", true),
+    )
+    .unwrap();
     g.insert_memory_fact_in(
         MemoryBucket::PrivateLocal,
         &mem_fact("c", "private note", "personal", false),
@@ -1193,7 +1347,10 @@ fn curated_summary_pins_first_and_gates_private() {
     // Pinning is toggleable and reflected in the ordering.
     assert!(g.set_memory_pinned("a", true).unwrap());
     let after = g.curated_summary("personal", false, 10).unwrap();
-    assert!(after[0].pinned && after[1].pinned, "both pinned now sort first");
+    assert!(
+        after[0].pinned && after[1].pinned,
+        "both pinned now sort first"
+    );
 }
 
 #[test]
@@ -1366,10 +1523,7 @@ fn retention_purges_only_expired_terminal_and_audit_rows() {
             )
             .unwrap();
         }
-        for (conversation, ts) in [
-            ("old", now - 91 * 86_400),
-            ("recent", now - 89 * 86_400),
-        ] {
+        for (conversation, ts) in [("old", now - 91 * 86_400), ("recent", now - 89 * 86_400)] {
             conn.execute(
                 "INSERT INTO tool_audit
                  (ts, conversation_id, tool_name, canonical_args, fingerprint, risk, outcome)
@@ -1380,7 +1534,11 @@ fn retention_purges_only_expired_terminal_and_audit_rows() {
         }
     }
 
-    assert_eq!(p.purge_terminal_work_items_older_than(now - 30 * 86_400).unwrap(), 2);
+    assert_eq!(
+        p.purge_terminal_work_items_older_than(now - 30 * 86_400)
+            .unwrap(),
+        2
+    );
     assert!(p.get_work_item("old-done").unwrap().is_none());
     assert!(p.get_work_item("old-failed").unwrap().is_none());
     assert!(p.get_work_item("old-running").unwrap().is_some());
@@ -1506,7 +1664,11 @@ fn sqlite_vec_extension_loads_and_does_knn() {
         .collect::<rusqlite::Result<Vec<i64>>>()
         .expect("KNN query must run");
 
-    assert_eq!(nearest, vec![1, 3], "nearest-match ordering must be 1 then 3");
+    assert_eq!(
+        nearest,
+        vec![1, 3],
+        "nearest-match ordering must be 1 then 3"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1533,8 +1695,10 @@ fn semantic_lane_finds_meaning_matches_without_keyword_overlap() {
         &mem_fact("b", "the standup moved to Tuesdays", "personal", false),
     )
     .unwrap();
-    g.upsert_memory_embedding(MemoryBucket::Shared, "a", &axis_vec(0)).unwrap();
-    g.upsert_memory_embedding(MemoryBucket::Shared, "b", &axis_vec(1)).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "a", &axis_vec(0))
+        .unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "b", &axis_vec(1))
+        .unwrap();
 
     // The query shares ZERO tokens with fact "a" — keyword-only finds nothing —
     // but its vector sits on fact "a"'s axis (distance 0), so the meaning lane
@@ -1549,7 +1713,11 @@ fn semantic_lane_finds_meaning_matches_without_keyword_overlap() {
             3,
         )
         .unwrap();
-    assert_eq!(hits.len(), 1, "only the near-by-meaning fact clears the gate");
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the near-by-meaning fact clears the gate"
+    );
     assert_eq!(hits[0].fact.id, "a");
 
     // Without a query vector (no embedder installed) the same query finds
@@ -1564,7 +1732,10 @@ fn semantic_lane_finds_meaning_matches_without_keyword_overlap() {
             3,
         )
         .unwrap();
-    assert!(none.is_empty(), "keyword-only lane has no match for this phrasing");
+    assert!(
+        none.is_empty(),
+        "keyword-only lane has no match for this phrasing"
+    );
 }
 
 #[test]
@@ -1572,10 +1743,16 @@ fn semantic_lane_respects_private_wall_profile_scope_and_dim_guard() {
     let g = GlobalDb::open_in_memory().unwrap();
     g.insert_memory_fact_in(
         MemoryBucket::PrivateLocal,
-        &mem_fact("p", "my insulin dose is 12 units nightly", "personal", false),
+        &mem_fact(
+            "p",
+            "my insulin dose is 12 units nightly",
+            "personal",
+            false,
+        ),
     )
     .unwrap();
-    g.upsert_memory_embedding(MemoryBucket::PrivateLocal, "p", &axis_vec(2)).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::PrivateLocal, "p", &axis_vec(2))
+        .unwrap();
 
     // Cloud turn (allow_private=false): even an exact vector match must not
     // surface the private fact — the private vector table is never queried.
@@ -1589,7 +1766,10 @@ fn semantic_lane_respects_private_wall_profile_scope_and_dim_guard() {
             5,
         )
         .unwrap();
-    assert!(cloud.is_empty(), "cloud turn must never see the private vector index");
+    assert!(
+        cloud.is_empty(),
+        "cloud turn must never see the private vector index"
+    );
 
     // Local turn, same profile: found.
     let local = g
@@ -1618,18 +1798,29 @@ fn semantic_lane_respects_private_wall_profile_scope_and_dim_guard() {
             5,
         )
         .unwrap();
-    assert!(other.is_empty(), "private-local must not cross the profile boundary");
+    assert!(
+        other.is_empty(),
+        "private-local must not cross the profile boundary"
+    );
 
     // Dimension guard: a stale 3-dim blob must be skipped, not error the query.
     g.insert_memory_fact_in(
         MemoryBucket::Shared,
-        &mem_fact("stale", "an old fact with a stale vector", "personal", false),
+        &mem_fact(
+            "stale",
+            "an old fact with a stale vector",
+            "personal",
+            false,
+        ),
     )
     .unwrap();
     g.insert_memory_vector(&MemoryVector {
         id: 0,
         fact_id: "stale".into(),
-        embedding: vec![1.0f32, 0.0, 0.0].into_iter().flat_map(|f| f.to_le_bytes()).collect(),
+        embedding: vec![1.0f32, 0.0, 0.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect(),
     })
     .unwrap();
     let ok = g
@@ -1642,7 +1833,10 @@ fn semantic_lane_respects_private_wall_profile_scope_and_dim_guard() {
             5,
         )
         .unwrap();
-    assert!(ok.is_empty(), "a wrong-dimension row is skipped, never an error");
+    assert!(
+        ok.is_empty(),
+        "a wrong-dimension row is skipped, never an error"
+    );
 }
 
 #[test]
@@ -1651,7 +1845,12 @@ fn hybrid_fuses_keyword_and_semantic_lanes() {
     // "both": keyword AND meaning match. "kw": keyword only. "sem": meaning only.
     g.insert_memory_fact_in(
         MemoryBucket::Shared,
-        &mem_fact("both", "the deploy key lives in the vault", "personal", false),
+        &mem_fact(
+            "both",
+            "the deploy key lives in the vault",
+            "personal",
+            false,
+        ),
     )
     .unwrap();
     g.insert_memory_fact_in(
@@ -1661,12 +1860,20 @@ fn hybrid_fuses_keyword_and_semantic_lanes() {
     .unwrap();
     g.insert_memory_fact_in(
         MemoryBucket::Shared,
-        &mem_fact("sem", "credentials are stored in the password manager", "personal", false),
+        &mem_fact(
+            "sem",
+            "credentials are stored in the password manager",
+            "personal",
+            false,
+        ),
     )
     .unwrap();
-    g.upsert_memory_embedding(MemoryBucket::Shared, "both", &axis_vec(0)).unwrap();
-    g.upsert_memory_embedding(MemoryBucket::Shared, "kw", &axis_vec(1)).unwrap();
-    g.upsert_memory_embedding(MemoryBucket::Shared, "sem", &axis_vec(0)).unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "both", &axis_vec(0))
+        .unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "kw", &axis_vec(1))
+        .unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "sem", &axis_vec(0))
+        .unwrap();
 
     let hits = g
         .search_memory_scoped_hybrid(
@@ -1679,26 +1886,49 @@ fn hybrid_fuses_keyword_and_semantic_lanes() {
         )
         .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.fact.id.as_str()).collect();
-    assert!(ids.contains(&"both") && ids.contains(&"kw") && ids.contains(&"sem"),
-        "hybrid must union both lanes, got {ids:?}");
-    assert_eq!(ids[0], "both", "a fact matching BOTH lanes must rank first (RRF)");
+    assert!(
+        ids.contains(&"both") && ids.contains(&"kw") && ids.contains(&"sem"),
+        "hybrid must union both lanes, got {ids:?}"
+    );
+    assert_eq!(
+        ids[0], "both",
+        "a fact matching BOTH lanes must rank first (RRF)"
+    );
 }
 
 #[test]
 fn facts_missing_embedding_backfill_worklist() {
     let g = GlobalDb::open_in_memory().unwrap();
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("e1", "embedded fact", "p", false)).unwrap();
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mem_fact("e2", "not yet embedded", "p", false)).unwrap();
-    g.upsert_memory_embedding(MemoryBucket::Shared, "e1", &axis_vec(0)).unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("e1", "embedded fact", "p", false),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mem_fact("e2", "not yet embedded", "p", false),
+    )
+    .unwrap();
+    g.upsert_memory_embedding(MemoryBucket::Shared, "e1", &axis_vec(0))
+        .unwrap();
 
     let missing = g.facts_missing_embedding(MemoryBucket::Shared, 10).unwrap();
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].id, "e2");
 
-    g.upsert_memory_embedding(MemoryBucket::Shared, "e2", &axis_vec(1)).unwrap();
-    assert!(g.facts_missing_embedding(MemoryBucket::Shared, 10).unwrap().is_empty());
+    g.upsert_memory_embedding(MemoryBucket::Shared, "e2", &axis_vec(1))
+        .unwrap();
+    assert!(g
+        .facts_missing_embedding(MemoryBucket::Shared, 10)
+        .unwrap()
+        .is_empty());
 
     // Upsert replaces: re-embedding e1 leaves exactly one vector row.
-    g.upsert_memory_embedding(MemoryBucket::Shared, "e1", &axis_vec(3)).unwrap();
-    assert_eq!(g.list_vectors_for_fact("e1").unwrap().len(), 1, "upsert must replace, not stack");
+    g.upsert_memory_embedding(MemoryBucket::Shared, "e1", &axis_vec(3))
+        .unwrap();
+    assert_eq!(
+        g.list_vectors_for_fact("e1").unwrap().len(),
+        1,
+        "upsert must replace, not stack"
+    );
 }

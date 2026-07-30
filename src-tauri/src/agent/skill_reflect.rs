@@ -102,7 +102,10 @@ pub struct LocalModelDrafter {
 
 impl LocalModelDrafter {
     pub fn new(model_manager: Arc<ModelManager>, storage: Arc<Storage>) -> Self {
-        Self { model_manager, storage }
+        Self {
+            model_manager,
+            storage,
+        }
     }
 
     /// The first registered provider that is both `Local` AND private by URL —
@@ -175,7 +178,11 @@ fn is_reflect_source(m: &ChatMessage) -> bool {
 fn render_excerpt(turns: &[ChatMessage]) -> String {
     let mut s = String::new();
     for m in turns.iter().filter(|m| is_reflect_source(m)) {
-        let who = if m.role == "assistant" { "Assistant" } else { "User" };
+        let who = if m.role == "assistant" {
+            "Assistant"
+        } else {
+            "User"
+        };
         s.push_str(who);
         s.push_str(": ");
         s.push_str(m.content.trim());
@@ -499,7 +506,10 @@ mod tests {
         let drafts = parse_drafts(out); // must not panic
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].name, "中文技能");
-        assert!(drafts[0].content.contains("1. 运行测试"), "inline BODY: text kept");
+        assert!(
+            drafts[0].content.contains("1. 运行测试"),
+            "inline BODY: text kept"
+        );
         assert!(drafts[0].content.contains("push 到 droplet"));
     }
 
@@ -516,7 +526,10 @@ mod tests {
                    Capabilities: also a step\n";
         let drafts = parse_drafts(out);
         assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].description, "real description", "body text can't overwrite description");
+        assert_eq!(
+            drafts[0].description, "real description",
+            "body text can't overwrite description"
+        );
         assert!(drafts[0].content.contains("Description: this is a STEP"));
         assert!(drafts[0].content.contains("Capabilities: also a step"));
     }
@@ -528,7 +541,11 @@ mod tests {
         };
         let many = (0..6).map(block).collect::<Vec<_>>().join("");
         let drafts = parse_drafts(&many);
-        assert_eq!(drafts.len(), MAX_DRAFTS_PER_REFLECT, "the per-reflect cap holds");
+        assert_eq!(
+            drafts.len(),
+            MAX_DRAFTS_PER_REFLECT,
+            "the per-reflect cap holds"
+        );
     }
 
     #[test]
@@ -577,9 +594,15 @@ mod tests {
             }],
         });
 
-        let saved = run_reflect(drafter, Arc::clone(&storage), "personal", vec![user("...")], 42)
-            .await
-            .unwrap();
+        let saved = run_reflect(
+            drafter,
+            Arc::clone(&storage),
+            "personal",
+            vec![user("...")],
+            42,
+        )
+        .await
+        .unwrap();
         assert_eq!(saved, 1);
 
         let g = storage.global();
@@ -627,9 +650,15 @@ mod tests {
                 capabilities: vec![],
             }],
         });
-        let saved = run_reflect(drafter, Arc::clone(&storage), "personal", vec![user("x")], 1)
-            .await
-            .unwrap();
+        let saved = run_reflect(
+            drafter,
+            Arc::clone(&storage),
+            "personal",
+            vec![user("x")],
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(saved, 0, "a skill with an existing name is not re-drafted");
         assert_eq!(storage.global().list_skills().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(root);
@@ -689,7 +718,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(saved, 1, "the prior conversation is reflected into a pending draft");
+        assert_eq!(
+            saved, 1,
+            "the prior conversation is reflected into a pending draft"
+        );
 
         // Re-running does NOT re-reflect "prev" (high-water marked) — and even if
         // it tried, the name-dedup would stop a duplicate.
@@ -703,7 +735,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(again, 0, "an already-reflected conversation is not re-reflected");
+        assert_eq!(
+            again, 0,
+            "an already-reflected conversation is not re-reflected"
+        );
         assert_eq!(storage.global().list_skills().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -716,8 +751,11 @@ mod tests {
         let storage = Arc::new(Storage::open(&root).unwrap());
         let db = storage.open_profile("work").unwrap();
         // Wall the profile — its data must stay out of the shared global store.
-        db.set_memory_settings(&MemorySettings { semantic_search_enabled: false, walled: true })
-            .unwrap();
+        db.set_memory_settings(&MemorySettings {
+            semantic_search_enabled: false,
+            walled: true,
+        })
+        .unwrap();
         db.create_conversation(&Conversation {
             id: "prev".into(),
             name: "Prev".into(),
@@ -764,7 +802,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(saved, 0, "a walled profile must NOT deposit drafts in the global skills store");
+        assert_eq!(
+            saved, 0,
+            "a walled profile must NOT deposit drafts in the global skills store"
+        );
         assert!(
             storage.global().list_skills().unwrap().is_empty(),
             "no walled-derived skill row exists"
@@ -777,11 +818,19 @@ mod tests {
         let mut root = std::env::temp_dir();
         root.push(format!("lhp-reflect-empty-{}", uuid::Uuid::new_v4()));
         let storage = Arc::new(Storage::open(&root).unwrap());
-        let drafter: Arc<dyn SkillDrafter> =
-            Arc::new(FakeDrafter { available: true, drafts: vec![] });
-        let saved = run_reflect(drafter, Arc::clone(&storage), "personal", vec![asst("hi")], 1)
-            .await
-            .unwrap();
+        let drafter: Arc<dyn SkillDrafter> = Arc::new(FakeDrafter {
+            available: true,
+            drafts: vec![],
+        });
+        let saved = run_reflect(
+            drafter,
+            Arc::clone(&storage),
+            "personal",
+            vec![asst("hi")],
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(saved, 0);
         assert!(storage.global().list_skills().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);

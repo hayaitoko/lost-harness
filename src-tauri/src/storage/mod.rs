@@ -67,7 +67,10 @@ pub(crate) fn validate_profile_name(name: &str) -> Result<()> {
     if name.len() > 64 {
         anyhow::bail!("invalid profile name: too long ({} chars)", name.len());
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         anyhow::bail!(
             "invalid profile name: {name:?} (only ASCII letters, digits, '_' and '-' allowed)"
         );

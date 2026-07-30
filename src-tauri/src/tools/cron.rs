@@ -38,12 +38,28 @@ const MAX_JOBS_PER_PROFILE: usize = 64;
 /// Month name→number (JAN=1..DEC=12) — accepted in the month field, as
 /// standard `crontab(5)` does. Matched case-insensitively.
 const MONTH_NAMES: &[(&str, u32)] = &[
-    ("JAN", 1), ("FEB", 2), ("MAR", 3), ("APR", 4), ("MAY", 5), ("JUN", 6),
-    ("JUL", 7), ("AUG", 8), ("SEP", 9), ("OCT", 10), ("NOV", 11), ("DEC", 12),
+    ("JAN", 1),
+    ("FEB", 2),
+    ("MAR", 3),
+    ("APR", 4),
+    ("MAY", 5),
+    ("JUN", 6),
+    ("JUL", 7),
+    ("AUG", 8),
+    ("SEP", 9),
+    ("OCT", 10),
+    ("NOV", 11),
+    ("DEC", 12),
 ];
 /// Day-of-week name→number (SUN=0..SAT=6) — accepted in the day-of-week field.
 const DAY_NAMES: &[(&str, u32)] = &[
-    ("SUN", 0), ("MON", 1), ("TUE", 2), ("WED", 3), ("THU", 4), ("FRI", 5), ("SAT", 6),
+    ("SUN", 0),
+    ("MON", 1),
+    ("TUE", 2),
+    ("WED", 3),
+    ("THU", 4),
+    ("FRI", 5),
+    ("SAT", 6),
 ];
 
 /// Validate a cron `schedule` string so the agent can never persist an
@@ -184,7 +200,12 @@ fn macro_to_fields(macro_name: &str) -> Option<[&'static str; 5]> {
 /// Does a single cron `field` (a comma-list of `*` / value / range / step /
 /// name) match `value`? Assumes a validated field (invalid parts are treated as
 /// "no match", never a panic).
-fn cron_field_matches(field: &str, value: u32, (lo, hi): (u32, u32), names: &[(&str, u32)]) -> bool {
+fn cron_field_matches(
+    field: &str,
+    value: u32,
+    (lo, hi): (u32, u32),
+    names: &[(&str, u32)],
+) -> bool {
     for part in field.split(',') {
         let (base, step) = match part.split_once('/') {
             Some((b, s)) => match s.parse::<u32>() {
@@ -446,7 +467,9 @@ impl Tool for ManageCronTool {
                                         "target_conversation_id \"{cid}\" not found in this profile"
                                     ))
                                 }
-                                Err(e) => return ToolResult::Err(format!("manage_cron failed: {e}")),
+                                Err(e) => {
+                                    return ToolResult::Err(format!("manage_cron failed: {e}"))
+                                }
                             }
                         }
                         _ => None,
@@ -480,9 +503,7 @@ impl Tool for ManageCronTool {
                         Ok(true) => ToolResult::Ok(json!({
                             "action": action, "id": id, "enabled": enabled,
                         })),
-                        Ok(false) => {
-                            ToolResult::Err(format!("no scheduled job with id \"{id}\""))
-                        }
+                        Ok(false) => ToolResult::Err(format!("no scheduled job with id \"{id}\"")),
                         Err(e) => ToolResult::Err(format!("manage_cron failed: {e}")),
                     }
                 }
@@ -495,9 +516,7 @@ impl Tool for ManageCronTool {
                         Ok(true) => ToolResult::Ok(json!({
                             "action": "delete", "id": id, "deleted": true,
                         })),
-                        Ok(false) => {
-                            ToolResult::Err(format!("no scheduled job with id \"{id}\""))
-                        }
+                        Ok(false) => ToolResult::Err(format!("no scheduled job with id \"{id}\"")),
                         Err(e) => ToolResult::Err(format!("manage_cron failed: {e}")),
                     }
                 }
@@ -513,7 +532,9 @@ impl Tool for ManageCronTool {
 fn req_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
     match args.get(key).and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
-        _ => Err(format!("manage_cron requires a non-empty string \"{key}\" arg")),
+        _ => Err(format!(
+            "manage_cron requires a non-empty string \"{key}\" arg"
+        )),
     }
 }
 
@@ -532,38 +553,83 @@ mod tests {
     fn cron_due_matches_minute_hour_and_wildcards() {
         // 2026-07-15 is a Wednesday.
         let wed_0930 = at(2026, 7, 15, 9, 30);
-        assert!(cron_due("30 9 * * *", wed_0930), "exact minute+hour, wildcards");
+        assert!(
+            cron_due("30 9 * * *", wed_0930),
+            "exact minute+hour, wildcards"
+        );
         assert!(!cron_due("31 9 * * *", wed_0930), "wrong minute");
         assert!(!cron_due("30 10 * * *", wed_0930), "wrong hour");
         assert!(cron_due("* * * * *", wed_0930), "every minute");
-        assert!(cron_due("@hourly", at(2026, 7, 15, 9, 0)), "@hourly fires at :00");
-        assert!(!cron_due("@hourly", wed_0930), "@hourly doesn't fire at :30");
-        assert!(cron_due("@daily", at(2026, 7, 15, 0, 0)), "@daily at midnight");
+        assert!(
+            cron_due("@hourly", at(2026, 7, 15, 9, 0)),
+            "@hourly fires at :00"
+        );
+        assert!(
+            !cron_due("@hourly", wed_0930),
+            "@hourly doesn't fire at :30"
+        );
+        assert!(
+            cron_due("@daily", at(2026, 7, 15, 0, 0)),
+            "@daily at midnight"
+        );
     }
 
     #[test]
     fn cron_due_handles_lists_ranges_steps_and_names() {
         assert!(cron_due("0,30 * * * *", at(2026, 7, 15, 9, 30)), "list");
-        assert!(cron_due("*/15 * * * *", at(2026, 7, 15, 9, 45)), "step /15 at :45");
-        assert!(!cron_due("*/15 * * * *", at(2026, 7, 15, 9, 46)), "step /15 not at :46");
-        assert!(cron_due("0 9-17 * * *", at(2026, 7, 15, 14, 0)), "hour range");
-        assert!(!cron_due("0 9-17 * * *", at(2026, 7, 15, 18, 0)), "outside hour range");
-        assert!(cron_due("0 0 * JUL *", at(2026, 7, 1, 0, 0)), "month by name");
-        assert!(cron_due("0 0 * * WED", at(2026, 7, 15, 0, 0)), "weekday by name (Wed)");
+        assert!(
+            cron_due("*/15 * * * *", at(2026, 7, 15, 9, 45)),
+            "step /15 at :45"
+        );
+        assert!(
+            !cron_due("*/15 * * * *", at(2026, 7, 15, 9, 46)),
+            "step /15 not at :46"
+        );
+        assert!(
+            cron_due("0 9-17 * * *", at(2026, 7, 15, 14, 0)),
+            "hour range"
+        );
+        assert!(
+            !cron_due("0 9-17 * * *", at(2026, 7, 15, 18, 0)),
+            "outside hour range"
+        );
+        assert!(
+            cron_due("0 0 * JUL *", at(2026, 7, 1, 0, 0)),
+            "month by name"
+        );
+        assert!(
+            cron_due("0 0 * * WED", at(2026, 7, 15, 0, 0)),
+            "weekday by name (Wed)"
+        );
     }
 
     #[test]
     fn cron_due_dom_dow_or_semantics_and_sunday_0_or_7() {
         // When BOTH dom and dow are restricted, EITHER matching fires it.
         // 2026-07-15 is Wed the 15th. "1,15 of month OR Monday" → the 15th matches.
-        assert!(cron_due("0 0 15 * MON", at(2026, 7, 15, 0, 0)), "dom matches (OR)");
+        assert!(
+            cron_due("0 0 15 * MON", at(2026, 7, 15, 0, 0)),
+            "dom matches (OR)"
+        );
         // 2026-07-13 is a Monday, not the 15th → dow matches (OR).
-        assert!(cron_due("0 0 15 * MON", at(2026, 7, 13, 0, 0)), "dow matches (OR)");
+        assert!(
+            cron_due("0 0 15 * MON", at(2026, 7, 13, 0, 0)),
+            "dow matches (OR)"
+        );
         // 2026-07-14 (Tue, 14th) → neither → no fire.
-        assert!(!cron_due("0 0 15 * MON", at(2026, 7, 14, 0, 0)), "neither → no fire");
+        assert!(
+            !cron_due("0 0 15 * MON", at(2026, 7, 14, 0, 0)),
+            "neither → no fire"
+        );
         // Sunday: both 0 and 7 mean Sunday. 2026-07-19 is a Sunday.
-        assert!(cron_due("0 0 * * 0", at(2026, 7, 19, 0, 0)), "dow 0 = Sunday");
-        assert!(cron_due("0 0 * * 7", at(2026, 7, 19, 0, 0)), "dow 7 = Sunday");
+        assert!(
+            cron_due("0 0 * * 0", at(2026, 7, 19, 0, 0)),
+            "dow 0 = Sunday"
+        );
+        assert!(
+            cron_due("0 0 * * 7", at(2026, 7, 19, 0, 0)),
+            "dow 7 = Sunday"
+        );
     }
 
     fn temp_storage() -> (Storage, std::path::PathBuf) {
@@ -591,29 +657,29 @@ mod tests {
             "@daily",
             "@hourly",
             "5/15 * * * *",
-            "0 9 * * MON-FRI",     // named weekday range (very common)
-            "0 0 1 JAN *",         // named month
+            "0 9 * * MON-FRI",      // named weekday range (very common)
+            "0 0 1 JAN *",          // named month
             "30 8 * * mon,wed,fri", // lowercase names in a list
-            "0 12 * DEC SUN",      // named month + named day
+            "0 12 * DEC SUN",       // named month + named day
         ] {
             assert!(validate_cron(ok).is_ok(), "should accept {ok:?}");
         }
         // Invalid forms.
         for bad in [
             "",
-            "every day",       // prose
-            "0 9 * *",         // 4 fields
-            "0 9 * * * *",     // 6 fields
-            "99 * * * *",      // minute out of range
-            "* 24 * * *",      // hour out of range
-            "* * 0 * *",       // day-of-month below 1
-            "* * * 13 *",      // month out of range
-            "10-5 * * * *",    // inverted range
-            "*/0 * * * *",     // zero step
-            "@weeklyish",      // unknown macro
-            "0 9 * * FOO",     // bogus weekday name
-            "0 9 * MON *",     // a weekday name in the MONTH field is not valid
-            "MON * * * *",     // a name in the minute field is not valid
+            "every day",    // prose
+            "0 9 * *",      // 4 fields
+            "0 9 * * * *",  // 6 fields
+            "99 * * * *",   // minute out of range
+            "* 24 * * *",   // hour out of range
+            "* * 0 * *",    // day-of-month below 1
+            "* * * 13 *",   // month out of range
+            "10-5 * * * *", // inverted range
+            "*/0 * * * *",  // zero step
+            "@weeklyish",   // unknown macro
+            "0 9 * * FOO",  // bogus weekday name
+            "0 9 * MON *",  // a weekday name in the MONTH field is not valid
+            "MON * * * *",  // a name in the minute field is not valid
         ] {
             assert!(validate_cron(bad).is_err(), "should reject {bad:?}");
         }
@@ -623,11 +689,15 @@ mod tests {
     fn manage_cron_is_dangerous_so_accept_edits_cannot_silently_run_it() {
         // Regression for the review's HIGH finding: a mutating standing-automation
         // tool must NOT be Write (which accept_edits blanket-approves).
-        let storage_dir = std::env::temp_dir().join(format!("lhp-cron-risk-{}", uuid::Uuid::new_v4()));
+        let storage_dir =
+            std::env::temp_dir().join(format!("lhp-cron-risk-{}", uuid::Uuid::new_v4()));
         let storage = Storage::open(&storage_dir).unwrap();
         let tool = ManageCronTool::new(storage);
         assert_eq!(tool.risk(), RiskClass::Dangerous);
-        assert_eq!(ListCronJobsTool::new(Storage::open(&storage_dir).unwrap()).risk(), RiskClass::Safe);
+        assert_eq!(
+            ListCronJobsTool::new(Storage::open(&storage_dir).unwrap()).risk(),
+            RiskClass::Safe
+        );
         let _ = std::fs::remove_dir_all(storage_dir);
     }
 
@@ -751,7 +821,10 @@ mod tests {
         for action in ["enable", "disable", "delete"] {
             assert!(matches!(
                 create
-                    .run(ToolInput::new(json!({"action": action, "id": "nope"})), &ctx)
+                    .run(
+                        ToolInput::new(json!({"action": action, "id": "nope"})),
+                        &ctx
+                    )
                     .await,
                 ToolResult::Err(_)
             ));

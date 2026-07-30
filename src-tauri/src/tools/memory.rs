@@ -81,8 +81,7 @@ pub enum MemoryRoute {
 /// Route a fact by the classifier's read of it: a credential span → never
 /// persist; otherwise Private/Uncertain → private-local, Public → shared.
 pub fn route_memory_sensitivity(c: &Classification) -> MemoryRoute {
-    if c
-        .spans
+    if c.spans
         .iter()
         .any(|s| s.category == RuleCategory::Credential)
     {
@@ -443,8 +442,15 @@ mod tests {
         {
             ToolResult::Ok(v) => {
                 let matches = v["matches"].as_array().unwrap();
-                assert_eq!(matches.len(), 1, "a local turn may read private-local memory");
-                assert!(matches[0]["content"].as_str().unwrap().contains("Oak Street"));
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "a local turn may read private-local memory"
+                );
+                assert!(matches[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Oak Street"));
             }
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
@@ -458,7 +464,10 @@ mod tests {
             ..ExecCtx::default()
         };
         match tool
-            .run(ToolInput::new(json!({ "query": "Oak Street home address" })), &other_ctx)
+            .run(
+                ToolInput::new(json!({ "query": "Oak Street home address" })),
+                &other_ctx,
+            )
             .await
         {
             ToolResult::Ok(v) => assert!(
@@ -468,7 +477,10 @@ mod tests {
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
         match tool
-            .run(ToolInput::new(json!({ "query": "deploy key vault" })), &other_ctx)
+            .run(
+                ToolInput::new(json!({ "query": "deploy key vault" })),
+                &other_ctx,
+            )
             .await
         {
             ToolResult::Ok(v) => assert_eq!(
@@ -481,7 +493,8 @@ mod tests {
 
         // Empty query is a usage error.
         assert!(matches!(
-            tool.run(ToolInput::new(json!({ "query": "  " })), &ctx).await,
+            tool.run(ToolInput::new(json!({ "query": "  " })), &ctx)
+                .await,
             ToolResult::Err(_)
         ));
 
@@ -503,7 +516,10 @@ mod tests {
 
         // Benign → shared, saved.
         match tool
-            .run(ToolInput::new(json!({ "content": "the standup is at 10am" })), &ctx)
+            .run(
+                ToolInput::new(json!({ "content": "the standup is at 10am" })),
+                &ctx,
+            )
             .await
         {
             ToolResult::Ok(v) => {
@@ -532,7 +548,10 @@ mod tests {
 
         // A private detail (SSN) → the local-only store.
         match tool
-            .run(ToolInput::new(json!({ "content": "my SSN is 123-45-6789" })), &ctx)
+            .run(
+                ToolInput::new(json!({ "content": "my SSN is 123-45-6789" })),
+                &ctx,
+            )
             .await
         {
             ToolResult::Ok(v) => assert_eq!(v["sensitivity"], "private_local"),
@@ -541,7 +560,11 @@ mod tests {
 
         // The credential is nowhere (even a private-inclusive search finds nothing).
         assert!(
-            storage.global().search_memory("api key", true, 10).unwrap().is_empty(),
+            storage
+                .global()
+                .search_memory("api key", true, 10)
+                .unwrap()
+                .is_empty(),
             "a credential must never be persisted"
         );
         // The SSN is in the private store only — a cloud/shared search can't see it.
@@ -551,7 +574,11 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            storage.global().search_memory("123 45 6789", true, 10).unwrap().len(),
+            storage
+                .global()
+                .search_memory("123 45 6789", true, 10)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -607,7 +634,10 @@ mod tests {
 
         // Default profile (no settings row) → Shared.
         match tool
-            .run(ToolInput::new(json!({ "content": "a borderline note" })), &ctx)
+            .run(
+                ToolInput::new(json!({ "content": "a borderline note" })),
+                &ctx,
+            )
             .await
         {
             ToolResult::Ok(v) => assert_eq!(v["sensitivity"], "shared", "default cfg ⇒ shared"),
@@ -621,7 +651,10 @@ mod tests {
             .set_classifier_config(&crate::classifier::ClassifierConfig::from_ui(100, "medium"))
             .unwrap();
         match tool
-            .run(ToolInput::new(json!({ "content": "another borderline note" })), &ctx)
+            .run(
+                ToolInput::new(json!({ "content": "another borderline note" })),
+                &ctx,
+            )
             .await
         {
             ToolResult::Ok(v) => assert_eq!(
@@ -666,20 +699,29 @@ mod hybrid_tests {
             created_at: 1,
             pinned: false,
         };
-        storage.global().insert_memory_fact_in(MemoryBucket::Shared, &fact).unwrap();
+        storage
+            .global()
+            .insert_memory_fact_in(MemoryBucket::Shared, &fact)
+            .unwrap();
         embed_fact_best_effort(storage.global(), Some(&fake), MemoryBucket::Shared, &fact);
 
         let tool =
             RecallMemoryTool::new(storage.clone()).with_embedder(Some(EmbedderHandle::ready(fake)));
         // Zero keyword overlap with the fact (and stopwords don't count).
         match tool
-            .run(ToolInput::new(json!({ "query": "sign-in secret" })), &ExecCtx::default())
+            .run(
+                ToolInput::new(json!({ "query": "sign-in secret" })),
+                &ExecCtx::default(),
+            )
             .await
         {
             ToolResult::Ok(v) => {
                 let matches = v["matches"].as_array().unwrap();
                 assert_eq!(matches.len(), 1, "meaning lane must surface the fact");
-                assert!(matches[0]["content"].as_str().unwrap().contains("door code"));
+                assert!(matches[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("door code"));
             }
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
@@ -707,7 +749,11 @@ mod hybrid_tests {
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         };
         let vecs = storage.global().list_vectors_for_fact(&saved_id).unwrap();
-        assert_eq!(vecs.len(), 1, "remember must index the fact for the meaning lane");
+        assert_eq!(
+            vecs.len(),
+            1,
+            "remember must index the fact for the meaning lane"
+        );
         assert_eq!(vecs[0].embedding.len(), 8 * 4, "8-dim f32 blob");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -738,17 +784,27 @@ mod hybrid_tests {
         storage
             .open_profile("personal")
             .unwrap()
-            .set_memory_settings(&MemorySettings { semantic_search_enabled: false, walled: false })
+            .set_memory_settings(&MemorySettings {
+                semantic_search_enabled: false,
+                walled: false,
+            })
             .unwrap();
         let off_id = match tool
-            .run(ToolInput::new(json!({ "content": "the standup is at 10am" })), &ctx)
+            .run(
+                ToolInput::new(json!({ "content": "the standup is at 10am" })),
+                &ctx,
+            )
             .await
         {
             ToolResult::Ok(v) => v["id"].as_str().unwrap().to_string(),
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         };
         assert!(
-            storage.global().list_vectors_for_fact(&off_id).unwrap().is_empty(),
+            storage
+                .global()
+                .list_vectors_for_fact(&off_id)
+                .unwrap()
+                .is_empty(),
             "semantic off ⇒ no meaning fingerprint computed"
         );
 
@@ -756,17 +812,27 @@ mod hybrid_tests {
         storage
             .open_profile("personal")
             .unwrap()
-            .set_memory_settings(&MemorySettings { semantic_search_enabled: true, walled: false })
+            .set_memory_settings(&MemorySettings {
+                semantic_search_enabled: true,
+                walled: false,
+            })
             .unwrap();
         let on_id = match tool
-            .run(ToolInput::new(json!({ "content": "the standup moved to 9am" })), &ctx)
+            .run(
+                ToolInput::new(json!({ "content": "the standup moved to 9am" })),
+                &ctx,
+            )
             .await
         {
             ToolResult::Ok(v) => v["id"].as_str().unwrap().to_string(),
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         };
         assert_eq!(
-            storage.global().list_vectors_for_fact(&on_id).unwrap().len(),
+            storage
+                .global()
+                .list_vectors_for_fact(&on_id)
+                .unwrap()
+                .len(),
             1,
             "semantic on ⇒ the meaning lane indexes the fact"
         );

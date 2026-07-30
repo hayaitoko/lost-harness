@@ -37,7 +37,10 @@ pub struct ImageBlock {
 impl ImageBlock {
     /// A PNG image block (the format screen capture emits).
     pub fn png(data_b64: impl Into<String>) -> Self {
-        Self { media_type: "image/png".to_string(), data_b64: data_b64.into() }
+        Self {
+            media_type: "image/png".to_string(),
+            data_b64: data_b64.into(),
+        }
     }
 
     /// The `data:` URI form used by OpenAI-style `image_url` content parts.
@@ -97,8 +100,14 @@ mod tests {
     #[test]
     fn no_images_is_a_bare_text_string_on_either_endpoint() {
         // An ordinary text turn must be untouched — no array-ification.
-        assert_eq!(assemble_content("hello", &[], true), Value::String("hello".into()));
-        assert_eq!(assemble_content("hello", &[], false), Value::String("hello".into()));
+        assert_eq!(
+            assemble_content("hello", &[], true),
+            Value::String("hello".into())
+        );
+        assert_eq!(
+            assemble_content("hello", &[], false),
+            Value::String("hello".into())
+        );
     }
 
     #[test]
@@ -130,8 +139,14 @@ mod tests {
         let out = assemble_content("what is this", std::slice::from_ref(&img), false);
         let s = out.as_str().expect("text-only → string");
         assert!(s.starts_with("what is this"), "the real text is preserved");
-        assert!(s.contains(TEXT_ONLY_IMAGE_PLACEHOLDER), "the model is told an image existed");
-        assert!(!s.contains("QUJD"), "the image bytes NEVER reach a text-only endpoint");
+        assert!(
+            s.contains(TEXT_ONLY_IMAGE_PLACEHOLDER),
+            "the model is told an image existed"
+        );
+        assert!(
+            !s.contains("QUJD"),
+            "the image bytes NEVER reach a text-only endpoint"
+        );
     }
 
     #[test]

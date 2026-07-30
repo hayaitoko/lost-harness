@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use super::*;
 use crate::agent::gate::{Binding, PrivacyGate};
-use crate::models::{Provider, ProviderKind};
 use crate::classifier::HeuristicClassifier;
+use crate::models::{Provider, ProviderKind};
 
 // ── test-only hooks for ordering/short-circuit assertions ───────────────
 
@@ -86,7 +86,11 @@ fn deny_short_circuits_and_later_hooks_never_run() {
         other => panic!("expected Deny, got {other:?}"),
     }
     assert_eq!(denied_by, Some("second"));
-    assert_eq!(c1.load(Ordering::SeqCst), 1, "hook before the deny must run");
+    assert_eq!(
+        c1.load(Ordering::SeqCst),
+        1,
+        "hook before the deny must run"
+    );
     assert_eq!(c2.load(Ordering::SeqCst), 1);
     assert_eq!(
         c3.load(Ordering::SeqCst),
@@ -123,7 +127,10 @@ fn first_deny_wins_when_multiple_hooks_would_deny() {
     // Only the FIRST would-be-Deny hook should ever get the chance to
     // fire; a later hook that would also deny must never run at all.
     let (h1, c1) = recording("first_denier", HookResult::Deny("first reason".to_string()));
-    let (h2, c2) = recording("second_denier", HookResult::Deny("second reason".to_string()));
+    let (h2, c2) = recording(
+        "second_denier",
+        HookResult::Deny("second reason".to_string()),
+    );
 
     let mut chain = HookChain::new();
     chain.register_gating(h1);
@@ -186,7 +193,13 @@ fn default_pretooluse_chain_is_in_spec_order() {
     let chain = build_pretooluse_chain(real_gate(), policy);
     assert_eq!(
         chain.gating_names(),
-        vec!["privacy_filter", "sandbox", "protected_path", "permission", "first_use_confirm"]
+        vec![
+            "privacy_filter",
+            "sandbox",
+            "protected_path",
+            "permission",
+            "first_use_confirm"
+        ]
     );
 }
 
@@ -438,7 +451,14 @@ fn plan_mode_allows_reads_and_denies_every_mutation_through_the_full_chain() {
             .with_risk(risk)
             .with_session_mode(SessionMode::Plan);
         let (rm, by) = chain.run_gating(&mut m);
-        assert!(matches!(rm, HookResult::Deny(_)), "plan denies {risk:?}; got {rm:?}");
-        assert_eq!(by, Some("session_mode"), "plan denial comes from the session_mode hook");
+        assert!(
+            matches!(rm, HookResult::Deny(_)),
+            "plan denies {risk:?}; got {rm:?}"
+        );
+        assert_eq!(
+            by,
+            Some("session_mode"),
+            "plan denial comes from the session_mode hook"
+        );
     }
 }

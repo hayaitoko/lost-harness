@@ -24,7 +24,10 @@ fn restricted_to_excludes_every_tool_not_in_the_allowlist() {
     // (available_tools) nor a direct dispatch (get) can reach them.
     let sub = registry().restricted_to(&allow(&["echo"]));
     assert!(sub.get("echo").is_some());
-    assert!(sub.get("screenshot").is_none(), "a tool outside the belt is not lookupable");
+    assert!(
+        sub.get("screenshot").is_none(),
+        "a tool outside the belt is not lookupable"
+    );
     assert!(sub.get("sync_file").is_none());
     let names: Vec<String> = sub
         .available_tools(&BodyEnv::app_default())
@@ -40,9 +43,16 @@ fn restricted_to_is_an_intersection_never_a_widening() {
     // a persona can never gain a capability the parent body doesn't have.
     let sub = registry().restricted_to(&allow(&["echo", "shell_exec", "ghost_tool"]));
     assert!(sub.get("echo").is_some());
-    assert!(sub.get("shell_exec").is_none(), "not registered → not granted");
+    assert!(
+        sub.get("shell_exec").is_none(),
+        "not registered → not granted"
+    );
     assert!(sub.get("ghost_tool").is_none());
-    assert_eq!(sub.len(), 1, "only the intersection with the registered set survives");
+    assert_eq!(
+        sub.len(),
+        1,
+        "only the intersection with the registered set survives"
+    );
 }
 
 #[test]
@@ -52,11 +62,23 @@ fn restricted_to_still_applies_the_env_capability_filter() {
     // Network) is allowed but an env with neither can't offer it.
     let sub = registry().restricted_to(&allow(&["echo", "sync_file"]));
     let bare = BodyEnv::empty();
-    let names: Vec<String> = sub.available_tools(&bare).into_iter().map(|t| t.name().to_string()).collect();
-    assert_eq!(names, vec!["echo"], "sync_file is allowed but ungranted by this env");
+    let names: Vec<String> = sub
+        .available_tools(&bare)
+        .into_iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["echo"],
+        "sync_file is allowed but ungranted by this env"
+    );
     // With the capabilities present, the allowed tool becomes available.
     let full = BodyEnv::new([Capability::Filesystem, Capability::Network]);
-    let names2: Vec<String> = sub.available_tools(&full).into_iter().map(|t| t.name().to_string()).collect();
+    let names2: Vec<String> = sub
+        .available_tools(&full)
+        .into_iter()
+        .map(|t| t.name().to_string())
+        .collect();
     assert!(names2.iter().any(|n| n == "sync_file") && names2.iter().any(|n| n == "echo"));
 }
 
@@ -76,7 +98,10 @@ fn no_requirements_tool_available_everywhere() {
         .into_iter()
         .map(|t| t.name().to_string())
         .collect();
-    assert!(names.iter().any(|n| n == "echo"), "echo has no requirements, should always be available");
+    assert!(
+        names.iter().any(|n| n == "echo"),
+        "echo has no requirements, should always be available"
+    );
     assert!(!names.iter().any(|n| n == "screenshot"));
     assert!(!names.iter().any(|n| n == "sync_file"));
 }

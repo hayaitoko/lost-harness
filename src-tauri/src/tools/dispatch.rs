@@ -33,7 +33,9 @@ use crate::models::{ChatMessage, OwnOutput};
 use crate::tools::calling::{
     guard_wrap, neutralize_untrusted, parse_tool_calls, render_tool_catalog, ParsedToolCall,
 };
-use crate::tools::{BodyEnv, ConversationReads, ExecCtx, RiskClass, ToolCall, ToolInput, ToolRegistry, ToolResult};
+use crate::tools::{
+    BodyEnv, ConversationReads, ExecCtx, RiskClass, ToolCall, ToolInput, ToolRegistry, ToolResult,
+};
 
 // ── Q4 do-now budgets ──────────────────────────────────────────────────────
 //
@@ -392,13 +394,15 @@ impl ToolDispatcher {
             .expect("run_state mutex poisoned")
             .run_nonce
             .clone();
-        let jkey = format!("action:{}:{run_nonce}:{fingerprint}", run_ctx.conversation_id);
+        let jkey = format!(
+            "action:{}:{run_nonce}:{fingerprint}",
+            run_ctx.conversation_id
+        );
         match db.find_work_item_by_claim_key(&jkey) {
             // A recorded SUCCESS is immutable — replay, never re-run.
             Ok(Some(prior)) if prior.state == WorkState::Done => {
                 let raw = prior.result_json.unwrap_or_default();
-                let value =
-                    serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+                let value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
                 return ToolOutcome::Ok(value);
             }
             // In-flight double-fire (or a crash row boot hasn't reconciled yet).
@@ -453,9 +457,13 @@ impl ToolDispatcher {
         // completed effect as refused would be worse than a stale `running` row
         // (which the boot pass terminalizes like any crash).
         let fin = match &result {
-            ToolResult::Ok(v) => {
-                db.finish_work_item(&row_id, WorkState::Done, Some(&v.to_string()), None, finished)
-            }
+            ToolResult::Ok(v) => db.finish_work_item(
+                &row_id,
+                WorkState::Done,
+                Some(&v.to_string()),
+                None,
+                finished,
+            ),
             ToolResult::Err(e) => {
                 db.finish_work_item(&row_id, WorkState::Failed, None, Some(e), finished)
             }
@@ -631,7 +639,13 @@ impl ToolDispatcher {
     ) -> ToolOutcome {
         let start = std::time::Instant::now();
         let outcome = self.dispatch_inner(call, ctx, binding, is_cloud).await;
-        self.fire_audit(call, ctx, is_cloud, &outcome, start.elapsed().as_millis() as i64);
+        self.fire_audit(
+            call,
+            ctx,
+            is_cloud,
+            &outcome,
+            start.elapsed().as_millis() as i64,
+        );
         outcome
     }
 
@@ -646,7 +660,10 @@ impl ToolDispatcher {
         binding: Binding,
         is_cloud: bool,
     ) -> ToolOutcome {
-        let Some(tool) = self.registry.get(&call.name).or_else(|| self.lazy_resolve_skill(&call.name))
+        let Some(tool) = self
+            .registry
+            .get(&call.name)
+            .or_else(|| self.lazy_resolve_skill(&call.name))
         else {
             return ToolOutcome::Unknown(format!("no tool named '{}'", call.name));
         };
@@ -776,7 +793,14 @@ impl ToolDispatcher {
                     if mutating {
                         if let Some(storage) = &self.journal {
                             return self
-                                .run_journaled(storage, tool.as_ref(), &ev, &run_ctx, &fingerprint, &canonical)
+                                .run_journaled(
+                                    storage,
+                                    tool.as_ref(),
+                                    &ev,
+                                    &run_ctx,
+                                    &fingerprint,
+                                    &canonical,
+                                )
                                 .await;
                         }
                     }
@@ -838,8 +862,12 @@ impl ToolDispatcher {
                             // approved it in person); only the STANDING
                             // coverage is narrowed. Replaces the item-7
                             // Dangerous-only collapse hack with the full matrix.
-                            let (scope, target) =
-                                crate::hooks::resolve_grant(tool.risk(), scope, target, &fingerprint);
+                            let (scope, target) = crate::hooks::resolve_grant(
+                                tool.risk(),
+                                scope,
+                                target,
+                                &fingerprint,
+                            );
                             self.ledger.grant(target, scope);
                             // The protected-paths floor is Once-only by
                             // construction (it checks `covers_once`, not
@@ -1090,8 +1118,7 @@ impl ToolDispatcher {
                     // scoped so we never hold the guard across the await.
                     let fingerprint = ActionFingerprint::of(&call.name, &call.args);
                     let budget_denial: Option<(String, bool)> = {
-                        let mut state =
-                            self.run_state.lock().expect("run_state mutex poisoned");
+                        let mut state = self.run_state.lock().expect("run_state mutex poisoned");
                         if state.dispatch_count >= PER_RUN_DISPATCH_CEILING {
                             Some((
                                 format!(
@@ -1108,10 +1135,7 @@ impl ToolDispatcher {
                             .count()
                             >= REPEAT_DETECTION_THRESHOLD - 1
                         {
-                            Some((
-                                "repeat detected — same call, same args".to_string(),
-                                false,
-                            ))
+                            Some(("repeat detected — same call, same args".to_string(), false))
                         } else {
                             state.dispatch_count += 1;
                             if state.recent_fingerprints.len() >= PER_RUN_DISPATCH_CEILING {
@@ -1297,7 +1321,10 @@ fn format_outcome(name: &str, outcome: ToolOutcome) -> String {
         }
         ToolOutcome::Err(msg) => format!("[tool {name} → error] {}", neutralize_untrusted(&msg)),
         ToolOutcome::Denied { by, reason } => {
-            format!("[tool {name} → denied by {by}] {}", neutralize_untrusted(&reason))
+            format!(
+                "[tool {name} → denied by {by}] {}",
+                neutralize_untrusted(&reason)
+            )
         }
         ToolOutcome::Ask { by, prompt } => format!(
             "[tool {name} → needs approval ({by}); not granted this round, so it did not run] {}",
@@ -1307,7 +1334,10 @@ fn format_outcome(name: &str, outcome: ToolOutcome) -> String {
             format!("[tool {name} → unavailable] {}", neutralize_untrusted(&msg))
         }
         ToolOutcome::Unknown(msg) => {
-            format!("[tool {name} → unknown tool] {}", neutralize_untrusted(&msg))
+            format!(
+                "[tool {name} → unknown tool] {}",
+                neutralize_untrusted(&msg)
+            )
         }
         // Byte-identical to the wording the old `Denied{by:"privacy-filter"}`
         // arm produced — so a reroute with NO local candidate (see
@@ -1332,13 +1362,13 @@ mod tests {
 
     use super::*;
     use crate::agent::gate::PrivacyGate;
+    use crate::classifier::HeuristicClassifier;
     use crate::hooks::{
         build_pretooluse_chain, build_pretooluse_chain_full, build_pretooluse_chain_with_confirmed,
         GrantScope, GrantTarget, InMemoryPolicySource, PermissionMode,
     };
     use crate::tools::fs::ReadFileTool;
     use crate::tools::{Capability, EchoTool, SyncFileTool, Tool};
-    use crate::classifier::HeuristicClassifier;
 
     /// Test-only constructor. `OwnOutput::from_stream_assembly` is `pub(crate)`,
     /// so this compiles from any test module in the crate.
@@ -1462,7 +1492,12 @@ mod tests {
         let dispatcher = ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty());
 
         let outcome = dispatcher
-            .dispatch(&call("echo", serde_json::json!({"x": 1})), &ctx(), Binding::Public, true)
+            .dispatch(
+                &call("echo", serde_json::json!({"x": 1})),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
             .await;
         assert_eq!(outcome, ToolOutcome::Ok(serde_json::json!({"x": 1})));
     }
@@ -1471,7 +1506,12 @@ mod tests {
     async fn unknown_tool_is_reported() {
         let dispatcher = ToolDispatcher::empty();
         let outcome = dispatcher
-            .dispatch(&call("nope", serde_json::Value::Null), &ctx(), Binding::Public, true)
+            .dispatch(
+                &call("nope", serde_json::Value::Null),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
             .await;
         assert!(matches!(outcome, ToolOutcome::Unknown(_)));
     }
@@ -1480,11 +1520,16 @@ mod tests {
     async fn tool_missing_capability_is_unavailable() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(SyncFileTool)); // needs Filesystem + Network
-        // Environment provides neither.
+                                                   // Environment provides neither.
         let dispatcher = ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty());
 
         let outcome = dispatcher
-            .dispatch(&call("sync_file", serde_json::Value::Null), &ctx(), Binding::Public, true)
+            .dispatch(
+                &call("sync_file", serde_json::Value::Null),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
             .await;
         assert!(matches!(outcome, ToolOutcome::Unavailable(_)));
     }
@@ -1573,10 +1618,15 @@ mod tests {
             )
             .await;
         match outcome {
-            ToolOutcome::Denied { by, .. } => assert_eq!(by, "sandbox", "the full gate still fires"),
+            ToolOutcome::Denied { by, .. } => {
+                assert_eq!(by, "sandbox", "the full gate still fires")
+            }
             other => panic!("expected sandbox Denied through the sub-dispatcher, got {other:?}"),
         }
-        assert!(!ran.load(Ordering::SeqCst), "a denied call never runs, even in a sub-agent");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a denied call never runs, even in a sub-agent"
+        );
     }
 
     #[tokio::test]
@@ -1618,7 +1668,11 @@ mod tests {
             .feedback();
 
         assert_eq!(feedback.role, "user");
-        assert!(feedback.content.contains("hello from disk"), "content: {}", feedback.content);
+        assert!(
+            feedback.content.contains("hello from disk"),
+            "content: {}",
+            feedback.content
+        );
         assert!(feedback.content.contains("UNTRUSTED TOOL OUTPUT"));
         assert!(feedback.content.contains("read_file → ok"));
     }
@@ -1697,7 +1751,10 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(
-                &call("remote_tool", serde_json::json!({"note": "private payload"})),
+                &call(
+                    "remote_tool",
+                    serde_json::json!({"note": "private payload"}),
+                ),
                 &ctx(),
                 Binding::Private,
                 false, // local model; the tool destination is still off-box
@@ -1707,7 +1764,10 @@ mod tests {
             matches!(outcome, ToolOutcome::Denied { ref by, .. } if by == "privacy_filter"),
             "Private + local model + off-box tool must be privacy-denied, got {outcome:?}"
         );
-        assert!(!ran.load(Ordering::SeqCst), "the off-box tool must never run");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the off-box tool must never run"
+        );
     }
 
     #[tokio::test]
@@ -1723,13 +1783,8 @@ mod tests {
         let ledger = Arc::new(ApprovalLedger::new());
         let mut policy = InMemoryPolicySource::new();
         policy.set_mode("remote_tool", PermissionMode::Ask);
-        let chain = build_pretooluse_chain_full(
-            gate(),
-            Box::new(policy),
-            &[],
-            Arc::clone(&ledger),
-            None,
-        );
+        let chain =
+            build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger), None);
         let prompter = Arc::new(MockPrompter {
             response: MockResponse::ApproveOnceAction,
             calls: asks.clone(),
@@ -1745,12 +1800,19 @@ mod tests {
                 false,
             )
             .await;
-        assert_eq!(asks.load(Ordering::SeqCst), 1, "the External floor still asks once");
+        assert_eq!(
+            asks.load(Ordering::SeqCst),
+            1,
+            "the External floor still asks once"
+        );
         assert!(
             matches!(outcome, ToolOutcome::Denied { ref by, .. } if by == "privacy_filter"),
             "approval must not override the privacy gate, got {outcome:?}"
         );
-        assert!(!ran.load(Ordering::SeqCst), "private content must never reach the off-box tool");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "private content must never reach the off-box tool"
+        );
     }
 
     // ── item 6: NeedsLocalReroute + TurnOutcome ──────────────────────────
@@ -1805,7 +1867,10 @@ mod tests {
             matches!(outcome, ToolOutcome::NeedsLocalReroute { .. }),
             "PII on cloud must be NeedsLocalReroute, got {outcome:?}"
         );
-        assert!(!ran.load(Ordering::SeqCst), "a rerouted call must never run the tool");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a rerouted call must never run the tool"
+        );
     }
 
     #[test]
@@ -1830,7 +1895,12 @@ mod tests {
         // Test 6.
         let dispatcher = reroute_echo_dispatcher();
         let out = dispatcher
-            .run_turn(&own(&one_block("echo", pii_args())), &ctx(), Binding::Auto, true)
+            .run_turn(
+                &own(&one_block("echo", pii_args())),
+                &ctx(),
+                Binding::Auto,
+                true,
+            )
             .await;
         match out {
             TurnOutcome::NeedsLocalReroute {
@@ -1866,7 +1936,11 @@ mod tests {
                 ..
             } => {
                 assert_eq!(prior_sections.len(), 1, "prior: {prior_sections:?}");
-                assert!(prior_sections[0].contains("→ ok"), "prior[0]: {}", prior_sections[0]);
+                assert!(
+                    prior_sections[0].contains("→ ok"),
+                    "prior[0]: {}",
+                    prior_sections[0]
+                );
                 assert!(remaining.is_empty(), "remaining: {remaining:?}");
             }
             other => panic!("expected NeedsLocalReroute, got {other:?}"),
@@ -1926,7 +2000,10 @@ mod tests {
             )
             .await;
         assert!(msg.content.contains("→ ok"), "content: {}", msg.content);
-        assert!(ran.load(Ordering::SeqCst), "resume runs on is_cloud=false → the tool must run");
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "resume runs on is_cloud=false → the tool must run"
+        );
     }
 
     #[tokio::test]
@@ -1934,7 +2011,10 @@ mod tests {
         // Test 10: prior section, then the resumed call, then remaining.
         let dispatcher = reroute_echo_dispatcher();
         let prior = vec!["PRIOR_SECTION_MARKER".to_string()];
-        let remaining = vec![ParsedToolCall::Call(call("echo", serde_json::json!({"n": 99})))];
+        let remaining = vec![ParsedToolCall::Call(call(
+            "echo",
+            serde_json::json!({"n": 99}),
+        ))];
         let msg = dispatcher
             .resume_after_local_switch(
                 call("echo", serde_json::json!({"n": 1})),
@@ -1946,9 +2026,16 @@ mod tests {
                 false,
             )
             .await;
-        let marker = msg.content.find("PRIOR_SECTION_MARKER").expect("prior section present");
+        let marker = msg
+            .content
+            .find("PRIOR_SECTION_MARKER")
+            .expect("prior section present");
         let first_ok = msg.content.find("→ ok").expect("resumed call ran");
-        assert!(marker < first_ok, "prior must precede the resumed output: {}", msg.content);
+        assert!(
+            marker < first_ok,
+            "prior must precede the resumed output: {}",
+            msg.content
+        );
         assert_eq!(
             msg.content.matches("→ ok").count(),
             2,
@@ -1982,7 +2069,10 @@ mod tests {
         let msg = dispatcher
             .resume_after_local_switch(
                 call("echo", serde_json::json!({"n": 1})), // the rerouted Safe call
-                vec![ParsedToolCall::Call(call("write_c", serde_json::json!({"v": 2})))],
+                vec![ParsedToolCall::Call(call(
+                    "write_c",
+                    serde_json::json!({"v": 2}),
+                ))],
                 vec![],
                 &ctx(),
                 Binding::Public,
@@ -2001,7 +2091,10 @@ mod tests {
             "the non-Safe remaining call must be cascade-skipped after the reroute: {}",
             msg.content
         );
-        assert!(!ran_c.load(Ordering::SeqCst), "write_c must never run under an active cascade");
+        assert!(
+            !ran_c.load(Ordering::SeqCst),
+            "write_c must never run under an active cascade"
+        );
     }
 
     #[tokio::test]
@@ -2052,9 +2145,10 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = ApprovalDecision> + Send + 'a>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let decision = match self.response {
-                MockResponse::ApproveOnceAction => {
-                    ApprovalDecision::Approve(GrantScope::Once, GrantTarget::Fingerprint(req.fingerprint))
-                }
+                MockResponse::ApproveOnceAction => ApprovalDecision::Approve(
+                    GrantScope::Once,
+                    GrantTarget::Fingerprint(req.fingerprint),
+                ),
                 MockResponse::ApproveSessionTool => {
                     ApprovalDecision::Approve(GrantScope::Session, GrantTarget::Tool(req.tool_name))
                 }
@@ -2084,7 +2178,10 @@ mod tests {
         let chain =
             build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger), None);
 
-        let prompter = Arc::new(MockPrompter { response, calls: calls.clone() });
+        let prompter = Arc::new(MockPrompter {
+            response,
+            calls: calls.clone(),
+        });
         let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
             .with_approval(ledger, Some(prompter));
         (dispatcher, ran, calls)
@@ -2094,9 +2191,17 @@ mod tests {
     async fn approving_once_runs_the_tool() {
         let (dispatcher, ran, calls) = ask_mode_dispatcher(MockResponse::ApproveOnceAction);
         let outcome = dispatcher
-            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "ls"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(outcome, ToolOutcome::Ok(_)), "approve → runs, got {outcome:?}");
+        assert!(
+            matches!(outcome, ToolOutcome::Ok(_)),
+            "approve → runs, got {outcome:?}"
+        );
         assert!(ran.load(Ordering::SeqCst), "an approved call must run");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "asked exactly once");
     }
@@ -2105,26 +2210,42 @@ mod tests {
     async fn declining_blocks_the_tool() {
         let (dispatcher, ran, _calls) = ask_mode_dispatcher(MockResponse::Deny);
         let outcome = dispatcher
-            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "ls"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
         match outcome {
             ToolOutcome::Denied { by, .. } => assert_eq!(by, "user"),
             other => panic!("decline → Denied by user, got {other:?}"),
         }
-        assert!(!ran.load(Ordering::SeqCst), "a declined call must never run");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a declined call must never run"
+        );
     }
 
     #[tokio::test]
     async fn timing_out_denies_by_default() {
         let (dispatcher, ran, _calls) = ask_mode_dispatcher(MockResponse::Timeout);
         let outcome = dispatcher
-            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "ls"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
         match outcome {
             ToolOutcome::Denied { by, .. } => assert_eq!(by, "approval"),
             other => panic!("timeout → Denied by approval, got {other:?}"),
         }
-        assert!(!ran.load(Ordering::SeqCst), "a timed-out call must never run");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a timed-out call must never run"
+        );
     }
 
     #[tokio::test]
@@ -2132,15 +2253,35 @@ mod tests {
         let (dispatcher, ran, calls) = ask_mode_dispatcher(MockResponse::ApproveSessionTool);
         // First call prompts and approves the whole tool for the session.
         let o1 = dispatcher
-            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "ls"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(o1, ToolOutcome::Ok(_)), "first call should run, got {o1:?}");
+        assert!(
+            matches!(o1, ToolOutcome::Ok(_)),
+            "first call should run, got {o1:?}"
+        );
         // Second call with DIFFERENT args is covered by the session-tool grant.
         let o2 = dispatcher
-            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "pwd"})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "pwd"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(o2, ToolOutcome::Ok(_)), "second call should run, got {o2:?}");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "a session grant must not re-prompt");
+        assert!(
+            matches!(o2, ToolOutcome::Ok(_)),
+            "second call should run, got {o2:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a session grant must not re-prompt"
+        );
         assert!(ran.load(Ordering::SeqCst));
     }
 
@@ -2148,13 +2289,20 @@ mod tests {
     async fn no_approver_falls_back_to_surfacing_ask() {
         // Ask-mode tool but NO prompter wired → round-1 behavior (surface Ask).
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(SpyTool { ran: Arc::new(AtomicBool::new(false)) }));
+        registry.register(Box::new(SpyTool {
+            ran: Arc::new(AtomicBool::new(false)),
+        }));
         let mut policy = InMemoryPolicySource::new();
         policy.set_mode("shell_exec", PermissionMode::Ask);
         let chain = build_pretooluse_chain(gate(), Box::new(policy));
         let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty());
         let outcome = dispatcher
-            .dispatch(&call("shell_exec", serde_json::json!({"cmd": "ls"})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"cmd": "ls"})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
         assert!(
             matches!(outcome, ToolOutcome::Ask { .. }),
@@ -2186,19 +2334,30 @@ mod tests {
             response: MockResponse::ApproveOnceAction,
             calls: calls.clone(),
         });
-        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::new([Capability::Filesystem]))
-            .with_approval(ledger, Some(prompter));
+        let dispatcher =
+            ToolDispatcher::new(registry, chain, BodyEnv::new([Capability::Filesystem]))
+                .with_approval(ledger, Some(prompter));
 
         let outcome = dispatcher
             .dispatch(
-                &call("write_file", serde_json::json!({"path": "note.txt", "content": "hi"})),
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": "note.txt", "content": "hi"}),
+                ),
                 &ctx(),
                 Binding::Public,
                 false,
             )
             .await;
-        assert!(matches!(outcome, ToolOutcome::Ok(_)), "approved write should run, got {outcome:?}");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "should have prompted exactly once");
+        assert!(
+            matches!(outcome, ToolOutcome::Ok(_)),
+            "approved write should run, got {outcome:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should have prompted exactly once"
+        );
         assert_eq!(
             std::fs::read_to_string(ws.join("note.txt")).unwrap(),
             "hi",
@@ -2236,7 +2395,10 @@ mod tests {
         // 1) Blind overwrite of an existing file → refused by the guard.
         let blind = dispatcher
             .dispatch(
-                &call("write_file", serde_json::json!({"path": "doc.txt", "content": "x"})),
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": "doc.txt", "content": "x"}),
+                ),
                 &ctx(),
                 Binding::Public,
                 false,
@@ -2246,7 +2408,10 @@ mod tests {
             matches!(blind, ToolOutcome::Err(ref e) if e.contains("read_file it first")),
             "blind overwrite must be refused, got {blind:?}"
         );
-        assert_eq!(std::fs::read_to_string(ws.join("doc.txt")).unwrap(), "original");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("doc.txt")).unwrap(),
+            "original"
+        );
 
         // 2) Read it (records into the dispatcher's shared read-set)…
         let _ = dispatcher
@@ -2260,7 +2425,10 @@ mod tests {
         // 3) …now the write on a LATER dispatch call is allowed.
         let ok = dispatcher
             .dispatch(
-                &call("write_file", serde_json::json!({"path": "doc.txt", "content": "rewritten"})),
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": "doc.txt", "content": "rewritten"}),
+                ),
                 &ctx(),
                 Binding::Public,
                 false,
@@ -2270,7 +2438,10 @@ mod tests {
             matches!(ok, ToolOutcome::Ok(_)),
             "read→write across calls must be allowed, got {ok:?}"
         );
-        assert_eq!(std::fs::read_to_string(ws.join("doc.txt")).unwrap(), "rewritten");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("doc.txt")).unwrap(),
+            "rewritten"
+        );
     }
 
     // ── Q4 do-now item 2: per-turn + per-run budgets, repeat detection,
@@ -2404,14 +2575,20 @@ mod tests {
             .iter()
             .filter(|s| s.contains("→ denied by budget"))
             .count();
-        assert_eq!(budget_sections, 1, "expected 1 budget denial, got {budget_sections}");
+        assert_eq!(
+            budget_sections, 1,
+            "expected 1 budget denial, got {budget_sections}"
+        );
 
         // The budget denial must mention the limit and the suppressed tail.
         let budget = sections
             .iter()
             .find(|s| s.contains("→ denied by budget"))
             .expect("budget denial present");
-        assert!(budget.contains("per-turn tool-call limit (8)"), "reason: {budget}");
+        assert!(
+            budget.contains("per-turn tool-call limit (8)"),
+            "reason: {budget}"
+        );
         assert!(budget.contains("2 further call(s)"), "reason: {budget}");
     }
 
@@ -2434,12 +2611,7 @@ mod tests {
         ];
 
         let feedback = dispatcher
-            .run_turn(
-                &own(&model_output(&blocks)),
-                &ctx(),
-                Binding::Public,
-                false,
-            )
+            .run_turn(&own(&model_output(&blocks)), &ctx(), Binding::Public, false)
             .await
             .feedback();
 
@@ -2516,7 +2688,10 @@ mod tests {
                 .count();
         }
 
-        assert_eq!(total_ok, 50, "first 50 dispatches should run, got {total_ok}");
+        assert_eq!(
+            total_ok, 50,
+            "first 50 dispatches should run, got {total_ok}"
+        );
         assert_eq!(
             total_budget, 1,
             "exactly one budget denial (the 51st), got {total_budget}"
@@ -2534,7 +2709,12 @@ mod tests {
         for i in 0..50 {
             let block = format!(r#"{{"name": "echo", "args": {{"n": {i}}}}}"#);
             let feedback = dispatcher
-                .run_turn(&own(&model_output(&[block.as_str()])), &ctx(), Binding::Public, false)
+                .run_turn(
+                    &own(&model_output(&[block.as_str()])),
+                    &ctx(),
+                    Binding::Public,
+                    false,
+                )
                 .await
                 .feedback();
             assert!(
@@ -2588,26 +2768,54 @@ mod tests {
         let block = r#"{"name": "echo", "args": {"x": 1}}"#;
 
         let r1 = dispatcher
-            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .run_turn(
+                &own(&model_output(&[block])),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await
             .feedback();
         let r2 = dispatcher
-            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .run_turn(
+                &own(&model_output(&[block])),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await
             .feedback();
         let r3 = dispatcher
-            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .run_turn(
+                &own(&model_output(&[block])),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await
             .feedback();
 
-        assert!(r1.content.contains("[tool echo → ok]"), "call 1: {}", r1.content);
-        assert!(r2.content.contains("[tool echo → ok]"), "call 2: {}", r2.content);
+        assert!(
+            r1.content.contains("[tool echo → ok]"),
+            "call 1: {}",
+            r1.content
+        );
+        assert!(
+            r2.content.contains("[tool echo → ok]"),
+            "call 2: {}",
+            r2.content
+        );
 
         // Call 3 must be denied by budget with the exact repeat-detection
         // reason string (quoted verbatim in docs/tool-system-decisions.md).
-        assert!(r3.content.contains("→ denied by budget"), "call 3: {}", r3.content);
         assert!(
-            r3.content.contains("repeat detected — same call, same args"),
+            r3.content.contains("→ denied by budget"),
+            "call 3: {}",
+            r3.content
+        );
+        assert!(
+            r3.content
+                .contains("repeat detected — same call, same args"),
             "call 3 reason: {}",
             r3.content
         );
@@ -2622,7 +2830,12 @@ mod tests {
         for i in 0..3 {
             let block = format!(r#"{{"name": "echo", "args": {{"n": {i}}}}}"#);
             let feedback = dispatcher
-                .run_turn(&own(&model_output(&[block.as_str()])), &ctx(), Binding::Public, false)
+                .run_turn(
+                    &own(&model_output(&[block.as_str()])),
+                    &ctx(),
+                    Binding::Public,
+                    false,
+                )
                 .await
                 .feedback();
             assert!(
@@ -2725,13 +2938,8 @@ mod tests {
         let mut policy = InMemoryPolicySource::new();
         policy.set_mode("shell_exec", PermissionMode::Allow); // sandbox will still deny
         policy.set_mode("tool_b", PermissionMode::Ask);
-        let chain = build_pretooluse_chain_full(
-            gate(),
-            Box::new(policy),
-            &[],
-            Arc::clone(&ledger),
-            None,
-        );
+        let chain =
+            build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger), None);
 
         let prompter: Arc<dyn ApprovalPrompter> = Arc::new(MockPrompter {
             response: MockResponse::Deny, // outcome for tool_b doesn't matter; the
@@ -2789,7 +2997,7 @@ mod tests {
         write_file_mode: PermissionMode,
     ) -> (
         ToolDispatcher,
-        Arc<AtomicUsize>, // prompter calls
+        Arc<AtomicUsize>,   // prompter calls
         std::path::PathBuf, // workspace root
     ) {
         use crate::tools::fs::WriteFileTool;
@@ -2837,8 +3045,9 @@ mod tests {
             response,
             calls: calls.clone(),
         });
-        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::new([Capability::Filesystem]))
-            .with_approval(ledger, Some(prompter));
+        let dispatcher =
+            ToolDispatcher::new(registry, chain, BodyEnv::new([Capability::Filesystem]))
+                .with_approval(ledger, Some(prompter));
         (dispatcher, calls, profile_root)
     }
 
@@ -2971,7 +3180,10 @@ mod tests {
 
         let outcome = dispatcher
             .dispatch(
-                &call("write_file", serde_json::json!({"path": "alias/pwned", "content": "x"})),
+                &call(
+                    "write_file",
+                    serde_json::json!({"path": "alias/pwned", "content": "x"}),
+                ),
                 &ctx(),
                 Binding::Public,
                 false,
@@ -3053,8 +3265,7 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(SpyTool { ran: ran.clone() }));
-        let chain =
-            build_pretooluse_chain(gate(), Box::new(allow_policy(&["shell_exec"])));
+        let chain = build_pretooluse_chain(gate(), Box::new(allow_policy(&["shell_exec"])));
         let (dispatcher, entries) = with_audit(registry, chain, BodyEnv::empty());
 
         let outcome = dispatcher
@@ -3133,11 +3344,8 @@ mod tests {
         // audit must still fire (Unknown is a load-bearing audit
         // entry — a model hallucinating a tool name is exactly the
         // thing an Activity pane should surface).
-        let (dispatcher, entries) = with_audit(
-            ToolRegistry::new(),
-            HookChain::new(),
-            BodyEnv::empty(),
-        );
+        let (dispatcher, entries) =
+            with_audit(ToolRegistry::new(), HookChain::new(), BodyEnv::empty());
         let outcome = dispatcher
             .dispatch(
                 &call("nope", serde_json::Value::Null),
@@ -3166,8 +3374,7 @@ mod tests {
         // before the gating chain. The audit row must still fire.
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(SyncFileTool));
-        let (dispatcher, entries) =
-            with_audit(registry, HookChain::new(), BodyEnv::empty());
+        let (dispatcher, entries) = with_audit(registry, HookChain::new(), BodyEnv::empty());
         let outcome = dispatcher
             .dispatch(
                 &call("sync_file", serde_json::Value::Null),
@@ -3196,8 +3403,7 @@ mod tests {
         // contract: no panic, normal outcome, nothing to assert on.
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
-        let dispatcher =
-            ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty());
+        let dispatcher = ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty());
         let outcome = dispatcher
             .dispatch(
                 &call("echo", serde_json::json!({})),
@@ -3223,24 +3429,44 @@ mod tests {
         let block = r#"{"name": "echo", "args": {"x": 1}}"#;
 
         let r1 = dispatcher
-            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .run_turn(
+                &own(&model_output(&[block])),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await
             .feedback();
         let r2 = dispatcher
-            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .run_turn(
+                &own(&model_output(&[block])),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await
             .feedback();
         let r3 = dispatcher
-            .run_turn(&own(&model_output(&[block])), &ctx(), Binding::Public, false)
+            .run_turn(
+                &own(&model_output(&[block])),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await
             .feedback();
 
         // Observer-only: the text fed back to the model is exactly as before.
         assert!(r1.content.contains("[tool echo → ok]"));
         assert!(r2.content.contains("[tool echo → ok]"));
-        assert!(r3.content.contains("→ denied by budget"), "call 3: {}", r3.content);
         assert!(
-            r3.content.contains("repeat detected — same call, same args"),
+            r3.content.contains("→ denied by budget"),
+            "call 3: {}",
+            r3.content
+        );
+        assert!(
+            r3.content
+                .contains("repeat detected — same call, same args"),
             "call 3: {}",
             r3.content
         );
@@ -3254,7 +3480,12 @@ mod tests {
             1,
             "call 3's pre-dispatch repeat denial must produce exactly one audit row"
         );
-        assert_eq!(entries.len(), 3, "3 rows total: 2 ok + 1 denied, got {}", entries.len());
+        assert_eq!(
+            entries.len(),
+            3,
+            "3 rows total: 2 ok + 1 denied, got {}",
+            entries.len()
+        );
         let d = denied[0];
         assert_eq!(d.tool_name, "echo");
         assert_eq!(d.gate_by.as_deref(), Some("budget"));
@@ -3325,7 +3556,10 @@ mod tests {
             &[]
         }
         fn match_text(&self, args: &serde_json::Value) -> String {
-            args.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string()
+            args.get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
         }
         fn run<'a>(
             &'a self,
@@ -3345,7 +3579,9 @@ mod tests {
             _spec: &crate::tools::exec::ExecSpec,
         ) -> Result<(tokio::process::Child, Vec<std::path::PathBuf>), crate::tools::exec::ExecError>
         {
-            Err(crate::tools::exec::ExecError::SandboxApply("test: never spawns".to_string()))
+            Err(crate::tools::exec::ExecError::SandboxApply(
+                "test: never spawns".to_string(),
+            ))
         }
     }
 
@@ -3364,23 +3600,40 @@ mod tests {
         let ledger = Arc::new(ApprovalLedger::new());
         let mut policy = InMemoryPolicySource::new();
         policy.set_mode("dangerous_tool", PermissionMode::Ask);
-        let chain = build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger), None);
+        let chain =
+            build_pretooluse_chain_full(gate(), Box::new(policy), &[], Arc::clone(&ledger), None);
         let calls = Arc::new(AtomicUsize::new(0));
         let prompter = Arc::new(MockPrompter {
             response: MockResponse::ApproveSessionTool,
             calls: calls.clone(),
         });
-        let dispatcher =
-            ToolDispatcher::new(registry, chain, BodyEnv::empty()).with_approval(ledger, Some(prompter));
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::empty())
+            .with_approval(ledger, Some(prompter));
 
         let o1 = dispatcher
-            .dispatch(&call("dangerous_tool", serde_json::json!({"v": 1})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("dangerous_tool", serde_json::json!({"v": 1})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(o1, ToolOutcome::Ok(_)), "call 1 should run after approval, got {o1:?}");
+        assert!(
+            matches!(o1, ToolOutcome::Ok(_)),
+            "call 1 should run after approval, got {o1:?}"
+        );
         let o2 = dispatcher
-            .dispatch(&call("dangerous_tool", serde_json::json!({"v": 2})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("dangerous_tool", serde_json::json!({"v": 2})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(o2, ToolOutcome::Ok(_)), "call 2 should also run after RE-approval, got {o2:?}");
+        assert!(
+            matches!(o2, ToolOutcome::Ok(_)),
+            "call 2 should also run after RE-approval, got {o2:?}"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -3438,9 +3691,17 @@ mod tests {
 
         // First call: Ask → "Always allow" → persist a rule + run once.
         let o1 = dispatcher
-            .dispatch(&call("write_file", serde_json::json!({"v": 1})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("write_file", serde_json::json!({"v": 1})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(o1, ToolOutcome::Ok(_)), "the approved call should run, got {o1:?}");
+        assert!(
+            matches!(o1, ToolOutcome::Ok(_)),
+            "the approved call should run, got {o1:?}"
+        );
         let rules = storage
             .open_profile("personal")
             .unwrap()
@@ -3452,9 +3713,17 @@ mod tests {
         // Second call, DIFFERENT args: covered by the persisted rule read live
         // by SqlitePolicySource → no re-prompt.
         let o2 = dispatcher
-            .dispatch(&call("write_file", serde_json::json!({"v": 2})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("write_file", serde_json::json!({"v": 2})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(o2, ToolOutcome::Ok(_)), "the persisted rule should cover it, got {o2:?}");
+        assert!(
+            matches!(o2, ToolOutcome::Ok(_)),
+            "the persisted rule should cover it, got {o2:?}"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -3499,9 +3768,17 @@ mod tests {
             .with_rule_writer(Arc::new(StorageToolRuleWriter::new(storage.clone())));
 
         let o1 = dispatcher
-            .dispatch(&call("shell_exec", serde_json::json!({"v": 1})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"v": 1})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(o1, ToolOutcome::Ok(_)), "call 1 runs after approval, got {o1:?}");
+        assert!(
+            matches!(o1, ToolOutcome::Ok(_)),
+            "call 1 runs after approval, got {o1:?}"
+        );
         assert!(
             storage
                 .open_profile("personal")
@@ -3513,9 +3790,17 @@ mod tests {
         );
 
         let o2 = dispatcher
-            .dispatch(&call("shell_exec", serde_json::json!({"v": 2})), &ctx(), Binding::Public, false)
+            .dispatch(
+                &call("shell_exec", serde_json::json!({"v": 2})),
+                &ctx(),
+                Binding::Public,
+                false,
+            )
             .await;
-        assert!(matches!(o2, ToolOutcome::Ok(_)), "call 2 runs after RE-approval, got {o2:?}");
+        assert!(
+            matches!(o2, ToolOutcome::Ok(_)),
+            "call 2 runs after RE-approval, got {o2:?}"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -3564,8 +3849,7 @@ mod tests {
             std::time::Duration::from_secs(5),
         )));
         let chain = build_pretooluse_chain(gate(), Box::new(allow_policy(&["shell_exec"])));
-        let dispatcher =
-            ToolDispatcher::new(registry, chain, BodyEnv::app_default());
+        let dispatcher = ToolDispatcher::new(registry, chain, BodyEnv::app_default());
 
         let outcome = dispatcher
             .dispatch(
@@ -3619,7 +3903,11 @@ mod tests {
     fn journaled_dispatcher(
         runs: Arc<AtomicUsize>,
         fail_first: bool,
-    ) -> (ToolDispatcher, Arc<crate::storage::Storage>, std::path::PathBuf) {
+    ) -> (
+        ToolDispatcher,
+        Arc<crate::storage::Storage>,
+        std::path::PathBuf,
+    ) {
         let mut root = std::env::temp_dir();
         root.push(format!("lhp-journal-{}", uuid::Uuid::new_v4()));
         let storage = Arc::new(crate::storage::Storage::open(&root).unwrap());
@@ -3639,17 +3927,46 @@ mod tests {
         let (dispatcher, storage, root) = journaled_dispatcher(Arc::clone(&runs), false);
         let args = serde_json::json!({"x": 1});
 
-        let first = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
-        assert_eq!(first, ToolOutcome::Ok(args.clone()), "first fire runs and succeeds");
+        let first = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
+        assert_eq!(
+            first,
+            ToolOutcome::Ok(args.clone()),
+            "first fire runs and succeeds"
+        );
         // The double-fire: the identical call REPLAYS the recorded outcome.
-        let second = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
-        assert_eq!(second, ToolOutcome::Ok(args.clone()), "the recorded result is replayed");
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "the EFFECT ran exactly once");
+        let second = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
+        assert_eq!(
+            second,
+            ToolOutcome::Ok(args.clone()),
+            "the recorded result is replayed"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the EFFECT ran exactly once"
+        );
 
         // The journal row: done, kind mutating_action, idempotency-keyed.
         let fp = crate::hooks::ActionFingerprint::of("mutate_thing", &args);
         let db = storage.open_profile("personal").unwrap();
-        let row = db.find_work_item_by_claim_key(&format!("action:conv-1::{fp}")).unwrap().expect("journal row");
+        let row = db
+            .find_work_item_by_claim_key(&format!("action:conv-1::{fp}"))
+            .unwrap()
+            .expect("journal row");
         assert_eq!(row.kind, crate::queue::WorkKind::MutatingAction);
         assert_eq!(row.state, crate::queue::WorkState::Done);
         assert_eq!(row.idempotency_key.as_deref(), Some(fp.as_str()));
@@ -3662,17 +3979,41 @@ mod tests {
         let (dispatcher, storage, root) = journaled_dispatcher(Arc::clone(&runs), true);
         let args = serde_json::json!({"y": 2});
 
-        let first = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
-        assert!(matches!(first, ToolOutcome::Err(_)), "the forced first failure surfaces");
+        let first = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(first, ToolOutcome::Err(_)),
+            "the forced first failure surfaces"
+        );
         // A retry after failure RE-RUNS (the effect did not complete — re-running
         // is the recovery), it is not replay-blocked like a recorded success.
-        let second = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        let second = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
         assert_eq!(second, ToolOutcome::Ok(args.clone()));
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "failed → retried → ran again");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "failed → retried → ran again"
+        );
 
         let fp = crate::hooks::ActionFingerprint::of("mutate_thing", &args);
         let db = storage.open_profile("personal").unwrap();
-        let row = db.find_work_item_by_claim_key(&format!("action:conv-1::{fp}")).unwrap().unwrap();
+        let row = db
+            .find_work_item_by_claim_key(&format!("action:conv-1::{fp}"))
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, crate::queue::WorkState::Done);
         assert_eq!(row.attempts, 2, "one row, two attempts");
         let _ = std::fs::remove_dir_all(root);
@@ -3700,15 +4041,32 @@ mod tests {
         assert!(db.start_work_attempt(&item.id, now).unwrap());
 
         // Before reconciliation: the identical dispatch is refused (in-flight).
-        let refused = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
-        assert!(matches!(refused, ToolOutcome::Err(_)), "a running row refuses a double-run");
+        let refused = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(refused, ToolOutcome::Err(_)),
+            "a running row refuses a double-run"
+        );
         assert_eq!(runs.load(Ordering::SeqCst), 0, "the tool never ran");
 
         // The boot pass terminalizes the orphaned row (crash reconcile)...
         assert_eq!(db.terminalize_orphaned_work(2_000).unwrap(), 1);
         // ...after which a re-issued action (which re-passed the whole gate
         // chain) re-runs as the recovery.
-        let rerun = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        let rerun = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
         assert_eq!(rerun, ToolOutcome::Ok(args.clone()));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(root);
@@ -3725,13 +4083,18 @@ mod tests {
             .with_journal(Arc::clone(&storage));
 
         let args = serde_json::json!({"q": 1});
-        let out = dispatcher.dispatch(&call("echo", args.clone()), &ctx(), Binding::Public, true).await;
+        let out = dispatcher
+            .dispatch(&call("echo", args.clone()), &ctx(), Binding::Public, true)
+            .await;
         assert_eq!(out, ToolOutcome::Ok(args.clone()));
         // No journal row for a Safe read — nothing to protect, and journaling
         // every read would bloat the table for zero durability value.
         let fp = crate::hooks::ActionFingerprint::of("echo", &args);
         let db = storage.open_profile("personal").unwrap();
-        assert!(db.find_work_item_by_claim_key(&format!("action:conv-1::{fp}")).unwrap().is_none());
+        assert!(db
+            .find_work_item_by_claim_key(&format!("action:conv-1::{fp}"))
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3758,10 +4121,16 @@ mod tests {
             })
             .unwrap();
         // An EMPTY registry — the skill is nowhere until the lazy lookup fires.
-        let dispatcher = ToolDispatcher::new(ToolRegistry::new(), HookChain::new(), BodyEnv::empty())
-            .with_journal(Arc::clone(&storage));
+        let dispatcher =
+            ToolDispatcher::new(ToolRegistry::new(), HookChain::new(), BodyEnv::empty())
+                .with_journal(Arc::clone(&storage));
         let out = dispatcher
-            .dispatch(&call("skill_fold_laundry", serde_json::json!({})), &ctx(), Binding::Public, true)
+            .dispatch(
+                &call("skill_fold_laundry", serde_json::json!({})),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
             .await;
         match out {
             ToolOutcome::Ok(v) => assert!(v["playbook"].as_str().unwrap().contains("fold it")),
@@ -3772,12 +4141,21 @@ mod tests {
             .global()
             .set_skill_approval("lz1", crate::storage::SkillApproval::Rejected)
             .unwrap();
-        let dispatcher2 = ToolDispatcher::new(ToolRegistry::new(), HookChain::new(), BodyEnv::empty())
-            .with_journal(Arc::clone(&storage));
+        let dispatcher2 =
+            ToolDispatcher::new(ToolRegistry::new(), HookChain::new(), BodyEnv::empty())
+                .with_journal(Arc::clone(&storage));
         let refused = dispatcher2
-            .dispatch(&call("skill_fold_laundry", serde_json::json!({})), &ctx(), Binding::Public, true)
+            .dispatch(
+                &call("skill_fold_laundry", serde_json::json!({})),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
             .await;
-        assert!(matches!(refused, ToolOutcome::Unknown(_)), "a rejected skill is INERT, got {refused:?}");
+        assert!(
+            matches!(refused, ToolOutcome::Unknown(_)),
+            "a rejected skill is INERT, got {refused:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3792,17 +4170,46 @@ mod tests {
         let args = serde_json::json!({"again": true});
 
         dispatcher.begin_run(); // user message #1
-        let a = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        let a = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
         assert_eq!(a, ToolOutcome::Ok(args.clone()));
         // Same run: the double-fire replays, executes once.
-        let b = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        let b = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
         assert_eq!(b, ToolOutcome::Ok(args.clone()));
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "in-run double-fire executes once");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "in-run double-fire executes once"
+        );
 
         dispatcher.begin_run(); // user message #2 — a fresh issuance
-        let c = dispatcher.dispatch(&call("mutate_thing", args.clone()), &ctx(), Binding::Public, true).await;
+        let c = dispatcher
+            .dispatch(
+                &call("mutate_thing", args.clone()),
+                &ctx(),
+                Binding::Public,
+                true,
+            )
+            .await;
         assert_eq!(c, ToolOutcome::Ok(args.clone()));
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "a deliberate re-issue on a new run RE-RUNS");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "a deliberate re-issue on a new run RE-RUNS"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

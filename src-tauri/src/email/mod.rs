@@ -45,9 +45,9 @@
 //!   [`gmail::TokenProvider`] (stage 2 implements it over the keychain +
 //!   [`oauth::refresh`]); pure fixture-tested parsers for everything else.
 
+pub mod calendar;
 pub mod gmail;
 pub mod google;
-pub mod calendar;
 pub mod oauth;
 pub mod tasks;
 pub mod token_provider;
@@ -98,8 +98,14 @@ mod tests {
         // user machines) — changing them orphans stored credentials. Lock them.
         assert_eq!(SECRET_GMAIL_CLIENT_ID, "gmail:client_id");
         assert_eq!(SECRET_GMAIL_CLIENT_SECRET, "gmail:client_secret");
-        assert_eq!(secret_gmail_refresh_token("work"), "gmail:work:refresh_token");
-        assert_eq!(secret_gmail_account_email("work"), "gmail:work:account_email");
+        assert_eq!(
+            secret_gmail_refresh_token("work"),
+            "gmail:work:refresh_token"
+        );
+        assert_eq!(
+            secret_gmail_account_email("work"),
+            "gmail:work:account_email"
+        );
         assert_ne!(
             secret_gmail_refresh_token("work"),
             secret_gmail_refresh_token("home"),

@@ -147,7 +147,10 @@ mod tests {
     async fn returns_the_users_answer() {
         let tool = AskHumanTool::new(Some(Arc::new(FakePrompter(Some("blue".into())))));
         match tool
-            .run(ToolInput::new(json!({ "question": "favorite color?" })), &ExecCtx::default())
+            .run(
+                ToolInput::new(json!({ "question": "favorite color?" })),
+                &ExecCtx::default(),
+            )
             .await
         {
             ToolResult::Ok(v) => {
@@ -163,7 +166,10 @@ mod tests {
     async fn declined_or_timed_out_is_a_not_answered_ok() {
         let tool = AskHumanTool::new(Some(Arc::new(FakePrompter(None))));
         match tool
-            .run(ToolInput::new(json!({ "question": "proceed?" })), &ExecCtx::default())
+            .run(
+                ToolInput::new(json!({ "question": "proceed?" })),
+                &ExecCtx::default(),
+            )
             .await
         {
             ToolResult::Ok(v) => assert_eq!(v["answered"], false),
@@ -175,7 +181,10 @@ mod tests {
     async fn no_prompter_reports_no_interactive_user() {
         let tool = AskHumanTool::new(None);
         match tool
-            .run(ToolInput::new(json!({ "question": "there?" })), &ExecCtx::default())
+            .run(
+                ToolInput::new(json!({ "question": "there?" })),
+                &ExecCtx::default(),
+            )
             .await
         {
             ToolResult::Ok(v) => {
@@ -190,7 +199,11 @@ mod tests {
     async fn empty_question_is_a_usage_error() {
         let tool = AskHumanTool::new(Some(Arc::new(FakePrompter(Some("x".into())))));
         assert!(matches!(
-            tool.run(ToolInput::new(json!({ "question": "  " })), &ExecCtx::default()).await,
+            tool.run(
+                ToolInput::new(json!({ "question": "  " })),
+                &ExecCtx::default()
+            )
+            .await,
             ToolResult::Err(_)
         ));
     }

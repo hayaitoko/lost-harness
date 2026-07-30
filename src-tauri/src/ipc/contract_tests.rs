@@ -30,16 +30,16 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tauri::ipc::{CallbackFn, InvokeBody, InvokeResponseBody};
-use tauri::test::{get_ipc_response, mock_context, mock_builder, noop_assets, MockRuntime};
+use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime};
 use tauri::webview::InvokeRequest;
 use tauri::{App, Manager, WebviewWindow, WebviewWindowBuilder};
 
 use crate::agent::gate::PrivacyGate;
 use crate::agent::loop_mod::AgentLoop;
+use crate::classifier::HeuristicClassifier;
 use crate::ipc::{self, AppState};
 use crate::models::ModelManager;
 use crate::storage::Storage;
-use crate::classifier::HeuristicClassifier;
 
 // ── Harness ─────────────────────────────────────────────────────────────
 
@@ -269,7 +269,10 @@ fn create_conversation_correct_shape_dispatches_and_succeeds() {
     let value: Value = ok.deserialize().expect("response must be valid JSON");
     assert_eq!(value["name"], "Test Conversation");
     assert_eq!(value["binding"], "auto");
-    assert!(value["id"].is_string(), "expected a generated id: {value:?}");
+    assert!(
+        value["id"].is_string(),
+        "expected a generated id: {value:?}"
+    );
 }
 
 #[test]
@@ -516,7 +519,9 @@ fn update_provider_correct_shape_dispatches_and_keeps_stored_key() {
         }),
     )
     .expect("seed add_provider must succeed");
-    let added: Value = added.deserialize().expect("seed response must be valid JSON");
+    let added: Value = added
+        .deserialize()
+        .expect("seed response must be valid JSON");
     let id = added["id"].as_str().expect("seed id").to_string();
 
     // Edit with NO api_key — mirrors the Settings edit form, which never
@@ -620,7 +625,8 @@ fn list_models_correct_shape_dispatches_and_reaches_command_body() {
 
     let body = json!({"args": {"provider_id": "does-not-exist"}});
     let res = call(&webview, "list_models", body);
-    let err = res.expect_err("unknown provider id should be a domain-level error, not a dispatch failure");
+    let err = res
+        .expect_err("unknown provider id should be a domain-level error, not a dispatch failure");
     let msg = err.as_str().unwrap_or_default();
     assert!(
         !is_ipc_arg_rejection(msg),
@@ -648,7 +654,10 @@ fn list_models_old_broken_shape_is_rejected() {
     );
     // And must NOT be the domain error — proves it never reached
     // `ModelManager::list_models_for`.
-    assert!(!msg.contains("unknown provider"), "leaked into command body: {msg}");
+    assert!(
+        !msg.contains("unknown provider"),
+        "leaked into command body: {msg}"
+    );
 }
 
 // ── active_profile (set → get round-trip) ──────────────────────────────
@@ -664,21 +673,28 @@ fn active_profile_round_trips_through_real_ipc() {
     let webview = test_webview(&app);
 
     // Fresh install: nothing persisted yet → the default.
-    let got = call(&webview, "get_active_profile", json!({}))
-        .expect("get_active_profile must dispatch");
+    let got =
+        call(&webview, "get_active_profile", json!({})).expect("get_active_profile must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
     assert_eq!(got, "personal", "a fresh install defaults to personal");
 
     // Switch to "work" and persist it.
-    call(&webview, "set_active_profile", json!({ "args": { "id": "work" } }))
-        .expect("set_active_profile must dispatch and succeed");
+    call(
+        &webview,
+        "set_active_profile",
+        json!({ "args": { "id": "work" } }),
+    )
+    .expect("set_active_profile must dispatch and succeed");
 
     // Read it back through IPC — this is exactly what boot-time `hydrate()`
     // sees. Before the fix this stayed "personal"; now it's the stored choice.
-    let got = call(&webview, "get_active_profile", json!({}))
-        .expect("get_active_profile must dispatch");
+    let got =
+        call(&webview, "get_active_profile", json!({})).expect("get_active_profile must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
-    assert_eq!(got, "work", "the persisted profile must survive a (simulated) restart");
+    assert_eq!(
+        got, "work",
+        "the persisted profile must survive a (simulated) restart"
+    );
 }
 
 #[test]
@@ -689,20 +705,30 @@ fn set_active_profile_rejects_a_confusable_name() {
     // A whitespace-padded name maps to a distinct `.db` file — the allowlist
     // rejects it as a DOMAIN error (the command ran and validated), not an
     // arg-shape rejection. Proves `validate_profile_name` guards this writer.
-    let res = call(&webview, "set_active_profile", json!({ "args": { "id": "work " } }));
+    let res = call(
+        &webview,
+        "set_active_profile",
+        json!({ "args": { "id": "work " } }),
+    );
     let err = res.expect_err("a padded/confusable name must be rejected");
     let msg = err.as_str().unwrap_or_default();
     assert!(
         !is_ipc_arg_rejection(msg),
         "expected a domain-level validation error, got an arg rejection: {msg}"
     );
-    assert!(msg.contains("invalid profile name"), "expected the validator's message, got: {msg}");
+    assert!(
+        msg.contains("invalid profile name"),
+        "expected the validator's message, got: {msg}"
+    );
 
     // A rejected set persists nothing — the read still returns the default.
-    let got = call(&webview, "get_active_profile", json!({}))
-        .expect("get_active_profile must dispatch");
+    let got =
+        call(&webview, "get_active_profile", json!({})).expect("get_active_profile must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
-    assert_eq!(got, "personal", "a rejected set must not have written a row");
+    assert_eq!(
+        got, "personal",
+        "a rejected set must not have written a row"
+    );
 }
 
 // ── scheduled jobs (the ScheduledJobs screen surface) ──────────────────
@@ -713,8 +739,12 @@ fn cron_jobs_list_toggle_delete_round_trip_through_real_ipc() {
     let webview = test_webview(&app);
 
     // Empty profile → empty list (correct nested-args shape dispatches).
-    let got = call(&webview, "list_cron_jobs", json!({ "args": { "profile": "personal" } }))
-        .expect("list_cron_jobs must dispatch");
+    let got = call(
+        &webview,
+        "list_cron_jobs",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("list_cron_jobs must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
     assert_eq!(got, json!([]), "a fresh profile has no scheduled jobs");
 
@@ -722,7 +752,10 @@ fn cron_jobs_list_toggle_delete_round_trip_through_real_ipc() {
     // via the Dangerous manage_cron tool, not this IPC surface).
     {
         let state: tauri::State<'_, crate::AppState> = app.state();
-        let db = state.storage.open_profile("personal").expect("open profile");
+        let db = state
+            .storage
+            .open_profile("personal")
+            .expect("open profile");
         db.insert_cron_job(&crate::storage::CronJob {
             id: "cj-1".into(),
             name: "morning brief".into(),
@@ -737,8 +770,12 @@ fn cron_jobs_list_toggle_delete_round_trip_through_real_ipc() {
     }
 
     // The list surfaces it.
-    let got = call(&webview, "list_cron_jobs", json!({ "args": { "profile": "personal" } }))
-        .expect("list_cron_jobs must dispatch");
+    let got = call(
+        &webview,
+        "list_cron_jobs",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("list_cron_jobs must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
     assert_eq!(got.as_array().map(|a| a.len()), Some(1));
     assert_eq!(got[0]["name"], "morning brief");
@@ -753,8 +790,12 @@ fn cron_jobs_list_toggle_delete_round_trip_through_real_ipc() {
     .expect("set_cron_job_enabled must dispatch");
     let ok: Value = ok.deserialize().expect("valid JSON");
     assert_eq!(ok, true);
-    let got = call(&webview, "list_cron_jobs", json!({ "args": { "profile": "personal" } }))
-        .expect("list_cron_jobs must dispatch");
+    let got = call(
+        &webview,
+        "list_cron_jobs",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("list_cron_jobs must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
     assert_eq!(got[0]["enabled"], false, "the pause must persist");
 
@@ -767,8 +808,12 @@ fn cron_jobs_list_toggle_delete_round_trip_through_real_ipc() {
     .expect("delete_cron_job must dispatch");
     let ok: Value = ok.deserialize().expect("valid JSON");
     assert_eq!(ok, true);
-    let got = call(&webview, "list_cron_jobs", json!({ "args": { "profile": "personal" } }))
-        .expect("list_cron_jobs must dispatch");
+    let got = call(
+        &webview,
+        "list_cron_jobs",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("list_cron_jobs must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
     assert_eq!(got, json!([]));
     let ok = call(
@@ -857,8 +902,12 @@ fn gmail_setup_status_and_client_paste_round_trip_through_real_ipc() {
     let webview = test_webview(&app);
 
     // Fresh install: nothing configured, nothing connected.
-    let got = call(&webview, "gmail_setup_status", json!({ "args": { "profile": "personal" } }))
-        .expect("gmail_setup_status must dispatch");
+    let got = call(
+        &webview,
+        "gmail_setup_status",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("gmail_setup_status must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
     assert_eq!(got["client_configured"], false);
     assert_eq!(got["connected"], false);
@@ -885,11 +934,18 @@ fn gmail_setup_status_and_client_paste_round_trip_through_real_ipc() {
         } }),
     )
     .expect("a plausible client must persist");
-    let got = call(&webview, "gmail_setup_status", json!({ "args": { "profile": "personal" } }))
-        .expect("gmail_setup_status must dispatch");
+    let got = call(
+        &webview,
+        "gmail_setup_status",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("gmail_setup_status must dispatch");
     let got: Value = got.deserialize().expect("valid JSON");
     assert_eq!(got["client_configured"], true);
-    assert_eq!(got["connected"], false, "a pasted client alone is not a connection");
+    assert_eq!(
+        got["connected"], false,
+        "a pasted client alone is not a connection"
+    );
 }
 
 #[test]
@@ -918,13 +974,19 @@ fn gmail_flows_fail_closed_with_setup_pointing_errors() {
     )
     .expect_err("list_email without setup must be refused");
     assert!(
-        err.as_str().unwrap_or_default().contains("Settings → Email"),
+        err.as_str()
+            .unwrap_or_default()
+            .contains("Settings → Email"),
         "got: {err:?}"
     );
 
     // Disconnect is idempotent — never an error on an unconnected profile.
-    call(&webview, "gmail_disconnect", json!({ "args": { "profile": "personal" } }))
-        .expect("disconnect must be idempotent");
+    call(
+        &webview,
+        "gmail_disconnect",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("disconnect must be idempotent");
 }
 
 // ── classifier settings (PLAN §11) ─────────────────────────────────────
@@ -966,7 +1028,10 @@ fn classifier_settings_round_trip_through_real_ipc() {
     .expect("get after set")
     .deserialize()
     .expect("valid JSON");
-    assert_eq!(reget["strictness"], 100, "persisted strictness must survive a re-read");
+    assert_eq!(
+        reget["strictness"], 100,
+        "persisted strictness must survive a re-read"
+    );
     assert_eq!(reget["uncertainty_band"], "wide");
 
     // Toggling redaction preserves the thresholds (and vice versa).
@@ -979,7 +1044,10 @@ fn classifier_settings_round_trip_through_real_ipc() {
     .deserialize()
     .expect("valid JSON");
     assert_eq!(red["redaction_enabled"], false);
-    assert_eq!(red["strictness"], 100, "redaction toggle preserved thresholds");
+    assert_eq!(
+        red["strictness"], 100,
+        "redaction toggle preserved thresholds"
+    );
     assert_eq!(red["uncertainty_band"], "wide");
 
     // Reset → back to defaults (thresholds AND redaction on).
@@ -1043,7 +1111,10 @@ fn calculate_model_fit_correct_shape_dispatches_and_returns_calc_output() {
     let ok = res.expect("correctly-wrapped args must dispatch and succeed");
     let value: Value = ok.deserialize().expect("response must be valid JSON");
     // A CalcOutput shape: the fit verdict + the byte breakdown must be present.
-    assert!(value["fit"].is_string(), "expected a fit verdict: {value:?}");
+    assert!(
+        value["fit"].is_string(),
+        "expected a fit verdict: {value:?}"
+    );
     assert!(value["total_required_bytes"].is_number());
     assert!(value["kv_cache_bytes"].is_number());
     assert!(value.get("notes").is_some());
@@ -1120,13 +1191,24 @@ fn set_then_get_sandbox_config_round_trips_the_ceiling() {
         "excluded_commands": ["rm"],
         "network": {"allowed_domains": ["example.com"], "allow_localhost": false, "allow_unix_sockets": []}
     });
-    let set = call(&webview, "set_sandbox_config", json!({"args": {"profile": "personal", "config": cfg}}));
+    let set = call(
+        &webview,
+        "set_sandbox_config",
+        json!({"args": {"profile": "personal", "config": cfg}}),
+    );
     set.expect("a valid config must persist");
-    let got = call(&webview, "get_sandbox_config", json!({"args": {"profile": "personal"}}))
-        .expect("get must dispatch")
-        .deserialize::<Value>()
-        .unwrap();
-    assert_eq!(got["network"]["allow_localhost"], false, "the locked-down ceiling round-trips");
+    let got = call(
+        &webview,
+        "get_sandbox_config",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("get must dispatch")
+    .deserialize::<Value>()
+    .unwrap();
+    assert_eq!(
+        got["network"]["allow_localhost"], false,
+        "the locked-down ceiling round-trips"
+    );
     assert_eq!(got["network"]["allowed_domains"][0], "example.com");
     assert_eq!(got["enabled"], true);
 }
@@ -1135,10 +1217,14 @@ fn set_then_get_sandbox_config_round_trips_the_ceiling() {
 fn get_sandbox_config_returns_default_when_unset() {
     let app = test_app();
     let webview = test_webview(&app);
-    let got = call(&webview, "get_sandbox_config", json!({"args": {"profile": "personal"}}))
-        .expect("get must dispatch")
-        .deserialize::<Value>()
-        .unwrap();
+    let got = call(
+        &webview,
+        "get_sandbox_config",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("get must dispatch")
+    .deserialize::<Value>()
+    .unwrap();
     // The library default: disabled, localhost allowed, no domains.
     assert_eq!(got["enabled"], false);
     assert_eq!(got["network"]["allow_localhost"], true);
@@ -1152,11 +1238,21 @@ fn set_sandbox_config_rejects_an_empty_allowlist_entry() {
         "enabled": true, "auto_allow_if_sandboxed": false, "excluded_commands": [],
         "network": {"allowed_domains": ["  "], "allow_localhost": true, "allow_unix_sockets": []}
     });
-    let res = call(&webview, "set_sandbox_config", json!({"args": {"profile": "personal", "config": cfg}}));
+    let res = call(
+        &webview,
+        "set_sandbox_config",
+        json!({"args": {"profile": "personal", "config": cfg}}),
+    );
     let err = res.expect_err("an empty allowed_domain must be rejected");
     let msg = err.as_str().unwrap_or_default();
-    assert!(msg.contains("must not be empty"), "expected a validation error, got: {msg}");
-    assert!(!is_ipc_arg_rejection(msg), "it's a domain-level validation error, not an arg-shape rejection");
+    assert!(
+        msg.contains("must not be empty"),
+        "expected a validation error, got: {msg}"
+    );
+    assert!(
+        !is_ipc_arg_rejection(msg),
+        "it's a domain-level validation error, not an arg-shape rejection"
+    );
 }
 
 #[test]
@@ -1164,7 +1260,11 @@ fn sandbox_config_old_broken_shape_is_rejected() {
     let app = test_app();
     let webview = test_webview(&app);
     // No `args` wrapper.
-    let res = call(&webview, "get_sandbox_config", json!({"profile": "personal"}));
+    let res = call(
+        &webview,
+        "get_sandbox_config",
+        json!({"profile": "personal"}),
+    );
     let err = res.expect_err("flat/unwrapped args must NOT dispatch");
     assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
 }
@@ -1175,18 +1275,35 @@ fn sandbox_config_old_broken_shape_is_rejected() {
 fn set_then_get_budget_settings_round_trips_and_reset_clears() {
     let app = test_app();
     let webview = test_webview(&app);
-    call(&webview, "set_budget_settings", json!({"args": {"profile": "personal", "cap_usd": 12.5}}))
-        .expect("set a cap");
-    let got = call(&webview, "get_budget_settings", json!({"args": {"profile": "personal"}}))
-        .expect("get")
-        .deserialize::<Value>()
-        .unwrap();
+    call(
+        &webview,
+        "set_budget_settings",
+        json!({"args": {"profile": "personal", "cap_usd": 12.5}}),
+    )
+    .expect("set a cap");
+    let got = call(
+        &webview,
+        "get_budget_settings",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("get")
+    .deserialize::<Value>()
+    .unwrap();
     assert_eq!(got["cap_usd"], 12.5, "the cap round-trips");
-    call(&webview, "reset_budget_settings", json!({"args": {"profile": "personal"}})).expect("reset");
-    let after = call(&webview, "get_budget_settings", json!({"args": {"profile": "personal"}}))
-        .expect("get")
-        .deserialize::<Value>()
-        .unwrap();
+    call(
+        &webview,
+        "reset_budget_settings",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("reset");
+    let after = call(
+        &webview,
+        "get_budget_settings",
+        json!({"args": {"profile": "personal"}}),
+    )
+    .expect("get")
+    .deserialize::<Value>()
+    .unwrap();
     assert!(after["cap_usd"].is_null(), "reset → uncapped (null)");
 }
 
@@ -1194,7 +1311,11 @@ fn set_then_get_budget_settings_round_trips_and_reset_clears() {
 fn budget_settings_old_broken_shape_is_rejected() {
     let app = test_app();
     let webview = test_webview(&app);
-    let res = call(&webview, "get_budget_settings", json!({"profile": "personal"})); // no `args`
+    let res = call(
+        &webview,
+        "get_budget_settings",
+        json!({"profile": "personal"}),
+    ); // no `args`
     let err = res.expect_err("flat/unwrapped args must NOT dispatch");
     assert!(is_ipc_arg_rejection(err.as_str().unwrap_or_default()));
 }
@@ -1270,7 +1391,9 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
     ];
     for cmd in args_cmds {
         let res = call(&webview, cmd, flat.clone());
-        let err = res.err().unwrap_or_else(|| panic!("{cmd}: an unwrapped body must be rejected, not accepted"));
+        let err = res
+            .err()
+            .unwrap_or_else(|| panic!("{cmd}: an unwrapped body must be rejected, not accepted"));
         assert!(
             is_ipc_arg_rejection(err.as_str().unwrap_or_default()),
             "{cmd}: expected an IPC arg-envelope rejection, got: {err:?}"

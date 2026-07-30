@@ -150,9 +150,15 @@ mod tests {
 
         assert_eq!(
             migrate_legacy_provider_secrets(&db, &secrets),
-            SecretMigrationReport { migrated: 1, failed: 0 }
+            SecretMigrationReport {
+                migrated: 1,
+                failed: 0
+            }
         );
-        assert_eq!(secrets.get("cloud-1").unwrap().as_deref(), Some("sk-legacy-secret"));
+        assert_eq!(
+            secrets.get("cloud-1").unwrap().as_deref(),
+            Some("sk-legacy-secret")
+        );
         let row = db.get_endpoint("cloud-1").unwrap().unwrap();
         assert_eq!(row.api_key_marker.as_deref(), Some(KEYCHAIN_MARKER));
 
@@ -192,7 +198,10 @@ mod tests {
 
         assert_eq!(
             migrate_legacy_provider_secrets(&db, &FailingStore),
-            SecretMigrationReport { migrated: 0, failed: 1 }
+            SecretMigrationReport {
+                migrated: 0,
+                failed: 1
+            }
         );
         assert_eq!(
             db.get_endpoint("cloud-2")

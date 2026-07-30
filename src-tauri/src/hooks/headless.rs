@@ -114,7 +114,11 @@ pub struct QueueingPrompter {
 }
 
 impl QueueingPrompter {
-    pub fn new(queue: Arc<ApprovalQueue>, policy: Arc<dyn PolicySource>, profile: impl Into<String>) -> Self {
+    pub fn new(
+        queue: Arc<ApprovalQueue>,
+        policy: Arc<dyn PolicySource>,
+        profile: impl Into<String>,
+    ) -> Self {
         Self {
             queue,
             policy,
@@ -160,7 +164,10 @@ impl QueueingPrompter {
             }
         }
 
-        Some((GrantScope::Once, GrantTarget::Fingerprint(req.fingerprint.clone())))
+        Some((
+            GrantScope::Once,
+            GrantTarget::Fingerprint(req.fingerprint.clone()),
+        ))
     }
 }
 
@@ -240,7 +247,11 @@ mod tests {
     #[tokio::test]
     async fn a_matching_allow_rule_preauthorizes_a_write() {
         let queue = Arc::new(ApprovalQueue::new());
-        let policy = policy_with(vec![ToolRule::new("write_file", "*", PermissionMode::Allow)]);
+        let policy = policy_with(vec![ToolRule::new(
+            "write_file",
+            "*",
+            PermissionMode::Allow,
+        )]);
         let prompter = QueueingPrompter::new(queue.clone(), policy, "personal");
 
         let d = decide(&prompter, req("write_file", RiskClass::Write, None)).await;
@@ -257,11 +268,19 @@ mod tests {
     async fn dangerous_is_never_preauthorized_even_with_a_matching_rule() {
         let queue = Arc::new(ApprovalQueue::new());
         // Even a wide-open Allow rule for the tool must not pre-authorize it.
-        let policy = policy_with(vec![ToolRule::new("shell_exec", "*", PermissionMode::Allow)]);
+        let policy = policy_with(vec![ToolRule::new(
+            "shell_exec",
+            "*",
+            PermissionMode::Allow,
+        )]);
         let prompter = QueueingPrompter::new(queue.clone(), policy, "personal");
 
         let d = decide(&prompter, req("shell_exec", RiskClass::Dangerous, None)).await;
-        assert_eq!(d, ApprovalDecision::Deny, "Dangerous must fail closed regardless of rules");
+        assert_eq!(
+            d,
+            ApprovalDecision::Deny,
+            "Dangerous must fail closed regardless of rules"
+        );
         assert_eq!(queue.len(), 1);
     }
 
@@ -279,34 +298,65 @@ mod tests {
         );
         let d = decide(
             &star,
-            req_cmd("fetch_url", RiskClass::External, Some("example.com"), ex_cmd),
+            req_cmd(
+                "fetch_url",
+                RiskClass::External,
+                Some("example.com"),
+                ex_cmd,
+            ),
         )
         .await;
-        assert_eq!(d, ApprovalDecision::Deny, "bare * must not green-light egress");
+        assert_eq!(
+            d,
+            ApprovalDecision::Deny,
+            "bare * must not green-light egress"
+        );
 
         // Finding A: an all-wildcard pattern ("**") likewise names nothing.
         let star2 = QueueingPrompter::new(
             Arc::new(ApprovalQueue::new()),
-            policy_with(vec![ToolRule::new("fetch_url", "**", PermissionMode::Allow)]),
+            policy_with(vec![ToolRule::new(
+                "fetch_url",
+                "**",
+                PermissionMode::Allow,
+            )]),
             "personal",
         );
         let d = decide(
             &star2,
-            req_cmd("fetch_url", RiskClass::External, Some("example.com"), ex_cmd),
+            req_cmd(
+                "fetch_url",
+                RiskClass::External,
+                Some("example.com"),
+                ex_cmd,
+            ),
         )
         .await;
-        assert_eq!(d, ApprovalDecision::Deny, "** must not green-light egress either");
+        assert_eq!(
+            d,
+            ApprovalDecision::Deny,
+            "** must not green-light egress either"
+        );
 
         // A rule naming the destination DOES pre-authorize it.
         let named_queue = Arc::new(ApprovalQueue::new());
         let named = QueueingPrompter::new(
             named_queue.clone(),
-            policy_with(vec![ToolRule::new("fetch_url", "*example.com*", PermissionMode::Allow)]),
+            policy_with(vec![ToolRule::new(
+                "fetch_url",
+                "*example.com*",
+                PermissionMode::Allow,
+            )]),
             "personal",
         );
         let d = decide(
             &named,
-            req_cmd("fetch_url", RiskClass::External, Some("example.com"), ex_cmd),
+            req_cmd(
+                "fetch_url",
+                RiskClass::External,
+                Some("example.com"),
+                ex_cmd,
+            ),
         )
         .await;
         assert!(
@@ -327,7 +377,11 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(d, ApprovalDecision::Deny, "the rule names example.com, not evil.com");
+        assert_eq!(
+            d,
+            ApprovalDecision::Deny,
+            "the rule names example.com, not evil.com"
+        );
     }
 
     #[tokio::test]
@@ -354,11 +408,20 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(d, ApprovalDecision::Deny, "a specific Ask carve-out must win → park");
+        assert_eq!(
+            d,
+            ApprovalDecision::Deny,
+            "a specific Ask carve-out must win → park"
+        );
         // A non-matching command still rides the broad Allow.
         let d = decide(
             &prompter,
-            req_cmd("write_file", RiskClass::Write, None, r#"write_file {"path":"notes.txt"}"#),
+            req_cmd(
+                "write_file",
+                RiskClass::Write,
+                None,
+                r#"write_file {"path":"notes.txt"}"#,
+            ),
         )
         .await;
         assert!(matches!(d, ApprovalDecision::Approve(GrantScope::Once, _)));
@@ -374,7 +437,9 @@ mod tests {
         let prompter = QueueingPrompter::new(queue.clone(), policy_with(vec![]), "work");
         let _ = decide(&prompter, req("delete_file", RiskClass::Write, None)).await;
         assert_eq!(queue.len(), 1);
-        let drained = queue.resolve("req-delete_file").expect("parked entry present");
+        let drained = queue
+            .resolve("req-delete_file")
+            .expect("parked entry present");
         assert_eq!(drained.tool_name, "delete_file");
         assert!(queue.is_empty(), "resolve removes it");
         assert!(queue.resolve("nope").is_none(), "unknown id ⇒ None");

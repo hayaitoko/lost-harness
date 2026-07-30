@@ -244,7 +244,8 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
     // persisted to expire yet. Kept as an explicit, named step so this
     // pass already has the right shape once a persisted artifact exists.
 
-    tx.commit().context("crash-recovery: committing transaction")?;
+    tx.commit()
+        .context("crash-recovery: committing transaction")?;
     Ok(terminalized)
 }
 

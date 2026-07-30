@@ -582,8 +582,8 @@ impl ProfileDb {
 
     pub fn list_tags(&self) -> Result<Vec<TagDefinition>> {
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT id, label, color, created_at FROM tag_definitions ORDER BY label")?;
+        let mut stmt = conn
+            .prepare("SELECT id, label, color, created_at FROM tag_definitions ORDER BY label")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(TagDefinition {
@@ -1000,9 +1000,11 @@ impl ProfileDb {
         Ok(self
             .conn
             .lock()
-            .query_row("SELECT cap_usd FROM budget_settings WHERE id = 1", [], |r| {
-                r.get::<_, Option<f64>>(0)
-            })
+            .query_row(
+                "SELECT cap_usd FROM budget_settings WHERE id = 1",
+                [],
+                |r| r.get::<_, Option<f64>>(0),
+            )
             .optional()
             .context("read budget_settings row")?
             .flatten())
@@ -1149,7 +1151,10 @@ impl ProfileDb {
     /// C2: look up the (at-most-one, thanks to the partial UNIQUE index) work
     /// item carrying this `claim_key` — the durability journal's
     /// find-prior-attempt primitive.
-    pub fn find_work_item_by_claim_key(&self, claim_key: &str) -> Result<Option<crate::queue::WorkItem>> {
+    pub fn find_work_item_by_claim_key(
+        &self,
+        claim_key: &str,
+    ) -> Result<Option<crate::queue::WorkItem>> {
         Ok(self
             .conn
             .lock()
@@ -1266,27 +1271,29 @@ impl ProfileDb {
     /// `conn.last_insert_rowid()` but we don't return it; the caller
     /// that needs it back can re-`list_tool_audit` by `(ts, fingerprint)`.
     pub fn add_tool_audit(&self, row: &ToolAuditRow) -> Result<()> {
-        self.conn.lock().execute(
-            "INSERT INTO tool_audit
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO tool_audit
              (ts, conversation_id, tool_name, canonical_args, fingerprint, risk, outcome,
               gate_by, grant_used, decision, endpoint_kind, duration_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                row.ts,
-                row.conversation_id,
-                row.tool_name,
-                row.canonical_args,
-                row.fingerprint,
-                row.risk,
-                row.outcome,
-                row.gate_by,
-                row.grant_used,
-                row.decision,
-                row.endpoint_kind,
-                row.duration_ms,
-            ],
-        )
-        .context("insert tool_audit row")?;
+                params![
+                    row.ts,
+                    row.conversation_id,
+                    row.tool_name,
+                    row.canonical_args,
+                    row.fingerprint,
+                    row.risk,
+                    row.outcome,
+                    row.gate_by,
+                    row.grant_used,
+                    row.decision,
+                    row.endpoint_kind,
+                    row.duration_ms,
+                ],
+            )
+            .context("insert tool_audit row")?;
         Ok(())
     }
 
@@ -1341,7 +1348,13 @@ impl ProfileDb {
                 "INSERT OR REPLACE INTO tool_rules
                  (id, tool_name, pattern, action, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![row.id, row.tool_name, row.pattern, row.action, row.created_at],
+                params![
+                    row.id,
+                    row.tool_name,
+                    row.pattern,
+                    row.action,
+                    row.created_at
+                ],
             )
             .context("insert tool_rules row")?;
         Ok(())
@@ -1642,10 +1655,10 @@ impl ProfileDb {
 
     /// Unbind a seat (it then resolves to `inherit`). Returns whether a row went.
     pub fn delete_seat_binding(&self, seat: &str) -> Result<bool> {
-        let n = self
-            .conn
-            .lock()
-            .execute("DELETE FROM seat_bindings WHERE seat = ?1", params![seat.trim()])?;
+        let n = self.conn.lock().execute(
+            "DELETE FROM seat_bindings WHERE seat = ?1",
+            params![seat.trim()],
+        )?;
         Ok(n > 0)
     }
 }
@@ -1720,10 +1733,12 @@ fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> 
 fn row_to_work_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::queue::WorkItem> {
     let kind_s: String = r.get(1)?;
     let state_s: String = r.get(2)?;
-    let kind = crate::queue::WorkKind::from_str(&kind_s)
-        .ok_or_else(|| rusqlite::Error::InvalidColumnName(format!("bad work_items.kind: {kind_s}")))?;
-    let state = crate::queue::WorkState::from_str(&state_s)
-        .ok_or_else(|| rusqlite::Error::InvalidColumnName(format!("bad work_items.state: {state_s}")))?;
+    let kind = crate::queue::WorkKind::from_str(&kind_s).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnName(format!("bad work_items.kind: {kind_s}"))
+    })?;
+    let state = crate::queue::WorkState::from_str(&state_s).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnName(format!("bad work_items.state: {state_s}"))
+    })?;
     Ok(crate::queue::WorkItem {
         id: r.get(0)?,
         kind,
@@ -1790,7 +1805,14 @@ mod tests {
 
         // Fresh ledger is empty.
         let s = db.usage_summary().unwrap();
-        assert_eq!(s, UsageSummary { total_calls: 0, known_cost_usd: 0.0, unknown_cost_calls: 0 });
+        assert_eq!(
+            s,
+            UsageSummary {
+                total_calls: 0,
+                known_cost_usd: 0.0,
+                unknown_cost_calls: 0
+            }
+        );
 
         // Two local ($0), one priced cloud, two unknown-cost cloud calls.
         db.record_usage(&ev("local", Some(0.0))).unwrap();
@@ -1802,8 +1824,15 @@ mod tests {
         let s = db.usage_summary().unwrap();
         assert_eq!(s.total_calls, 5);
         // Known cost = 0 + 0 + 0.42; the two None calls are NOT guessed into it.
-        assert!((s.known_cost_usd - 0.42).abs() < 1e-9, "known cost = {}", s.known_cost_usd);
-        assert_eq!(s.unknown_cost_calls, 2, "the two None cloud calls are flagged, not summed");
+        assert!(
+            (s.known_cost_usd - 0.42).abs() < 1e-9,
+            "known cost = {}",
+            s.known_cost_usd
+        );
+        assert_eq!(
+            s.unknown_cost_calls, 2,
+            "the two None cloud calls are flagged, not summed"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1820,7 +1849,10 @@ mod tests {
         assert!(db.insert_work_item(&a).unwrap(), "first enqueue inserts");
         let mut dup = WorkItem::queued(WorkKind::Cron, r#"{"prompt":"a"}"#, 101);
         dup.claim_key = Some("cron:job1@1000".into()); // same key → deduped
-        assert!(!db.insert_work_item(&dup).unwrap(), "same claim_key is a dedup no-op");
+        assert!(
+            !db.insert_work_item(&dup).unwrap(),
+            "same claim_key is a dedup no-op"
+        );
 
         let b = WorkItem::queued(WorkKind::AgentDispatch, r#"{"prompt":"b"}"#, 50);
         assert!(db.insert_work_item(&b).unwrap());
@@ -1838,15 +1870,22 @@ mod tests {
         assert_eq!(claimed_a.id, a.id);
 
         // Finish `b` (running) → done; a re-finish is a no-op (already terminal).
-        assert!(db.finish_work_item(&b.id, WorkState::Done, Some(r#"{"ok":true}"#), None, 200).unwrap());
-        assert!(!db.finish_work_item(&b.id, WorkState::Failed, None, Some("x"), 300).unwrap(),
-            "a terminal item can't be re-finished");
+        assert!(db
+            .finish_work_item(&b.id, WorkState::Done, Some(r#"{"ok":true}"#), None, 200)
+            .unwrap());
+        assert!(
+            !db.finish_work_item(&b.id, WorkState::Failed, None, Some("x"), 300)
+                .unwrap(),
+            "a terminal item can't be re-finished"
+        );
         let got = db.get_work_item(&b.id).unwrap().unwrap();
         assert_eq!(got.state, WorkState::Done);
         assert_eq!(got.result_json.as_deref(), Some(r#"{"ok":true}"#));
 
         // An illegal transition (running -> queued) is rejected.
-        assert!(db.finish_work_item(&a.id, WorkState::Queued, None, None, 400).is_err());
+        assert!(db
+            .finish_work_item(&a.id, WorkState::Queued, None, None, 400)
+            .is_err());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1863,12 +1902,22 @@ mod tests {
         // Claim ONE (both are due; which one is a tie) so it's mid-run, then
         // simulate a crash + boot reconcile.
         let claimed_id = db.claim_next_due_work(10).unwrap().unwrap().id;
-        let other_id = if claimed_id == r.id { q.id.clone() } else { r.id.clone() };
+        let other_id = if claimed_id == r.id {
+            q.id.clone()
+        } else {
+            r.id.clone()
+        };
         let n = db.terminalize_orphaned_work(500).unwrap();
         assert_eq!(n, 1, "only the running item is reconciled");
-        assert_eq!(db.get_work_item(&claimed_id).unwrap().unwrap().state, WorkState::Failed);
+        assert_eq!(
+            db.get_work_item(&claimed_id).unwrap().unwrap().state,
+            WorkState::Failed
+        );
         // The still-queued item is untouched (it will run later).
-        assert_eq!(db.get_work_item(&other_id).unwrap().unwrap().state, WorkState::Queued);
+        assert_eq!(
+            db.get_work_item(&other_id).unwrap().unwrap().state,
+            WorkState::Queued
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

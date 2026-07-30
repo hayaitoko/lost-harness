@@ -70,7 +70,10 @@ impl KeychainTokenProvider {
             .get(super::SECRET_GMAIL_CLIENT_SECRET)
             .map_err(anyhow::Error::msg)?;
         match (id, secret) {
-            (Some(client_id), Some(client_secret)) => Ok(GcpClient { client_id, client_secret }),
+            (Some(client_id), Some(client_secret)) => Ok(GcpClient {
+                client_id,
+                client_secret,
+            }),
             _ => anyhow::bail!(
                 "no Google OAuth client is configured — finish the Gmail setup in Settings → Email"
             ),
@@ -109,7 +112,10 @@ impl KeychainTokenProvider {
                 }
                 let expiry = Instant::now()
                     + Duration::from_secs(
-                        tokens.expires_in_secs.saturating_sub(EXPIRY_MARGIN_SECS).max(30),
+                        tokens
+                            .expires_in_secs
+                            .saturating_sub(EXPIRY_MARGIN_SECS)
+                            .max(30),
                     );
                 *self.cache.lock() = Some((tokens.access_token.clone(), expiry));
                 Ok(tokens.access_token)
@@ -207,11 +213,18 @@ mod tests {
 
     fn seeded_store() -> Arc<MemoryProviderSecretStore> {
         let s = Arc::new(MemoryProviderSecretStore::default());
-        s.set(crate::email::SECRET_GMAIL_CLIENT_ID, "x.apps.googleusercontent.com")
+        s.set(
+            crate::email::SECRET_GMAIL_CLIENT_ID,
+            "x.apps.googleusercontent.com",
+        )
+        .unwrap();
+        s.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh")
             .unwrap();
-        s.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh").unwrap();
-        s.set(&crate::email::secret_gmail_refresh_token("personal"), "rt-1")
-            .unwrap();
+        s.set(
+            &crate::email::secret_gmail_refresh_token("personal"),
+            "rt-1",
+        )
+        .unwrap();
         s
     }
 
@@ -227,7 +240,10 @@ mod tests {
     async fn caches_until_forced_and_persists_a_rotated_refresh_token() {
         let store = seeded_store();
         let endpoint = Arc::new(ScriptedEndpoint {
-            responses: Mutex::new(vec![ok_tokens("at-1", Some("rt-2")), ok_tokens("at-2", None)]),
+            responses: Mutex::new(vec![
+                ok_tokens("at-1", Some("rt-2")),
+                ok_tokens("at-2", None),
+            ]),
             calls: Mutex::new(0),
         });
         let p = KeychainTokenProvider::new("personal", store.clone(), endpoint.clone());
@@ -259,7 +275,9 @@ mod tests {
     async fn dead_grant_carries_the_reconnect_marker() {
         let store = seeded_store();
         let endpoint = Arc::new(ScriptedEndpoint {
-            responses: Mutex::new(vec![Err(RefreshError::NeedsReconnect { detail: "invalid_grant".into() })]),
+            responses: Mutex::new(vec![Err(RefreshError::NeedsReconnect {
+                detail: "invalid_grant".into(),
+            })]),
             calls: Mutex::new(0),
         });
         let p = KeychainTokenProvider::new("personal", store, endpoint);
@@ -283,7 +301,10 @@ mod tests {
             let delay = self.delay;
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
-                Ok((200, r#"{"access_token":"at-single","expires_in":3599}"#.to_string()))
+                Ok((
+                    200,
+                    r#"{"access_token":"at-single","expires_in":3599}"#.to_string(),
+                ))
             })
         }
     }
@@ -298,7 +319,11 @@ mod tests {
             calls: std::sync::atomic::AtomicU32::new(0),
             delay: Duration::from_millis(80),
         });
-        let provider = Arc::new(KeychainTokenProvider::new("personal", store, endpoint.clone()));
+        let provider = Arc::new(KeychainTokenProvider::new(
+            "personal",
+            store,
+            endpoint.clone(),
+        ));
 
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -346,11 +371,19 @@ mod tests {
     async fn a_failed_keychain_write_surfaces_and_does_not_cache_the_token() {
         let inner = MemoryProviderSecretStore::default();
         inner
-            .set(crate::email::SECRET_GMAIL_CLIENT_ID, "x.apps.googleusercontent.com")
+            .set(
+                crate::email::SECRET_GMAIL_CLIENT_ID,
+                "x.apps.googleusercontent.com",
+            )
             .unwrap();
-        inner.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh").unwrap();
         inner
-            .set(&crate::email::secret_gmail_refresh_token("personal"), "rt-1")
+            .set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh")
+            .unwrap();
+        inner
+            .set(
+                &crate::email::secret_gmail_refresh_token("personal"),
+                "rt-1",
+            )
             .unwrap();
         let store = Arc::new(WriteFailStore { inner });
         let endpoint = Arc::new(ScriptedEndpoint {
@@ -363,8 +396,14 @@ mod tests {
         let p = KeychainTokenProvider::new("personal", store.clone(), endpoint.clone());
 
         let err = p.access_token(false).await.unwrap_err().to_string();
-        assert!(err.contains("failed to persist rotated refresh token"), "got: {err}");
-        assert!(err.contains("keychain is locked"), "the store's own reason survives: {err}");
+        assert!(
+            err.contains("failed to persist rotated refresh token"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("keychain is locked"),
+            "the store's own reason survives: {err}"
+        );
         // The old token is still what's on disk — we did not pretend otherwise.
         assert_eq!(
             store
@@ -376,8 +415,15 @@ mod tests {
         // Nothing was cached, so the next call retries rather than serving an
         // access token whose refresh token we failed to record.
         let err2 = p.access_token(false).await.unwrap_err().to_string();
-        assert!(err2.contains("failed to persist rotated refresh token"), "got: {err2}");
-        assert_eq!(*endpoint.calls.lock(), 2, "the failure was retried, not cached over");
+        assert!(
+            err2.contains("failed to persist rotated refresh token"),
+            "got: {err2}"
+        );
+        assert_eq!(
+            *endpoint.calls.lock(),
+            2,
+            "the failure was retried, not cached over"
+        );
     }
 
     #[tokio::test]
@@ -393,9 +439,14 @@ mod tests {
 
         // Client present but profile unconnected → the connect message.
         empty
-            .set(crate::email::SECRET_GMAIL_CLIENT_ID, "x.apps.googleusercontent.com")
+            .set(
+                crate::email::SECRET_GMAIL_CLIENT_ID,
+                "x.apps.googleusercontent.com",
+            )
             .unwrap();
-        empty.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh").unwrap();
+        empty
+            .set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh")
+            .unwrap();
         let err = p.access_token(false).await.unwrap_err().to_string();
         assert!(err.contains("isn't connected"), "got: {err}");
     }

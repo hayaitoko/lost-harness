@@ -86,7 +86,9 @@ impl ModelManager {
         }
         let provider = self.get_provider(id)?;
         let client = ModelClient::new(provider).ok()?;
-        self.clients.write().insert(id.to_string(), clone_client(&client));
+        self.clients
+            .write()
+            .insert(id.to_string(), clone_client(&client));
         Some(client)
     }
 

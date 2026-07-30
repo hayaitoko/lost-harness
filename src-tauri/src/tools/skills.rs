@@ -186,7 +186,9 @@ impl Tool for SaveSkillTool {
                 Err(e) => return ToolResult::Err(e),
             };
             if name.chars().count() > MAX_SKILL_NAME {
-                return ToolResult::Err(format!("skill name too long (max {MAX_SKILL_NAME} chars)"));
+                return ToolResult::Err(format!(
+                    "skill name too long (max {MAX_SKILL_NAME} chars)"
+                ));
             }
             let content = match req_str(&input.args, "content") {
                 Ok(s) => s,
@@ -211,7 +213,11 @@ impl Tool for SaveSkillTool {
             }
             // Validate declared capabilities against the known set.
             let mut capabilities_required = Vec::new();
-            if let Some(arr) = input.args.get("capabilities_required").and_then(|v| v.as_array()) {
+            if let Some(arr) = input
+                .args
+                .get("capabilities_required")
+                .and_then(|v| v.as_array())
+            {
                 for c in arr {
                     let Some(c) = c.as_str() else {
                         return ToolResult::Err(
@@ -254,7 +260,9 @@ impl Tool for SaveSkillTool {
 fn req_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
     match args.get(key).and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
-        _ => Err(format!("save_skill requires a non-empty string \"{key}\" arg")),
+        _ => Err(format!(
+            "save_skill requires a non-empty string \"{key}\" arg"
+        )),
     }
 }
 
@@ -274,7 +282,11 @@ pub fn skill_tool_name(skill_name: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     let trimmed = slug.trim_matches('_');
-    let base = if trimmed.is_empty() { "unnamed" } else { trimmed };
+    let base = if trimmed.is_empty() {
+        "unnamed"
+    } else {
+        trimmed
+    };
     let capped: String = base.chars().take(58).collect(); // 64 - "skill_".len()
     format!("skill_{}", capped.trim_end_matches('_'))
 }
@@ -350,7 +362,10 @@ impl SkillTool {
         Some(SkillTool {
             skill_id: skill.id.clone(),
             tool_name: skill_tool_name(&skill.name),
-            description: format!("Apply the approved skill \"{}\": {}", skill.name, skill.description),
+            description: format!(
+                "Apply the approved skill \"{}\": {}",
+                skill.name, skill.description
+            ),
             requires,
             risk,
             storage,
@@ -449,17 +464,26 @@ mod tests {
         }
 
         // An approved skill is searchable by a content/description keyword.
-        match search.run(ToolInput::new(json!({ "query": "deploy" })), &ctx).await {
+        match search
+            .run(ToolInput::new(json!({ "query": "deploy" })), &ctx)
+            .await
+        {
             ToolResult::Ok(v) => {
                 let m = v["matches"].as_array().unwrap();
                 assert_eq!(m.len(), 1);
                 assert_eq!(m[0]["name"], "Deploy the app");
-                assert!(m[0]["body"].as_str().unwrap().contains("push to the droplet"));
+                assert!(m[0]["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("push to the droplet"));
             }
             ToolResult::Err(e) => panic!("search failed: {e}"),
         }
         // A non-matching query returns nothing.
-        match search.run(ToolInput::new(json!({ "query": "zzz nonsense" })), &ctx).await {
+        match search
+            .run(ToolInput::new(json!({ "query": "zzz nonsense" })), &ctx)
+            .await
+        {
             ToolResult::Ok(v) => assert!(v["matches"].as_array().unwrap().is_empty()),
             ToolResult::Err(e) => panic!("search failed: {e}"),
         }
@@ -479,7 +503,9 @@ mod tests {
         // Unknown capability.
         assert!(matches!(
             save.run(
-                ToolInput::new(json!({ "name": "x", "content": "y", "capabilities_required": ["Telepathy"] })),
+                ToolInput::new(
+                    json!({ "name": "x", "content": "y", "capabilities_required": ["Telepathy"] })
+                ),
                 &ctx
             )
             .await,
@@ -494,7 +520,10 @@ mod tests {
         // (which accept_edits blanket-approves) — a skill is standing +
         // cross-profile + persistent, so it must always be reviewed.
         let (storage, root) = temp_storage();
-        assert_eq!(SaveSkillTool::new(storage.clone()).risk(), RiskClass::Dangerous);
+        assert_eq!(
+            SaveSkillTool::new(storage.clone()).risk(),
+            RiskClass::Dangerous
+        );
         assert_eq!(SearchSkillsTool::new(storage).risk(), RiskClass::Safe);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -519,7 +548,10 @@ mod tests {
             .unwrap();
         let search = SearchSkillsTool::new(storage.clone());
         match search
-            .run(ToolInput::new(json!({ "query": "deploy" })), &ExecCtx::default())
+            .run(
+                ToolInput::new(json!({ "query": "deploy" })),
+                &ExecCtx::default(),
+            )
             .await
         {
             ToolResult::Ok(v) => assert!(
@@ -549,14 +581,21 @@ mod tests {
 
     #[test]
     fn skill_tool_name_is_prefixed_and_slugged() {
-        assert_eq!(skill_tool_name("My Deploy Playbook"), "skill_my_deploy_playbook");
+        assert_eq!(
+            skill_tool_name("My Deploy Playbook"),
+            "skill_my_deploy_playbook"
+        );
         assert_eq!(skill_tool_name("weird!!chars"), "skill_weird__chars");
         // The prefix structurally prevents shadowing any built-in tool name.
         assert!(skill_tool_name("shell_exec").starts_with("skill_"));
         // Review #2: the FULL name fits the strictest native function-name
         // limit (64) — one long-named skill must never brick the tools array.
         let long = skill_tool_name(&"very long skill name ".repeat(20));
-        assert!(long.chars().count() <= 64, "got {} chars", long.chars().count());
+        assert!(
+            long.chars().count() <= 64,
+            "got {} chars",
+            long.chars().count()
+        );
         // Review #3 edge: an all-symbols name gets the explicit fallback.
         assert_eq!(skill_tool_name("!!!"), "skill_unnamed");
     }
@@ -583,10 +622,16 @@ mod tests {
         assert_eq!(risk_for_capabilities(&[C::Filesystem]), RiskClass::Write);
         // Egress capabilities gate like fetch_url.
         assert_eq!(risk_for_capabilities(&[C::Network]), RiskClass::External);
-        assert_eq!(risk_for_capabilities(&[C::WebResearch]), RiskClass::External);
+        assert_eq!(
+            risk_for_capabilities(&[C::WebResearch]),
+            RiskClass::External
+        );
         // Shell gates like shell_exec (Dangerous) and dominates.
         assert_eq!(risk_for_capabilities(&[C::Shell]), RiskClass::Dangerous);
-        assert_eq!(risk_for_capabilities(&[C::Network, C::Shell]), RiskClass::Dangerous);
+        assert_eq!(
+            risk_for_capabilities(&[C::Network, C::Shell]),
+            RiskClass::Dangerous
+        );
     }
 
     #[test]
@@ -594,15 +639,26 @@ mod tests {
         let (storage, root) = temp_storage();
         let storage = std::sync::Arc::new(storage);
         let mut s = approved_skill("s1", "Deploy It", &["Shell"]);
-        let tool = SkillTool::for_skill(&s, std::sync::Arc::clone(&storage)).expect("approved wraps");
+        let tool =
+            SkillTool::for_skill(&s, std::sync::Arc::clone(&storage)).expect("approved wraps");
         assert_eq!(tool.name(), "skill_deploy_it");
-        assert_eq!(tool.risk(), RiskClass::Dangerous, "Shell skill re-gates like shell_exec");
+        assert_eq!(
+            tool.risk(),
+            RiskClass::Dangerous,
+            "Shell skill re-gates like shell_exec"
+        );
 
         s.approval_status = SkillApproval::Pending;
-        assert!(SkillTool::for_skill(&s, std::sync::Arc::clone(&storage)).is_none(), "pending never wraps");
+        assert!(
+            SkillTool::for_skill(&s, std::sync::Arc::clone(&storage)).is_none(),
+            "pending never wraps"
+        );
         s.approval_status = SkillApproval::Approved;
         s.capabilities_required = vec!["NotACapability".into()];
-        assert!(SkillTool::for_skill(&s, storage).is_none(), "unparseable capability fails closed");
+        assert!(
+            SkillTool::for_skill(&s, storage).is_none(),
+            "unparseable capability fails closed"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -615,16 +671,26 @@ mod tests {
         let tool = SkillTool::for_skill(&skill, std::sync::Arc::clone(&storage)).unwrap();
 
         // Approved → the playbook loads.
-        let ok = tool.run(ToolInput::new(json!({})), &ExecCtx::default()).await;
+        let ok = tool
+            .run(ToolInput::new(json!({})), &ExecCtx::default())
+            .await;
         match ok {
             ToolResult::Ok(v) => assert!(v["playbook"].as_str().unwrap().contains("do the thing")),
             other => panic!("expected the playbook, got {other:?}"),
         }
         // Rejected AFTER registration → a stale wrapper must refuse (the DB is
         // the source of truth, not the captured struct).
-        storage.global().set_skill_approval("s2", SkillApproval::Rejected).unwrap();
-        let refused = tool.run(ToolInput::new(json!({})), &ExecCtx::default()).await;
-        assert!(matches!(refused, ToolResult::Err(_)), "a revoked skill's body never loads");
+        storage
+            .global()
+            .set_skill_approval("s2", SkillApproval::Rejected)
+            .unwrap();
+        let refused = tool
+            .run(ToolInput::new(json!({})), &ExecCtx::default())
+            .await;
+        assert!(
+            matches!(refused, ToolResult::Err(_)),
+            "a revoked skill's body never loads"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -638,31 +704,56 @@ mod tests {
 
         let skill = approved_skill("s3", "Summarize Inbox", &[]);
         let tool = SkillTool::for_skill(&skill, std::sync::Arc::clone(&storage)).unwrap();
-        assert!(registry.register_dynamic(Box::new(tool)), "hot-register succeeds");
-        assert!(registry.get("skill_summarize_inbox").is_some(), "callable by name");
+        assert!(
+            registry.register_dynamic(Box::new(tool)),
+            "hot-register succeeds"
+        );
+        assert!(
+            registry.get("skill_summarize_inbox").is_some(),
+            "callable by name"
+        );
         assert!(registry.all_names().contains("skill_summarize_inbox"));
 
         // A dynamic tool can never shadow a static one (nor itself).
         struct FakeEcho;
         impl Tool for FakeEcho {
-            fn name(&self) -> &str { "echo" }
-            fn requires(&self) -> &[Capability] { &[] }
-            fn run<'a>(&'a self, _i: ToolInput, _c: &'a ExecCtx)
-                -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn requires(&self) -> &[Capability] {
+                &[]
+            }
+            fn run<'a>(
+                &'a self,
+                _i: ToolInput,
+                _c: &'a ExecCtx,
+            ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
                 Box::pin(async { ToolResult::Err("shadow".into()) })
             }
         }
-        assert!(!registry.register_dynamic(Box::new(FakeEcho)), "shadowing a built-in refused");
+        assert!(
+            !registry.register_dynamic(Box::new(FakeEcho)),
+            "shadowing a built-in refused"
+        );
 
         // A helper's frozen belt SNAPSHOTS the dynamic set (no later widening).
         let belt: std::collections::HashSet<String> =
             ["skill_summarize_inbox".to_string()].into_iter().collect();
         let sub = registry.restricted_to(&belt);
-        assert!(sub.get("skill_summarize_inbox").is_some(), "snapshot carries the skill");
+        assert!(
+            sub.get("skill_summarize_inbox").is_some(),
+            "snapshot carries the skill"
+        );
 
         assert!(registry.unregister_dynamic("skill_summarize_inbox"));
-        assert!(registry.get("skill_summarize_inbox").is_none(), "unregistered → not callable");
-        assert!(!registry.unregister_dynamic("echo"), "static tools are untouchable");
+        assert!(
+            registry.get("skill_summarize_inbox").is_none(),
+            "unregistered → not callable"
+        );
+        assert!(
+            !registry.unregister_dynamic("echo"),
+            "static tools are untouchable"
+        );
         assert!(registry.get("echo").is_some());
         let _ = std::fs::remove_dir_all(root);
     }

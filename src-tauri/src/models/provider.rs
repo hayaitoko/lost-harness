@@ -137,7 +137,13 @@ mod tests {
     fn local_origin_defaults_to_none_and_is_builder_set() {
         // C5: a plain Local provider has no origin and isn't a bundled runner —
         // keeps every existing Provider::new call site's meaning unchanged.
-        let plain = Provider::new("p", "P", "http://127.0.0.1:1234/v1", None, ProviderKind::Local);
+        let plain = Provider::new(
+            "p",
+            "P",
+            "http://127.0.0.1:1234/v1",
+            None,
+            ProviderKind::Local,
+        );
         assert_eq!(plain.local_origin, None);
         assert!(!plain.is_bundled_runner());
 
@@ -146,8 +152,14 @@ mod tests {
         assert!(bundled.is_bundled_runner());
 
         // A user-added local endpoint is explicitly UserAdded → not a runner.
-        let user = Provider::new("lm", "LM", "http://127.0.0.1:1234/v1", None, ProviderKind::Local)
-            .with_local_origin(LocalOrigin::UserAdded);
+        let user = Provider::new(
+            "lm",
+            "LM",
+            "http://127.0.0.1:1234/v1",
+            None,
+            ProviderKind::Local,
+        )
+        .with_local_origin(LocalOrigin::UserAdded);
         assert!(!user.is_bundled_runner());
 
         // Cloud is never a bundled runner regardless.

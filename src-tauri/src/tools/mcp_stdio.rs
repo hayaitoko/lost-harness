@@ -275,10 +275,16 @@ impl StdioMcpTransport {
             .spawn()
             .map_err(|e| format!("couldn't spawn MCP server `{command}`: {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin pipe on the MCP child")?;
-        let stdout = child.stdout.take().ok_or("no stdout pipe on the MCP child")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("no stdout pipe on the MCP child")?;
         let transport = Self {
             child: tokio::sync::Mutex::new(child),
-            io: tokio::sync::Mutex::new(Io { stdin, stdout: BufReader::new(stdout) }),
+            io: tokio::sync::Mutex::new(Io {
+                stdin,
+                stdout: BufReader::new(stdout),
+            }),
             next_id: AtomicI64::new(0),
         };
 
@@ -329,7 +335,10 @@ impl StdioMcpTransport {
                 .write_all(line.as_bytes())
                 .await
                 .map_err(|e| format!("MCP stdin write failed: {e}"))?;
-            io.stdin.flush().await.map_err(|e| format!("MCP stdin flush failed: {e}"))?;
+            io.stdin
+                .flush()
+                .await
+                .map_err(|e| format!("MCP stdin flush failed: {e}"))?;
             loop {
                 let mut buf = String::new();
                 // A bounded reader wrapper so a runaway line can't OOM us
@@ -352,7 +361,10 @@ impl StdioMcpTransport {
                 if let Some(err) = msg.get("error") {
                     return Err(format!("MCP server error: {err}"));
                 }
-                return Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null));
+                return Ok(msg
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
             }
         };
         tokio::time::timeout(RPC_TIMEOUT, fut)
@@ -372,7 +384,10 @@ impl StdioMcpTransport {
                 .write_all(line.as_bytes())
                 .await
                 .map_err(|e| format!("MCP stdin write failed: {e}"))?;
-            io.stdin.flush().await.map_err(|e| format!("MCP stdin flush failed: {e}"))
+            io.stdin
+                .flush()
+                .await
+                .map_err(|e| format!("MCP stdin flush failed: {e}"))
         };
         tokio::time::timeout(RPC_TIMEOUT, fut)
             .await
@@ -445,8 +460,14 @@ impl McpTransport for StdioMcpTransport {
                 .await?;
             // MCP's server-side tool-error signal — surfaced as Err so it flows
             // through the SAME ToolResult::Err arm as any transport failure.
-            if result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false) {
-                return Err(format!("MCP tool `{tool_name}` reported an error: {result}"));
+            if result
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return Err(format!(
+                    "MCP tool `{tool_name}` reported an error: {result}"
+                ));
             }
             // Return the raw result envelope unmodified (content shaping is a
             // later UX pass — unwrapping content[0].text here would be a lossy
@@ -551,7 +572,11 @@ pub async fn bring_up_server(
     let cfg = McpServerConfig {
         server_name: row.name.clone(),
         // Unknown tier strings fail CLOSED to Remote (the stricter tier).
-        tier: if row.tier == "local" { McpTrustTier::Local } else { McpTrustTier::Remote },
+        tier: if row.tier == "local" {
+            McpTrustTier::Local
+        } else {
+            McpTrustTier::Remote
+        },
         trusted_read_only: row.trusted_read_only,
         capabilities: row
             .capabilities
@@ -575,7 +600,10 @@ pub async fn bring_up_server(
     }
     runtime.servers.lock().insert(
         row.id.clone(),
-        McpRuntimeEntry { transport, tool_names: names.clone() },
+        McpRuntimeEntry {
+            transport,
+            tool_names: names.clone(),
+        },
     );
     Ok(names)
 }
@@ -684,8 +712,14 @@ mod tests {
         let t = StdioMcpTransport::spawn("sh", &[script])
             .await
             .expect("allowlisted PATH must still resolve the shell fixture");
-        let tools = t.list_tools().await.expect("environment fixture lists tools");
-        assert_eq!(tools[0].description, "unset", "parent secret leaked to MCP child");
+        let tools = t
+            .list_tools()
+            .await
+            .expect("environment fixture lists tools");
+        assert_eq!(
+            tools[0].description, "unset",
+            "parent secret leaked to MCP child"
+        );
         t.shutdown().await;
         std::env::remove_var(marker);
     }
@@ -726,14 +760,19 @@ mod tests {
 
         // Bring-up: spawn + handshake + tools/list + hot-register through the
         // untouched trust spine (namespaced name proves it went through).
-        let names = bring_up_server(&row, &dispatcher, &runtime).await.expect("bring-up");
+        let names = bring_up_server(&row, &dispatcher, &runtime)
+            .await
+            .expect("bring-up");
         assert_eq!(names, vec!["mcp__fixture__echo_upper".to_string()]);
 
         // A REAL dispatch through the dispatcher reaches the child and returns
         // the raw MCP result envelope.
         let out = dispatcher
             .dispatch(
-                &ToolCall { name: names[0].clone(), args: serde_json::json!({"text": "hello"}) },
+                &ToolCall {
+                    name: names[0].clone(),
+                    args: serde_json::json!({"text": "hello"}),
+                },
                 &ExecCtx::default(),
                 Binding::Public,
                 true,
@@ -748,13 +787,19 @@ mod tests {
         assert!(tear_down_server("srv1", &dispatcher, &runtime).await);
         let gone = dispatcher
             .dispatch(
-                &ToolCall { name: names[0].clone(), args: serde_json::json!({}) },
+                &ToolCall {
+                    name: names[0].clone(),
+                    args: serde_json::json!({}),
+                },
                 &ExecCtx::default(),
                 Binding::Public,
                 true,
             )
             .await;
-        assert!(matches!(gone, ToolOutcome::Unknown(_)), "a removed server's tools are gone");
+        assert!(
+            matches!(gone, ToolOutcome::Unknown(_)),
+            "a removed server's tools are gone"
+        );
     }
 
     #[tokio::test]
@@ -762,7 +807,10 @@ mod tests {
         // A command that exits immediately: the handshake read hits EOF → Err,
         // never a half-initialized transport.
         let r = StdioMcpTransport::spawn("true", &[]).await;
-        assert!(r.is_err(), "an exiting child can never hand back a transport");
+        assert!(
+            r.is_err(),
+            "an exiting child can never hand back a transport"
+        );
         // A nonexistent binary fails at spawn.
         let r2 = StdioMcpTransport::spawn("/nonexistent/lhp-mcp-server", &[]).await;
         assert!(r2.is_err());

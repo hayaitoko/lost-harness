@@ -227,13 +227,18 @@ impl ConversationReads {
     /// Record that `path` (already canonicalized) was read in `conversation`.
     pub fn record(&self, conversation: &str, path: PathBuf) {
         let mut guard = self.inner.lock().expect("ConversationReads mutex poisoned");
-        guard.entry(conversation.to_string()).or_default().insert(path);
+        guard
+            .entry(conversation.to_string())
+            .or_default()
+            .insert(path);
     }
 
     /// Has `path` been read in `conversation` this session?
     pub fn contains(&self, conversation: &str, path: &Path) -> bool {
         let guard = self.inner.lock().expect("ConversationReads mutex poisoned");
-        guard.get(conversation).is_some_and(|set| set.contains(path))
+        guard
+            .get(conversation)
+            .is_some_and(|set| set.contains(path))
     }
 }
 

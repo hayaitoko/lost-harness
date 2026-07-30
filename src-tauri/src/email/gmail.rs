@@ -135,7 +135,10 @@ pub trait GmailApi: Send + Sync {
     /// `GET /gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=...`
     /// — lightweight: headers + snippet only, no body data. Use for search
     /// previews where the full body is unnecessary.
-    fn get_message_metadata<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<EmailMessage>>;
+    fn get_message_metadata<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<EmailMessage>>;
 
     /// `POST /gmail/v1/users/me/messages/send` — send a raw RFC 822 message
     /// (build it with [`build_rfc822`]). Returns the sent message's id.
@@ -273,11 +276,9 @@ impl GmailClient {
         let token = self.tokens.access_token(false).await?;
         let (mut status, mut text) = self.http.request(method, url, &token, body).await?;
         if status == 401 {
-            let fresh = self
-                .tokens
-                .access_token(true)
-                .await
-                .map_err(|e| anyhow::anyhow!("Gmail rejected the access token and refresh failed: {e}"))?;
+            let fresh = self.tokens.access_token(true).await.map_err(|e| {
+                anyhow::anyhow!("Gmail rejected the access token and refresh failed: {e}")
+            })?;
             (status, text) = self.http.request(method, url, &fresh, body).await?;
         }
         if !(200..300).contains(&status) {
@@ -323,13 +324,19 @@ impl GmailApi for GmailClient {
             if !valid_message_id(id) {
                 anyhow::bail!("malformed Gmail message id: {id:?}");
             }
-            let url = format!("{}/gmail/v1/users/me/messages/{id}?format=full", self.base_url);
+            let url = format!(
+                "{}/gmail/v1/users/me/messages/{id}?format=full",
+                self.base_url
+            );
             let body = self.execute(HttpMethod::Get, &url, None).await?;
             parse_message(&body)
         })
     }
 
-    fn get_message_metadata<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<EmailMessage>> {
+    fn get_message_metadata<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<EmailMessage>> {
         Box::pin(async move {
             if !valid_message_id(id) {
                 anyhow::bail!("malformed Gmail message id: {id:?}");
@@ -457,14 +464,17 @@ pub fn parse_message_list(json: &str) -> anyhow::Result<Vec<MessageMeta>> {
     Ok(list
         .messages
         .into_iter()
-        .map(|m| MessageMeta { id: m.id, thread_id: m.thread_id })
+        .map(|m| MessageMeta {
+            id: m.id,
+            thread_id: m.thread_id,
+        })
         .collect())
 }
 
 /// Parse a `format=full` message into an [`EmailMessage`]. Pure.
 pub fn parse_message(json: &str) -> anyhow::Result<EmailMessage> {
-    let msg: WireMessage = serde_json::from_str(json)
-        .map_err(|e| anyhow::anyhow!("message didn't parse: {e}"))?;
+    let msg: WireMessage =
+        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("message didn't parse: {e}"))?;
     let payload = msg.payload.unwrap_or_default();
     Ok(EmailMessage {
         id: msg.id,
@@ -671,7 +681,10 @@ mod tests {
         let padded = base64::engine::general_purpose::URL_SAFE.encode(b"hi!!");
         assert!(padded.ends_with('='));
         assert_eq!(decode_b64url(&padded).unwrap(), b"hi!!");
-        assert!(decode_b64url("not base64 !!!").is_err(), "no unwrap on untrusted data");
+        assert!(
+            decode_b64url("not base64 !!!").is_err(),
+            "no unwrap on untrusted data"
+        );
     }
 
     /// The nested-multipart fixture the task asks for:
@@ -712,7 +725,10 @@ mod tests {
         let msg = parse_message(&nested_message_json()).unwrap();
         assert_eq!(msg.id, "m1");
         assert_eq!(msg.from, "Ada <ada@example.com>");
-        assert_eq!(msg.to, "lukas@example.com", "header lookup is case-insensitive");
+        assert_eq!(
+            msg.to, "lukas@example.com",
+            "header lookup is case-insensitive"
+        );
         assert_eq!(msg.subject, "Lunch");
         assert_eq!(msg.date, "Thu, 23 Jul 2026 09:00:00 -0700");
         assert_eq!(msg.snippet, "Lunch tomorrow?");
@@ -754,12 +770,21 @@ mod tests {
         assert_eq!(
             list,
             vec![
-                MessageMeta { id: "a".into(), thread_id: "ta".into() },
-                MessageMeta { id: "b".into(), thread_id: "tb".into() },
+                MessageMeta {
+                    id: "a".into(),
+                    thread_id: "ta".into()
+                },
+                MessageMeta {
+                    id: "b".into(),
+                    thread_id: "tb".into()
+                },
             ]
         );
         // Gmail omits `messages` entirely when nothing matches.
-        assert_eq!(parse_message_list(r#"{"resultSizeEstimate":0}"#).unwrap(), vec![]);
+        assert_eq!(
+            parse_message_list(r#"{"resultSizeEstimate":0}"#).unwrap(),
+            vec![]
+        );
     }
 
     // -- rfc822 ------------------------------------------------------------
@@ -808,10 +833,11 @@ mod tests {
                 .strip_prefix("=?UTF-8?B?")
                 .and_then(|w| w.strip_suffix("?="))
                 .unwrap_or_else(|| panic!("not an encoded word: {word}"));
-            assert!(word.len() <= 75, "encoded word over RFC 2047 length: {word}");
-            decoded.push_str(
-                &String::from_utf8(STANDARD.decode(b64.as_bytes()).unwrap()).unwrap(),
+            assert!(
+                word.len() <= 75,
+                "encoded word over RFC 2047 length: {word}"
             );
+            decoded.push_str(&String::from_utf8(STANDARD.decode(b64.as_bytes()).unwrap()).unwrap());
         }
         assert_eq!(decoded, subject);
         // Every header line is CRLF-separated ASCII.
@@ -847,7 +873,10 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 responses: Mutex::new(
-                    responses.into_iter().map(|(s, b)| (s, b.to_string())).collect(),
+                    responses
+                        .into_iter()
+                        .map(|(s, b)| (s, b.to_string()))
+                        .collect(),
                 ),
             }
         }
@@ -883,7 +912,9 @@ mod tests {
 
     impl FakeTokens {
         fn new() -> Self {
-            Self { forced: Mutex::new(0) }
+            Self {
+                forced: Mutex::new(0),
+            }
         }
     }
 
@@ -907,11 +938,18 @@ mod tests {
         ]));
         let list = client.list_messages(None, 10).await.unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(*tokens.forced.lock().unwrap(), 1, "exactly one forced refresh");
+        assert_eq!(
+            *tokens.forced.lock().unwrap(),
+            1,
+            "exactly one forced refresh"
+        );
         let calls = http.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].2, "stale-token");
-        assert_eq!(calls[1].2, "fresh-token", "retry carries the refreshed token");
+        assert_eq!(
+            calls[1].2, "fresh-token",
+            "retry carries the refreshed token"
+        );
         assert_eq!(calls[0].1, calls[1].1, "identical request retried");
     }
 
@@ -920,17 +958,21 @@ mod tests {
         let ((client, http), tokens) =
             arc_client(FakeHttp::scripted(vec![(401, "no"), (401, "still no")]));
         let err = client.list_messages(None, 5).await.unwrap_err();
-        assert!(err.to_string().contains("401"), "honest status in the error: {err}");
-        assert_eq!(*tokens.forced.lock().unwrap(), 1, "refresh attempted once, never looped");
+        assert!(
+            err.to_string().contains("401"),
+            "honest status in the error: {err}"
+        );
+        assert_eq!(
+            *tokens.forced.lock().unwrap(),
+            1,
+            "refresh attempted once, never looped"
+        );
         assert_eq!(http.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn list_url_carries_query_and_clamped_max() {
-        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(
-            200,
-            r#"{"messages":[]}"#,
-        )]));
+        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(200, r#"{"messages":[]}"#)]));
         let (client, http) = client;
         client
             .list_messages(Some("is:unread from:ada"), 9999)
@@ -949,15 +991,20 @@ mod tests {
     async fn get_message_refuses_a_malformed_id_before_any_request() {
         let (client, _tokens) = arc_client(FakeHttp::scripted(vec![]));
         let (client, http) = client;
-        let err = client.get_message("../users/other/messages/x").await.unwrap_err();
+        let err = client
+            .get_message("../users/other/messages/x")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("malformed"), "{err}");
         assert!(http.calls.lock().unwrap().is_empty(), "no request was sent");
     }
 
     #[tokio::test]
     async fn send_posts_base64url_raw_and_returns_the_id() {
-        let (client, _tokens) =
-            arc_client(FakeHttp::scripted(vec![(200, r#"{"id":"sent-1","threadId":"t"}"#)]));
+        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(
+            200,
+            r#"{"id":"sent-1","threadId":"t"}"#,
+        )]));
         let (client, http) = client;
         let raw = build_rfc822("a@b.c", "Hi", "Body").unwrap();
         let id = client.send(&raw).await.unwrap();
@@ -969,7 +1016,11 @@ mod tests {
         let encoded = body["raw"].as_str().expect("raw field");
         assert!(!encoded.contains('='), "unpadded base64url");
         let decoded = URL_SAFE_NO_PAD.decode(encoded.as_bytes()).unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap(), raw, "raw survives the encode");
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            raw,
+            "raw survives the encode"
+        );
     }
 
     // -- the real reqwest transport against a loopback server ---------------
@@ -1053,7 +1104,10 @@ mod tests {
 
         // 3. Control: a body under the cap still comes back intact.
         let url = serve_once(with_content_length(br#"{"id":"m-1"}"#)).await;
-        let (status, body) = http.request(HttpMethod::Get, &url, "tok", None).await.unwrap();
+        let (status, body) = http
+            .request(HttpMethod::Get, &url, "tok", None)
+            .await
+            .unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, r#"{"id":"m-1"}"#);
     }
@@ -1061,7 +1115,10 @@ mod tests {
     /// Build a client whose FakeHttp stays reachable for assertions.
     fn arc_client(
         http: FakeHttp,
-    ) -> ((GmailClient, std::sync::Arc<FakeHttp>), std::sync::Arc<FakeTokens>) {
+    ) -> (
+        (GmailClient, std::sync::Arc<FakeHttp>),
+        std::sync::Arc<FakeTokens>,
+    ) {
         let http = std::sync::Arc::new(http);
         let tokens = std::sync::Arc::new(FakeTokens::new());
         struct SharedHttp(std::sync::Arc<FakeHttp>);
@@ -1084,7 +1141,10 @@ mod tests {
         }
         (
             (
-                GmailClient::new(Box::new(SharedHttp(http.clone())), Arc::new(SharedTokens(tokens.clone()))),
+                GmailClient::new(
+                    Box::new(SharedHttp(http.clone())),
+                    Arc::new(SharedTokens(tokens.clone())),
+                ),
                 http,
             ),
             tokens,

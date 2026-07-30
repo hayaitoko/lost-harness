@@ -59,7 +59,10 @@ mod tests {
         // gpt-4o: $2.50/Mtok in, $10/Mtok out. 1000 in + 500 out.
         let c = cost_usd("gpt-4o", 1000, 500).unwrap();
         let expected = (1000.0 / 1e6) * 2.50 + (500.0 / 1e6) * 10.00;
-        assert!((c - expected).abs() < 1e-12, "cost = {c}, expected {expected}");
+        assert!(
+            (c - expected).abs() < 1e-12,
+            "cost = {c}, expected {expected}"
+        );
     }
 
     #[test]

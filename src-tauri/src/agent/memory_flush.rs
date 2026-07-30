@@ -89,7 +89,10 @@ pub struct LocalModelExtractor {
 
 impl LocalModelExtractor {
     pub fn new(model_manager: Arc<ModelManager>, storage: Arc<Storage>) -> Self {
-        Self { model_manager, storage }
+        Self {
+            model_manager,
+            storage,
+        }
     }
 
     /// The first registered provider that is both `Local` AND private by URL —
@@ -158,15 +161,17 @@ impl DurableFactExtractor for LocalModelExtractor {
 /// memory-flush extractor and the skill-reflect drafter (B10).
 pub(crate) fn book_local_usage(storage: &Storage, profile: &str, model: &str, provider_id: &str) {
     let book = || -> anyhow::Result<()> {
-        storage.open_profile(profile)?.record_usage(&crate::storage::UsageEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            conversation_id: None,
-            model: model.to_string(),
-            provider_id: Some(provider_id.to_string()),
-            provider_kind: "local".to_string(),
-            cost_usd: Some(0.0), // local/private endpoint — always $0, never a guess
-            created_at: chrono::Utc::now().timestamp(),
-        })?;
+        storage
+            .open_profile(profile)?
+            .record_usage(&crate::storage::UsageEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: None,
+                model: model.to_string(),
+                provider_id: Some(provider_id.to_string()),
+                provider_kind: "local".to_string(),
+                cost_usd: Some(0.0), // local/private endpoint — always $0, never a guess
+                created_at: chrono::Utc::now().timestamp(),
+            })?;
         Ok(())
     };
     if let Err(e) = book() {
@@ -214,7 +219,11 @@ pub(crate) fn select_unswept(
 fn render_excerpt(turns: &[ChatMessage]) -> String {
     let mut s = String::new();
     for m in turns.iter().filter(|m| is_fact_source(m)) {
-        let who = if m.role == "assistant" { "Assistant" } else { "User" };
+        let who = if m.role == "assistant" {
+            "Assistant"
+        } else {
+            "User"
+        };
         s.push_str(who);
         s.push_str(": ");
         s.push_str(m.content.trim());
@@ -290,8 +299,11 @@ pub(crate) async fn run_flush(
     let mem = storage.memory_db_for_profile(&profile)?;
     let emb = embedder.as_ref().and_then(|h| h.get());
     let want_embed = semantic_search_enabled(&storage, &profile);
-    let tags = serde_json::json!(["source:pre_compaction", format!("conversation:{conversation_id}")])
-        .to_string();
+    let tags = serde_json::json!([
+        "source:pre_compaction",
+        format!("conversation:{conversation_id}")
+    ])
+    .to_string();
 
     let mut saved = 0usize;
     for fact in facts {
@@ -328,7 +340,10 @@ pub(crate) async fn run_flush(
 fn fact_already_saved(mem: &crate::storage::GlobalDb, content: &str) -> bool {
     let norm = content.trim().to_lowercase();
     mem.search_memory(content, true, 8)
-        .map(|hits| hits.iter().any(|h| h.fact.content.trim().to_lowercase() == norm))
+        .map(|hits| {
+            hits.iter()
+                .any(|h| h.fact.content.trim().to_lowercase() == norm)
+        })
         .unwrap_or(false)
 }
 
@@ -385,14 +400,7 @@ pub(crate) async fn run_new_chat_nudge(
         return Ok(0);
     }
     run_flush(
-        extractor,
-        classifier,
-        storage,
-        embedder,
-        profile,
-        prior.id,
-        unswept,
-        now,
+        extractor, classifier, storage, embedder, profile, prior.id, unswept, now,
     )
     .await
 }
@@ -456,13 +464,24 @@ mod tests {
 
     #[test]
     fn parse_facts_strips_markers_drops_none_and_caps() {
-        let out = "- i prefer dark mode\n1. my dog is named Rex\nNONE\n\n* the deadline is Friday\n";
+        let out =
+            "- i prefer dark mode\n1. my dog is named Rex\nNONE\n\n* the deadline is Friday\n";
         let facts = parse_facts(out);
-        assert_eq!(facts, vec!["i prefer dark mode", "my dog is named Rex", "the deadline is Friday"]);
+        assert_eq!(
+            facts,
+            vec![
+                "i prefer dark mode",
+                "my dog is named Rex",
+                "the deadline is Friday"
+            ]
+        );
         // A pure "NONE" answer yields nothing.
         assert!(parse_facts("NONE").is_empty());
         // The cap holds.
-        let many = (0..50).map(|i| format!("- fact {i}")).collect::<Vec<_>>().join("\n");
+        let many = (0..50)
+            .map(|i| format!("- fact {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(parse_facts(&many).len(), MAX_FACTS_PER_FLUSH);
     }
 
@@ -471,7 +490,10 @@ mod tests {
         let c = RulesClassifier::new();
         let cfg = ClassifierConfig::default();
         // A credential → dropped (None).
-        assert_eq!(classify_and_route(&c, &cfg, "my api key is sk-live-abcdef0123456789abcdef"), None);
+        assert_eq!(
+            classify_and_route(&c, &cfg, "my api key is sk-live-abcdef0123456789abcdef"),
+            None
+        );
         // A private PII fact → private-local bucket.
         assert_eq!(
             classify_and_route(&c, &cfg, "my SSN is 123-45-6789"),
@@ -519,12 +541,18 @@ mod tests {
         let shared = g.search_memory("standup", false, 10).unwrap();
         assert!(shared.iter().any(|h| h.fact.content.contains("standup")));
         let any_secret = g.search_memory("sk-live", true, 10).unwrap();
-        assert!(any_secret.is_empty(), "a credential must never be persisted");
+        assert!(
+            any_secret.is_empty(),
+            "a credential must never be persisted"
+        );
         // The SSN fact is present only via a private-inclusive search.
         let priv_only = g.search_memory("SSN", true, 10).unwrap();
         assert!(priv_only.iter().any(|h| h.fact.content.contains("SSN")));
         let cloud_view = g.search_memory("SSN", false, 10).unwrap();
-        assert!(cloud_view.is_empty(), "a private fact never surfaces on a cloud (shared) search");
+        assert!(
+            cloud_view.is_empty(),
+            "a private fact never surfaces on a cloud (shared) search"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -639,7 +667,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(again, 0, "an already-swept conversation is not re-consolidated");
+        assert_eq!(
+            again, 0,
+            "an already-swept conversation is not re-consolidated"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -650,8 +681,10 @@ mod tests {
         root.push(format!("lhp-flush-empty-{}", uuid::Uuid::new_v4()));
         let storage = Arc::new(Storage::open(&root).unwrap());
         let classifier: Arc<dyn Classifier> = Arc::new(RulesClassifier::new());
-        let extractor: Arc<dyn DurableFactExtractor> =
-            Arc::new(FakeExtractor { available: true, facts: vec![] });
+        let extractor: Arc<dyn DurableFactExtractor> = Arc::new(FakeExtractor {
+            available: true,
+            facts: vec![],
+        });
         let saved = run_flush(
             extractor,
             classifier,
@@ -676,12 +709,30 @@ mod tests {
         let mut root = std::env::temp_dir();
         root.push(format!("lhp-book-{}", uuid::Uuid::new_v4()));
         let storage = Arc::new(Storage::open(&root).unwrap());
-        let before = storage.open_profile("personal").unwrap().usage_summary().unwrap();
+        let before = storage
+            .open_profile("personal")
+            .unwrap()
+            .usage_summary()
+            .unwrap();
         book_local_usage(&storage, "personal", "qwen3-0.6b", "local-runner:x");
-        let after = storage.open_profile("personal").unwrap().usage_summary().unwrap();
-        assert_eq!(after.total_calls, before.total_calls + 1, "the local complete() call is booked");
-        assert_eq!(after.known_cost_usd, before.known_cost_usd, "a local call adds $0");
-        assert_eq!(after.unknown_cost_calls, before.unknown_cost_calls, "local $0 is known, not unknown");
+        let after = storage
+            .open_profile("personal")
+            .unwrap()
+            .usage_summary()
+            .unwrap();
+        assert_eq!(
+            after.total_calls,
+            before.total_calls + 1,
+            "the local complete() call is booked"
+        );
+        assert_eq!(
+            after.known_cost_usd, before.known_cost_usd,
+            "a local call adds $0"
+        );
+        assert_eq!(
+            after.unknown_cost_calls, before.unknown_cost_calls,
+            "local $0 is known, not unknown"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

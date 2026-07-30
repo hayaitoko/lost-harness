@@ -15,9 +15,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::agent::crash_recovery::{
-    reconcile_profile_db, run_boot_pass, INTERRUPTED_ERROR_TAG,
-};
+use crate::agent::crash_recovery::{reconcile_profile_db, run_boot_pass, INTERRUPTED_ERROR_TAG};
 use crate::storage::{Conversation, Message, ProfileDb, Storage};
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -149,7 +147,10 @@ fn reconcile_terminalizes_a_dangling_tool_call() {
     let repair = msgs.last().expect("non-empty");
     assert_eq!(repair.role, "tool");
     assert_eq!(repair.error.as_deref(), Some(INTERRUPTED_ERROR_TAG));
-    assert!(repair.aborted, "aborted must be true so the UI can render it");
+    assert!(
+        repair.aborted,
+        "aborted must be true so the UI can render it"
+    );
     assert_eq!(repair.routing_decision.as_deref(), Some("crash_recovery"));
     assert!(
         repair.content.starts_with("[tool interrupted]"),
@@ -170,10 +171,7 @@ fn reconcile_is_idempotent_on_second_pass() {
 
     let first = reconcile_profile_db(&db).expect("first pass");
     assert_eq!(first, vec!["c-1".to_string()]);
-    let count_after_first = db
-        .list_messages_by_conversation("c-1")
-        .expect("list")
-        .len();
+    let count_after_first = db.list_messages_by_conversation("c-1").expect("list").len();
 
     // A second boot pass on the same DB must not double-insert.
     let second = reconcile_profile_db(&db).expect("second pass");
@@ -182,10 +180,7 @@ fn reconcile_is_idempotent_on_second_pass() {
         "a second pass must not re-terminalize; got {:?}",
         second
     );
-    let count_after_second = db
-        .list_messages_by_conversation("c-1")
-        .expect("list")
-        .len();
+    let count_after_second = db.list_messages_by_conversation("c-1").expect("list").len();
     assert_eq!(
         count_after_first, count_after_second,
         "the repair row is the new last message, so a second pass is a no-op"
@@ -210,9 +205,7 @@ fn reconcile_leaves_a_normal_final_answer_alone() {
         terminalized
     );
     assert_eq!(
-        db.list_messages_by_conversation("c-1")
-            .expect("list")
-            .len(),
+        db.list_messages_by_conversation("c-1").expect("list").len(),
         2,
         "no row may be appended"
     );
@@ -236,9 +229,7 @@ fn reconcile_leaves_a_completed_tool_round_alone() {
         terminalized
     );
     assert_eq!(
-        db.list_messages_by_conversation("c-1")
-            .expect("list")
-            .len(),
+        db.list_messages_by_conversation("c-1").expect("list").len(),
         3,
         "no row may be appended"
     );
@@ -260,9 +251,7 @@ fn reconcile_leaves_a_dangling_user_message_alone() {
         terminalized
     );
     assert_eq!(
-        db.list_messages_by_conversation("c-1")
-            .expect("list")
-            .len(),
+        db.list_messages_by_conversation("c-1").expect("list").len(),
         1,
         "no row may be appended"
     );
@@ -303,11 +292,16 @@ fn reconcile_distinguishes_round_cap_stop_from_genuine_crash() {
     );
 
     // b-crash: repaired — the interrupted row was appended.
-    let b = db
-        .list_messages_by_conversation("b-crash")
-        .expect("list");
-    assert_eq!(b.len(), 3, "the genuine crash must be terminalized with a repair row");
-    assert_eq!(b.last().unwrap().error.as_deref(), Some(INTERRUPTED_ERROR_TAG));
+    let b = db.list_messages_by_conversation("b-crash").expect("list");
+    assert_eq!(
+        b.len(),
+        3,
+        "the genuine crash must be terminalized with a repair row"
+    );
+    assert_eq!(
+        b.last().unwrap().error.as_deref(),
+        Some(INTERRUPTED_ERROR_TAG)
+    );
 }
 
 // ── run_boot_pass: integration against on-disk Storage ───────────────────
@@ -393,7 +387,10 @@ fn run_boot_pass_skips_a_bad_profile_without_aborting() {
         "the valid profile's dangling tool call must still be reconciled"
     );
     assert!(
-        report.profile_errors.iter().any(|(name, _)| name == "corrupt"),
+        report
+            .profile_errors
+            .iter()
+            .any(|(name, _)| name == "corrupt"),
         "the corrupt profile must be reported in profile_errors, not silently dropped; got {:?}",
         report.profile_errors
     );

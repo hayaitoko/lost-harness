@@ -321,7 +321,10 @@ impl ProcessSpawner for TokioSpawner {
                 }
             });
         }
-        Ok(Box::new(TokioChild { child, stderr: tail }))
+        Ok(Box::new(TokioChild {
+            child,
+            stderr: tail,
+        }))
     }
 }
 
@@ -556,8 +559,15 @@ impl LocalRunnerSupervisor {
 
     /// The production supervisor: real spawner, real HTTP health check.
     pub fn real(pidfile_dir: PathBuf) -> Self {
-        let config = SupervisorConfig { pidfile_dir: Some(pidfile_dir), ..Default::default() };
-        Self::new(Arc::new(TokioSpawner), Arc::new(HttpHealthCheck::new()), config)
+        let config = SupervisorConfig {
+            pidfile_dir: Some(pidfile_dir),
+            ..Default::default()
+        };
+        Self::new(
+            Arc::new(TokioSpawner),
+            Arc::new(HttpHealthCheck::new()),
+            config,
+        )
     }
 
     pub fn is_running(&self, catalog_id: &str) -> bool {
@@ -649,10 +659,9 @@ impl LocalRunnerSupervisor {
                 Ok(handle.base_url.clone())
             }
             Err(e) => {
-                self.states.write().insert(
-                    catalog_id.to_string(),
-                    RunnerState::Failed(e.to_string()),
-                );
+                self.states
+                    .write()
+                    .insert(catalog_id.to_string(), RunnerState::Failed(e.to_string()));
                 Err(e.context("sidecar would not become healthy (runner_failed)"))
             }
         }
@@ -726,7 +735,11 @@ impl LocalRunnerSupervisor {
                     diagnostics(&stderr)
                 );
             }
-            if self.health.is_healthy(base_url, cmd.api_key.as_deref()).await {
+            if self
+                .health
+                .is_healthy(base_url, cmd.api_key.as_deref())
+                .await
+            {
                 let port = base_url
                     .rsplit(':')
                     .next()
@@ -919,8 +932,12 @@ impl LocalRunnerSupervisor {
     }
 
     fn write_pidfile(&self, handle: &RunnerHandle) {
-        let Some(path) = self.pidfile_path(&handle.catalog_id) else { return };
-        let Some(pid) = handle.process.lock().id() else { return };
+        let Some(path) = self.pidfile_path(&handle.catalog_id) else {
+            return;
+        };
+        let Some(pid) = handle.process.lock().id() else {
+            return;
+        };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -932,7 +949,11 @@ impl LocalRunnerSupervisor {
         // process and must never be killed.
         let _ = std::fs::write(
             &path,
-            format!("{pid} {} {}", chrono::Utc::now().timestamp(), current_boot_id().unwrap_or_default()),
+            format!(
+                "{pid} {} {}",
+                chrono::Utc::now().timestamp(),
+                current_boot_id().unwrap_or_default()
+            ),
         );
     }
 
@@ -957,7 +978,9 @@ impl LocalRunnerSupervisor {
 /// pidfile is removed either way. Best-effort, never bricks boot. Returns how
 /// many processes were killed.
 pub fn reap_orphan_sidecars(pidfile_dir: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(pidfile_dir) else { return 0 };
+    let Ok(entries) = std::fs::read_dir(pidfile_dir) else {
+        return 0;
+    };
     let current_boot = current_boot_id();
     let mut killed = 0;
     for entry in entries.flatten() {
@@ -970,11 +993,11 @@ pub fn reap_orphan_sidecars(pidfile_dir: &Path) -> usize {
             let pid = fields.next().and_then(|p| p.parse::<i32>().ok());
             let epoch = fields.next().and_then(|e| e.parse::<i64>().ok());
             let file_boot = fields.next(); // Option<&str>; absent in legacy pidfiles
-            // Cross-reboot PID-reuse guard (finding #5): if the pidfile recorded
-            // a boot id and it differs from the current boot, the PID space has
-            // since reset — a process at that PID is NOT ours. Never kill; just
-            // clean up. A legacy (no-boot-id) pidfile falls back to the
-            // comm-name check alone (prior behavior).
+                                           // Cross-reboot PID-reuse guard (finding #5): if the pidfile recorded
+                                           // a boot id and it differs from the current boot, the PID space has
+                                           // since reset — a process at that PID is NOT ours. Never kill; just
+                                           // clean up. A legacy (no-boot-id) pidfile falls back to the
+                                           // comm-name check alone (prior behavior).
             let stale_boot = matches!(
                 (file_boot, current_boot.as_deref()),
                 (Some(fb), Some(cb)) if fb != cb
@@ -1025,7 +1048,13 @@ fn current_boot_id() -> Option<String> {
     }
     // e.g. "{ sec = 1699999999, usec = 0 } Mon Nov ..." → the `sec` value.
     let s = String::from_utf8_lossy(&out.stdout);
-    let sec = s.split("sec =").nth(1)?.split(',').next()?.trim().to_string();
+    let sec = s
+        .split("sec =")
+        .nth(1)?
+        .split(',')
+        .next()?
+        .trim()
+        .to_string();
     if sec.is_empty() {
         None
     } else {
@@ -1048,9 +1077,8 @@ fn current_boot_id() -> Option<String> {
 fn process_exe_path(pid: i32) -> Option<PathBuf> {
     // PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN).
     let mut buf = vec![0u8; 4096];
-    let n = unsafe {
-        libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
-    };
+    let n =
+        unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
     if n <= 0 {
         return None;
     }
@@ -1293,11 +1321,10 @@ pub async fn ensure_running(
     if !supervisor.is_hash_verified(&row.id) {
         let path_owned = model_path.to_path_buf();
         let expected = row.sha256.to_ascii_lowercase();
-        let actual = tokio::task::spawn_blocking(move || {
-            crate::models::download::file_sha256(&path_owned)
-        })
-        .await
-        .context("hashing the model file panicked")?;
+        let actual =
+            tokio::task::spawn_blocking(move || crate::models::download::file_sha256(&path_owned))
+                .await
+                .context("hashing the model file panicked")?;
         match actual {
             Ok(actual) if actual == expected => supervisor.mark_hash_verified(&row.id),
             Ok(_) => {
@@ -1470,7 +1497,11 @@ mod tests {
         fn spawn(&self, cmd: &SidecarCommand) -> Result<Box<dyn SpawnedProcess>> {
             let behavior = {
                 let mut b = self.0.behaviors.lock();
-                if b.len() > 1 { b.pop_front().unwrap() } else { *b.front().expect("behavior") }
+                if b.len() > 1 {
+                    b.pop_front().unwrap()
+                } else {
+                    *b.front().expect("behavior")
+                }
             };
             if !self.0.server_token_pinned.load(Ordering::SeqCst) {
                 *self.0.server_token.lock() = cmd.api_key.clone();
@@ -1561,8 +1592,14 @@ mod tests {
         let c = cmd();
         let joined = c.args.join(" ");
         // THE pinned assertion (design §D): loopback only, never all-interfaces.
-        assert!(joined.contains("--host 127.0.0.1"), "must bind loopback: {joined}");
-        assert!(!joined.contains("0.0.0.0"), "must NEVER bind all interfaces");
+        assert!(
+            joined.contains("--host 127.0.0.1"),
+            "must bind loopback: {joined}"
+        );
+        assert!(
+            !joined.contains("0.0.0.0"),
+            "must NEVER bind all interfaces"
+        );
         // The calculator's knobs pass through.
         assert!(joined.contains("--ctx-size 8192"));
         assert!(joined.contains("--cache-type-k q8_0"));
@@ -1586,7 +1623,10 @@ mod tests {
         let joined = c.args.join(" ");
         // llama-server learns the token here — this is what makes it reject
         // everyone who doesn't know it.
-        assert!(joined.contains("--api-key tok-abc"), "argv carries the key: {joined}");
+        assert!(
+            joined.contains("--api-key tok-abc"),
+            "argv carries the key: {joined}"
+        );
         // ...and OUR side keeps it, because the health check AND the provider
         // client both have to present it.
         assert_eq!(c.api_key.as_deref(), Some("tok-abc"));
@@ -1604,7 +1644,10 @@ mod tests {
         // Debug is the log path: neither the field nor the argv value may appear.
         let dbg = format!("{:?}", cmd_with_token(Some(&a)));
         assert!(!dbg.contains(&a), "token leaked into Debug output: {dbg}");
-        assert!(dbg.contains("--api-key"), "the flag itself still shows: {dbg}");
+        assert!(
+            dbg.contains("--api-key"),
+            "the flag itself still shows: {dbg}"
+        );
         assert!(dbg.contains("<redacted>"));
     }
 
@@ -1639,7 +1682,10 @@ mod tests {
             .ensure_started("m1", cmd(), "http://127.0.0.1:8080/v1".into())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("runner_failed"), "distinct failure state: {err}");
+        assert!(
+            err.to_string().contains("runner_failed"),
+            "distinct failure state: {err}"
+        );
         // No registration ever happened (a model is never a provider until healthy).
         assert!(!sup.is_running("m1"));
         assert!(matches!(sup.state("m1"), Some(RunnerState::Failed(_))));
@@ -1675,7 +1721,11 @@ mod tests {
         // Let the crash land and the monitor restart it: crash at +300ms,
         // monitor polls every 200ms, restart backoff slot 0 = 1s.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(world.spawn_count(), 2, "the monitor respawned the crashed sidecar");
+        assert_eq!(
+            world.spawn_count(),
+            2,
+            "the monitor respawned the crashed sidecar"
+        );
         assert!(sup.is_running("m1"), "back up after restart");
         assert_eq!(sup.state("m1"), Some(RunnerState::Healthy));
     }
@@ -1692,7 +1742,11 @@ mod tests {
         assert_eq!(world.kill_calls.load(Ordering::SeqCst), 1);
         // A second stop is a no-op — kill-once semantics.
         sup.stop("m1").await;
-        assert_eq!(world.kill_calls.load(Ordering::SeqCst), 1, "never double-kills");
+        assert_eq!(
+            world.kill_calls.load(Ordering::SeqCst),
+            1,
+            "never double-kills"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1705,7 +1759,10 @@ mod tests {
         let before = Instant::now();
         sup.stop("m1").await; // must return after kill_grace, not hang
         let took = Instant::now().duration_since(before);
-        assert!(took >= Duration::from_millis(300), "waited the grace window");
+        assert!(
+            took >= Duration::from_millis(300),
+            "waited the grace window"
+        );
         assert!(!sup.is_running("m1"), "removed from registry regardless");
     }
 
@@ -1720,7 +1777,10 @@ mod tests {
         let guard = sup.begin_request("m1").expect("running");
         tokio::time::sleep(Duration::from_secs(3600)).await;
         sup.idle_sweep().await;
-        assert!(sup.is_running("m1"), "an in-flight runner is NEVER idle-killed");
+        assert!(
+            sup.is_running("m1"),
+            "an in-flight runner is NEVER idle-killed"
+        );
         // Drop the guard (refreshes last_used), then age past idle: now stops.
         drop(guard);
         sup.idle_sweep().await;
@@ -1741,7 +1801,10 @@ mod tests {
             .await
             .unwrap();
         let guard = sup.begin_request("m1").expect("running");
-        assert!(!sup.stop_if_idle("m1").await, "an in-flight runner is spared");
+        assert!(
+            !sup.stop_if_idle("m1").await,
+            "an in-flight runner is spared"
+        );
         assert!(sup.is_running("m1"), "still running");
         drop(guard);
         assert!(sup.stop_if_idle("m1").await, "an idle runner is stopped");
@@ -1788,7 +1851,10 @@ mod tests {
         std::fs::write(dir.join("m2.pid"), "2147483647").unwrap(); // legacy 1-field, dead pid
         let killed = super::reap_orphan_sidecars(&dir);
         assert_eq!(killed, 0, "nothing real to reap in a temp dir");
-        assert!(!dir.join("m1.pid").exists(), "pidfiles are always cleaned up");
+        assert!(
+            !dir.join("m1.pid").exists(),
+            "pidfiles are always cleaned up"
+        );
         assert!(!dir.join("m2.pid").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1807,7 +1873,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("previously failed"));
-        assert_eq!(world.spawn_count(), spawns_after_fail, "no spawn while Failed");
+        assert_eq!(
+            world.spawn_count(),
+            spawns_after_fail,
+            "no spawn while Failed"
+        );
         // clear_failed re-arms the retry path.
         sup.clear_failed("m1");
         assert_eq!(sup.state("m1"), None);
@@ -1839,11 +1909,15 @@ mod tests {
     /// Returns the `/v1` base_url.
     async fn spawn_fake_server(kind: FakeServer) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 tokio::spawn(async move {
                     // Read the request head (one request per connection — every
                     // reply says `Connection: close`).
@@ -1884,7 +1958,11 @@ mod tests {
                         FakeServer::OpenToAnyone => {
                             // Answers anything to anyone — including the models
                             // list, which is what made the old check fall for it.
-                            if path.ends_with("/models") { MODELS } else { PROPS }
+                            if path.ends_with("/models") {
+                                MODELS
+                            } else {
+                                PROPS
+                            }
                         }
                         FakeServer::RejectsEverything => DENY,
                         FakeServer::EnforcesToken(t) => {
@@ -1940,7 +2018,10 @@ mod tests {
         assert_eq!(server_root("http://127.0.0.1:9/v1"), "http://127.0.0.1:9");
         assert_eq!(server_root("http://127.0.0.1:9/v1/"), "http://127.0.0.1:9");
         assert_eq!(server_root("http://127.0.0.1:9"), "http://127.0.0.1:9");
-        assert_eq!(IDENTITY_PATH, "/props", "an endpoint the api-key DOES cover");
+        assert_eq!(
+            IDENTITY_PATH, "/props",
+            "an endpoint the api-key DOES cover"
+        );
     }
 
     #[tokio::test]
@@ -2008,7 +2089,11 @@ mod tests {
     async fn the_vendored_sidecar_enforces_the_api_key_on_props_but_not_on_models() {
         let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("vendor/llama-cpp/macos-arm64/llama-server");
-        assert!(bin.is_file(), "the vendored sidecar must be present: {}", bin.display());
+        assert!(
+            bin.is_file(),
+            "the vendored sidecar must be present: {}",
+            bin.display()
+        );
         let empty = tmp_dir(); // no models in it — router mode needs no GGUF
         let port = pick_free_port().unwrap();
         let token = new_spawn_token();
@@ -2064,7 +2149,11 @@ mod tests {
              must not rely on it refusing anonymous callers"
         );
         // /props is PROTECTED, and answers with no model loaded.
-        assert_eq!(status(IDENTITY_PATH, None).await, 401, "anonymous must be refused");
+        assert_eq!(
+            status(IDENTITY_PATH, None).await,
+            401,
+            "anonymous must be refused"
+        );
         assert_eq!(
             status(IDENTITY_PATH, Some("not-the-token".into())).await,
             401,
@@ -2119,7 +2208,11 @@ mod tests {
         world.pin_server_token(Some(TEST_TOKEN));
         let sup = supervisor_with(&world);
         let err = sup
-            .ensure_started("m1", cmd_with_token(None), "http://127.0.0.1:8080/v1".into())
+            .ensure_started(
+                "m1",
+                cmd_with_token(None),
+                "http://127.0.0.1:8080/v1".into(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("runner_failed"), "{err}");
@@ -2172,8 +2265,16 @@ mod tests {
         let status = |id: &str| storage.global().get_model(id).unwrap().unwrap().status;
         assert_eq!(status("good"), "ready", "an intact model stays ready");
         assert_eq!(status("missing"), "quarantined");
-        assert_eq!(status("truncated"), "quarantined", "size check catches truncation");
-        assert_eq!(status("tampered"), "quarantined", "rehash catches tampering");
+        assert_eq!(
+            status("truncated"),
+            "quarantined",
+            "size check catches truncation"
+        );
+        assert_eq!(
+            status("tampered"),
+            "quarantined",
+            "rehash catches tampering"
+        );
         // Without rehash, tampering (same size) is NOT caught — documented cost
         // tradeoff; size/existence still are.
         let storage2 = Storage::open(&tmp_dir()).unwrap();
@@ -2194,7 +2295,10 @@ mod tests {
             })
             .unwrap();
         let r2 = sweep_local_model_integrity_at_boot(&storage2, false);
-        assert!(r2.quarantined.is_empty(), "cheap sweep passes same-size tampering");
+        assert!(
+            r2.quarantined.is_empty(),
+            "cheap sweep passes same-size tampering"
+        );
     }
 
     #[test]
@@ -2209,8 +2313,14 @@ mod tests {
         let killed = reap_orphan_sidecars(&dir);
         assert_eq!(killed, 0, "no stranger processes were killed");
         assert!(!dir.join("m1.pid").exists(), "stale pidfile removed");
-        assert!(!dir.join("m2.pid").exists(), "PID-reuse-guarded pidfile removed");
-        assert!(dir.join("not-a-pidfile.txt").exists(), "non-pidfiles untouched");
+        assert!(
+            !dir.join("m2.pid").exists(),
+            "PID-reuse-guarded pidfile removed"
+        );
+        assert!(
+            dir.join("not-a-pidfile.txt").exists(),
+            "non-pidfiles untouched"
+        );
     }
 
     // ── M-11: reaper identity (PID reuse) ──────────────────────────────
@@ -2237,8 +2347,15 @@ mod tests {
 
         // The kernel reports this process's own executable, not `llama-server`.
         let exe = super::process_exe_path(me).expect("proc_pidpath works on self");
-        assert!(exe.is_absolute(), "a real path from the kernel: {}", exe.display());
-        assert_ne!(exe.file_name().and_then(|f| f.to_str()), Some("llama-server"));
+        assert!(
+            exe.is_absolute(),
+            "a real path from the kernel: {}",
+            exe.display()
+        );
+        assert_ne!(
+            exe.file_name().and_then(|f| f.to_str()),
+            Some("llama-server")
+        );
         assert!(!super::process_is_our_sidecar(me));
 
         let killed = reap_orphan_sidecars(&dir);
@@ -2343,7 +2460,9 @@ mod tests {
         let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
         let sup = supervisor_with(&world);
         let mm = ModelManager::new();
-        let paths = SidecarPaths { bin: PathBuf::from("/fake/llama-server") };
+        let paths = SidecarPaths {
+            bin: PathBuf::from("/fake/llama-server"),
+        };
 
         let provider = ensure_running(&sup, &mm, &storage, &paths, None, Some(8192), None)
             .await
@@ -2351,9 +2470,15 @@ mod tests {
         assert_eq!(provider.id, "local-runner:tiny");
         assert!(provider.is_local(), "kind Local");
         assert!(provider.is_private(), "127.0.0.1 base_url is private");
-        assert!(provider.is_bundled_runner(), "C5: a runner-spawned provider is BundledRunner origin");
+        assert!(
+            provider.is_bundled_runner(),
+            "C5: a runner-spawned provider is BundledRunner origin"
+        );
         assert!(provider.base_url.starts_with("http://127.0.0.1:"));
-        assert!(mm.get_provider("local-runner:tiny").is_some(), "registered in the manager");
+        assert!(
+            mm.get_provider("local-runner:tiny").is_some(),
+            "registered in the manager"
+        );
         // The spawned argv carried the model path + loopback host.
         let spawns = world.spawns.lock();
         let joined = spawns[0].0.args.join(" ");
@@ -2366,11 +2491,16 @@ mod tests {
     async fn ensure_running_refuses_quarantined_and_missing_files() {
         let dir = tmp_dir();
         let storage = seeded_storage(&dir);
-        storage.global().set_model_status("tiny", "quarantined").unwrap();
+        storage
+            .global()
+            .set_model_status("tiny", "quarantined")
+            .unwrap();
         let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
         let sup = supervisor_with(&world);
         let mm = ModelManager::new();
-        let paths = SidecarPaths { bin: PathBuf::from("/fake/llama-server") };
+        let paths = SidecarPaths {
+            bin: PathBuf::from("/fake/llama-server"),
+        };
         // Quarantined-only catalog → "no ready model" (the default pick skips it).
         let err = ensure_running(&sup, &mm, &storage, &paths, None, None, None)
             .await
@@ -2410,7 +2540,9 @@ mod tests {
         let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
         let sup = supervisor_with(&world);
         let mm = ModelManager::new();
-        let paths = SidecarPaths { bin: PathBuf::from("/fake/llama-server") };
+        let paths = SidecarPaths {
+            bin: PathBuf::from("/fake/llama-server"),
+        };
 
         let provider = ensure_running(&sup, &mm, &storage, &paths, None, Some(4096), None)
             .await
@@ -2419,7 +2551,10 @@ mod tests {
         // The token llama-server was actually told to enforce.
         let spawned = world.spawns.lock()[0].0.clone();
         let argv = spawned.args.join(" ");
-        let token = spawned.api_key.clone().expect("a token was minted per spawn");
+        let token = spawned
+            .api_key
+            .clone()
+            .expect("a token was minted per spawn");
         assert!(argv.contains(&format!("--api-key {token}")), "argv: {argv}");
         assert_eq!(token.len(), 32, "a real 128-bit token, not a placeholder");
 
@@ -2465,13 +2600,22 @@ mod tests {
         let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
         let sup = supervisor_with(&world);
         let mm = ModelManager::new();
-        let paths = SidecarPaths { bin: PathBuf::from("/fake/llama-server") };
+        let paths = SidecarPaths {
+            bin: PathBuf::from("/fake/llama-server"),
+        };
         let err = ensure_running(&sup, &mm, &storage, &paths, None, None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("integrity check"), "{err}");
-        assert_eq!(world.spawn_count(), 0, "quarantine happens BEFORE any spawn");
-        assert!(mm.get_provider("local-runner:tiny").is_none(), "never a provider");
+        assert_eq!(
+            world.spawn_count(),
+            0,
+            "quarantine happens BEFORE any spawn"
+        );
+        assert!(
+            mm.get_provider("local-runner:tiny").is_none(),
+            "never a provider"
+        );
         assert_eq!(
             storage.global().get_model("tiny").unwrap().unwrap().status,
             "quarantined"
@@ -2490,7 +2634,9 @@ mod tests {
         let world = FakeWorld::new(vec![FakeBehavior::HealthyImmediately]);
         let sup = supervisor_with(&world);
         let mm = ModelManager::new();
-        let paths = SidecarPaths { bin: PathBuf::from("/fake/llama-server") };
+        let paths = SidecarPaths {
+            bin: PathBuf::from("/fake/llama-server"),
+        };
         ensure_running(&sup, &mm, &storage, &paths, None, None, None)
             .await
             .unwrap();
@@ -2562,9 +2708,15 @@ mod tests {
         let line = redact_stderr_line(
             "error loading model /Users/someone/Documents/Lost-Harness/models/x.gguf",
         );
-        assert!(!line.contains("someone"), "account name must not survive: {line}");
+        assert!(
+            !line.contains("someone"),
+            "account name must not survive: {line}"
+        );
         assert!(!line.contains(".gguf"), "the path is gone entirely: {line}");
-        assert!(line.starts_with("error loading model "), "the message survives: {line}");
+        assert!(
+            line.starts_with("error loading model "),
+            "the message survives: {line}"
+        );
         assert!(line.contains("<path>"));
 
         // A bearer token / sha256 in a log line.
@@ -2590,7 +2742,10 @@ mod tests {
             STDERR_TAIL_LINES,
             "the ring never grows past its cap"
         );
-        assert!(snap.contains(&format!("line {}", STDERR_TAIL_LINES + 24)), "keeps the newest");
+        assert!(
+            snap.contains(&format!("line {}", STDERR_TAIL_LINES + 24)),
+            "keeps the newest"
+        );
         assert!(!snap.contains("line 0\n"), "drops the oldest");
 
         let long = StderrTail::default();
@@ -2660,7 +2815,10 @@ mod tests {
         assert!(msg.contains("exited (code 3)"), "{msg}");
         // Redaction happened on the way into the buffer, so the error the user
         // sees (and any log of it) has no absolute path in it.
-        assert!(!msg.contains("/Users/nobody"), "path leaked into the error: {msg}");
+        assert!(
+            !msg.contains("/Users/nobody"),
+            "path leaked into the error: {msg}"
+        );
         assert!(msg.contains("<path>"), "{msg}");
     }
 
@@ -2674,16 +2832,23 @@ mod tests {
             .expect("vendor/llama-cpp/MANIFEST.sha256 must be committed");
         let mut checked = 0;
         for line in contents.lines() {
-            let Some((hash, name)) = line.split_once("  ") else { continue };
+            let Some((hash, name)) = line.split_once("  ") else {
+                continue;
+            };
             let file = vendor.join("macos-arm64").join(name.trim());
             let actual = crate::models::download::file_sha256(&file)
                 .unwrap_or_else(|e| panic!("hashing {}: {e}", file.display()));
             assert_eq!(actual, hash.trim(), "vendored file drifted: {name}");
             checked += 1;
         }
-        assert!(checked >= 11, "manifest covers the binary + its dylib closure ({checked})");
+        assert!(
+            checked >= 11,
+            "manifest covers the binary + its dylib closure ({checked})"
+        );
         assert_eq!(
-            std::fs::read_to_string(vendor.join("VERSION")).unwrap().trim(),
+            std::fs::read_to_string(vendor.join("VERSION"))
+                .unwrap()
+                .trim(),
             "b10088",
             "pinned llama.cpp release"
         );
@@ -2716,14 +2881,27 @@ mod tests {
         // must enforce (the health check requires an unauthenticated probe to be
         // refused) and that the real client must present on every call.
         let token = new_spawn_token();
-        let cmd = build_args(&bin, Path::new(&gguf), port, 4, Some(2048), None, Some(&token));
+        let cmd = build_args(
+            &bin,
+            Path::new(&gguf),
+            port,
+            4,
+            Some(2048),
+            None,
+            Some(&token),
+        );
         sup.ensure_started("live-test", cmd, base_url.clone())
             .await
             .expect("sidecar becomes healthy");
 
         // One real chat round-trip through the existing ModelClient.
-        let provider =
-            Provider::new("live-test", "Live", &base_url, Some(token), ProviderKind::Local);
+        let provider = Provider::new(
+            "live-test",
+            "Live",
+            &base_url,
+            Some(token),
+            ProviderKind::Local,
+        );
         let client = crate::models::ModelClient::new(provider).unwrap();
         let models = client.list_models().await.expect("GET /v1/models");
         assert!(!models.is_empty(), "the served model is listed");
@@ -2792,9 +2970,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let partial = dir.join("model.gguf.partial");
         let gguf = dir.join("model.gguf");
-        crate::models::download::download_to_partial(&file.url, &partial, file.size_bytes, |_, _| {})
-            .await
-            .expect("download");
+        crate::models::download::download_to_partial(
+            &file.url,
+            &partial,
+            file.size_bytes,
+            |_, _| {},
+        )
+        .await
+        .expect("download");
         crate::models::download::verify_and_install(&partial, &gguf, &file.sha256)
             .expect("sha256 verifies — bytes match the HF-reported oid");
         assert!(gguf.exists() && !partial.exists());

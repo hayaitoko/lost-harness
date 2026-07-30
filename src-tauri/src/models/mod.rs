@@ -12,15 +12,15 @@
 //! `crate::agent::egress::is_private_endpoint` (see `Provider::is_private`).
 
 pub mod calculator;
-pub mod content;
-pub mod provider;
 pub mod client;
-pub mod manager;
+pub mod content;
 pub mod download;
 pub mod gguf_meta;
 pub mod hardware;
 pub mod hf_search;
+pub mod manager;
 pub mod pricing;
+pub mod provider;
 #[cfg(feature = "local-runner")]
 pub mod runner;
 pub mod seat;

@@ -1909,16 +1909,21 @@ pub async fn download_model(
     // Stream, emitting progress (throttling is the frontend's job).
     let id_for_progress = id.clone();
     let app_for_progress = app.clone();
-    crate::models::download::download_to_partial(&file.url, &partial, file.size_bytes, move |downloaded, total| {
-        let _ = app_for_progress.emit(
-            "model:download-progress",
-            DownloadProgress {
-                id: id_for_progress.clone(),
-                downloaded,
-                total,
-            },
-        );
-    })
+    crate::models::download::download_to_partial(
+        &file.url,
+        &partial,
+        file.size_bytes,
+        move |downloaded, total| {
+            let _ = app_for_progress.emit(
+                "model:download-progress",
+                DownloadProgress {
+                    id: id_for_progress.clone(),
+                    downloaded,
+                    total,
+                },
+            );
+        },
+    )
     .await
     .map_err(|e| e.to_string())?;
 

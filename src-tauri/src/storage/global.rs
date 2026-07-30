@@ -215,11 +215,11 @@ fn fts_match_expr(query: &str) -> Option<String> {
     /// Content words only; a query that is ALL stopwords gets no keyword lane
     /// (the meaning lane, when installed, can still match it).
     const STOPWORDS: &[&str] = &[
-        "a", "an", "and", "are", "as", "at", "be", "but", "by", "did", "do", "does", "for",
-        "from", "had", "has", "have", "how", "i", "if", "in", "is", "it", "its", "me", "my",
-        "no", "not", "of", "on", "or", "our", "so", "that", "the", "their", "them", "then",
-        "there", "these", "they", "this", "to", "was", "we", "were", "what", "when", "where",
-        "which", "who", "why", "will", "with", "would", "you", "your",
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "did", "do", "does", "for", "from",
+        "had", "has", "have", "how", "i", "if", "in", "is", "it", "its", "me", "my", "no", "not",
+        "of", "on", "or", "our", "so", "that", "the", "their", "them", "then", "there", "these",
+        "they", "this", "to", "was", "we", "were", "what", "when", "where", "which", "who", "why",
+        "will", "with", "would", "you", "your",
     ];
     let tokens: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric())
@@ -262,7 +262,11 @@ fn rrf_fuse(
             }
         }
     }
-    fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     fused.truncate(limit);
     fused
 }
@@ -479,7 +483,9 @@ impl GlobalDb {
         let conn = Connection::open(path)
             .with_context(|| format!("opening global.db at {}", path.display()))?;
         migrate_global(&conn)?;
-        Ok(Self { conn: parking_lot::Mutex::new(conn) })
+        Ok(Self {
+            conn: parking_lot::Mutex::new(conn),
+        })
     }
 
     /// In-memory variant for tests.
@@ -488,7 +494,9 @@ impl GlobalDb {
         crate::storage::ensure_sqlite_vec_registered();
         let conn = Connection::open_in_memory()?;
         migrate_global(&conn)?;
-        Ok(Self { conn: parking_lot::Mutex::new(conn) })
+        Ok(Self {
+            conn: parking_lot::Mutex::new(conn),
+        })
     }
 
     /// Lock and borrow the underlying connection. Use sparingly — most
@@ -1045,7 +1053,11 @@ impl GlobalDb {
                 limit,
             )?);
         }
-        hits.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(limit);
         Ok(hits)
     }
@@ -1070,7 +1082,11 @@ impl GlobalDb {
             )?);
         }
         // Lower bm25 = more relevant. Stable sort across the merged buckets.
-        hits.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(limit);
         Ok(hits)
     }
@@ -1141,8 +1157,13 @@ impl GlobalDb {
         let keyword = self.search_memory_scoped(query, profile, allow_private, limit)?;
         let semantic = match query_vec {
             Some(qv) => {
-                let mut s =
-                    self.semantic_search_bucket(MemoryBucket::Shared, qv, Some(profile), max_dist, limit)?;
+                let mut s = self.semantic_search_bucket(
+                    MemoryBucket::Shared,
+                    qv,
+                    Some(profile),
+                    max_dist,
+                    limit,
+                )?;
                 if allow_private {
                     s.extend(self.semantic_search_bucket(
                         MemoryBucket::PrivateLocal,
@@ -1152,7 +1173,11 @@ impl GlobalDb {
                         limit,
                     )?);
                 }
-                s.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+                s.sort_by(|a, b| {
+                    a.score
+                        .partial_cmp(&b.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 s.truncate(limit);
                 s
             }
@@ -1189,7 +1214,11 @@ impl GlobalDb {
                         limit,
                     )?);
                 }
-                s.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+                s.sort_by(|a, b| {
+                    a.score
+                        .partial_cmp(&b.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 s.truncate(limit);
                 s
             }
@@ -1393,7 +1422,10 @@ impl GlobalDb {
     /// with the wildcard-escaped query — good enough for the handful of skills a
     /// profile has; a meaning lane (sqlite-vec, like memory) is a later refinement.
     pub fn search_skills(&self, query: &str, limit: usize) -> Result<Vec<Skill>> {
-        let esc = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let esc = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let pat = format!("%{esc}%");
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -1583,7 +1615,9 @@ impl GlobalDb {
     /// and an unreadable one both let the caller fall back to its default
     /// (`"personal"`), matching `skill_reflect_enabled`'s fail-soft read.
     pub fn active_profile(&self) -> Option<String> {
-        self.get_app_setting(Self::ACTIVE_PROFILE_KEY).ok().flatten()
+        self.get_app_setting(Self::ACTIVE_PROFILE_KEY)
+            .ok()
+            .flatten()
     }
 
     /// Persist the active-profile id (backs the UI's `switchProfile`). The

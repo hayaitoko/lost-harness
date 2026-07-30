@@ -89,17 +89,17 @@ mod tests {
         storage.open_profile("personal").unwrap();
 
         let tool = SystemStatusTool::new(storage.clone());
-        match tool
-            .run(ToolInput::empty(), &ExecCtx::default())
-            .await
-        {
+        match tool.run(ToolInput::empty(), &ExecCtx::default()).await {
             ToolResult::Ok(v) => {
                 assert_eq!(v["os"], std::env::consts::OS);
                 assert_eq!(v["arch"], std::env::consts::ARCH);
                 assert_eq!(v["profiles"], 1);
                 // No models installed in a fresh temp storage.
                 assert_eq!(v["models"]["memory_embedder_installed"], false);
-                assert!(v["storage_root"].as_str().unwrap().contains("lhp-sysstatus-"));
+                assert!(v["storage_root"]
+                    .as_str()
+                    .unwrap()
+                    .contains("lhp-sysstatus-"));
             }
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }

@@ -13,10 +13,10 @@
 // ── Module declarations ──────────────────────────────────────────────────────
 
 mod agent; // M1: agent loop, §7 gate, tool dispatch
-mod classifier; // M1: privacy classifier (heuristic + trained model)
-mod embedder; // PLAN §9: on-device text embedder (memory's meaning-search lane)
 mod audio; // M6: Audio engine, VAD, TTS pipeline
+mod classifier; // M1: privacy classifier (heuristic + trained model)
 mod email; // Email round (stage 1): Gmail OAuth (PKCE) + REST client — toolized in stage 2
+mod embedder; // PLAN §9: on-device text embedder (memory's meaning-search lane)
 mod hooks; // M3: Hook chain — privacy filter + permission + sandbox + first-use
 mod ipc; // M1: Tauri command handlers
 mod models; // M4: Model manager (local + cloud)
@@ -35,11 +35,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use crate::agent::gate::PrivacyGate;
 use crate::agent::loop_mod::AgentLoop;
+use crate::classifier::RulesClassifier;
 use crate::ipc::AppState;
 use crate::models::{ModelManager, Provider, ProviderKind};
 use crate::storage::Storage;
 use crate::tools::ToolDispatcher;
-use crate::classifier::RulesClassifier;
 
 /// M-10 — the manual local-model integrity verify, in its own module
 /// because `#[tauri::command]` macro-exports helper macros to the crate
@@ -80,10 +80,7 @@ pub mod local_integrity {
                     }
                 }
             }
-            tracing::info!(
-                checked = report.checked,
-                "manual integrity verify finished"
-            );
+            tracing::info!(checked = report.checked, "manual integrity verify finished");
             Ok(report.quarantined)
         }
         #[cfg(not(feature = "local-runner"))]
@@ -800,7 +797,10 @@ fn hydrate_providers_from_storage(
             .with_native_tools(ep.supports_native_tools);
         mm.add_provider(provider);
     }
-    tracing::info!(count = mm.list_providers().len(), "hydrated providers from storage");
+    tracing::info!(
+        count = mm.list_providers().len(),
+        "hydrated providers from storage"
+    );
 }
 
 /// Build the M3 tool dispatcher for the desktop app body.
@@ -989,14 +989,14 @@ fn build_tool_dispatcher(
     ));
     // Wave 2.1: the agent's recall over past conversations (read-only, Safe,
     // profile-scoped) — distinct from memory (`recall_memory`).
-    registry.register(Box::new(crate::tools::session_search::SessionSearchTool::new(
-        storage.clone(),
-    )));
+    registry.register(Box::new(
+        crate::tools::session_search::SessionSearchTool::new(storage.clone()),
+    ));
     // Wave 2.1: a read-only local status snapshot (OS/arch, profiles, model
     // install state). Safe → pre-trusted.
-    registry.register(Box::new(crate::tools::system_status::SystemStatusTool::new(
-        storage.clone(),
-    )));
+    registry.register(Box::new(
+        crate::tools::system_status::SystemStatusTool::new(storage.clone()),
+    ));
     // Wave 2.1: cron management — profile-scoped scheduled-job CRUD. Listing is
     // read-only (Safe → pre-trusted); mutating (create/enable/disable/delete)
     // is Write, so it routes through the approval spine. No scheduler runs these
@@ -1027,33 +1027,41 @@ fn build_tool_dispatcher(
                 Arc::new(endpoint),
                 email_needs_reconnect,
             );
-            registry.register(Box::new(crate::tools::email::EmailSearchTool::new(deps.clone())));
-            registry.register(Box::new(crate::tools::email::EmailReadTool::new(deps.clone())));
-            registry.register(Box::new(crate::tools::email::EmailSendTool::new(deps.clone())));
+            registry.register(Box::new(crate::tools::email::EmailSearchTool::new(
+                deps.clone(),
+            )));
+            registry.register(Box::new(crate::tools::email::EmailReadTool::new(
+                deps.clone(),
+            )));
+            registry.register(Box::new(crate::tools::email::EmailSendTool::new(
+                deps.clone(),
+            )));
             let productivity = crate::tools::productivity::ProductivityToolDeps::new(deps);
-            registry.register(Box::new(
-                crate::tools::productivity::CalendarListTool::new(productivity.clone()),
-            ));
+            registry.register(Box::new(crate::tools::productivity::CalendarListTool::new(
+                productivity.clone(),
+            )));
             registry.register(Box::new(
                 crate::tools::productivity::CalendarCreateTool::new(productivity.clone()),
             ));
             registry.register(Box::new(
                 crate::tools::productivity::CalendarDeleteTool::new(productivity.clone()),
             ));
-            registry.register(Box::new(
-                crate::tools::productivity::TaskListTool::new(productivity.clone()),
-            ));
-            registry.register(Box::new(
-                crate::tools::productivity::TaskCreateTool::new(productivity.clone()),
-            ));
-            registry.register(Box::new(
-                crate::tools::productivity::TaskCompleteTool::new(productivity.clone()),
-            ));
-            registry.register(Box::new(
-                crate::tools::productivity::TaskDeleteTool::new(productivity),
-            ));
+            registry.register(Box::new(crate::tools::productivity::TaskListTool::new(
+                productivity.clone(),
+            )));
+            registry.register(Box::new(crate::tools::productivity::TaskCreateTool::new(
+                productivity.clone(),
+            )));
+            registry.register(Box::new(crate::tools::productivity::TaskCompleteTool::new(
+                productivity.clone(),
+            )));
+            registry.register(Box::new(crate::tools::productivity::TaskDeleteTool::new(
+                productivity,
+            )));
         }
-        Err(e) => tracing::warn!(error = %e, "email tools unavailable (token endpoint failed to build)"),
+        Err(e) => {
+            tracing::warn!(error = %e, "email tools unavailable (token endpoint failed to build)")
+        }
     }
     // Wave 2.1: the single blocking "ask the user" tool. Safe → pre-trusted
     // (asking a question has no side effect); it blocks the loop until the user
@@ -1151,10 +1159,8 @@ fn build_tool_dispatcher(
     // the risk-derived in-memory defaults. `mode_for` still comes from the
     // defaults; persisted rules are read live on the gating path and resolved
     // through the same deny>ask>allow / most-specific-wins path.
-    let layered = LayeredPolicySource::new(
-        Box::new(policy),
-        Box::new(SqlitePolicySource::new(storage)),
-    );
+    let layered =
+        LayeredPolicySource::new(Box::new(policy), Box::new(SqlitePolicySource::new(storage)));
 
     let mut chain = build_pretooluse_chain_full(
         // C-01 / H-12: the caller's gate — a `clone()` of the message-egress
@@ -1168,9 +1174,7 @@ fn build_tool_dispatcher(
         Arc::clone(&ledger),
         Some(hook_workspace_root),
     );
-    chain.register_observer(Box::new(AuditObserverHook::new(Arc::clone(
-        &audit_writer,
-    ))));
+    chain.register_observer(Box::new(AuditObserverHook::new(Arc::clone(&audit_writer))));
 
     // C6 / M5: the `ui_*` act tools + the OnScreenActionHook. macOS receives
     // the concrete Accessibility/Quartz backend; other platforms keep the

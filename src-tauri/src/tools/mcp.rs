@@ -181,7 +181,10 @@ pub fn sanitize_mcp_description(raw: &str) -> String {
     if neutralized.chars().count() <= MCP_DESCRIPTION_MAX_CHARS {
         neutralized
     } else {
-        let truncated: String = neutralized.chars().take(MCP_DESCRIPTION_MAX_CHARS).collect();
+        let truncated: String = neutralized
+            .chars()
+            .take(MCP_DESCRIPTION_MAX_CHARS)
+            .collect();
         format!("{truncated}…[truncated]")
     }
 }
@@ -210,11 +213,7 @@ impl McpTransport for UnwiredTransport {
         _args: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
         let name = tool_name.to_string();
-        Box::pin(async move {
-            Err(format!(
-                "no MCP transport wired for tool '{name}'"
-            ))
-        })
+        Box::pin(async move { Err(format!("no MCP transport wired for tool '{name}'")) })
     }
 }
 
@@ -288,7 +287,11 @@ impl Tool for McpTool {
             // wrapped by dispatch's `format_outcome` like any other tool's
             // output — no MCP-specific wrapping here (that would be a sign
             // something bypassed dispatch()).
-            match self.transport.call_tool(&self.raw_tool_name, input.args).await {
+            match self
+                .transport
+                .call_tool(&self.raw_tool_name, input.args)
+                .await
+            {
                 Ok(v) => ToolResult::Ok(v),
                 Err(e) => ToolResult::Err(e),
             }
@@ -328,16 +331,25 @@ mod tests {
         let cfg = McpServerConfig::new("evil");
         let d = descriptor("read_file", McpToolAnnotations::default());
         let mcp = unwired(&cfg, &d);
-        assert_eq!(mcp.name(), "mcp__evil__read_file", "must be namespaced, never bare");
+        assert_eq!(
+            mcp.name(),
+            "mcp__evil__read_file",
+            "must be namespaced, never bare"
+        );
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ReadFileTool::new(std::env::temp_dir())));
         registry.register(Box::new(unwired(&cfg, &d)));
         // The bare name still resolves to the NATIVE tool; the MCP tool is only
         // reachable under its namespaced key.
-        assert_eq!(registry.get("read_file").map(|t| t.name().to_string()), Some("read_file".to_string()));
         assert_eq!(
-            registry.get("mcp__evil__read_file").map(|t| t.name().to_string()),
+            registry.get("read_file").map(|t| t.name().to_string()),
+            Some("read_file".to_string())
+        );
+        assert_eq!(
+            registry
+                .get("mcp__evil__read_file")
+                .map(|t| t.name().to_string()),
             Some("mcp__evil__read_file".to_string())
         );
     }
@@ -362,20 +374,32 @@ mod tests {
 
     #[test]
     fn readonly_hint_lowers_only_a_trusted_local_server() {
-        let ann = McpToolAnnotations { read_only_hint: true, destructive_hint: false };
+        let ann = McpToolAnnotations {
+            read_only_hint: true,
+            destructive_hint: false,
+        };
         // Not trusted → stays at tier default, NOT Safe.
-        assert_eq!(mcp_risk(McpTrustTier::Remote, &ann, false), RiskClass::External);
+        assert_eq!(
+            mcp_risk(McpTrustTier::Remote, &ann, false),
+            RiskClass::External
+        );
         assert_eq!(mcp_risk(McpTrustTier::Local, &ann, false), RiskClass::Write);
         // Remote remains External even when marked trusted/read-only: the
         // network destination itself is the non-overridable floor.
-        assert_eq!(mcp_risk(McpTrustTier::Remote, &ann, true), RiskClass::External);
+        assert_eq!(
+            mcp_risk(McpTrustTier::Remote, &ann, true),
+            RiskClass::External
+        );
         // A trusted local read-only server may still lower to Safe.
         assert_eq!(mcp_risk(McpTrustTier::Local, &ann, true), RiskClass::Safe);
     }
 
     #[test]
     fn destructive_hint_raises_even_over_trusted_readonly() {
-        let ann = McpToolAnnotations { read_only_hint: true, destructive_hint: true };
+        let ann = McpToolAnnotations {
+            read_only_hint: true,
+            destructive_hint: true,
+        };
         assert_eq!(
             mcp_risk(McpTrustTier::Local, &ann, true),
             RiskClass::Dangerous,
@@ -393,7 +417,10 @@ mod tests {
             capabilities: vec![],
         };
         let caps = mcp_capabilities(cfg.tier, &cfg.capabilities);
-        assert!(caps.contains(&Capability::Network), "remote must require Network");
+        assert!(
+            caps.contains(&Capability::Network),
+            "remote must require Network"
+        );
 
         // And it appears in the built tool's requires() too.
         let d = descriptor("t", McpToolAnnotations::default());
@@ -482,7 +509,10 @@ mod tests {
     #[tokio::test]
     async fn unwired_transport_fails_loudly_not_silently() {
         let res = UnwiredTransport.call_tool("some_tool", json!({})).await;
-        assert!(matches!(res, Err(ref e) if e.contains("no MCP transport wired")), "got {res:?}");
+        assert!(
+            matches!(res, Err(ref e) if e.contains("no MCP transport wired")),
+            "got {res:?}"
+        );
     }
 
     #[tokio::test]
@@ -492,7 +522,9 @@ mod tests {
         // with ZERO MCP-specific code in dispatch.rs.
         use crate::agent::gate::{Binding, PrivacyGate};
         use crate::classifier::HeuristicClassifier;
-        use crate::hooks::{build_pretooluse_chain_with_confirmed, InMemoryPolicySource, PermissionMode};
+        use crate::hooks::{
+            build_pretooluse_chain_with_confirmed, InMemoryPolicySource, PermissionMode,
+        };
         use crate::models::OwnOutput;
         use crate::tools::calling::parse_tool_calls;
         use crate::tools::dispatch::TurnOutcome;
@@ -523,7 +555,10 @@ mod tests {
         let d = McpToolDescriptor {
             name: "fetch".to_string(),
             description: "x".to_string(),
-            annotations: McpToolAnnotations { read_only_hint: true, destructive_hint: false },
+            annotations: McpToolAnnotations {
+                read_only_hint: true,
+                destructive_hint: false,
+            },
             input_schema: json!({}),
         };
         let tool = McpTool::new(&cfg, &d, Arc::new(MockTransport));
@@ -553,13 +588,21 @@ mod tests {
             ..ExecCtx::default()
         };
         let out = dispatcher
-            .run_turn(&OwnOutput::from_stream_assembly(output), &ctx, Binding::Public, false)
+            .run_turn(
+                &OwnOutput::from_stream_assembly(output),
+                &ctx,
+                Binding::Public,
+                false,
+            )
             .await;
         let content = match out {
             TurnOutcome::Feedback(m) => m.content,
             other => panic!("expected Feedback, got {other:?}"),
         };
-        assert!(content.contains("UNTRUSTED TOOL OUTPUT"), "result must be guard-wrapped: {content}");
+        assert!(
+            content.contains("UNTRUSTED TOOL OUTPUT"),
+            "result must be guard-wrapped: {content}"
+        );
         assert!(
             parse_tool_calls(&OwnOutput::from_stream_assembly(content.clone())).is_empty(),
             "the forged fence in the MCP result must not survive guard-wrapping: {content}"

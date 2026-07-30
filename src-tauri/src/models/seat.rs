@@ -73,7 +73,11 @@ mod tests {
     fn unbound_seat_inherits_the_callers_model() {
         let (storage, mm, root) = setup();
         let (p, m) = resolve_seat(&storage, &mm, "personal", "Coding", "cloudco", "gpt-x");
-        assert_eq!((p.as_str(), m.as_str()), ("cloudco", "gpt-x"), "unbound → inherit");
+        assert_eq!(
+            (p.as_str(), m.as_str()),
+            ("cloudco", "gpt-x"),
+            "unbound → inherit"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -95,13 +99,19 @@ mod tests {
     fn a_bound_seat_resolves_to_its_pair_and_rebinding_changes_it() {
         let (storage, mm, root) = setup();
         let db = storage.open_profile("personal").unwrap();
-        db.set_seat_binding("Coding", "lmstudio", "qwen3-14b").unwrap();
+        db.set_seat_binding("Coding", "lmstudio", "qwen3-14b")
+            .unwrap();
 
         let (p, m) = resolve_seat(&storage, &mm, "personal", "Coding", "cloudco", "gpt-x");
-        assert_eq!((p.as_str(), m.as_str()), ("lmstudio", "qwen3-14b"), "bound seat used");
+        assert_eq!(
+            (p.as_str(), m.as_str()),
+            ("lmstudio", "qwen3-14b"),
+            "bound seat used"
+        );
 
         // "rebinding a seat changes behavior with no code change" (manifest done-when).
-        db.set_seat_binding("Coding", "lmstudio", "qwen3-30b").unwrap();
+        db.set_seat_binding("Coding", "lmstudio", "qwen3-30b")
+            .unwrap();
         let (_, m2) = resolve_seat(&storage, &mm, "personal", "Coding", "cloudco", "gpt-x");
         assert_eq!(m2, "qwen3-30b", "rebind changes what the seat resolves to");
         let _ = std::fs::remove_dir_all(root);
@@ -112,7 +122,8 @@ mod tests {
         let (storage, mm, root) = setup();
         let db = storage.open_profile("personal").unwrap();
         // Bind to a provider id that is NOT registered in the ModelManager.
-        db.set_seat_binding("Coding", "ghost-provider", "some-model").unwrap();
+        db.set_seat_binding("Coding", "ghost-provider", "some-model")
+            .unwrap();
         let (p, m) = resolve_seat(&storage, &mm, "personal", "Coding", "cloudco", "gpt-x");
         assert_eq!(
             (p.as_str(), m.as_str()),

@@ -45,12 +45,25 @@ pub enum ComputerAction {
     /// Read the clipboard (guard-wrapped as untrusted content by the caller).
     ReadClipboard,
     /// Scroll — intrinsically reversible, no "sometimes irreversible" mode.
-    Scroll { target: ActionTarget },
+    Scroll {
+        target: ActionTarget,
+    },
     // ── Consequential/Irreversible (discrete actuation on a control) ──
-    Click { target: ActionTarget },
-    Type { target: ActionTarget, text: String },
-    Key { target: ActionTarget, keys: String },
-    Drag { from: ActionTarget, to: ActionTarget },
+    Click {
+        target: ActionTarget,
+    },
+    Type {
+        target: ActionTarget,
+        text: String,
+    },
+    Key {
+        target: ActionTarget,
+        keys: String,
+    },
+    Drag {
+        from: ActionTarget,
+        to: ActionTarget,
+    },
 }
 
 /// How reversible an action is — the axis the shell-command approval flow does
@@ -71,10 +84,32 @@ pub enum Reversibility {
 /// starts with (or equals) one of these, treat it as irreversible. Deliberately
 /// OVER-broad (fail toward Once), case-insensitive, whole-word-ish.
 const IRREVERSIBLE_VERBS: &[&str] = &[
-    "send", "delete", "remove", "buy", "purchase", "pay", "order", "submit",
-    "confirm", "post", "publish", "transfer", "withdraw", "trash", "erase",
-    "discard", "empty trash", "move to trash", "sign out", "log out",
-    "shut down", "restart", "unfriend", "unfollow", "block", "reply all",
+    "send",
+    "delete",
+    "remove",
+    "buy",
+    "purchase",
+    "pay",
+    "order",
+    "submit",
+    "confirm",
+    "post",
+    "publish",
+    "transfer",
+    "withdraw",
+    "trash",
+    "erase",
+    "discard",
+    "empty trash",
+    "move to trash",
+    "sign out",
+    "log out",
+    "shut down",
+    "restart",
+    "unfriend",
+    "unfollow",
+    "block",
+    "reply all",
 ];
 
 fn label_is_irreversible(label: &str) -> bool {
@@ -145,10 +180,16 @@ mod tests {
     use super::*;
 
     fn target(app: &str, role: &str, label: &str) -> ActionTarget {
-        ActionTarget { app: app.into(), role: role.into(), label: label.into() }
+        ActionTarget {
+            app: app.into(),
+            role: role.into(),
+            label: label.into(),
+        }
     }
     fn click(label: &str) -> ComputerAction {
-        ComputerAction::Click { target: target("Mail", "button", label) }
+        ComputerAction::Click {
+            target: target("Mail", "button", label),
+        }
     }
 
     #[test]
@@ -157,10 +198,16 @@ mod tests {
             ComputerAction::ReadUiTree,
             ComputerAction::CaptureScreen,
             ComputerAction::ReadClipboard,
-            ComputerAction::Scroll { target: target("Mail", "scrollArea", "list") },
+            ComputerAction::Scroll {
+                target: target("Mail", "scrollArea", "list"),
+            },
         ] {
             assert_eq!(reversibility(&a), Reversibility::Reversible);
-            assert_eq!(risk_class(&a), RiskClass::Safe, "reversible reads are Safe → no prompt");
+            assert_eq!(
+                risk_class(&a),
+                RiskClass::Safe,
+                "reversible reads are Safe → no prompt"
+            );
         }
     }
 
@@ -168,12 +215,25 @@ mod tests {
     fn a_normal_click_is_consequential_external() {
         let a = click("Reply");
         assert_eq!(reversibility(&a), Reversibility::Consequential);
-        assert_eq!(risk_class(&a), RiskClass::External, "consequential → External (session-grantable per target)");
+        assert_eq!(
+            risk_class(&a),
+            RiskClass::External,
+            "consequential → External (session-grantable per target)"
+        );
     }
 
     #[test]
     fn an_irreversible_verb_click_is_irreversible() {
-        for label in ["Send", "Send Now", "Delete", "Buy", "Pay", "Submit", "Move to Trash", "reply all"] {
+        for label in [
+            "Send",
+            "Send Now",
+            "Delete",
+            "Buy",
+            "Pay",
+            "Submit",
+            "Move to Trash",
+            "reply all",
+        ] {
             assert_eq!(
                 reversibility(&click(label)),
                 Reversibility::Irreversible,
@@ -181,7 +241,10 @@ mod tests {
             );
         }
         // NOT a false match: "Sender" starts with "send" but isn't the verb.
-        assert_eq!(reversibility(&click("Sender")), Reversibility::Consequential);
+        assert_eq!(
+            reversibility(&click("Sender")),
+            Reversibility::Consequential
+        );
         assert_eq!(reversibility(&click("Reply")), Reversibility::Consequential);
     }
 

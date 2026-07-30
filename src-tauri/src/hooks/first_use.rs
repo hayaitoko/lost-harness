@@ -50,7 +50,10 @@ impl FirstUseConfirmHook {
 
     /// Has this tool already been confirmed in this session?
     pub fn is_confirmed(&self, tool_name: &str) -> bool {
-        self.seen.lock().expect("first_use lock poisoned").contains(tool_name)
+        self.seen
+            .lock()
+            .expect("first_use lock poisoned")
+            .contains(tool_name)
     }
 
     /// Explicitly mark a tool confirmed without going through `on_event` —
@@ -101,7 +104,10 @@ impl GatingHook for FirstUseConfirmHook {
             return HookResult::Continue;
         }
         let fp = ActionFingerprint::from_ctx(ctx);
-        if self.ledger.covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended) {
+        if self
+            .ledger
+            .covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended)
+        {
             return HookResult::Continue;
         }
         HookResult::Ask(format!(

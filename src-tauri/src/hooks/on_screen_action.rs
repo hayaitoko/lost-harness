@@ -39,7 +39,10 @@ pub struct OnScreenActionHook {
 
 impl OnScreenActionHook {
     pub fn new(backend: Arc<dyn ComputerBackend>) -> Self {
-        Self { backend, ledger: Arc::new(ApprovalLedger::new()) }
+        Self {
+            backend,
+            ledger: Arc::new(ApprovalLedger::new()),
+        }
     }
 
     /// Share the SAME ledger `Arc` the dispatcher/chain use, so a `Once` grant
@@ -60,7 +63,8 @@ impl GatingHook for OnScreenActionHook {
             return HookResult::Continue;
         }
         // Only `ui_*` actions are mine; everything else passes untouched.
-        let Some(action) = crate::tools::computer_tools::parse_action(&ctx.tool_name, &ctx.input.args)
+        let Some(action) =
+            crate::tools::computer_tools::parse_action(&ctx.tool_name, &ctx.input.args)
         else {
             return HookResult::Continue;
         };
@@ -124,7 +128,11 @@ mod tests {
 
     fn hook_with(
         elements: Vec<(&'static str, &'static str, &'static str)>,
-    ) -> (OnScreenActionHook, Arc<ApprovalLedger>, Arc<MockComputerBackend>) {
+    ) -> (
+        OnScreenActionHook,
+        Arc<ApprovalLedger>,
+        Arc<MockComputerBackend>,
+    ) {
         let mock = Arc::new(MockComputerBackend::with_elements(elements));
         let ledger = Arc::new(ApprovalLedger::new());
         let hook = OnScreenActionHook::new(mock.clone() as Arc<dyn ComputerBackend>)
@@ -133,8 +141,9 @@ mod tests {
     }
 
     fn click_ctx(label: &str) -> EventContext {
-        EventContext::pre_tool_use("ui_click")
-            .with_input(ToolInput::new(json!({"app": "Mail", "role": "button", "label": label})))
+        EventContext::pre_tool_use("ui_click").with_input(ToolInput::new(
+            json!({"app": "Mail", "role": "button", "label": label}),
+        ))
     }
 
     #[test]
@@ -148,8 +157,9 @@ mod tests {
     #[test]
     fn scroll_is_never_gated_here() {
         let (hook, _, _) = hook_with(vec![]); // even with NO resolvable elements
-        let mut ctx = EventContext::pre_tool_use("ui_scroll")
-            .with_input(ToolInput::new(json!({"app": "Mail", "role": "scrollArea", "label": "list"})));
+        let mut ctx = EventContext::pre_tool_use("ui_scroll").with_input(ToolInput::new(
+            json!({"app": "Mail", "role": "scrollArea", "label": "list"}),
+        ));
         assert_eq!(hook.on_event(&mut ctx), HookResult::Continue);
     }
 
@@ -158,7 +168,9 @@ mod tests {
         let (hook, _, mock) = hook_with(vec![("Mail", "button", "Reply")]);
         mock.vanish_all();
         let mut ctx = click_ctx("Reply");
-        assert!(matches!(hook.on_event(&mut ctx), HookResult::Deny(ref r) if r.contains("moved or vanished")));
+        assert!(
+            matches!(hook.on_event(&mut ctx), HookResult::Deny(ref r) if r.contains("moved or vanished"))
+        );
     }
 
     #[test]

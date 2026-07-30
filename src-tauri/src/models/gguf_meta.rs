@@ -175,13 +175,17 @@ enum MetaVal {
 fn read_value(c: &mut Cursor, vtype: u32) -> Option<Option<MetaVal>> {
     match vtype {
         T_UINT8 => Some(Some(MetaVal::U(c.take(1)?[0] as u64))),
-        T_UINT16 => Some(Some(MetaVal::U(u16::from_le_bytes(c.take(2)?.try_into().ok()?) as u64))),
+        T_UINT16 => Some(Some(MetaVal::U(
+            u16::from_le_bytes(c.take(2)?.try_into().ok()?) as u64,
+        ))),
         T_UINT32 => Some(Some(MetaVal::U(c.u32()? as u64))),
         T_UINT64 => Some(Some(MetaVal::U(c.u64()?))),
         // Signed ints: kept as u64 (the keys we actually read are all unsigned;
         // a negative unrelated key is never looked up, so widening is harmless).
         T_INT8 => Some(Some(MetaVal::U(c.take(1)?[0] as u64))),
-        T_INT16 => Some(Some(MetaVal::U(u16::from_le_bytes(c.take(2)?.try_into().ok()?) as u64))),
+        T_INT16 => Some(Some(MetaVal::U(
+            u16::from_le_bytes(c.take(2)?.try_into().ok()?) as u64,
+        ))),
         T_INT32 => Some(Some(MetaVal::U(c.u32()? as u64))),
         T_INT64 => Some(Some(MetaVal::U(c.u64()?))),
         T_STRING => Some(Some(MetaVal::S(c.gstr()?))),
@@ -230,16 +234,24 @@ fn read_value(c: &mut Cursor, vtype: u32) -> Option<Option<MetaVal>> {
 /// whether that's enough for an exact spec). Pure.
 pub fn parse_gguf_header(bytes: &[u8]) -> anyhow::Result<GgufHeaderMeta> {
     let mut c = Cursor { b: bytes, p: 0 };
-    let magic = c.take(4).ok_or_else(|| anyhow::anyhow!("buffer too small for GGUF magic"))?;
+    let magic = c
+        .take(4)
+        .ok_or_else(|| anyhow::anyhow!("buffer too small for GGUF magic"))?;
     if magic != GGUF_MAGIC {
         anyhow::bail!("not a GGUF file (bad magic)");
     }
-    let version = c.u32().ok_or_else(|| anyhow::anyhow!("truncated before version"))?;
+    let version = c
+        .u32()
+        .ok_or_else(|| anyhow::anyhow!("truncated before version"))?;
     if !(2..=3).contains(&version) {
         anyhow::bail!("unsupported GGUF version {version} (expected 2 or 3)");
     }
-    let _tensor_count = c.u64().ok_or_else(|| anyhow::anyhow!("truncated before tensor count"))?;
-    let kv_count = c.u64().ok_or_else(|| anyhow::anyhow!("truncated before kv count"))?;
+    let _tensor_count = c
+        .u64()
+        .ok_or_else(|| anyhow::anyhow!("truncated before tensor count"))?;
+    let kv_count = c
+        .u64()
+        .ok_or_else(|| anyhow::anyhow!("truncated before kv count"))?;
 
     let mut map: HashMap<String, MetaVal> = HashMap::new();
     for _ in 0..kv_count {
@@ -297,7 +309,11 @@ pub fn parse_repo_summary(json: &str) -> anyhow::Result<RepoSummary> {
         .and_then(|c| c.as_u64())
         .and_then(|c| u32::try_from(c).ok());
     let total_params = g.and_then(|g| g.get("total")).and_then(|t| t.as_u64());
-    Ok(RepoSummary { architecture, context_length, total_params })
+    Ok(RepoSummary {
+        architecture,
+        context_length,
+        total_params,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +490,13 @@ pub async fn fetch_repo_summary(model_id: &str) -> anyhow::Result<RepoSummary> {
         anyhow::bail!("refusing to fetch a non-allowlisted host: {url}");
     }
     let client = meta_client()?;
-    let body = client.get(&url).send().await?.error_for_status()?.text().await?;
+    let body = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     parse_repo_summary(&body)
 }
 
@@ -489,7 +511,10 @@ pub async fn fetch_gguf_header(gguf_url: &str) -> anyhow::Result<GgufHeaderMeta>
     let client = meta_client()?;
     let resp = client
         .get(gguf_url)
-        .header(reqwest::header::RANGE, format!("bytes=0-{}", HEADER_READ_BYTES - 1))
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", HEADER_READ_BYTES - 1),
+        )
         .send()
         .await?
         .error_for_status()?;
@@ -645,7 +670,10 @@ mod tests {
         assert_eq!(spec.head_dim, 128);
         assert_eq!(spec.native_context_len, 8192);
         assert!((spec.total_params_b - 8.0).abs() < 1e-6);
-        assert_eq!(spec.active_params_b, spec.total_params_b, "dense assumption");
+        assert_eq!(
+            spec.active_params_b, spec.total_params_b,
+            "dense assumption"
+        );
         assert!(notes.is_empty());
     }
 
@@ -664,7 +692,11 @@ mod tests {
         assert_eq!(meta.key_length, None);
         let (spec, _) = build_model_spec(Some(&meta), None).unwrap();
         assert!(spec.kv_exact);
-        assert_eq!(spec.head_dim, 2560 / 20, "derived from embedding/head_count");
+        assert_eq!(
+            spec.head_dim,
+            2560 / 20,
+            "derived from embedding/head_count"
+        );
         assert_eq!(spec.n_kv_heads, 4);
     }
 
@@ -686,7 +718,10 @@ mod tests {
         assert_eq!(meta.expert_count, Some(128));
         let (spec, notes) = build_model_spec(Some(&meta), None).unwrap();
         assert!(spec.kv_exact);
-        assert_eq!(spec.active_params_b, spec.total_params_b, "conservative dense");
+        assert_eq!(
+            spec.active_params_b, spec.total_params_b,
+            "conservative dense"
+        );
         assert!(notes.iter().any(|n| n.contains("Mixture-of-Experts")));
         // The expert ratio the header exposes is surfaced honestly in the note
         // (never used to scale active params — that would overestimate speed).
@@ -711,9 +746,15 @@ mod tests {
             ("llama.context_length", TV::U32(8192)),
         ]);
         let meta = parse_gguf_header(&bytes).unwrap();
-        assert!(!meta.has_exact_geometry(), "zero n_layers is not exact geometry");
+        assert!(
+            !meta.has_exact_geometry(),
+            "zero n_layers is not exact geometry"
+        );
         let (spec, notes) = build_model_spec(Some(&meta), None).unwrap();
-        assert!(!spec.kv_exact, "degrades to the labeled estimate, never fake-exact");
+        assert!(
+            !spec.kv_exact,
+            "degrades to the labeled estimate, never fake-exact"
+        );
         assert!(spec.n_layers > 0, "the estimate supplies sane geometry");
         assert!(notes.iter().any(|n| n.contains("APPROXIMATE")));
     }
@@ -731,7 +772,10 @@ mod tests {
             ("llama.attention.head_count_kv", TV::U32(8)),
         ]);
         let meta = parse_gguf_header(&bytes).unwrap();
-        assert!(!meta.has_exact_geometry(), "derived head_dim 0 is not exact");
+        assert!(
+            !meta.has_exact_geometry(),
+            "derived head_dim 0 is not exact"
+        );
         let (spec, _) = build_model_spec(Some(&meta), None).unwrap();
         assert!(!spec.kv_exact);
         assert!(spec.head_dim > 0);
@@ -749,7 +793,11 @@ mod tests {
             ("llama.attention.key_length", TV::U32(128)),
         ]);
         let meta = parse_gguf_header(&bytes).unwrap();
-        assert_eq!(meta.block_count, Some(32), "keys after the empty array parse");
+        assert_eq!(
+            meta.block_count,
+            Some(32),
+            "keys after the empty array parse"
+        );
         assert!(meta.has_exact_geometry());
     }
 
@@ -769,7 +817,10 @@ mod tests {
         let meta = parse_gguf_header(&bytes).unwrap();
         let (spec, notes) = build_model_spec(Some(&meta), None).unwrap();
         assert!(spec.kv_exact, "geometry is still exact");
-        assert_eq!(spec.total_params_b, 0.0, "the calculator's unknown sentinel");
+        assert_eq!(
+            spec.total_params_b, 0.0,
+            "the calculator's unknown sentinel"
+        );
         assert!(
             notes.iter().any(|n| n.contains("Parameter count unknown")),
             "the absence is non-silent: {notes:?}"
@@ -824,8 +875,14 @@ mod tests {
         }
         let url = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf";
         let meta = fetch_gguf_header(url).await.expect("ranged header read");
-        assert!(meta.architecture.is_some(), "real GGUF exposes an architecture");
+        assert!(
+            meta.architecture.is_some(),
+            "real GGUF exposes an architecture"
+        );
         assert!(meta.block_count.is_some(), "real GGUF exposes block_count");
-        assert!(meta.has_exact_geometry(), "the header read yields exact geometry");
+        assert!(
+            meta.has_exact_geometry(),
+            "the header read yields exact geometry"
+        );
     }
 }

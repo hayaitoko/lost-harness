@@ -239,7 +239,11 @@ impl PolicySource for SqlitePolicySource {
                     // A malformed action must NEVER silently widen access —
                     // drop the rule (falls through to the default mode) + flag.
                     other => {
-                        tracing::warn!(tool = tool_name, action = other, "tool_rules: skipping rule with unknown action");
+                        tracing::warn!(
+                            tool = tool_name,
+                            action = other,
+                            "tool_rules: skipping rule with unknown action"
+                        );
                         return None;
                     }
                 };
@@ -264,7 +268,10 @@ pub struct LayeredPolicySource {
 
 impl LayeredPolicySource {
     pub fn new(defaults: Box<dyn PolicySource>, persisted: Box<dyn PolicySource>) -> Self {
-        Self { defaults, persisted }
+        Self {
+            defaults,
+            persisted,
+        }
     }
 }
 
@@ -403,7 +410,10 @@ impl GatingHook for PermissionHook {
                 // fall to Ask (the unattended prompter parks/denies).
                 if ctx.risk == crate::tools::RiskClass::External && !ctx.attended {
                     let fp = ActionFingerprint::from_ctx(ctx);
-                    if self.ledger.covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended) {
+                    if self
+                        .ledger
+                        .covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended)
+                    {
                         return HookResult::Continue;
                     }
                     return HookResult::Ask(format!(
@@ -428,7 +438,10 @@ impl GatingHook for PermissionHook {
                 // A prior interactive approval may already cover this exact
                 // action (or this whole tool). If so, don't ask again.
                 let fp = ActionFingerprint::from_ctx(ctx);
-                if self.ledger.covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended) {
+                if self
+                    .ledger
+                    .covers_for(&ctx.tool_name, &fp, ctx.risk, ctx.attended)
+                {
                     HookResult::Continue
                 } else {
                     HookResult::Ask(format!("tool '{}' requires confirmation", ctx.tool_name))
@@ -505,8 +518,8 @@ mod tests {
         policy.add_rule("shell_exec", "git commit:*", PermissionMode::Allow);
         let hook = PermissionHook::new(Box::new(policy));
 
-        let mut allowed = EventContext::pre_tool_use("shell_exec")
-            .with_command_text("git commit:-m fix typo");
+        let mut allowed =
+            EventContext::pre_tool_use("shell_exec").with_command_text("git commit:-m fix typo");
         assert_eq!(hook.on_event(&mut allowed), HookResult::Continue);
 
         // Doesn't match the pattern → falls back to the whole-tool Ask.
@@ -535,8 +548,7 @@ mod tests {
             other => panic!("expected Deny (most specific rule), got {other:?}"),
         }
 
-        let mut ctx2 =
-            EventContext::pre_tool_use("shell_exec").with_command_text("git status");
+        let mut ctx2 = EventContext::pre_tool_use("shell_exec").with_command_text("git status");
         assert_eq!(hook.on_event(&mut ctx2), HookResult::Continue);
     }
 
@@ -548,8 +560,7 @@ mod tests {
         policy.add_rule("shell_exec", "rm -rf:*", PermissionMode::Deny);
         policy.add_rule("shell_exec", "rm -rf:*", PermissionMode::Allow);
         let hook = PermissionHook::new(Box::new(policy));
-        let mut ctx =
-            EventContext::pre_tool_use("shell_exec").with_command_text("rm -rf:/tmp/x");
+        let mut ctx = EventContext::pre_tool_use("shell_exec").with_command_text("rm -rf:/tmp/x");
         match hook.on_event(&mut ctx) {
             HookResult::Deny(_) => {}
             other => panic!("expected Deny to win the tiebreak, got {other:?}"),
@@ -606,8 +617,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("lhp-perm-test-{}-{n}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("lhp-perm-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         let storage = crate::storage::Storage::open(&path).unwrap();
         (storage, path)

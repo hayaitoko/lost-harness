@@ -112,7 +112,13 @@ mod tests {
         (storage, root)
     }
 
-    fn seed(storage: &Storage, profile: &str, conv_id: &str, conv_name: &str, turns: &[(&str, &str)]) {
+    fn seed(
+        storage: &Storage,
+        profile: &str,
+        conv_id: &str,
+        conv_name: &str,
+        turns: &[(&str, &str)],
+    ) {
         let db = storage.open_profile(profile).unwrap();
         db.create_conversation(&Conversation {
             id: conv_id.into(),
@@ -200,7 +206,8 @@ mod tests {
 
         // Empty query is a usage error.
         assert!(matches!(
-            tool.run(ToolInput::new(json!({ "query": "   " })), &ctx).await,
+            tool.run(ToolInput::new(json!({ "query": "   " })), &ctx)
+                .await,
             ToolResult::Err(_)
         ));
 
@@ -234,7 +241,11 @@ mod tests {
         {
             ToolResult::Ok(v) => {
                 let matches = v["matches"].as_array().unwrap();
-                assert_eq!(matches.len(), 1, "the % must be escaped, matching literally");
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "the % must be escaped, matching literally"
+                );
                 assert!(matches[0]["snippet"].as_str().unwrap().contains("50%"));
             }
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),

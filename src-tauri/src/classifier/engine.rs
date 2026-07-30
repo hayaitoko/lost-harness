@@ -370,7 +370,10 @@ mod parity_tests {
             "health context should be Private (model-only category)"
         );
 
-        let long = format!("{} My password is hunter2secret!", "Here is a very long message. ".repeat(60));
+        let long = format!(
+            "{} My password is hunter2secret!",
+            "Here is a very long message. ".repeat(60)
+        );
         let long_c = clf.classify(&long);
         assert_ne!(
             long_c.label,

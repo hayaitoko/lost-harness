@@ -80,36 +80,64 @@ mod tests {
     use super::*;
 
     fn summary(known: f64, unknown: usize) -> UsageSummary {
-        UsageSummary { total_calls: 1, known_cost_usd: known, unknown_cost_calls: unknown }
+        UsageSummary {
+            total_calls: 1,
+            known_cost_usd: known,
+            unknown_cost_calls: unknown,
+        }
     }
 
     #[test]
     fn uncapped_is_always_ok() {
-        assert_eq!(evaluate(None, &summary(9999.0, 5), false), BudgetVerdict::Ok);
+        assert_eq!(
+            evaluate(None, &summary(9999.0, 5), false),
+            BudgetVerdict::Ok
+        );
         assert_eq!(evaluate(None, &summary(9999.0, 5), true), BudgetVerdict::Ok);
     }
 
     #[test]
     fn under_cap_with_known_cost_is_ok() {
-        assert_eq!(evaluate(Some(10.0), &summary(3.0, 0), false), BudgetVerdict::Ok);
-        assert_eq!(evaluate(Some(10.0), &summary(3.0, 0), true), BudgetVerdict::Ok);
+        assert_eq!(
+            evaluate(Some(10.0), &summary(3.0, 0), false),
+            BudgetVerdict::Ok
+        );
+        assert_eq!(
+            evaluate(Some(10.0), &summary(3.0, 0), true),
+            BudgetVerdict::Ok
+        );
     }
 
     #[test]
     fn over_cap_warns_when_attended_halts_when_not() {
-        assert!(matches!(evaluate(Some(5.0), &summary(6.0, 0), true), BudgetVerdict::Warn(_)));
-        assert!(matches!(evaluate(Some(5.0), &summary(6.0, 0), false), BudgetVerdict::Halt(_)));
+        assert!(matches!(
+            evaluate(Some(5.0), &summary(6.0, 0), true),
+            BudgetVerdict::Warn(_)
+        ));
+        assert!(matches!(
+            evaluate(Some(5.0), &summary(6.0, 0), false),
+            BudgetVerdict::Halt(_)
+        ));
         // Exactly at the cap counts as reached.
-        assert!(matches!(evaluate(Some(5.0), &summary(5.0, 0), false), BudgetVerdict::Halt(_)));
+        assert!(matches!(
+            evaluate(Some(5.0), &summary(5.0, 0), false),
+            BudgetVerdict::Halt(_)
+        ));
     }
 
     #[test]
     fn unknown_cost_fails_closed_even_under_the_known_cap() {
         // Known spend is well under the cap, but a call has unknown cost →
         // capped branch (possibly already over).
-        assert!(matches!(evaluate(Some(50.0), &summary(1.0, 1), false), BudgetVerdict::Halt(_)));
+        assert!(matches!(
+            evaluate(Some(50.0), &summary(1.0, 1), false),
+            BudgetVerdict::Halt(_)
+        ));
         // ...and attended still only WARNS, never halts the human.
-        assert!(matches!(evaluate(Some(50.0), &summary(1.0, 1), true), BudgetVerdict::Warn(_)));
+        assert!(matches!(
+            evaluate(Some(50.0), &summary(1.0, 1), true),
+            BudgetVerdict::Warn(_)
+        ));
     }
 
     #[test]
@@ -117,6 +145,11 @@ mod tests {
         use chrono::{TimeZone, Utc};
         let mid_month = Utc.with_ymd_and_hms(2026, 7, 22, 14, 30, 0).unwrap();
         let start = month_start_ts(mid_month);
-        assert_eq!(start, Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap().timestamp());
+        assert_eq!(
+            start,
+            Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0)
+                .unwrap()
+                .timestamp()
+        );
     }
 }

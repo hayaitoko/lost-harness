@@ -50,7 +50,10 @@ pub struct DelegateTool {
 
 impl DelegateTool {
     pub fn new(storage: Storage, model_manager: Arc<ModelManager>) -> Self {
-        Self { storage, model_manager }
+        Self {
+            storage,
+            model_manager,
+        }
     }
 }
 
@@ -107,19 +110,20 @@ impl Tool for DelegateTool {
         ctx: &'a ExecCtx,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let agent_type = match input.args.get("agent_type").and_then(|v| v.as_str()) {
-                Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-                _ => {
-                    return ToolResult::Err(
+            let agent_type =
+                match input.args.get("agent_type").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+                    _ => return ToolResult::Err(
                         "delegate requires a non-empty string \"agent_type\" (the persona name)"
                             .to_string(),
-                    )
-                }
-            };
+                    ),
+                };
             let task = match input.args.get("task").and_then(|v| v.as_str()) {
                 Some(s) if !s.trim().is_empty() => s.trim().to_string(),
                 _ => {
-                    return ToolResult::Err("delegate requires a non-empty string \"task\"".to_string())
+                    return ToolResult::Err(
+                        "delegate requires a non-empty string \"task\"".to_string(),
+                    )
                 }
             };
 
@@ -237,7 +241,13 @@ mod tests {
         let (storage, root) = temp_storage();
         storage.global().ensure_builtin_agent_types(1).unwrap();
         let mm = ModelManager::new();
-        mm.add_provider(Provider::new("lmstudio", "LM Studio", "http://localhost:1234/v1", None, ProviderKind::Local));
+        mm.add_provider(Provider::new(
+            "lmstudio",
+            "LM Studio",
+            "http://localhost:1234/v1",
+            None,
+            ProviderKind::Local,
+        ));
         storage
             .open_profile("personal")
             .unwrap()
@@ -266,9 +276,15 @@ mod tests {
                 ..ExecCtx::default()
             };
             let out = tool
-                .run(ToolInput::new(json!({"agent_type": "Code reviewer", "task": "review"})), &ctx)
+                .run(
+                    ToolInput::new(json!({"agent_type": "Code reviewer", "task": "review"})),
+                    &ctx,
+                )
                 .await;
-            assert!(matches!(out, ToolResult::Ok(_)), "dispatch should succeed, got {out:?}");
+            assert!(
+                matches!(out, ToolResult::Ok(_)),
+                "dispatch should succeed, got {out:?}"
+            );
             let claimed = storage
                 .open_profile("personal")
                 .unwrap()
@@ -276,7 +292,10 @@ mod tests {
                 .unwrap()
                 .expect("enqueued");
             let payload: serde_json::Value = serde_json::from_str(&claimed.input_json).unwrap();
-            assert_eq!(payload["binding"], expect, "helper must inherit the {turn_binding:?} parent binding");
+            assert_eq!(
+                payload["binding"], expect,
+                "helper must inherit the {turn_binding:?} parent binding"
+            );
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -301,7 +320,10 @@ mod tests {
                 &ctx,
             )
             .await;
-        assert!(matches!(out, ToolResult::Err(_)), "unapproved agent type must error, got {out:?}");
+        assert!(
+            matches!(out, ToolResult::Err(_)),
+            "unapproved agent type must error, got {out:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -311,11 +333,13 @@ mod tests {
         let tool = DelegateTool::new(storage, Arc::new(ModelManager::new()));
         let ctx = ctx_for("personal", "conv-1");
         assert!(matches!(
-            tool.run(ToolInput::new(json!({"task": "do it"})), &ctx).await,
+            tool.run(ToolInput::new(json!({"task": "do it"})), &ctx)
+                .await,
             ToolResult::Err(_)
         ));
         assert!(matches!(
-            tool.run(ToolInput::new(json!({"agent_type": "Code reviewer"})), &ctx).await,
+            tool.run(ToolInput::new(json!({"agent_type": "Code reviewer"})), &ctx)
+                .await,
             ToolResult::Err(_)
         ));
         let _ = std::fs::remove_dir_all(root);
@@ -362,7 +386,11 @@ mod tests {
             .unwrap()
             .expect("a work item should have been enqueued");
         assert_eq!(claimed.kind, WorkKind::AgentDispatch);
-        assert_eq!(claimed.state, WorkState::Running, "claiming flips it to running");
+        assert_eq!(
+            claimed.state,
+            WorkState::Running,
+            "claiming flips it to running"
+        );
         assert_eq!(
             claimed.target_conversation_id.as_deref(),
             Some("conv-42"),
@@ -392,7 +420,10 @@ mod tests {
                 &ctx,
             )
             .await;
-        assert!(matches!(out, ToolResult::Err(_)), "unbound seat + no caller model must error");
+        assert!(
+            matches!(out, ToolResult::Err(_)),
+            "unbound seat + no caller model must error"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

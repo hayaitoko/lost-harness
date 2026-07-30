@@ -345,7 +345,9 @@ mod tests {
 
     #[test]
     fn truncate_args_over_cap_is_suffixed() {
-        let s: String = std::iter::repeat('a').take(CAPTURED_ARGS_CAP + 100).collect();
+        let s: String = std::iter::repeat('a')
+            .take(CAPTURED_ARGS_CAP + 100)
+            .collect();
         let t = truncate_args(&s);
         assert!(t.starts_with(&s[..CAPTURED_ARGS_CAP]));
         assert!(t.contains("…[truncated from"));
@@ -394,7 +396,10 @@ mod tests {
 
     #[test]
     fn outcome_label_maps_every_variant() {
-        assert_eq!(outcome_label(&ToolOutcome::Ok(serde_json::json!(null))), "ok");
+        assert_eq!(
+            outcome_label(&ToolOutcome::Ok(serde_json::json!(null))),
+            "ok"
+        );
         assert_eq!(outcome_label(&ToolOutcome::Err("x".into())), "err");
         assert_eq!(
             outcome_label(&ToolOutcome::Denied {
@@ -410,7 +415,10 @@ mod tests {
             }),
             "ask"
         );
-        assert_eq!(outcome_label(&ToolOutcome::Unavailable("x".into())), "unavailable");
+        assert_eq!(
+            outcome_label(&ToolOutcome::Unavailable("x".into())),
+            "unavailable"
+        );
         assert_eq!(outcome_label(&ToolOutcome::Unknown("x".into())), "unknown");
     }
 

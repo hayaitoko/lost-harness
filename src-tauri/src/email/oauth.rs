@@ -128,7 +128,11 @@ impl std::fmt::Debug for TokenSet {
             .field("access_token", &"<redacted>")
             .field(
                 "refresh_token",
-                &if self.refresh_token.is_some() { "<present>" } else { "<absent>" },
+                &if self.refresh_token.is_some() {
+                    "<present>"
+                } else {
+                    "<absent>"
+                },
             )
             .field("expires_in_secs", &self.expires_in_secs)
             .finish()
@@ -189,7 +193,10 @@ pub enum RefreshError {
 /// fake-testable (same object-safe boxed-future shape as
 /// `models::runner::HealthCheck`).
 pub trait TokenEndpoint: Send + Sync {
-    fn post_form(&self, form: Vec<(String, String)>) -> BoxFuture<'_, anyhow::Result<(u16, String)>>;
+    fn post_form(
+        &self,
+        form: Vec<(String, String)>,
+    ) -> BoxFuture<'_, anyhow::Result<(u16, String)>>;
 }
 
 /// Hard ceiling on a token-endpoint response body, in bytes.
@@ -231,7 +238,10 @@ impl HttpTokenEndpoint {
 }
 
 impl TokenEndpoint for HttpTokenEndpoint {
-    fn post_form(&self, form: Vec<(String, String)>) -> BoxFuture<'_, anyhow::Result<(u16, String)>> {
+    fn post_form(
+        &self,
+        form: Vec<(String, String)>,
+    ) -> BoxFuture<'_, anyhow::Result<(u16, String)>> {
         Box::pin(async move {
             let resp = self
                 .client
@@ -278,7 +288,10 @@ fn random_bytes(n_uuids: usize) -> Vec<u8> {
 pub fn generate_pkce() -> PkcePair {
     let verifier = URL_SAFE_NO_PAD.encode(random_bytes(4));
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    PkcePair { verifier, challenge }
+    PkcePair {
+        verifier,
+        challenge,
+    }
 }
 
 /// Generate the anti-CSRF `state` token: 32 entropy bytes → 43 chars.
@@ -373,7 +386,11 @@ fn parse_redirect_request(head: &str) -> Option<RedirectParams> {
         return None;
     }
     let parsed = url::Url::parse(&format!("http://127.0.0.1{path}")).ok()?;
-    let mut out = RedirectParams { code: None, state: None, error: None };
+    let mut out = RedirectParams {
+        code: None,
+        state: None,
+        error: None,
+    };
     for (k, v) in parsed.query_pairs() {
         match k.as_ref() {
             "code" => out.code = Some(v.into_owned()),
@@ -468,7 +485,13 @@ impl PendingAuth {
         endpoint: &dyn TokenEndpoint,
         gcp: &GcpClient,
     ) -> Result<TokenSet, OauthError> {
-        let PendingAuth { listener, redirect_uri, pkce, state, .. } = self;
+        let PendingAuth {
+            listener,
+            redirect_uri,
+            pkce,
+            state,
+            ..
+        } = self;
         tokio::time::timeout(
             Duration::from_secs(AUTH_TIMEOUT_SECS),
             wait_and_exchange(listener, endpoint, gcp, &redirect_uri, &pkce, &state),
@@ -559,7 +582,10 @@ pub async fn exchange_code(
         .await
         .map_err(|e| OauthError::Io(e.to_string()))?;
     if !(200..300).contains(&status) {
-        return Err(OauthError::TokenEndpoint { status, detail: snippet(&body) });
+        return Err(OauthError::TokenEndpoint {
+            status,
+            detail: snippet(&body),
+        });
     }
     parse_token_response(&body)
         .map_err(|e| OauthError::Protocol(format!("token response didn't parse: {e}")))
@@ -580,7 +606,9 @@ pub async fn refresh(
     let (status, body) = endpoint
         .post_form(form)
         .await
-        .map_err(|e| RefreshError::Transient { detail: e.to_string() })?;
+        .map_err(|e| RefreshError::Transient {
+            detail: e.to_string(),
+        })?;
     if !(200..300).contains(&status) {
         return Err(classify_refresh_failure(status, &body));
     }
@@ -680,9 +708,11 @@ mod tests {
             self.forms.lock().unwrap().len()
         }
         fn form_value(&self, call: usize, key: &str) -> Option<String> {
-            self.forms.lock().unwrap().get(call).and_then(|f| {
-                f.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-            })
+            self.forms
+                .lock()
+                .unwrap()
+                .get(call)
+                .and_then(|f| f.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
         }
     }
 
@@ -692,7 +722,12 @@ mod tests {
             form: Vec<(String, String)>,
         ) -> BoxFuture<'_, anyhow::Result<(u16, String)>> {
             self.forms.lock().unwrap().push(form);
-            let resp = self.responses.lock().unwrap().pop().expect("scripted response");
+            let resp = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("scripted response");
             Box::pin(async move { resp })
         }
     }
@@ -703,9 +738,15 @@ mod tests {
     #[test]
     fn pkce_pair_meets_rfc7636() {
         let p = generate_pkce();
-        assert!((43..=128).contains(&p.verifier.len()), "len {}", p.verifier.len());
         assert!(
-            p.verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            (43..=128).contains(&p.verifier.len()),
+            "len {}",
+            p.verifier.len()
+        );
+        assert!(
+            p.verifier
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
             "base64url alphabet ⊂ RFC 7636 unreserved"
         );
         // The challenge is exactly base64url_nopad(sha256(verifier)).
@@ -722,16 +763,25 @@ mod tests {
         let pending = begin_auth(&gcp()).await.unwrap();
         assert_ne!(pending.port, 0, "a real ephemeral port was assigned");
         let u = url::Url::parse(&pending.auth_url).unwrap();
-        assert_eq!(u.origin().ascii_serialization(), "https://accounts.google.com");
+        assert_eq!(
+            u.origin().ascii_serialization(),
+            "https://accounts.google.com"
+        );
         let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
         assert_eq!(q["client_id"], gcp().client_id);
-        assert_eq!(q["redirect_uri"], format!("http://127.0.0.1:{}", pending.port));
+        assert_eq!(
+            q["redirect_uri"],
+            format!("http://127.0.0.1:{}", pending.port)
+        );
         assert_eq!(q["response_type"], "code");
         assert_eq!(q["scope"], GOOGLE_PRODUCTIVITY_SCOPES);
         assert_eq!(q["code_challenge_method"], "S256");
         assert_eq!(q["code_challenge"], pending.pkce.challenge);
         assert_eq!(q["state"], pending.state);
-        assert_eq!(q["access_type"], "offline", "refresh token requires offline");
+        assert_eq!(
+            q["access_type"], "offline",
+            "refresh token requires offline"
+        );
         assert_eq!(q["prompt"], "consent", "consent forces a refresh token");
     }
 
@@ -745,8 +795,8 @@ mod tests {
         assert_eq!(got.state.as_deref(), Some("st1"));
         assert_eq!(got.error, None);
         // Denial redirect.
-        let denied = parse_redirect_request("GET /?error=access_denied&state=s HTTP/1.1\r\n\r\n")
-            .unwrap();
+        let denied =
+            parse_redirect_request("GET /?error=access_denied&state=s HTTP/1.1\r\n\r\n").unwrap();
         assert_eq!(denied.error.as_deref(), Some("access_denied"));
         // Noise: favicon, non-GET, garbage — all None (404 + keep waiting).
         assert!(parse_redirect_request("GET /favicon.ico HTTP/1.1\r\n\r\n").is_none());
@@ -779,14 +829,27 @@ mod tests {
 
         // The browser saw the self-contained success page.
         let page = browser.await.unwrap();
-        assert!(page.starts_with("HTTP/1.1 200"), "got: {}", &page[..40.min(page.len())]);
+        assert!(
+            page.starts_with("HTTP/1.1 200"),
+            "got: {}",
+            &page[..40.min(page.len())]
+        );
         assert!(page.contains("You can close this tab"));
-        assert!(!page.contains("http://"), "no external resources on the page");
+        assert!(
+            !page.contains("http://"),
+            "no external resources on the page"
+        );
 
         // The exchange carried the code AND the PKCE verifier.
         assert_eq!(endpoint.calls(), 1);
-        assert_eq!(endpoint.form_value(0, "code").as_deref(), Some("auth-code-1"));
-        assert_eq!(endpoint.form_value(0, "code_verifier").as_deref(), Some(&*verifier));
+        assert_eq!(
+            endpoint.form_value(0, "code").as_deref(),
+            Some("auth-code-1")
+        );
+        assert_eq!(
+            endpoint.form_value(0, "code_verifier").as_deref(),
+            Some(&*verifier)
+        );
         assert_eq!(
             endpoint.form_value(0, "redirect_uri").as_deref(),
             Some(&*format!("http://127.0.0.1:{port}"))
@@ -819,7 +882,10 @@ mod tests {
                 .unwrap();
             let mut r1 = String::new();
             s1.read_to_string(&mut r1).await.unwrap();
-            assert!(r1.starts_with("HTTP/1.1 404"), "forged state → 404, got {r1}");
+            assert!(
+                r1.starts_with("HTTP/1.1 404"),
+                "forged state → 404, got {r1}"
+            );
 
             // The flow must still be alive to receive this.
             let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -833,7 +899,11 @@ mod tests {
         let endpoint = FakeEndpoint::respond(200, TOKEN_OK);
         let tokens = pending.finish(&endpoint, &gcp()).await.unwrap();
         assert_eq!(tokens.access_token, "at-1");
-        assert_eq!(endpoint.calls(), 1, "only the correctly-stated redirect is ever exchanged");
+        assert_eq!(
+            endpoint.calls(),
+            1,
+            "only the correctly-stated redirect is ever exchanged"
+        );
         assert_eq!(
             endpoint.form_value(0, "code").as_deref(),
             Some("real"),
@@ -859,7 +929,10 @@ mod tests {
                 .unwrap();
             let mut r1 = String::new();
             s1.read_to_string(&mut r1).await.unwrap();
-            assert!(r1.starts_with("HTTP/1.1 404"), "stateless error → 404, got {r1}");
+            assert!(
+                r1.starts_with("HTTP/1.1 404"),
+                "stateless error → 404, got {r1}"
+            );
 
             let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             let req = format!("GET /?state={state}&code=real HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -886,10 +959,15 @@ mod tests {
         let state = pending.state.clone();
         let browser = tokio::spawn(async move {
             let mut s1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-            s1.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+            s1.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
             let mut r1 = String::new();
             s1.read_to_string(&mut r1).await.unwrap();
-            assert!(r1.starts_with("HTTP/1.1 404"), "stray request → 404, got {r1}");
+            assert!(
+                r1.starts_with("HTTP/1.1 404"),
+                "stray request → 404, got {r1}"
+            );
 
             let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             let req = format!("GET /?state={state}&code=c2 HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -930,13 +1008,21 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_success_parses_tokens_and_sends_the_grant() {
-        let endpoint =
-            FakeEndpoint::respond(200, r#"{"access_token":"at-2","expires_in":3599}"#);
+        let endpoint = FakeEndpoint::respond(200, r#"{"access_token":"at-2","expires_in":3599}"#);
         let t = refresh(&endpoint, &gcp(), "rt-old").await.unwrap();
         assert_eq!(t.access_token, "at-2");
-        assert_eq!(t.refresh_token, None, "Google usually doesn't rotate — keep the old one");
-        assert_eq!(endpoint.form_value(0, "grant_type").as_deref(), Some("refresh_token"));
-        assert_eq!(endpoint.form_value(0, "refresh_token").as_deref(), Some("rt-old"));
+        assert_eq!(
+            t.refresh_token, None,
+            "Google usually doesn't rotate — keep the old one"
+        );
+        assert_eq!(
+            endpoint.form_value(0, "grant_type").as_deref(),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            endpoint.form_value(0, "refresh_token").as_deref(),
+            Some("rt-old")
+        );
     }
 
     #[tokio::test]
@@ -993,7 +1079,10 @@ mod tests {
         let s = format!("{t:?}");
         assert!(!s.contains("SECRET"), "tokens must never Debug-print: {s}");
         let g = format!("{:?}", gcp());
-        assert!(!g.contains("shhh"), "client secret must never Debug-print: {g}");
+        assert!(
+            !g.contains("shhh"),
+            "client secret must never Debug-print: {g}"
+        );
         let p = format!("{:?}", generate_pkce());
         assert!(!p.contains("verifier: \"") || p.contains("<redacted>"));
     }

@@ -165,11 +165,20 @@ mod tests {
         let s = span("a@b.com", 12, 19, RuleCategory::PiiContact);
         let r = redact(text, &[s], N);
         assert!(r.is_redacted());
-        assert_eq!(r.redacted_text, "email me at [REDACTED:PII_CONTACT#t-1] about it");
-        assert!(!r.redacted_text.contains("a@b.com"), "value must not survive in the sent text");
+        assert_eq!(
+            r.redacted_text,
+            "email me at [REDACTED:PII_CONTACT#t-1] about it"
+        );
+        assert!(
+            !r.redacted_text.contains("a@b.com"),
+            "value must not survive in the sent text"
+        );
         // The model echoes the placeholder; rehydration restores the original.
         let reply = "Sure, I'll email [REDACTED:PII_CONTACT#t-1] shortly.";
-        assert_eq!(rehydrate(reply, &r.replacements), "Sure, I'll email a@b.com shortly.");
+        assert_eq!(
+            rehydrate(reply, &r.replacements),
+            "Sure, I'll email a@b.com shortly."
+        );
     }
 
     #[test]
@@ -192,7 +201,10 @@ mod tests {
         ];
         let r = redact(text, &spans, N);
         assert_eq!(r.replacements.len(), 2);
-        assert_eq!(r.redacted_text, "ssn [REDACTED:PII_ID#t-1] card [REDACTED:FINANCIAL#t-2]");
+        assert_eq!(
+            r.redacted_text,
+            "ssn [REDACTED:PII_ID#t-1] card [REDACTED:FINANCIAL#t-2]"
+        );
         assert!(!r.redacted_text.contains("123-45-6789"));
         assert!(!r.redacted_text.contains("4111111111111111"));
     }
@@ -222,9 +234,16 @@ mod tests {
             span("BBBBCCCC", 4, 12, RuleCategory::PiiId),
         ];
         let r = redact(text, &spans, N);
-        assert_eq!(r.replacements.len(), 1, "the overlapping cluster is one union");
+        assert_eq!(
+            r.replacements.len(),
+            1,
+            "the overlapping cluster is one union"
+        );
         assert_eq!(r.redacted_text, "[REDACTED:FINANCIAL#t-1]");
-        assert!(!r.redacted_text.contains("CCCC"), "no byte of the staggered span may survive");
+        assert!(
+            !r.redacted_text.contains("CCCC"),
+            "no byte of the staggered span may survive"
+        );
         assert!(!r.redacted_text.contains("BBBB"));
     }
 
@@ -238,7 +257,10 @@ mod tests {
         ];
         let r = redact(text, &spans, N);
         assert_eq!(r.replacements.len(), 2);
-        assert_eq!(r.redacted_text, "[REDACTED:PII_ID#t-1][REDACTED:FINANCIAL#t-2]");
+        assert_eq!(
+            r.redacted_text,
+            "[REDACTED:PII_ID#t-1][REDACTED:FINANCIAL#t-2]"
+        );
     }
 
     #[test]
@@ -262,7 +284,10 @@ mod tests {
         let b = redact(text, &[s], "bbbb");
         assert_ne!(a.replacements[0].placeholder, b.replacements[0].placeholder);
         // A forged placeholder with the wrong nonce is not rehydrated.
-        assert_eq!(rehydrate("see [REDACTED:PII_CONTACT#zzzz-1]", &a.replacements), "see [REDACTED:PII_CONTACT#zzzz-1]");
+        assert_eq!(
+            rehydrate("see [REDACTED:PII_CONTACT#zzzz-1]", &a.replacements),
+            "see [REDACTED:PII_CONTACT#zzzz-1]"
+        );
     }
 
     #[test]

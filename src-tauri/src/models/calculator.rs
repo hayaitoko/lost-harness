@@ -185,8 +185,7 @@ pub fn calculate(hw: &HardwareProfile, model: &ModelSpec, input: &CalcInput) -> 
         1.0
     };
     let predicted_tokens_per_sec = hw.mem_bandwidth_gbps.filter(|g| *g > 0.0).and_then(|gbps| {
-        let bytes_per_token =
-            weights_bytes as f64 * active_fraction + kv_cache_bytes as f64;
+        let bytes_per_token = weights_bytes as f64 * active_fraction + kv_cache_bytes as f64;
         if bytes_per_token > 0.0 {
             Some(gbps * 1e9 / bytes_per_token)
         } else {
@@ -413,7 +412,15 @@ mod tests {
     fn a_comfortable_model_fits_and_full_offloads() {
         let hw = mac(36, Some(300.0));
         let (m, wbytes) = dense_8b(5.0);
-        let out = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 8192 });
+        let out = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 8192,
+            },
+        );
         assert_eq!(out.fit, Fit::Fits);
         assert!(out.full_gpu_offload);
         assert_eq!(out.pool_kind, PoolKind::UnifiedMemory);
@@ -429,9 +436,29 @@ mod tests {
         // TooLarge at BOTH ends — the 2026-07-22 audit caught it).
         let hw = mac(16, Some(100.0));
         let (m, wbytes) = dense_8b(5.0);
-        let short = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 4096 });
-        let long = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 131072 });
-        assert_eq!(short.fit, Fit::Fits, "the short-context case must actually fit");
+        let short = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 4096,
+            },
+        );
+        let long = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 131072,
+            },
+        );
+        assert_eq!(
+            short.fit,
+            Fit::Fits,
+            "the short-context case must actually fit"
+        );
         assert!(long.kv_cache_bytes > short.kv_cache_bytes);
         assert_eq!(long.fit, Fit::TooLarge, "a huge context must push it over");
         assert!(long.notes.iter().any(|n| n.contains("Too large")));
@@ -446,23 +473,72 @@ mod tests {
         // quants — the 2026-07-22 audit caught it).
         let hw = mac(16, Some(200.0));
         let (m, wbytes) = dense_8b(6.0);
-        let heavy = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 65536 });
-        let light = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::Q4_0, context_len: 65536 });
+        let heavy = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 65536,
+            },
+        );
+        let light = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::Q4_0,
+                context_len: 65536,
+            },
+        );
         assert!(light.kv_cache_bytes < heavy.kv_cache_bytes);
         assert!(light.total_required_bytes < heavy.total_required_bytes);
-        assert_eq!(heavy.fit, Fit::TooLarge, "f16 KV at 64k must overflow this machine");
-        assert_eq!(light.fit, Fit::Fits, "q4_0 KV must rescue the same model+context to a real fit");
+        assert_eq!(
+            heavy.fit,
+            Fit::TooLarge,
+            "f16 KV at 64k must overflow this machine"
+        );
+        assert_eq!(
+            light.fit,
+            Fit::Fits,
+            "q4_0 KV must rescue the same model+context to a real fit"
+        );
     }
 
     #[test]
     fn moe_is_predicted_much_faster_than_a_same_size_dense() {
         let hw = mac(128, Some(400.0));
         let (moe, moe_w) = moe_30b_a3b(18.0);
-        let dense_same = ModelSpec { active_params_b: 30.5, ..moe.clone() }; // force dense-equivalent active
-        let a = calculate(&hw, &moe, &CalcInput { weight_file_bytes: moe_w, kv_quant: KvCacheQuant::F16, context_len: 8192 });
-        let b = calculate(&hw, &dense_same, &CalcInput { weight_file_bytes: moe_w, kv_quant: KvCacheQuant::F16, context_len: 8192 });
-        let (ta, tb) = (a.predicted_tokens_per_sec.unwrap(), b.predicted_tokens_per_sec.unwrap());
-        assert!(ta > tb * 3.0, "MoE active-fraction should make it multiples faster ({ta} vs {tb})");
+        let dense_same = ModelSpec {
+            active_params_b: 30.5,
+            ..moe.clone()
+        }; // force dense-equivalent active
+        let a = calculate(
+            &hw,
+            &moe,
+            &CalcInput {
+                weight_file_bytes: moe_w,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 8192,
+            },
+        );
+        let b = calculate(
+            &hw,
+            &dense_same,
+            &CalcInput {
+                weight_file_bytes: moe_w,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 8192,
+            },
+        );
+        let (ta, tb) = (
+            a.predicted_tokens_per_sec.unwrap(),
+            b.predicted_tokens_per_sec.unwrap(),
+        );
+        assert!(
+            ta > tb * 3.0,
+            "MoE active-fraction should make it multiples faster ({ta} vs {tb})"
+        );
         assert_eq!(a.speed_tier, SpeedTier::Fast);
     }
 
@@ -470,11 +546,22 @@ mod tests {
     fn unknown_bandwidth_yields_no_speed_number_but_still_sizes() {
         let hw = mac(36, None); // bandwidth unknown
         let (m, wbytes) = dense_8b(5.0);
-        let out = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 8192 });
+        let out = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 8192,
+            },
+        );
         assert!(out.predicted_tokens_per_sec.is_none());
         assert_eq!(out.speed_tier, SpeedTier::Unknown);
         assert_eq!(out.fit, Fit::Fits, "still sizes on memory");
-        assert!(out.notes.iter().any(|n| n.to_lowercase().contains("memory fit only")));
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n.to_lowercase().contains("memory fit only")));
     }
 
     #[test]
@@ -482,7 +569,15 @@ mod tests {
         let mut hw = mac(0, Some(300.0)); // total_ram 0 = probe failure
         hw.total_ram_bytes = 0;
         let (m, wbytes) = dense_8b(2.0);
-        let out = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 4096 });
+        let out = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 4096,
+            },
+        );
         assert_eq!(out.fit, Fit::TooLarge, "unknown RAM never claims a fit");
         assert!(!out.full_gpu_offload);
     }
@@ -493,9 +588,20 @@ mod tests {
         let mut m = dense_8b(5.0).0;
         m.kv_exact = false;
         let wbytes = (5.0 * GB as f64) as u64;
-        let out = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 131072 });
+        let out = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 131072,
+            },
+        );
         assert!(out.notes.iter().any(|n| n.contains("approximate")));
-        assert!(out.notes.iter().any(|n| n.contains("exceeds the model's native window")));
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n.contains("exceeds the model's native window")));
     }
 
     #[test]
@@ -514,24 +620,57 @@ mod tests {
             ..Default::default()
         };
         let (m, wbytes) = dense_8b(5.0);
-        let out = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 4096 });
+        let out = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 4096,
+            },
+        );
         assert_eq!(out.pool_kind, PoolKind::CpuRam);
         assert!(out.notes.iter().any(|n| n.contains("didn't run")));
-        assert!(!out.notes.iter().any(|n| n.contains("No usable GPU was detected")));
+        assert!(!out
+            .notes
+            .iter()
+            .any(|n| n.contains("No usable GPU was detected")));
 
         // Confirmed-empty (Some(vec![])) IS allowed to say no GPU was found.
         let mut hw2 = hw.clone();
         hw2.gpus = Some(vec![]);
-        let out2 = calculate(&hw2, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 4096 });
-        assert!(out2.notes.iter().any(|n| n.contains("No usable GPU was detected")));
+        let out2 = calculate(
+            &hw2,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 4096,
+            },
+        );
+        assert!(out2
+            .notes
+            .iter()
+            .any(|n| n.contains("No usable GPU was detected")));
     }
 
     #[test]
     fn non_positive_bandwidth_yields_no_fabricated_speed() {
         let hw = mac(36, Some(0.0)); // a bogus/zero reading must not fabricate a number
         let (m, wbytes) = dense_8b(5.0);
-        let out = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 4096 });
-        assert!(out.predicted_tokens_per_sec.is_none(), "zero bandwidth → Unknown, not Some(0.0)");
+        let out = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 4096,
+            },
+        );
+        assert!(
+            out.predicted_tokens_per_sec.is_none(),
+            "zero bandwidth → Unknown, not Some(0.0)"
+        );
         assert_eq!(out.speed_tier, SpeedTier::Unknown);
     }
 
@@ -553,7 +692,15 @@ mod tests {
             ..Default::default()
         };
         let (m, wbytes) = dense_8b(5.0);
-        let out = calculate(&hw, &m, &CalcInput { weight_file_bytes: wbytes, kv_quant: KvCacheQuant::F16, context_len: 8192 });
+        let out = calculate(
+            &hw,
+            &m,
+            &CalcInput {
+                weight_file_bytes: wbytes,
+                kv_quant: KvCacheQuant::F16,
+                context_len: 8192,
+            },
+        );
         assert_eq!(out.pool_kind, PoolKind::DiscreteVram);
         // available = 24 GB VRAM - 0.75 GB reserve; a 5 GB model fits.
         assert_eq!(out.fit, Fit::Fits);

@@ -103,7 +103,10 @@ impl WorkState {
 
     /// Is this a terminal state (no further transitions)?
     pub fn is_terminal(self) -> bool {
-        matches!(self, WorkState::Done | WorkState::Failed | WorkState::Cancelled)
+        matches!(
+            self,
+            WorkState::Done | WorkState::Failed | WorkState::Cancelled
+        )
     }
 
     /// May an item move from `self` to `to`? The single source of truth for the
@@ -210,22 +213,34 @@ mod tests {
         // Queued.
         assert!(Queued.can_transition_to(Running));
         assert!(Queued.can_transition_to(Cancelled));
-        assert!(!Queued.can_transition_to(Done), "a queued item can't jump to done");
+        assert!(
+            !Queued.can_transition_to(Done),
+            "a queued item can't jump to done"
+        );
         assert!(!Queued.can_transition_to(Parked));
         // Running.
         assert!(Running.can_transition_to(Done));
         assert!(Running.can_transition_to(Failed));
         assert!(Running.can_transition_to(Parked));
-        assert!(!Running.can_transition_to(Queued), "a running item can't silently un-claim");
+        assert!(
+            !Running.can_transition_to(Queued),
+            "a running item can't silently un-claim"
+        );
         // Parked resumes or cancels.
         assert!(Parked.can_transition_to(Queued));
         assert!(Parked.can_transition_to(Cancelled));
-        assert!(!Parked.can_transition_to(Running), "parked must re-queue before running");
+        assert!(
+            !Parked.can_transition_to(Running),
+            "parked must re-queue before running"
+        );
         // Terminals are frozen.
         for t in [Done, Failed, Cancelled] {
             assert!(t.is_terminal());
             for to in [Queued, Running, Done, Failed, Parked, Cancelled] {
-                assert!(!t.can_transition_to(to), "{t:?} is terminal, can't → {to:?}");
+                assert!(
+                    !t.can_transition_to(to),
+                    "{t:?} is terminal, can't → {to:?}"
+                );
             }
         }
     }

@@ -20,10 +20,34 @@ use super::sse::{SseEvent, SseStream};
 
 #[test]
 fn provider_is_local_matches_kind() {
-    let local = Provider::new("lmstudio", "LM Studio", "http://localhost:1234/v1", None, ProviderKind::Local);
-    let cloud = Provider::new("openai", "OpenAI", "https://api.openai.com/v1", Some("sk-".into()), ProviderKind::Cloud);
-    let custom_public = Provider::new("my-proxy", "My Proxy", "https://api.example.com/v1", None, ProviderKind::Custom);
-    let custom_private = Provider::new("tadashi", "Tadashi", "http://10.0.0.5:8080/v1", None, ProviderKind::Custom);
+    let local = Provider::new(
+        "lmstudio",
+        "LM Studio",
+        "http://localhost:1234/v1",
+        None,
+        ProviderKind::Local,
+    );
+    let cloud = Provider::new(
+        "openai",
+        "OpenAI",
+        "https://api.openai.com/v1",
+        Some("sk-".into()),
+        ProviderKind::Cloud,
+    );
+    let custom_public = Provider::new(
+        "my-proxy",
+        "My Proxy",
+        "https://api.example.com/v1",
+        None,
+        ProviderKind::Custom,
+    );
+    let custom_private = Provider::new(
+        "tadashi",
+        "Tadashi",
+        "http://10.0.0.5:8080/v1",
+        None,
+        ProviderKind::Custom,
+    );
 
     assert!(local.is_local());
     assert!(!cloud.is_local());
@@ -33,30 +57,78 @@ fn provider_is_local_matches_kind() {
 
 #[test]
 fn provider_is_private_uses_egress_check() {
-    let localhost = Provider::new("p1", "p1", "http://localhost:1234/v1", None, ProviderKind::Local);
-    let tailnet = Provider::new("p2", "p2", "http://100.97.80.2:8765/v1", None, ProviderKind::Custom);
-    let rfc1918 = Provider::new("p3", "p3", "http://192.168.1.10:11434/v1", None, ProviderKind::Local);
-    let openai = Provider::new("p4", "p4", "https://api.openai.com/v1", Some("sk".into()), ProviderKind::Cloud);
-    let lookalike = Provider::new("p5", "p5", "https://10.evil.com/v1", None, ProviderKind::Custom);
-    let m_dns = Provider::new("p6", "p6", "http://macbook.local:1234/v1", None, ProviderKind::Local);
+    let localhost = Provider::new(
+        "p1",
+        "p1",
+        "http://localhost:1234/v1",
+        None,
+        ProviderKind::Local,
+    );
+    let tailnet = Provider::new(
+        "p2",
+        "p2",
+        "http://100.97.80.2:8765/v1",
+        None,
+        ProviderKind::Custom,
+    );
+    let rfc1918 = Provider::new(
+        "p3",
+        "p3",
+        "http://192.168.1.10:11434/v1",
+        None,
+        ProviderKind::Local,
+    );
+    let openai = Provider::new(
+        "p4",
+        "p4",
+        "https://api.openai.com/v1",
+        Some("sk".into()),
+        ProviderKind::Cloud,
+    );
+    let lookalike = Provider::new(
+        "p5",
+        "p5",
+        "https://10.evil.com/v1",
+        None,
+        ProviderKind::Custom,
+    );
+    let m_dns = Provider::new(
+        "p6",
+        "p6",
+        "http://macbook.local:1234/v1",
+        None,
+        ProviderKind::Local,
+    );
     let unparseable = Provider::new("p7", "p7", "not a url", None, ProviderKind::Cloud);
 
     assert!(localhost.is_private());
     assert!(tailnet.is_private(), "Tailscale CGNAT 100.64.0.0/10");
     assert!(rfc1918.is_private(), "RFC 1918 192.168.0.0/16");
     assert!(!openai.is_private());
-    assert!(!lookalike.is_private(), "host is a public name, not a dotted-quad");
+    assert!(
+        !lookalike.is_private(),
+        "host is a public name, not a dotted-quad"
+    );
     assert!(
         !m_dns.is_private(),
         "H-05 (P02): a .local mDNS name is spoofable and no longer grants private trust \
          on its own — it is surfaced to the user as trusted-by-name instead"
     );
-    assert!(!unparseable.is_private(), "unparseable URL is treated as public (refuse)");
+    assert!(
+        !unparseable.is_private(),
+        "unparseable URL is treated as public (refuse)"
+    );
 }
 
 #[test]
 fn provider_serde_roundtrip() {
-    let p = Provider::new("openai", "OpenAI", "https://api.openai.com/v1", Some("sk-abc".into()), ProviderKind::Cloud);
+    let p = Provider::new(
+        "openai",
+        "OpenAI",
+        "https://api.openai.com/v1",
+        Some("sk-abc".into()),
+        ProviderKind::Cloud,
+    );
     let json = serde_json::to_string(&p).unwrap();
     let back: Provider = serde_json::from_str(&json).unwrap();
     assert_eq!(back.id, "openai");
@@ -83,9 +155,7 @@ fn stream_from_chunks(chunks: Vec<Vec<u8>>) -> SseStream {
     // for in production — we never produce one in the synthetic test
     // stream, so it doesn't matter how the value is constructed.
     SseStream::from_byte_stream(tokio_stream::iter(
-        chunks
-            .into_iter()
-            .map(|b| Ok::<Vec<u8>, reqwest::Error>(b)),
+        chunks.into_iter().map(|b| Ok::<Vec<u8>, reqwest::Error>(b)),
     ))
 }
 
@@ -121,10 +191,7 @@ async fn sse_handles_split_chunks() {
                 data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\
                 data: [DONE]\n";
     // Split into tiny pieces.
-    let chunks: Vec<Vec<u8>> = full
-        .chunks(7)
-        .map(|c| c.to_vec())
-        .collect();
+    let chunks: Vec<Vec<u8>> = full.chunks(7).map(|c| c.to_vec()).collect();
     let events = collect(stream_from_chunks(chunks)).await;
     assert_eq!(
         events,
@@ -148,7 +215,10 @@ async fn sse_parses_the_final_usage_chunk() {
         events,
         vec![
             SseEvent::Delta("hi".to_string()),
-            SseEvent::Usage { prompt_tokens: 123, completion_tokens: 45 },
+            SseEvent::Usage {
+                prompt_tokens: 123,
+                completion_tokens: 45
+            },
             SseEvent::Done,
         ]
     );
@@ -176,7 +246,11 @@ async fn sse_ignores_a_zero_usage_chunk() {
     let body = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\
                  data: [DONE]\n";
     let events = collect(stream_from_chunks(vec![body.to_vec()])).await;
-    assert_eq!(events, vec![SseEvent::Done], "zero-token usage is not surfaced");
+    assert_eq!(
+        events,
+        vec![SseEvent::Done],
+        "zero-token usage is not surfaced"
+    );
 }
 
 #[tokio::test]
@@ -184,10 +258,7 @@ async fn sse_handles_crlf_line_endings() {
     let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\r\n\
                  data: [DONE]\r\n";
     let events = collect(stream_from_chunks(vec![body.to_vec()])).await;
-    assert_eq!(
-        events,
-        vec![SseEvent::Delta("x".into()), SseEvent::Done]
-    );
+    assert_eq!(events, vec![SseEvent::Delta("x".into()), SseEvent::Done]);
 }
 
 #[tokio::test]
@@ -202,10 +273,7 @@ async fn sse_skips_keepalives_and_comments() {
     // We don't emit KeepAlive for the actually-discharged lines; the parser
     // swallows them silently. The only events the caller sees are the
     // content delta and the Done sentinel.
-    assert_eq!(
-        events,
-        vec![SseEvent::Delta("ok".into()), SseEvent::Done]
-    );
+    assert_eq!(events, vec![SseEvent::Delta("ok".into()), SseEvent::Done]);
 }
 
 #[tokio::test]
@@ -215,10 +283,7 @@ async fn sse_emits_error_payload() {
     let events = collect(stream_from_chunks(vec![body.to_vec()])).await;
     assert_eq!(
         events,
-        vec![
-            SseEvent::Error("rate limited".to_string()),
-            SseEvent::Done,
-        ]
+        vec![SseEvent::Error("rate limited".to_string()), SseEvent::Done,]
     );
 }
 
@@ -249,10 +314,7 @@ async fn sse_handles_role_only_chunk() {
                  data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
                  data: [DONE]\n";
     let events = collect(stream_from_chunks(vec![body.to_vec()])).await;
-    assert_eq!(
-        events,
-        vec![SseEvent::Delta("hi".into()), SseEvent::Done]
-    );
+    assert_eq!(events, vec![SseEvent::Delta("hi".into()), SseEvent::Done]);
 }
 
 #[tokio::test]
@@ -285,8 +347,20 @@ fn manager_add_remove_and_list() {
     let m = ModelManager::new();
     assert!(m.list_providers().is_empty());
 
-    let p1 = Provider::new("openai", "OpenAI", "https://api.openai.com/v1", Some("sk".into()), ProviderKind::Cloud);
-    let p2 = Provider::new("lmstudio", "LM Studio", "http://localhost:1234/v1", None, ProviderKind::Local);
+    let p1 = Provider::new(
+        "openai",
+        "OpenAI",
+        "https://api.openai.com/v1",
+        Some("sk".into()),
+        ProviderKind::Cloud,
+    );
+    let p2 = Provider::new(
+        "lmstudio",
+        "LM Studio",
+        "http://localhost:1234/v1",
+        None,
+        ProviderKind::Local,
+    );
     m.add_provider(p1);
     m.add_provider(p2);
     assert_eq!(m.list_providers().len(), 2);
@@ -296,10 +370,19 @@ fn manager_add_remove_and_list() {
     assert!(m.get_provider("nope").is_none());
 
     // Replace existing by id.
-    let replacement = Provider::new("openai", "OpenAI (new key)", "https://api.openai.com/v1", Some("sk2".into()), ProviderKind::Cloud);
+    let replacement = Provider::new(
+        "openai",
+        "OpenAI (new key)",
+        "https://api.openai.com/v1",
+        Some("sk2".into()),
+        ProviderKind::Cloud,
+    );
     m.add_provider(replacement);
     assert_eq!(m.list_providers().len(), 2, "replace, not append");
-    assert_eq!(m.get_provider("openai").unwrap().api_key.as_deref(), Some("sk2"));
+    assert_eq!(
+        m.get_provider("openai").unwrap().api_key.as_deref(),
+        Some("sk2")
+    );
 
     m.remove_provider("openai");
     assert_eq!(m.list_providers().len(), 1);
@@ -313,7 +396,13 @@ fn manager_add_remove_and_list() {
 #[test]
 fn manager_get_client_returns_clone() {
     let m = ModelManager::new();
-    let p = Provider::new("lmstudio", "LM Studio", "http://localhost:1234/v1", None, ProviderKind::Local);
+    let p = Provider::new(
+        "lmstudio",
+        "LM Studio",
+        "http://localhost:1234/v1",
+        None,
+        ProviderKind::Local,
+    );
     m.add_provider(p);
 
     let c1 = m.get_client("lmstudio");
@@ -362,7 +451,10 @@ async fn sse_decodes_native_tool_call_deltas() {
         })
         .flatten()
         .collect();
-    assert!(!frags.is_empty(), "expected tool-call fragments, got {events:?}");
+    assert!(
+        !frags.is_empty(),
+        "expected tool-call fragments, got {events:?}"
+    );
 
     // The full round-trip: assemble the fragments into a concrete call.
     let calls = crate::tools::calling::assemble_native_calls(frags);
@@ -435,7 +527,10 @@ async fn live_native_tool_call_roundtrip() {
         }
     }
     let calls = crate::tools::calling::assemble_native_calls(frags);
-    eprintln!("live endpoint returned {} tool call(s); text={text:?}", calls.len());
+    eprintln!(
+        "live endpoint returned {} tool call(s); text={text:?}",
+        calls.len()
+    );
     assert!(
         !calls.is_empty(),
         "the model did not emit a native tool call (text was {text:?})"
@@ -443,7 +538,11 @@ async fn live_native_tool_call_roundtrip() {
     match &calls[0] {
         crate::tools::calling::ParsedToolCall::Call(c) => {
             assert_eq!(c.name, "get_weather", "unexpected tool name");
-            assert!(c.args.get("city").is_some(), "expected a city arg, got {}", c.args);
+            assert!(
+                c.args.get("city").is_some(),
+                "expected a city arg, got {}",
+                c.args
+            );
         }
         other => panic!("expected a well-formed call, got {other:?}"),
     }

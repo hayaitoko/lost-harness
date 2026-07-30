@@ -149,7 +149,11 @@ fn detect_credit_card(text: &str) -> Option<&'static str> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"\b(?:\d[ -]?){12,18}\d\b").unwrap());
     for mat in re.find_iter(text) {
-        let digits: String = mat.as_str().chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits: String = mat
+            .as_str()
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
         if (13..=19).contains(&digits.len()) && luhn_check(&digits) {
             return Some("Contains a number that passes a credit-card checksum");
         }
@@ -199,12 +203,8 @@ fn detect_api_key_secret(text: &str) -> Option<&'static str> {
 fn detect_email_password(text: &str) -> Option<&'static str> {
     static EMAIL: OnceLock<Regex> = OnceLock::new();
     static PASSWORD: OnceLock<Regex> = OnceLock::new();
-    let email_re = EMAIL.get_or_init(|| {
-        Regex::new(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b").unwrap()
-    });
-    let password_re = PASSWORD.get_or_init(|| {
-        Regex::new(r"(?i)\bpassword\b").unwrap()
-    });
+    let email_re = EMAIL.get_or_init(|| Regex::new(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b").unwrap());
+    let password_re = PASSWORD.get_or_init(|| Regex::new(r"(?i)\bpassword\b").unwrap());
     if email_re.is_match(text) && password_re.is_match(text) {
         Some("Mentions an email address alongside a password")
     } else {
@@ -217,8 +217,9 @@ fn detect_phone_number(text: &str) -> Option<&'static str> {
     static PHONE: OnceLock<Regex> = OnceLock::new();
     static CTX: OnceLock<Regex> = OnceLock::new();
     let phone_re = PHONE.get_or_init(|| Regex::new(r"\b(?:\+?\d[\d -]{7,}\d)\b").unwrap());
-    let ctx_re = CTX
-        .get_or_init(|| Regex::new(r"(?i)\b(my number|call me|text me|reach me at|my phone)\b").unwrap());
+    let ctx_re = CTX.get_or_init(|| {
+        Regex::new(r"(?i)\b(my number|call me|text me|reach me at|my phone)\b").unwrap()
+    });
     if phone_re.is_match(text) && ctx_re.is_match(text) {
         Some("Looks like a personal phone number")
     } else {
@@ -238,9 +239,7 @@ pub(crate) fn detect_health_info(text: &str) -> Option<&'static str> {
     let health_re = HEALTH.get_or_init(|| {
         Regex::new(r"(?i)\b(diagnos\w*|prescri\w*|medication|therapy|symptom\w*)\b").unwrap()
     });
-    let first_re = FIRST.get_or_init(|| {
-        Regex::new(r"(?i)\b(my|i've|i had|i was|i'm)\b").unwrap()
-    });
+    let first_re = FIRST.get_or_init(|| Regex::new(r"(?i)\b(my|i've|i had|i was|i'm)\b").unwrap());
     if health_re.is_match(text) && first_re.is_match(text) {
         Some("Mentions personal health information")
     } else {
@@ -251,9 +250,8 @@ pub(crate) fn detect_health_info(text: &str) -> Option<&'static str> {
 /// "Account number" / "account #" followed by 6+ digits.
 fn detect_financial_account(text: &str) -> Option<&'static str> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(?i)\baccount\s*(?:#|number)\s*:?\s*\d{6,}\b").unwrap()
-    });
+    let re =
+        RE.get_or_init(|| Regex::new(r"(?i)\baccount\s*(?:#|number)\s*:?\s*\d{6,}\b").unwrap());
     if re.is_match(text) {
         Some("Contains a financial account number")
     } else {

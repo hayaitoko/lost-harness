@@ -380,8 +380,14 @@ mod tests {
     #[test]
     fn fingerprint_differs_on_tool_or_args() {
         let base = ActionFingerprint::of("write_file", &json!({"path": "a.txt"}));
-        assert_ne!(base, ActionFingerprint::of("write_file", &json!({"path": "b.txt"})));
-        assert_ne!(base, ActionFingerprint::of("delete_file", &json!({"path": "a.txt"})));
+        assert_ne!(
+            base,
+            ActionFingerprint::of("write_file", &json!({"path": "b.txt"}))
+        );
+        assert_ne!(
+            base,
+            ActionFingerprint::of("delete_file", &json!({"path": "a.txt"}))
+        );
     }
 
     #[test]
@@ -391,7 +397,10 @@ mod tests {
         led.grant(GrantTarget::Fingerprint(fp.clone()), GrantScope::Once);
         assert!(led.covers("write_file", &fp));
         led.consume_once(&fp);
-        assert!(!led.covers("write_file", &fp), "a once-grant must not cover twice");
+        assert!(
+            !led.covers("write_file", &fp),
+            "a once-grant must not cover twice"
+        );
     }
 
     #[test]
@@ -408,7 +417,10 @@ mod tests {
         let led = ApprovalLedger::new();
         led.grant(GrantTarget::Tool("write_file".into()), GrantScope::Session);
         assert!(led.covers("write_file", "any-fp"));
-        assert!(!led.covers("delete_file", "any-fp"), "tool grant must not cover a different tool");
+        assert!(
+            !led.covers("delete_file", "any-fp"),
+            "tool grant must not cover a different tool"
+        );
     }
 
     #[test]
@@ -538,11 +550,18 @@ mod tests {
         for (scope, target) in [
             (GrantScope::Session, GrantTarget::Tool("shell_exec".into())),
             (GrantScope::Always, GrantTarget::Tool("shell_exec".into())),
-            (GrantScope::Session, GrantTarget::Fingerprint("other".into())),
+            (
+                GrantScope::Session,
+                GrantTarget::Fingerprint("other".into()),
+            ),
             (GrantScope::Always, GrantTarget::Fingerprint("other".into())),
         ] {
             let (s, t) = resolve_grant(RiskClass::Dangerous, scope, target, FP);
-            assert_eq!(s, GrantScope::Once, "Dangerous must never grant a standing scope");
+            assert_eq!(
+                s,
+                GrantScope::Once,
+                "Dangerous must never grant a standing scope"
+            );
             assert_eq!(t, GrantTarget::Fingerprint(FP.into()));
         }
     }

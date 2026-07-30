@@ -59,7 +59,9 @@ pub(crate) fn allowlisted_redirect_policy() -> reqwest::redirect::Policy {
         if host_allowed(&next) {
             attempt.follow()
         } else {
-            attempt.error(format!("redirect to a non-allowlisted host refused: {next}"))
+            attempt.error(format!(
+                "redirect to a non-allowlisted host refused: {next}"
+            ))
         }
     })
 }
@@ -377,7 +379,10 @@ where
 
     loop {
         let complete = expected_size > 0 && downloaded >= expected_size;
-        let budget = limits.total.checked_sub(started.elapsed()).unwrap_or_default();
+        let budget = limits
+            .total
+            .checked_sub(started.elapsed())
+            .unwrap_or_default();
         let wait;
         let kind;
         if complete {
@@ -566,9 +571,15 @@ mod tests {
         assert!(host_allowed("https://huggingface.co/x/y.gguf"));
         assert!(host_allowed("https://cdn-lfs.huggingface.co/blob"));
         assert!(host_allowed("https://hf.co/x"));
-        assert!(!host_allowed("http://huggingface.co/x"), "plain http refused");
+        assert!(
+            !host_allowed("http://huggingface.co/x"),
+            "plain http refused"
+        );
         assert!(!host_allowed("https://evil.com/x.gguf"));
-        assert!(!host_allowed("https://huggingface.co.evil.com/x"), "suffix-spoof refused");
+        assert!(
+            !host_allowed("https://huggingface.co.evil.com/x"),
+            "suffix-spoof refused"
+        );
         assert!(!host_allowed("not a url"));
     }
 
@@ -577,19 +588,31 @@ mod tests {
         let dir = tmp();
         let partial = dir.join("model.gguf.partial");
         let final_path = dir.join("model.gguf");
-        std::fs::File::create(&partial).unwrap().write_all(b"hello").unwrap();
+        std::fs::File::create(&partial)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
         // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
         let good = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
         // Mismatch → nothing installed, partial gone.
         assert!(verify_and_install(&partial, &final_path, &"a".repeat(64)).is_err());
         assert!(!partial.exists(), "a failed verify removes the partial");
-        assert!(!final_path.exists(), "a failed verify installs no final file");
+        assert!(
+            !final_path.exists(),
+            "a failed verify installs no final file"
+        );
 
         // Recreate + verify with the correct hash → atomic install.
-        std::fs::File::create(&partial).unwrap().write_all(b"hello").unwrap();
+        std::fs::File::create(&partial)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
         verify_and_install(&partial, &final_path, good).unwrap();
-        assert!(final_path.exists() && !partial.exists(), "verified → renamed to final");
+        assert!(
+            final_path.exists() && !partial.exists(),
+            "verified → renamed to final"
+        );
         assert_eq!(std::fs::read(&final_path).unwrap(), b"hello");
 
         let _ = std::fs::remove_dir_all(dir);
@@ -599,10 +622,16 @@ mod tests {
     fn verify_refuses_a_placeholder_hash() {
         let dir = tmp();
         let partial = dir.join("m.partial");
-        std::fs::File::create(&partial).unwrap().write_all(b"data").unwrap();
+        std::fs::File::create(&partial)
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
         let err = verify_and_install(&partial, &dir.join("m"), "TODO-CURATE").unwrap_err();
         assert!(err.to_string().contains("no real sha256"));
-        assert!(!partial.exists(), "a placeholder verify removes the partial too");
+        assert!(
+            !partial.exists(),
+            "a placeholder verify removes the partial too"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -610,7 +639,10 @@ mod tests {
     fn file_sha256_matches_known_vector() {
         let dir = tmp();
         let p = dir.join("f");
-        std::fs::File::create(&p).unwrap().write_all(b"hello").unwrap();
+        std::fs::File::create(&p)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
         assert_eq!(
             file_sha256(&p).unwrap(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
@@ -624,17 +656,29 @@ mod tests {
     fn content_range_parses_start_end_and_total() {
         assert_eq!(
             parse_content_range("bytes 100-199/1000").unwrap(),
-            ContentRange { start: 100, end: 199, total: Some(1000) }
+            ContentRange {
+                start: 100,
+                end: 199,
+                total: Some(1000)
+            }
         );
         // An unknown total is `*`, not absent.
         assert_eq!(
             parse_content_range("bytes 0-9/*").unwrap(),
-            ContentRange { start: 0, end: 9, total: None }
+            ContentRange {
+                start: 0,
+                end: 9,
+                total: None
+            }
         );
         // Case-insensitive unit + tolerant whitespace.
         assert_eq!(
             parse_content_range("  Bytes  5-6 / 7  ").unwrap(),
-            ContentRange { start: 5, end: 6, total: Some(7) }
+            ContentRange {
+                start: 5,
+                end: 6,
+                total: Some(7)
+            }
         );
     }
 
@@ -667,9 +711,18 @@ mod tests {
             ResumeAction::Append { from: 400 }
         );
         // Starting anywhere else would leave a hole or duplicate bytes.
-        for cr in ["bytes 399-999/1000", "bytes 401-999/1000", "bytes 0-999/1000"] {
-            let err = plan_resume(206, Some(cr), None, 400, 1000).unwrap_err().to_string();
-            assert!(err.contains("Content-Range starts at"), "unexpected error for {cr}: {err}");
+        for cr in [
+            "bytes 399-999/1000",
+            "bytes 401-999/1000",
+            "bytes 0-999/1000",
+        ] {
+            let err = plan_resume(206, Some(cr), None, 400, 1000)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("Content-Range starts at"),
+                "unexpected error for {cr}: {err}"
+            );
         }
     }
 
@@ -695,7 +748,10 @@ mod tests {
         let err = plan_resume(206, Some("bytes 400-1000/*"), None, 400, 1000)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("reaches past the declared size 1000"), "got: {err}");
+        assert!(
+            err.contains("reaches past the declared size 1000"),
+            "got: {err}"
+        );
         // The boundary itself is legal.
         assert_eq!(
             plan_resume(206, Some("bytes 400-999/*"), None, 400, 1000).unwrap(),
@@ -714,7 +770,9 @@ mod tests {
 
     #[test]
     fn a_206_without_a_content_range_header_is_refused() {
-        let err = plan_resume(206, None, Some(600), 400, 1000).unwrap_err().to_string();
+        let err = plan_resume(206, None, Some(600), 400, 1000)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("carried no Content-Range"), "got: {err}");
     }
 
@@ -730,13 +788,18 @@ mod tests {
 
     #[test]
     fn a_200_declaring_more_than_the_expected_size_is_refused_before_any_bytes() {
-        let err = plan_resume(200, None, Some(1001), 0, 1000).unwrap_err().to_string();
+        let err = plan_resume(200, None, Some(1001), 0, 1000)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("more than the expected size"), "got: {err}");
     }
 
     #[test]
     fn other_statuses_fail_closed_on_a_resume() {
-        assert!(plan_resume(416, None, None, 400, 1000).unwrap_err().to_string().contains("416"));
+        assert!(plan_resume(416, None, None, 400, 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("416"));
         assert!(plan_resume(404, None, None, 0, 1000).is_err());
         assert!(plan_resume(204, None, None, 0, 1000).is_err());
         assert!(plan_resume(302, None, None, 0, 1000).is_err());
@@ -758,7 +821,10 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let dir = tmp();
         let p = dir.join("m.partial");
-        std::fs::File::create(&p).unwrap().write_all(&[7u8; 500]).unwrap();
+        std::fs::File::create(&p)
+            .unwrap()
+            .write_all(&[7u8; 500])
+            .unwrap();
 
         // Resume at 500 → append mode, existing bytes intact.
         let mut f = open_partial(&p, 500).await.unwrap();
@@ -779,9 +845,15 @@ mod tests {
     async fn open_partial_refuses_a_file_that_is_not_the_length_the_plan_assumed() {
         let dir = tmp();
         let p = dir.join("m.partial");
-        std::fs::File::create(&p).unwrap().write_all(&[0u8; 10]).unwrap();
+        std::fs::File::create(&p)
+            .unwrap()
+            .write_all(&[0u8; 10])
+            .unwrap();
         let err = open_partial(&p, 400).await.unwrap_err().to_string();
-        assert!(err.contains("holds 10 byte(s) but the resume plan assumed 400"), "got: {err}");
+        assert!(
+            err.contains("holds 10 byte(s) but the resume plan assumed 400"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -845,7 +917,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         drop(f);
-        assert!(err.contains("more than the declared 10 bytes"), "got: {err}");
+        assert!(
+            err.contains("more than the declared 10 bytes"),
+            "got: {err}"
+        );
         assert!(err.contains("5 extra byte(s)"), "got: {err}");
         assert_eq!(
             std::fs::read(&p).unwrap(),
@@ -873,7 +948,11 @@ mod tests {
         .to_string();
         drop(f);
         assert!(err.contains("incomplete download: 3 of 10"), "got: {err}");
-        assert_eq!(std::fs::read(&p).unwrap(), b"abc", "the good prefix is kept for the resume");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"abc",
+            "the good prefix is kept for the resume"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -884,9 +963,10 @@ mod tests {
         // Every declared byte lands, then the server just holds the socket
         // open. Waiting the full idle timeout and then FAILING would turn a
         // complete download into an error, so the EOF probe is grace-bounded.
-        let stream = Box::pin(
-            tokio_stream::StreamExt::chain(chunks(&[b"abcdefghij"]), tokio_stream::pending()),
-        );
+        let stream = Box::pin(tokio_stream::StreamExt::chain(
+            chunks(&[b"abcdefghij"]),
+            tokio_stream::pending(),
+        ));
         let started = std::time::Instant::now();
         let n = stream_to_file(
             stream,
@@ -904,7 +984,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 10);
-        assert!(started.elapsed() < Duration::from_secs(5), "bounded by eof_grace, not by idle");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded by eof_grace, not by idle"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -946,7 +1029,9 @@ mod tests {
         // total budget this server holds the download open indefinitely.
         let drip = Box::pin(
             tokio_stream::iter(
-                (0..1000).map(|_| Ok::<Vec<u8>, String>(vec![b'x'])).collect::<Vec<_>>(),
+                (0..1000)
+                    .map(|_| Ok::<Vec<u8>, String>(vec![b'x']))
+                    .collect::<Vec<_>>(),
             )
             .throttle(Duration::from_secs(10)),
         );
@@ -974,14 +1059,27 @@ mod tests {
     async fn an_already_complete_partial_short_circuits_without_touching_the_network() {
         let dir = tmp();
         let p = dir.join("done.partial");
-        std::fs::File::create(&p).unwrap().write_all(b"hello").unwrap();
+        std::fs::File::create(&p)
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
         // An allowlisted host that does not resolve to this file: if the
         // short-circuit is removed, this either 404s or fails to connect.
         let url = "https://huggingface.co/lhp-test-not-a-real-repo/does-not-exist.gguf";
         let seen = std::cell::Cell::new((0u64, 0u64));
-        download_to_partial(url, &p, 5, |d, t| seen.set((d, t))).await.unwrap();
-        assert_eq!(seen.get(), (5, 5), "progress is reported as already-finished");
-        assert_eq!(std::fs::read(&p).unwrap(), b"hello", "the bytes are left for the hasher");
+        download_to_partial(url, &p, 5, |d, t| seen.set((d, t)))
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.get(),
+            (5, 5),
+            "progress is reported as already-finished"
+        );
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"hello",
+            "the bytes are left for the hasher"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

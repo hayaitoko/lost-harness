@@ -36,21 +36,35 @@ const CU_REQUIRES: &[Capability] = &[Capability::ComputerUse];
 /// (`from_app`… / `to_app`…).
 fn parse_target(args: &serde_json::Value, prefix: &str) -> Result<ActionTarget, String> {
     let field = |k: &str| -> Result<String, String> {
-        let key = if prefix.is_empty() { k.to_string() } else { format!("{prefix}_{k}") };
+        let key = if prefix.is_empty() {
+            k.to_string()
+        } else {
+            format!("{prefix}_{k}")
+        };
         match args.get(&key).and_then(|v| v.as_str()) {
             Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
-            _ => Err(format!("requires a non-empty string \"{key}\" arg (a semantic locator, never pixels)")),
+            _ => Err(format!(
+                "requires a non-empty string \"{key}\" arg (a semantic locator, never pixels)"
+            )),
         }
     };
-    Ok(ActionTarget { app: field("app")?, role: field("role")?, label: field("label")? })
+    Ok(ActionTarget {
+        app: field("app")?,
+        role: field("role")?,
+        label: field("label")?,
+    })
 }
 
 /// Build the [`ComputerAction`] a `ui_*` call describes. `None` for a non-ui
 /// tool name or unparseable args — the hook treats that as "not mine".
 pub(crate) fn parse_action(tool_name: &str, args: &serde_json::Value) -> Option<ComputerAction> {
     match tool_name {
-        "ui_scroll" => Some(ComputerAction::Scroll { target: parse_target(args, "").ok()? }),
-        "ui_click" => Some(ComputerAction::Click { target: parse_target(args, "").ok()? }),
+        "ui_scroll" => Some(ComputerAction::Scroll {
+            target: parse_target(args, "").ok()?,
+        }),
+        "ui_click" => Some(ComputerAction::Click {
+            target: parse_target(args, "").ok()?,
+        }),
         "ui_type" => Some(ComputerAction::Type {
             target: parse_target(args, "").ok()?,
             text: args.get("text")?.as_str()?.to_string(),
@@ -176,10 +190,15 @@ fn locator_schema(extra: &[(&str, &str)]) -> serde_json::Value {
     .iter()
     .chain(extra)
     {
-        props.insert((*k).to_string(), json!({"type": "string", "description": d}));
+        props.insert(
+            (*k).to_string(),
+            json!({"type": "string", "description": d}),
+        );
     }
-    let required: Vec<&str> =
-        ["app", "role", "label"].into_iter().chain(extra.iter().map(|(k, _)| *k)).collect();
+    let required: Vec<&str> = ["app", "role", "label"]
+        .into_iter()
+        .chain(extra.iter().map(|(k, _)| *k))
+        .collect();
     json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
 
@@ -265,9 +284,13 @@ mod tests {
 
     #[tokio::test]
     async fn ui_click_resolves_fresh_and_synthesizes() {
-        let mock = Arc::new(MockComputerBackend::with_elements(vec![("Mail", "button", "Reply")]));
+        let mock = Arc::new(MockComputerBackend::with_elements(vec![(
+            "Mail", "button", "Reply",
+        )]));
         let tool = UiClickTool::new(mock.clone() as Arc<dyn ComputerBackend>);
-        let out = tool.run(ToolInput::new(click_args("Reply")), &ExecCtx::default()).await;
+        let out = tool
+            .run(ToolInput::new(click_args("Reply")), &ExecCtx::default())
+            .await;
         match out {
             ToolResult::Ok(v) => assert_eq!(v["label"], "Reply"),
             other => panic!("expected an actuation, got {other:?}"),
@@ -277,11 +300,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_vanished_target_refuses_never_misclicks() {
-        let mock = Arc::new(MockComputerBackend::with_elements(vec![("Mail", "button", "Reply")]));
+        let mock = Arc::new(MockComputerBackend::with_elements(vec![(
+            "Mail", "button", "Reply",
+        )]));
         mock.vanish_all();
         let tool = UiClickTool::new(mock.clone() as Arc<dyn ComputerBackend>);
-        let out = tool.run(ToolInput::new(click_args("Reply")), &ExecCtx::default()).await;
-        assert!(matches!(out, ToolResult::Err(ref e) if e.contains("moved or vanished")), "got {out:?}");
+        let out = tool
+            .run(ToolInput::new(click_args("Reply")), &ExecCtx::default())
+            .await;
+        assert!(
+            matches!(out, ToolResult::Err(ref e) if e.contains("moved or vanished")),
+            "got {out:?}"
+        );
         assert!(mock.synthesized.lock().is_empty(), "NOTHING was actuated");
     }
 
@@ -289,8 +319,16 @@ mod tests {
     async fn pixel_args_are_rejected_semantic_locators_only() {
         let mock = Arc::new(MockComputerBackend::with_elements(vec![]));
         let tool = UiClickTool::new(mock as Arc<dyn ComputerBackend>);
-        let out = tool.run(ToolInput::new(json!({"x": 100, "y": 250})), &ExecCtx::default()).await;
-        assert!(matches!(out, ToolResult::Err(ref e) if e.contains("semantic locator")), "got {out:?}");
+        let out = tool
+            .run(
+                ToolInput::new(json!({"x": 100, "y": 250})),
+                &ExecCtx::default(),
+            )
+            .await;
+        assert!(
+            matches!(out, ToolResult::Err(ref e) if e.contains("semantic locator")),
+            "got {out:?}"
+        );
     }
 
     #[test]
@@ -309,7 +347,10 @@ mod tests {
     fn parse_action_builds_the_semantic_action() {
         let a = parse_action("ui_click", &click_args("Send")).unwrap();
         assert!(matches!(a, ComputerAction::Click { ref target } if target.label == "Send"));
-        assert!(parse_action("read_file", &json!({})).is_none(), "non-ui tools are not mine");
+        assert!(
+            parse_action("read_file", &json!({})).is_none(),
+            "non-ui tools are not mine"
+        );
         let d = parse_action(
             "ui_drag",
             &json!({"from_app": "Finder", "from_role": "file", "from_label": "a.txt",

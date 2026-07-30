@@ -154,7 +154,10 @@ mod tests {
         // Write → Allow + policy_allowed (zero-prompt).
         let mut w = ev("write_file", RiskClass::Write, SessionMode::AcceptEdits);
         assert_eq!(SessionModeHook.on_event(&mut w), HookResult::Allow);
-        assert!(w.policy_allowed, "accept-edits must satisfy first-use for a Write");
+        assert!(
+            w.policy_allowed,
+            "accept-edits must satisfy first-use for a Write"
+        );
 
         // External / Dangerous → Continue (fall through to the matrix), and it
         // must NOT set policy_allowed (that would bypass first-use for them).
@@ -174,11 +177,21 @@ mod tests {
 
     #[test]
     fn round_trips_through_str() {
-        for m in [SessionMode::Normal, SessionMode::Plan, SessionMode::AcceptEdits] {
+        for m in [
+            SessionMode::Normal,
+            SessionMode::Plan,
+            SessionMode::AcceptEdits,
+        ] {
             assert_eq!(SessionMode::from_str_lenient(m.as_str()), m);
         }
         // Unknown → Normal (never silently accept-edits).
-        assert_eq!(SessionMode::from_str_lenient("garbage"), SessionMode::Normal);
-        assert_eq!(SessionMode::from_str_lenient("accept-edits"), SessionMode::AcceptEdits);
+        assert_eq!(
+            SessionMode::from_str_lenient("garbage"),
+            SessionMode::Normal
+        );
+        assert_eq!(
+            SessionMode::from_str_lenient("accept-edits"),
+            SessionMode::AcceptEdits
+        );
     }
 }

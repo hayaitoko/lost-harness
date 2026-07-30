@@ -96,7 +96,7 @@ pub use approval::{
 };
 pub use audit::{
     outcome_gate_by, outcome_label, truncate_args, AuditEntry, AuditObserverHook, AuditWriter,
-    CAPTURED_ARGS_CAP, StorageAuditWriter,
+    StorageAuditWriter, CAPTURED_ARGS_CAP,
 };
 pub use first_use::FirstUseConfirmHook;
 pub use headless::{ApprovalQueue, QueuedApproval, QueueingPrompter};

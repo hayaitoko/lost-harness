@@ -18,10 +18,10 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
 use crate::agent::loop_mod::{sha256_hex, StreamErrorPayload, StreamTokenPayload};
+use crate::classifier::HeuristicClassifier;
 use crate::models::sse::{SseEvent, SseStream};
 use crate::models::{ChatMessage, Provider, ProviderKind};
 use crate::storage::{Message, Storage, TrmLog};
-use crate::classifier::HeuristicClassifier;
 
 // ── Fake model streamer ──────────────────────────────────────────────────
 
@@ -80,11 +80,8 @@ impl TestStreamer for FakeStreamer {
         // Clone the chunks out of `self` so the resulting stream
         // doesn't borrow from `&self` (SseStream requires `'static`).
         let chunks: Vec<Vec<u8>> = self.chunks.clone();
-        let byte_stream = tokio_stream::iter(
-            chunks
-                .into_iter()
-                .map(|b| Ok::<Vec<u8>, reqwest::Error>(b)),
-        );
+        let byte_stream =
+            tokio_stream::iter(chunks.into_iter().map(|b| Ok::<Vec<u8>, reqwest::Error>(b)));
         Ok(SseStream::from_byte_stream(byte_stream))
     }
 }
@@ -147,7 +144,12 @@ impl<R: Runtime> TestLoop<R> {
         conversation_id: String,
     ) -> Result<String, String> {
         let is_cloud = !crate::agent::egress::is_private_endpoint(&provider.base_url);
-        let decision = self.gate.check(&binding, content, is_cloud, &crate::classifier::ClassifierConfig::default());
+        let decision = self.gate.check(
+            &binding,
+            content,
+            is_cloud,
+            &crate::classifier::ClassifierConfig::default(),
+        );
         let message_hash = sha256_hex(content.as_bytes());
         self.log_trm(&conversation_id, &decision, &message_hash)
             .map_err(|e| e.to_string())?;
@@ -379,10 +381,7 @@ fn fresh_env() -> TestEnv {
 async fn public_binding_and_cloud_provider_goes_through() {
     let env = fresh_env();
     let provider = cloud_provider("openai");
-    let fake = Arc::new(FakeStreamer::new(
-        provider.clone(),
-        sse_chunks_for("hi"),
-    ));
+    let fake = Arc::new(FakeStreamer::new(provider.clone(), sse_chunks_for("hi")));
 
     let test_loop = TestLoop::new(
         env.storage.clone(),
@@ -495,10 +494,7 @@ async fn auto_binding_with_ssn_on_cloud_routes_to_local() {
 async fn auto_binding_with_clean_text_goes_through() {
     let env = fresh_env();
     let provider = cloud_provider("openai");
-    let fake = Arc::new(FakeStreamer::new(
-        provider.clone(),
-        sse_chunks_for("Paris"),
-    ));
+    let fake = Arc::new(FakeStreamer::new(provider.clone(), sse_chunks_for("Paris")));
 
     let test_loop = TestLoop::new(
         env.storage.clone(),
@@ -528,10 +524,7 @@ async fn auto_binding_with_clean_text_goes_through() {
 async fn trm_log_entry_is_written_for_every_decision() {
     let env = fresh_env();
     let provider = cloud_provider("openai");
-    let fake = Arc::new(FakeStreamer::new(
-        provider.clone(),
-        sse_chunks_for("ok"),
-    ));
+    let fake = Arc::new(FakeStreamer::new(provider.clone(), sse_chunks_for("ok")));
 
     let test_loop = TestLoop::new(
         env.storage.clone(),
@@ -567,13 +560,21 @@ async fn trm_log_entry_is_written_for_every_decision() {
 // wire a `ToolDispatcher`, so we build a real one here.
 
 fn local_provider(id: &str) -> Provider {
-    Provider::new(id, "LocalLLM", "http://localhost:1234/v1", None, ProviderKind::Local)
+    Provider::new(
+        id,
+        "LocalLLM",
+        "http://localhost:1234/v1",
+        None,
+        ProviderKind::Local,
+    )
 }
 
 /// A `ToolDispatcher` with one `EchoTool`, allowed + pre-confirmed, so gating
 /// passes and `resume_after_local_switch` actually runs the tool.
 fn echo_allow_dispatcher() -> crate::tools::ToolDispatcher {
-    use crate::hooks::{build_pretooluse_chain_with_confirmed, InMemoryPolicySource, PermissionMode};
+    use crate::hooks::{
+        build_pretooluse_chain_with_confirmed, InMemoryPolicySource, PermissionMode,
+    };
     use crate::tools::{BodyEnv, EchoTool, ToolDispatcher, ToolRegistry};
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(EchoTool));
@@ -615,7 +616,10 @@ async fn resolve_turn_outcome_reroutes_to_local_and_hides_reason() {
 
     let turn = TurnOutcome::NeedsLocalReroute {
         reason: "UNIQUE_TEST_MARKER".to_string(),
-        call: ToolCall { name: "echo".to_string(), args: serde_json::json!({"x": 1}) },
+        call: ToolCall {
+            name: "echo".to_string(),
+            args: serde_json::json!({"x": 1}),
+        },
         prior_sections: vec![],
         remaining: vec![],
         turn_call_count: 0,
@@ -655,7 +659,10 @@ async fn resolve_turn_outcome_reroutes_to_local_and_hides_reason() {
         !content.contains("UNIQUE_TEST_MARKER"),
         "the detailed reason must never leak into the replayed content: {content}"
     );
-    assert!(content.contains("[routing] switched to the local model"), "banner: {content}");
+    assert!(
+        content.contains("[routing] switched to the local model"),
+        "banner: {content}"
+    );
 }
 
 #[tokio::test]
@@ -674,7 +681,10 @@ async fn resolve_turn_outcome_no_local_candidate_stays_cloud_with_hard_deny() {
 
     let turn = TurnOutcome::NeedsLocalReroute {
         reason: "content must not leave this device".to_string(),
-        call: ToolCall { name: "echo".to_string(), args: serde_json::json!({"x": 1}) },
+        call: ToolCall {
+            name: "echo".to_string(),
+            args: serde_json::json!({"x": 1}),
+        },
         prior_sections: vec![],
         remaining: vec![],
         turn_call_count: 0,
@@ -706,9 +716,16 @@ async fn resolve_turn_outcome_no_local_candidate_stays_cloud_with_hard_deny() {
     assert!(is_cloud, "no local candidate → stays on cloud");
     assert_eq!(provider.id, cloud.id);
     assert_eq!(routing, "allow", "routing_decision unchanged");
-    assert_eq!(fired.load(Ordering::SeqCst), 0, "on_reroute must never fire");
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        0,
+        "on_reroute must never fire"
+    );
     let content = msg.expect("feedback present").content;
-    assert!(content.contains("must stay on-device"), "content: {content}");
+    assert!(
+        content.contains("must stay on-device"),
+        "content: {content}"
+    );
     assert!(
         content.contains("switch to a local model or set the conversation binding to Private"),
         "content: {content}"
@@ -723,7 +740,11 @@ async fn resolve_turn_outcome_no_local_candidate_stays_cloud_with_hard_deny() {
 /// Build a real `AgentLoop` (rules classifier) plus the shared `Storage` handle
 /// so a test can seed prior turns and then exercise the private redaction
 /// helpers directly.
-fn redaction_loop() -> (crate::agent::loop_mod::AgentLoop, Arc<Storage>, std::path::PathBuf) {
+fn redaction_loop() -> (
+    crate::agent::loop_mod::AgentLoop,
+    Arc<Storage>,
+    std::path::PathBuf,
+) {
     use crate::agent::loop_mod::AgentLoop;
     use crate::classifier::RulesClassifier;
     use crate::models::ModelManager;
@@ -754,7 +775,10 @@ fn plan_redaction_redacts_value_spans_and_honors_the_toggle() {
         .plan_redaction("personal", content, Some(&classification), &cfg)
         .expect("an email-only message must be redact-and-sendable");
     assert!(red.is_redacted());
-    assert!(!red.redacted_text.contains("a@b.com"), "the value must not survive redaction");
+    assert!(
+        !red.redacted_text.contains("a@b.com"),
+        "the value must not survive redaction"
+    );
 
     // A proprietary CUE ("confidential") is not a value — redacting it would
     // strip the signal, not the secret — so nothing is redacted and the turn
@@ -762,7 +786,9 @@ fn plan_redaction_redacts_value_spans_and_honors_the_toggle() {
     let cue = "this is strictly confidential, do not share";
     let cue_cls = clf.classify(cue);
     assert!(
-        agent.plan_redaction("personal", cue, Some(&cue_cls), &cfg).is_none(),
+        agent
+            .plan_redaction("personal", cue, Some(&cue_cls), &cfg)
+            .is_none(),
         "a proprietary-cue message can't be partially delegated → stays local"
     );
 
@@ -773,7 +799,9 @@ fn plan_redaction_redacts_value_spans_and_honors_the_toggle() {
         .set_redaction_enabled(false)
         .unwrap();
     assert!(
-        agent.plan_redaction("personal", content, Some(&classification), &cfg).is_none(),
+        agent
+            .plan_redaction("personal", content, Some(&classification), &cfg)
+            .is_none(),
         "redaction toggle off ⇒ no redact-and-send"
     );
 
@@ -929,7 +957,10 @@ fn cloud_safe_cache_flips_to_unsafe_when_a_private_turn_is_appended() {
     // Two benign turns → safe (and caches the verdict).
     add("what's the weather like", 1);
     add("thanks, and the forecast for tomorrow", 2);
-    assert!(agent.conversation_is_cloud_safe("personal", "c", &cfg), "benign history is cloud-safe");
+    assert!(
+        agent.conversation_is_cloud_safe("personal", "c", &cfg),
+        "benign history is cloud-safe"
+    );
     // A repeat hit uses the cache (still safe).
     assert!(agent.conversation_is_cloud_safe("personal", "c", &cfg));
 
@@ -962,30 +993,59 @@ fn assemble_memory_context_is_endpoint_aware_and_profile_scoped() {
         created_at: 1,
         pinned: false,
     };
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("s", "the deploy key lives in the vault", "personal")).unwrap();
-    g.insert_memory_fact_in(MemoryBucket::PrivateLocal, &mk("p", "home address is 123 Oak Street", "personal")).unwrap();
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("w", "work standup is at 9am", "work")).unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mk("s", "the deploy key lives in the vault", "personal"),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::PrivateLocal,
+        &mk("p", "home address is 123 Oak Street", "personal"),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mk("w", "work standup is at 9am", "work"),
+    )
+    .unwrap();
 
     // CLOUD turn (is_cloud=true): the always-loaded summary carries the shared
     // fact, the private-local fact is NEVER queried, and it's guard-wrapped.
     let (block, _recalled) = agent
         .assemble_memory_context("cv1", "personal", "where is the deploy key", true)
         .expect("some context to inject");
-    assert!(block.contains("deploy key"), "shared fact is loaded on a cloud turn");
-    assert!(!block.contains("Oak Street"), "cloud turn must NOT surface a private-local fact");
-    assert!(block.contains("UNTRUSTED TOOL OUTPUT"), "injected memory is guard-wrapped as untrusted");
+    assert!(
+        block.contains("deploy key"),
+        "shared fact is loaded on a cloud turn"
+    );
+    assert!(
+        !block.contains("Oak Street"),
+        "cloud turn must NOT surface a private-local fact"
+    );
+    assert!(
+        block.contains("UNTRUSTED TOOL OUTPUT"),
+        "injected memory is guard-wrapped as untrusted"
+    );
     // Profile scope: another profile's fact never appears.
-    assert!(!block.contains("work standup"), "another profile's fact must not leak in");
+    assert!(
+        !block.contains("work standup"),
+        "another profile's fact must not leak in"
+    );
 
     // LOCAL turn (is_cloud=false): the private-local fact MAY appear.
     let (block_local, _) = agent
         .assemble_memory_context("cv1", "personal", "what is my home address", false)
         .expect("some context");
-    assert!(block_local.contains("Oak Street"), "a local turn may surface private-local memory");
+    assert!(
+        block_local.contains("Oak Street"),
+        "a local turn may surface private-local memory"
+    );
     assert!(!block_local.contains("work standup"));
 
     // A profile with no facts injects nothing.
-    assert!(agent.assemble_memory_context("cv2", "school", "anything", true).is_none());
+    assert!(agent
+        .assemble_memory_context("cv2", "school", "anything", true)
+        .is_none());
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -997,8 +1057,11 @@ fn assemble_memory_context_uses_the_meaning_lane_with_a_relevance_gate() {
     use std::sync::Arc;
 
     let (agent, storage, dir) = redaction_loop();
-    let fake: Arc<dyn TextEmbedder> =
-        Arc::new(FakeEmbedder(vec![("heater", 2), ("furnace", 2), ("groceries", 3)]));
+    let fake: Arc<dyn TextEmbedder> = Arc::new(FakeEmbedder(vec![
+        ("heater", 2),
+        ("furnace", 2),
+        ("groceries", 3),
+    ]));
     let g = storage.global();
     let mk = |id: &str, content: &str| MemoryFact {
         id: id.into(),
@@ -1012,15 +1075,40 @@ fn assemble_memory_context_uses_the_meaning_lane_with_a_relevance_gate() {
     // snippets below are genuinely NEW to the turn (the injection path dedups
     // against the summary).
     for i in 0..8 {
-        let mut f = mk(&format!("pin{i}"), &format!("pinned filler fact number {i}"));
+        let mut f = mk(
+            &format!("pin{i}"),
+            &format!("pinned filler fact number {i}"),
+        );
         f.pinned = true;
         g.insert_memory_fact_in(MemoryBucket::Shared, &f).unwrap();
     }
     // Related-by-meaning fact (axis 2 via "heater") and an unrelated one (axis 3).
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("h", "the heater was repaired in March")).unwrap();
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("g", "groceries are delivered on Sundays")).unwrap();
-    g.upsert_memory_embedding(MemoryBucket::Shared, "h", &fake.embed_passage("the heater was repaired in March").unwrap()).unwrap();
-    g.upsert_memory_embedding(MemoryBucket::Shared, "g", &fake.embed_passage("groceries are delivered on Sundays").unwrap()).unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mk("h", "the heater was repaired in March"),
+    )
+    .unwrap();
+    g.insert_memory_fact_in(
+        MemoryBucket::Shared,
+        &mk("g", "groceries are delivered on Sundays"),
+    )
+    .unwrap();
+    g.upsert_memory_embedding(
+        MemoryBucket::Shared,
+        "h",
+        &fake
+            .embed_passage("the heater was repaired in March")
+            .unwrap(),
+    )
+    .unwrap();
+    g.upsert_memory_embedding(
+        MemoryBucket::Shared,
+        "g",
+        &fake
+            .embed_passage("groceries are delivered on Sundays")
+            .unwrap(),
+    )
+    .unwrap();
 
     let agent = agent.with_embedder(Some(EmbedderHandle::ready(fake)));
 
@@ -1036,7 +1124,10 @@ fn assemble_memory_context_uses_the_meaning_lane_with_a_relevance_gate() {
     // recalled counts only relevance snippets (not the always-loaded summary):
     // exactly the heater fact — the groceries fact is past the distance gate
     // and shares no keywords.
-    assert_eq!(recalled, 1, "only the semantically-near fact clears the inject gate");
+    assert_eq!(
+        recalled, 1,
+        "only the semantically-near fact clears the inject gate"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1059,7 +1150,8 @@ fn curated_summary_is_snapshotted_per_conversation() {
     };
     // Fact A exists at the start. The query shares no keyword with either fact,
     // so nothing arrives via the relevance lane — this isolates the summary.
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("a", "alpha the first note")).unwrap();
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("a", "alpha the first note"))
+        .unwrap();
 
     // First turn of conversation "cv" — freezes the summary (just A).
     let (b1, _) = agent
@@ -1069,7 +1161,8 @@ fn curated_summary_is_snapshotted_per_conversation() {
     assert!(!b1.contains("bravo"), "fact B doesn't exist yet");
 
     // Fact B is saved mid-conversation.
-    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("b", "bravo the second note")).unwrap();
+    g.insert_memory_fact_in(MemoryBucket::Shared, &mk("b", "bravo the second note"))
+        .unwrap();
 
     // Same conversation, later turn — the snapshot is unchanged (no B).
     let (b2, _) = agent
@@ -1085,7 +1178,10 @@ fn curated_summary_is_snapshotted_per_conversation() {
     let (b3, _) = agent
         .assemble_memory_context("cv2", "personal", "zzz unrelated query", false)
         .expect("fresh summary A+B");
-    assert!(b3.contains("alpha") && b3.contains("bravo"), "next conversation sees the new fact");
+    assert!(
+        b3.contains("alpha") && b3.contains("bravo"),
+        "next conversation sees the new fact"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1118,7 +1214,10 @@ fn curated_summary_prefix_is_byte_stable_across_turns() {
     let b = agent
         .assemble_curated_summary("cv1", "personal", true)
         .expect("summary");
-    assert_eq!(a, b, "same conversation + endpoint ⇒ byte-identical summary prefix");
+    assert_eq!(
+        a, b,
+        "same conversation + endpoint ⇒ byte-identical summary prefix"
+    );
     // A different conversation ⇒ a different nonce ⇒ different bytes, even though
     // the content is the same (the wrap is seeded by conversation id).
     let c = agent
@@ -1126,7 +1225,10 @@ fn curated_summary_prefix_is_byte_stable_across_turns() {
         .expect("summary");
     assert_ne!(a, c, "the stable nonce is scoped per conversation");
     // The volatile snippet block, by contrast, uses the random-nonce wrap.
-    assert!(a.contains("UNTRUSTED TOOL OUTPUT"), "summary is guard-wrapped");
+    assert!(
+        a.contains("UNTRUSTED TOOL OUTPUT"),
+        "summary is guard-wrapped"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1165,7 +1267,12 @@ async fn run_subagent_blocks_a_cloud_seat_under_a_private_binding_without_touchi
     );
     mm.add_provider(cloud.clone());
 
-    let agent = AgentLoop::new(gate, Arc::clone(&mm), Arc::clone(&storage), Arc::new(echo_allow_dispatcher()));
+    let agent = AgentLoop::new(
+        gate,
+        Arc::clone(&mm),
+        Arc::clone(&storage),
+        Arc::new(echo_allow_dispatcher()),
+    );
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -1196,7 +1303,13 @@ async fn run_subagent_blocks_a_cloud_seat_under_a_private_binding_without_touchi
 
 /// Build a real `AgentLoop` (RulesClassifier gate, so SSN/email are detected)
 /// with the fake streamer injected and its cloud provider registered.
-fn b7_loop(fake: Arc<FakeStreamer>) -> (crate::agent::loop_mod::AgentLoop, Arc<Storage>, std::path::PathBuf) {
+fn b7_loop(
+    fake: Arc<FakeStreamer>,
+) -> (
+    crate::agent::loop_mod::AgentLoop,
+    Arc<Storage>,
+    std::path::PathBuf,
+) {
     use crate::agent::loop_mod::AgentLoop;
     use crate::classifier::RulesClassifier;
     use crate::models::ModelManager;
@@ -1204,9 +1317,18 @@ fn b7_loop(fake: Arc<FakeStreamer>) -> (crate::agent::loop_mod::AgentLoop, Arc<S
     let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
     let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
     let mm = Arc::new(ModelManager::new());
-    mm.add_provider(<FakeStreamer as crate::agent::loop_mod::ModelStreamer>::provider(&fake).clone());
-    let agent = AgentLoop::new(gate, mm, Arc::clone(&storage), Arc::new(echo_allow_dispatcher()))
-        .with_model_streamer_override(Arc::clone(&fake) as Arc<dyn crate::agent::loop_mod::ModelStreamer>);
+    mm.add_provider(
+        <FakeStreamer as crate::agent::loop_mod::ModelStreamer>::provider(&fake).clone(),
+    );
+    let agent = AgentLoop::new(
+        gate,
+        mm,
+        Arc::clone(&storage),
+        Arc::new(echo_allow_dispatcher()),
+    )
+    .with_model_streamer_override(
+        Arc::clone(&fake) as Arc<dyn crate::agent::loop_mod::ModelStreamer>
+    );
     (agent, storage, dir)
 }
 
@@ -1235,7 +1357,10 @@ fn b7_seed_conversation(storage: &Storage, conv: &str) {
 async fn b7_usage_is_booked_for_a_streamed_turn() {
     // Gap 3: the streamed model call must be booked to the usage ledger.
     let cloud = cloud_provider("cloudco");
-    let fake = Arc::new(FakeStreamer::new(cloud.clone(), sse_chunks_for("hello there")));
+    let fake = Arc::new(FakeStreamer::new(
+        cloud.clone(),
+        sse_chunks_for("hello there"),
+    ));
     let (agent, storage, dir) = b7_loop(Arc::clone(&fake));
     b7_seed_conversation(&storage, "c1");
     // Public binding bypasses the classifier → a straight cloud send.
@@ -1252,9 +1377,19 @@ async fn b7_usage_is_booked_for_a_streamed_turn() {
         )
         .await
         .unwrap();
-    assert!(out.contains("hello there"), "the fake reply streams back: {out:?}");
-    let summary = storage.open_profile("personal").unwrap().usage_summary().unwrap();
-    assert_eq!(summary.total_calls, 1, "the streamed call is booked to the ledger");
+    assert!(
+        out.contains("hello there"),
+        "the fake reply streams back: {out:?}"
+    );
+    let summary = storage
+        .open_profile("personal")
+        .unwrap()
+        .usage_summary()
+        .unwrap();
+    assert_eq!(
+        summary.total_calls, 1,
+        "the streamed call is booked to the ledger"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1395,8 +1530,15 @@ async fn b6_delegated_helper_result_is_guard_wrapped_never_replayed_as_trusted_a
         .iter()
         .find(|m| m.content.contains("IGNORE ALL PRIOR"))
         .expect("the delegated content is on the wire");
-    assert_eq!(delegated.role, "user", "a delegated result must re-enter as neutralized user input");
-    assert!(delegated.content.contains("UNTRUSTED"), "it must be guard-wrapped, got: {:?}", delegated.content);
+    assert_eq!(
+        delegated.role, "user",
+        "a delegated result must re-enter as neutralized user input"
+    );
+    assert!(
+        delegated.content.contains("UNTRUSTED"),
+        "it must be guard-wrapped, got: {:?}",
+        delegated.content
+    );
     assert!(
         !sent.iter().any(|m| m.role == "assistant"
             && m.content.contains("IGNORE ALL PRIOR")
@@ -1452,7 +1594,10 @@ async fn b6_ordinary_assistant_turn_is_replayed_unwrapped() {
         .iter()
         .find(|m| m.content.contains("here is the ordinary answer"))
         .expect("present");
-    assert_eq!(m.role, "assistant", "an ordinary assistant turn stays a trusted assistant turn");
+    assert_eq!(
+        m.role, "assistant",
+        "an ordinary assistant turn stays a trusted assistant turn"
+    );
     assert!(!m.content.contains("UNTRUSTED"), "it is NOT guard-wrapped");
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1478,12 +1623,13 @@ async fn c7_cancel_message_aborts_an_in_flight_streaming_turn() {
             &'a self,
             _m: &'a str,
             _msgs: Vec<ChatMessage>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>,
+        > {
             Box::pin(async {
-                Ok(SseStream::from_byte_stream(
-                    tokio_stream::pending::<Result<Vec<u8>, reqwest::Error>>(),
-                ))
+                Ok(SseStream::from_byte_stream(tokio_stream::pending::<
+                    Result<Vec<u8>, reqwest::Error>,
+                >()))
             })
         }
     }
@@ -1495,8 +1641,15 @@ async fn c7_cancel_message_aborts_an_in_flight_streaming_turn() {
     mm.add_provider(cloud.clone());
     let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
     let agent = Arc::new(
-        AgentLoop::new(gate, mm, Arc::clone(&storage), Arc::new(echo_allow_dispatcher()))
-            .with_model_streamer_override(Arc::new(PendingStreamer(cloud.clone())) as Arc<dyn ModelStreamer>),
+        AgentLoop::new(
+            gate,
+            mm,
+            Arc::clone(&storage),
+            Arc::new(echo_allow_dispatcher()),
+        )
+        .with_model_streamer_override(
+            Arc::new(PendingStreamer(cloud.clone())) as Arc<dyn ModelStreamer>
+        ),
     );
     b7_seed_conversation(&storage, "cc");
 
@@ -1541,6 +1694,9 @@ async fn c7_cancel_message_aborts_an_in_flight_streaming_turn() {
         "the cancelled turn persists an aborted assistant message"
     );
     // The registry entry is cleaned up on exit — a second cancel finds nothing.
-    assert!(!agent.cancel_conversation("cc"), "the token is removed on turn exit");
+    assert!(
+        !agent.cancel_conversation("cc"),
+        "the token is removed on turn exit"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

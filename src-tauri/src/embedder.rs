@@ -250,10 +250,7 @@ mod onnx {
                 );
             }
             let session = Session::builder()?.commit_from_file(&onnx_path)?;
-            let wants_token_types = session
-                .inputs
-                .iter()
-                .any(|i| i.name == "token_type_ids");
+            let wants_token_types = session.inputs.iter().any(|i| i.name == "token_type_ids");
             let mut tokenizer =
                 Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("{e}"))?;
             // Same gotcha as the classifier: an exported tokenizer.json can
@@ -345,7 +342,9 @@ mod live_model_tests {
         let emb = OnnxEmbedder::load(std::path::Path::new(&dir))
             .expect("load embedder from LHP_EMBEDDER_MODELS_DIR");
 
-        let q = emb.embed_query("where do I keep the server login key?").unwrap();
+        let q = emb
+            .embed_query("where do I keep the server login key?")
+            .unwrap();
         let related = emb
             .embed_passage("the deploy key for the homelab lives in the vault")
             .unwrap();

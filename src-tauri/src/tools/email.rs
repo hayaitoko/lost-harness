@@ -146,7 +146,10 @@ async fn fetch_previews(
         let sem = Arc::clone(&sem);
         tasks.push(tokio::spawn(async move {
             match sem.acquire_owned().await {
-                Ok(_permit) => client.get_message_metadata(&id).await.map_err(|e| e.to_string()),
+                Ok(_permit) => client
+                    .get_message_metadata(&id)
+                    .await
+                    .map_err(|e| e.to_string()),
                 Err(_) => Err("the search fetch pool closed unexpectedly".to_string()),
             }
         }));
@@ -214,7 +217,11 @@ impl Tool for EmailSearchTool {
         ctx: &'a ExecCtx,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let query = input.args.get("query").and_then(|v| v.as_str()).map(String::from);
+            let query = input
+                .args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let max = input
                 .args
                 .get("max")
@@ -241,8 +248,11 @@ impl Tool for EmailSearchTool {
             // Bounded-concurrent preview fetches: headers + snippet via
             // format=metadata (no body data), at most SEARCH_CONCURRENCY in
             // flight, so one slow message doesn't stall the whole page.
-            let ids: Vec<String> =
-                metas.iter().take(max as usize).map(|m| m.id.clone()).collect();
+            let ids: Vec<String> = metas
+                .iter()
+                .take(max as usize)
+                .map(|m| m.id.clone())
+                .collect();
             let mut rows: Vec<serde_json::Value> = Vec::with_capacity(ids.len());
             for (id, res) in fetch_previews(client, ids).await {
                 match res {
@@ -415,7 +425,10 @@ impl Tool for EmailSendTool {
     fn destination(&self, args: &serde_json::Value) -> Option<String> {
         // The approval dialog shows WHO this send reaches, server-derived
         // from the call args (never client-supplied display text).
-        let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("<missing recipient>");
+        let to = args
+            .get("to")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<missing recipient>");
         Some(format!("{to} (via gmail.googleapis.com)"))
     }
 
@@ -426,8 +439,7 @@ impl Tool for EmailSendTool {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let get = |k: &str| input.args.get(k).and_then(|v| v.as_str()).map(String::from);
-            let (Some(to), Some(subject), Some(body)) =
-                (get("to"), get("subject"), get("body"))
+            let (Some(to), Some(subject), Some(body)) = (get("to"), get("subject"), get("body"))
             else {
                 return ToolResult::Err("email_send needs to, subject and body".into());
             };
@@ -471,7 +483,15 @@ mod tests {
 
     #[test]
     fn address_sanity_rejects_garbage_and_injection_shapes() {
-        for bad in ["", "nope", "a@b", "a b@c.d", "x@.com", "x@com.", "a@b.c\r\nBcc: e@f.g"] {
+        for bad in [
+            "",
+            "nope",
+            "a@b",
+            "a b@c.d",
+            "x@.com",
+            "x@com.",
+            "a@b.c\r\nBcc: e@f.g",
+        ] {
             assert!(!plausible_address(bad), "{bad:?} should be rejected");
         }
         for good in ["a@b.co", "first.last+tag@sub.domain.org"] {
@@ -490,9 +510,15 @@ mod tests {
             Arc::new(NoopEndpoint),
             empty_reconnect_set(),
         );
-        assert_eq!(EmailSearchTool::new(deps.clone()).risk(), RiskClass::External);
+        assert_eq!(
+            EmailSearchTool::new(deps.clone()).risk(),
+            RiskClass::External
+        );
         assert_eq!(EmailReadTool::new(deps.clone()).risk(), RiskClass::External);
-        assert_eq!(EmailSendTool::new(deps.clone()).risk(), RiskClass::Dangerous);
+        assert_eq!(
+            EmailSendTool::new(deps.clone()).risk(),
+            RiskClass::Dangerous
+        );
         // External ⇒ egresses_offbox folds into the privacy gate (F2).
         assert!(EmailSearchTool::new(deps.clone()).egresses_offbox());
         // The send dialog names the recipient.
@@ -591,14 +617,16 @@ mod tests {
         fn get_message<'a>(
             &'a self,
             _id: &'a str,
-        ) -> crate::email::BoxFuture<'a, anyhow::Result<crate::email::gmail::EmailMessage>> {
+        ) -> crate::email::BoxFuture<'a, anyhow::Result<crate::email::gmail::EmailMessage>>
+        {
             Box::pin(async { anyhow::bail!("not used by this test") })
         }
 
         fn get_message_metadata<'a>(
             &'a self,
             id: &'a str,
-        ) -> crate::email::BoxFuture<'a, anyhow::Result<crate::email::gmail::EmailMessage>> {
+        ) -> crate::email::BoxFuture<'a, anyhow::Result<crate::email::gmail::EmailMessage>>
+        {
             Box::pin(async move {
                 {
                     let mut n = self.in_flight.lock();
@@ -606,7 +634,11 @@ mod tests {
                     let mut peak = self.peak_in_flight.lock();
                     *peak = (*peak).max(*n);
                 }
-                let wait = if id == self.slow_id { self.slow } else { self.fast };
+                let wait = if id == self.slow_id {
+                    self.slow
+                } else {
+                    self.fast
+                };
                 tokio::time::sleep(wait).await;
                 *self.in_flight.lock() -= 1;
                 self.completed.lock().push(id.to_string());
@@ -644,20 +676,32 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_slow_preview_does_not_stall_the_others() {
         let mailbox = Arc::new(PacedMailbox::new(None));
-        let ids: Vec<String> =
-            vec!["slow".into(), "f1".into(), "f2".into(), "f3".into(), "f4".into()];
+        let ids: Vec<String> = vec![
+            "slow".into(),
+            "f1".into(),
+            "f2".into(),
+            "f3".into(),
+            "f4".into(),
+        ];
 
         let started = std::time::Instant::now();
         let out = fetch_previews(mailbox.clone(), ids.clone()).await;
         let elapsed = started.elapsed();
 
         // Results keep input order and each carries its own id.
-        assert_eq!(out.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(), ids);
+        assert_eq!(
+            out.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            ids
+        );
         assert!(out.iter().all(|(_, r)| r.is_ok()));
 
         // The four fast fetches all completed before the slow one did.
         let order = mailbox.completed.lock().clone();
-        assert_eq!(order.last().map(String::as_str), Some("slow"), "order was {order:?}");
+        assert_eq!(
+            order.last().map(String::as_str),
+            Some("slow"),
+            "order was {order:?}"
+        );
 
         // Concurrency stayed inside the semaphore's budget. Pinned to the
         // literal 3, NOT to SEARCH_CONCURRENCY: comparing the observed peak
@@ -698,11 +742,19 @@ mod tests {
     async fn needs_reconnect_marker_flips_the_shared_flag() {
         let secrets = crate::secrets::MemoryProviderSecretStore::default();
         secrets
-            .set(crate::email::SECRET_GMAIL_CLIENT_ID, "id-1.apps.googleusercontent.com")
+            .set(
+                crate::email::SECRET_GMAIL_CLIENT_ID,
+                "id-1.apps.googleusercontent.com",
+            )
             .unwrap();
-        secrets.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh").unwrap();
         secrets
-            .set(&crate::email::secret_gmail_refresh_token("personal"), "rt-dead")
+            .set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh")
+            .unwrap();
+        secrets
+            .set(
+                &crate::email::secret_gmail_refresh_token("personal"),
+                "rt-dead",
+            )
             .unwrap();
 
         let shared = empty_reconnect_set();

@@ -103,11 +103,7 @@ impl ApprovalRegistry {
     /// stored `(fingerprint, tool_name)` — so the frontend only has to say
     /// approve-vs-deny and action-vs-tool, never echo the fingerprint back.
     /// Returns false if the id is unknown (already answered, or timed out).
-    pub fn answer(
-        &self,
-        id: &str,
-        mk: impl FnOnce(&str, &str) -> ApprovalDecision,
-    ) -> bool {
+    pub fn answer(&self, id: &str, mk: impl FnOnce(&str, &str) -> ApprovalDecision) -> bool {
         match self.take(id) {
             Some(p) => {
                 let decision = mk(&p.fingerprint, &p.tool_name);
@@ -144,8 +140,12 @@ impl ApprovalPrompter for TauriApprovalPrompter {
         req: ApprovalRequest,
     ) -> Pin<Box<dyn Future<Output = ApprovalDecision> + Send + 'a>> {
         let (tx, rx) = oneshot::channel();
-        self.registry
-            .park(req.id.clone(), tx, req.fingerprint.clone(), req.tool_name.clone());
+        self.registry.park(
+            req.id.clone(),
+            tx,
+            req.fingerprint.clone(),
+            req.tool_name.clone(),
+        );
 
         // Surface the prompt. If emit fails (e.g. no window yet), the request
         // will simply time out and deny by default — fail closed.
