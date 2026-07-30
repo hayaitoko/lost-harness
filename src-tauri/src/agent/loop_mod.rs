@@ -1582,7 +1582,12 @@ impl AgentLoop {
         // Q4 do-now item 2: reset the dispatcher's per-run budget + repeat
         // detection ring at the start of every user message. The dispatcher
         // then enforces ceilings and cascades inside `run_turn`.
-        self.tools.begin_run();
+        //
+        // Scoped to THIS conversation: since M-08 (P14) replaced the global
+        // stream lock with a per-conversation one, another conversation may be
+        // mid-run against the same shared `Arc<ToolDispatcher>`, and starting
+        // this run must not wipe its budget, repeat ring or journal nonce.
+        self.tools.begin_run(&conversation_id);
 
         // Q1: the native tools spec is rendered once; whether a given round
         // USES it depends on the round's current provider (a mid-turn local

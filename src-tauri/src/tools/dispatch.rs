@@ -18,7 +18,7 @@
 //! feedback message to hand back to the model — with tool *output* (which
 //! the agent did not author) guard-wrapped as untrusted.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
@@ -56,8 +56,9 @@ const PER_RUN_DISPATCH_CEILING: usize = 50;
 // one run is denied on the Nth+ attempt instead of running again.
 const REPEAT_DETECTION_THRESHOLD: usize = 3;
 
-/// Run-scoped state held by `ToolDispatcher`. Persists across turns within
-/// one user message, reset only by `begin_run()`.
+/// Run-scoped state held by `ToolDispatcher`, keyed by conversation id (see
+/// `ToolDispatcher::run_states`). Persists across turns within one user
+/// message, reset only by `begin_run()` for that same conversation.
 #[derive(Debug, Default)]
 struct RunState {
     /// Calls actually passed to `dispatch()` since the last `begin_run()`.
@@ -172,13 +173,24 @@ pub struct ToolDispatcher {
     /// early turn is still visible to a write many turns later) and injected
     /// into each tool's `ExecCtx` at the `Tool::run` call site below.
     reads: Arc<ConversationReads>,
-    /// Q4 do-now: per-run budget + repeat-detection state. Persists across
-    /// turns within one user message, reset only by `begin_run()`. Safe as a
-    /// single mutable slot because `AgentLoop::stream_lock` serializes
-    /// `process_message` (Q10 single-in-flight) — only one run is ever in
-    /// flight against a given dispatcher. If concurrent runs are ever
-    /// allowed, this must become per-conversation-keyed.
-    run_state: Mutex<RunState>,
+    /// Q4 do-now: per-run budget + repeat-detection state, KEYED BY
+    /// CONVERSATION. Persists across turns within one user message, reset only
+    /// by `begin_run()` for that conversation.
+    ///
+    /// M-08 (P14) replaced the old global `AgentLoop::stream_lock` with a
+    /// per-conversation lock map, so several `process_message` runs are now in
+    /// flight concurrently against the ONE `Arc<ToolDispatcher>` that
+    /// `AppState` shares. A single mutable slot would let conversation B's
+    /// `begin_run()` wipe conversation A's dispatch budget, fingerprint ring
+    /// and journal nonce mid-run — so the state is keyed instead. P14 still
+    /// serializes runs WITHIN a conversation, which is exactly the scope one
+    /// entry covers.
+    ///
+    /// One small entry per conversation that has begun a run (a counter, ≤
+    /// `PER_RUN_DISPATCH_CEILING` hex fingerprints, and a nonce), with the same
+    /// lifetime discipline as `AgentLoop::stream_locks`: keyed by conversation
+    /// id and reused, never accumulating per run.
+    run_states: Mutex<HashMap<String, RunState>>,
     /// Q5 do-now: append-only post-tool-use audit writer. Fired once per
     /// `dispatch()` call (every return path), AFTER the outcome exists.
     /// `None` = no audit (test dispatchers that don't care; the default
@@ -212,7 +224,7 @@ impl ToolDispatcher {
             ledger: Arc::new(ApprovalLedger::new()),
             approver: None,
             reads: Arc::new(ConversationReads::new()),
-            run_state: Mutex::new(RunState::default()),
+            run_states: Mutex::new(HashMap::new()),
             audit_writer: None,
             rule_writer: None,
             journal: None,
@@ -265,7 +277,7 @@ impl ToolDispatcher {
             ledger: Arc::clone(&self.ledger),
             approver: None,
             reads: Arc::clone(&self.reads),
-            run_state: Mutex::new(RunState::default()),
+            run_states: Mutex::new(HashMap::new()),
             audit_writer: self.audit_writer.clone(),
             rule_writer: self.rule_writer.clone(),
             // C2: sub-dispatchers (cron/delegate helpers) journal too — unattended
@@ -388,12 +400,15 @@ impl ToolDispatcher {
         // issuance (a double-fire, a crash-replay of an unfinished turn) — a
         // deliberate re-issue on a later message gets a fresh nonce and
         // legitimately re-runs, instead of replaying a stale result forever.
+        // The nonce belongs to THIS conversation's run (see `run_states`): a
+        // concurrent run in another conversation must not be able to swap it.
         let run_nonce = self
-            .run_state
+            .run_states
             .lock()
-            .expect("run_state mutex poisoned")
-            .run_nonce
-            .clone();
+            .expect("run_states mutex poisoned")
+            .get(&run_ctx.conversation_id)
+            .map(|s| s.run_nonce.clone())
+            .unwrap_or_default();
         let jkey = format!(
             "action:{}:{run_nonce}:{fingerprint}",
             run_ctx.conversation_id
@@ -540,20 +555,51 @@ impl ToolDispatcher {
         Self::new(ToolRegistry::new(), HookChain::new(), BodyEnv::empty())
     }
 
-    /// Start a fresh budget window: zero the per-run dispatch counter and
-    /// clear the repeat-detection ring. Call once per user message, before
-    /// the first `run_turn` of that run (`AgentLoop::stream_to_provider`).
+    /// Start a fresh budget window FOR ONE CONVERSATION: zero that
+    /// conversation's per-run dispatch counter and clear its repeat-detection
+    /// ring. Call once per user message, before the first `run_turn` of that
+    /// run (`AgentLoop::stream_to_provider`).
     ///
-    /// Safe as a single mutable slot because `AgentLoop::stream_lock`
-    /// serializes `process_message` calls (Q10 single-in-flight) — only one
-    /// run is ever in flight against a given dispatcher. If concurrent runs
-    /// are ever allowed, this must become per-conversation-keyed.
-    pub fn begin_run(&self) {
-        let mut state = self.run_state.lock().expect("run_state mutex poisoned");
+    /// Scoped per conversation because M-08 (P14) allows concurrent
+    /// `process_message` runs against the one shared dispatcher: starting
+    /// conversation B's run must leave a still-streaming conversation A's
+    /// budget, fingerprint ring and journal nonce untouched. Runs within one
+    /// conversation stay serialized by P14's per-conversation stream lock, so
+    /// one entry per conversation is the right granularity.
+    pub fn begin_run(&self, conversation_id: &str) {
+        let mut states = self.run_states.lock().expect("run_states mutex poisoned");
+        let state = states.entry(conversation_id.to_string()).or_default();
         state.dispatch_count = 0;
         state.recent_fingerprints.clear();
         // C2: a fresh issuance scope for the durability journal.
         state.run_nonce = Uuid::new_v4().to_string();
+    }
+
+    /// HI2 test hook: this conversation's per-run dispatch counter (0 if it
+    /// has no entry). Exists so a test can assert that two concurrent runs
+    /// keep INDEPENDENT budgets rather than sharing one slot — the counter is
+    /// otherwise invisible until a ceiling denial fires 50 dispatches in.
+    #[cfg(test)]
+    pub(crate) fn run_dispatch_count(&self, conversation_id: &str) -> usize {
+        self.run_states
+            .lock()
+            .expect("run_states mutex poisoned")
+            .get(conversation_id)
+            .map(|s| s.dispatch_count)
+            .unwrap_or(0)
+    }
+
+    /// HI2 test hook: this conversation's journal issuance nonce (`""` if it
+    /// has no entry). Lets a test assert that another conversation's
+    /// `begin_run()` does not re-stamp a live run's nonce.
+    #[cfg(test)]
+    pub(crate) fn run_nonce_of(&self, conversation_id: &str) -> String {
+        self.run_states
+            .lock()
+            .expect("run_states mutex poisoned")
+            .get(conversation_id)
+            .map(|s| s.run_nonce.clone())
+            .unwrap_or_default()
     }
 
     /// The system-prompt fragment teaching the fenced dialect and listing
@@ -1025,9 +1071,9 @@ impl ToolDispatcher {
     /// turn-LOCAL and restart when `drive` is re-entered after a reroute
     /// (`deny_and_continue_turn` / `resume_after_local_switch`) — reroute is
     /// rare, and the true runaway bound (the per-RUN dispatch ceiling + repeat
-    /// detection) lives in `self.run_state`, which persists across every
-    /// `drive` call in the run. So a reroute never widens the real ceiling,
-    /// only the per-turn courtesy stop.
+    /// detection) lives in `self.run_states[conversation_id]`, which persists
+    /// across every `drive` call in the run. So a reroute never widens the real
+    /// ceiling, only the per-turn courtesy stop.
     #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
@@ -1042,7 +1088,7 @@ impl ToolDispatcher {
         // the split point (see `TurnOutcome::NeedsLocalReroute`). A "turn" spans
         // the whole run_turn drive-chain (one model output), so the cascade must
         // survive the reroute but must NOT leak across user messages — carrying
-        // it in the payload (not `run_state`) gives exactly that scope.
+        // it in the payload (not `run_states`) gives exactly that scope.
         mut turn_call_count: usize,
         mut cascade_active: bool,
     ) -> TurnOutcome {
@@ -1116,9 +1162,16 @@ impl ToolDispatcher {
                     // Per-run ceiling + repeat detection, checked before this
                     // call is actually passed to `dispatch()`. Lock is block-
                     // scoped so we never hold the guard across the await.
+                    //
+                    // Keyed by THIS turn's conversation (see `run_states`): a
+                    // run streaming concurrently in another conversation must
+                    // not be able to spend or reset this run's budget. A turn
+                    // that never called `begin_run()` (test dispatchers) gets a
+                    // default entry on first use, same as the old single slot.
                     let fingerprint = ActionFingerprint::of(&call.name, &call.args);
                     let budget_denial: Option<(String, bool)> = {
-                        let mut state = self.run_state.lock().expect("run_state mutex poisoned");
+                        let mut states = self.run_states.lock().expect("run_states mutex poisoned");
+                        let state = states.entry(ctx.conversation_id.clone()).or_default();
                         if state.dispatch_count >= PER_RUN_DISPATCH_CEILING {
                             Some((
                                 format!(
@@ -2742,7 +2795,7 @@ mod tests {
         );
 
         // Reset and try again — must succeed.
-        dispatcher.begin_run();
+        dispatcher.begin_run(&ctx().conversation_id);
         let reset_block = r#"{"name": "echo", "args": {"n": 100}}"#;
         let after_reset = dispatcher
             .run_turn(
@@ -2757,6 +2810,259 @@ mod tests {
             after_reset.content.contains("[tool echo → ok]"),
             "after begin_run(), the next dispatch should run, got: {}",
             after_reset.content
+        );
+    }
+
+    // ── HI2: concurrent runs against ONE shared dispatcher ────────────────
+    //
+    // P14 (M-08) replaced `AgentLoop`'s global `stream_lock` with a
+    // per-conversation lock map, so two conversations really do stream at the
+    // same time against the single `Arc<ToolDispatcher>` in `AppState`. These
+    // tests pin the consequence: run state must be per-conversation, not one
+    // shared slot.
+
+    /// A MUTATING tool (`RiskClass::Write`) that can be PARKED inside
+    /// `Tool::run`, so a test can hold conversation A's run genuinely in
+    /// flight while conversation B runs concurrently against the same
+    /// dispatcher. A call whose args carry `"park": true` signals `entered`
+    /// and then blocks on `release`; every other call returns immediately.
+    /// `runs` records the args of every execution that actually happened.
+    struct ParkableMutateTool {
+        runs: Arc<Mutex<Vec<serde_json::Value>>>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Tool for ParkableMutateTool {
+        fn name(&self) -> &str {
+            "mutate_thing"
+        }
+        fn risk(&self) -> RiskClass {
+            RiskClass::Write
+        }
+        fn requires(&self) -> &[Capability] {
+            &[]
+        }
+        fn run<'a>(
+            &'a self,
+            input: ToolInput,
+            _ctx: &'a ExecCtx,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+            self.runs
+                .lock()
+                .expect("runs mutex poisoned")
+                .push(input.args.clone());
+            let park = input
+                .args
+                .get("park")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                if park {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                ToolResult::Ok(input.args)
+            })
+        }
+    }
+
+    fn ctx_for(conversation_id: &str) -> ExecCtx {
+        ExecCtx {
+            conversation_id: conversation_id.to_string(),
+            ..ctx()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_runs_keep_independent_dedup_state() {
+        // Conversation A opens a run and dispatches the SAME mutating call
+        // twice, then parks inside a third call's `Tool::run`. While A is
+        // parked, conversation B calls `begin_run()` on the same dispatcher
+        // and dispatches its own calls. A then resumes and re-emits the
+        // identical mutating call a third time — the classic LLM repetition
+        // mode. It MUST still be suppressed by repeat detection.
+        //
+        // Under the pre-HI2 single shared `run_state` slot, B's `begin_run()`
+        // cleared A's fingerprint ring mid-run, so A's duplicate `mutate_thing
+        // {"x":1}` executed a THIRD time.
+        let runs: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParkableMutateTool {
+            runs: Arc::clone(&runs),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        // No hook chain and no journal: the budget/repeat gate under test
+        // fires before either, so an empty chain keeps every other verdict
+        // out of the feedback.
+        let dispatcher = ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty());
+
+        let ctx_a = ctx_for("conv-A");
+        let ctx_b = ctx_for("conv-B");
+
+        // A's run opens first; capture its nonce so we can prove B never
+        // re-stamps it.
+        dispatcher.begin_run(&ctx_a.conversation_id);
+        let nonce_a = dispatcher.run_nonce_of("conv-A");
+        assert!(!nonce_a.is_empty(), "begin_run must stamp a nonce");
+
+        let dup = r#"{"name": "mutate_thing", "args": {"x": 1}}"#;
+        let parked = r#"{"name": "mutate_thing", "args": {"park": true}}"#;
+        // 4 blocks, under the per-TURN ceiling of 8:
+        //   1,2 → the duplicate dispatches that fill A's ring
+        //   3   → parks inside Tool::run; B interleaves here
+        //   4   → the repeat that must be denied after A resumes
+        let a_output = model_output(&[dup, dup, parked, dup]);
+
+        let a_run = async {
+            dispatcher
+                .run_turn(&own(&a_output), &ctx_a, Binding::Public, false)
+                .await
+                .feedback()
+        };
+
+        let b_run = async {
+            // Wait until A is genuinely parked INSIDE its third dispatch.
+            entered.notified().await;
+            assert_eq!(
+                dispatcher.run_dispatch_count("conv-A"),
+                3,
+                "A should have spent 3 dispatches before parking"
+            );
+
+            // B's run begins while A is in flight.
+            dispatcher.begin_run(&ctx_b.conversation_id);
+            let b_feedback = dispatcher
+                .run_turn(
+                    &own(&model_output(&[
+                        r#"{"name": "mutate_thing", "args": {"y": 9}}"#,
+                        r#"{"name": "mutate_thing", "args": {"y": 9}}"#,
+                    ])),
+                    &ctx_b,
+                    Binding::Public,
+                    false,
+                )
+                .await
+                .feedback();
+
+            // Let A resume into its 4th block.
+            release.notify_one();
+            b_feedback
+        };
+
+        let (a_feedback, b_feedback) = tokio::join!(a_run, b_run);
+
+        // ── B's own two calls ran (B is unaffected by A) ──────────────────
+        let b_sections = split_sections(&b_feedback.content);
+        assert_eq!(
+            b_sections
+                .iter()
+                .filter(|s| s.starts_with("[tool mutate_thing → ok]"))
+                .count(),
+            2,
+            "B's two calls should both run, got: {}",
+            b_feedback.content
+        );
+
+        // ── A's 4th block: the duplicate is STILL suppressed ──────────────
+        let a_sections = split_sections(&a_feedback.content);
+        assert_eq!(
+            a_sections.len(),
+            4,
+            "A's turn should report 4 sections, got: {}",
+            a_feedback.content
+        );
+        assert!(
+            a_sections[3].contains("→ denied by budget"),
+            "A's 4th call (a duplicate re-emitted after B began its run) must \
+             still be denied; got: {}",
+            a_sections[3]
+        );
+        assert!(
+            a_sections[3].contains("repeat detected — same call, same args"),
+            "A's 4th call must be denied by REPEAT detection specifically, got: {}",
+            a_sections[3]
+        );
+
+        // The strongest statement: the duplicate mutating action executed
+        // exactly twice, never a third time.
+        let dup_args = serde_json::json!({"x": 1});
+        let executions = runs.lock().expect("runs mutex poisoned");
+        assert_eq!(
+            executions.iter().filter(|a| **a == dup_args).count(),
+            2,
+            "the duplicate mutating call must execute exactly twice (the 3rd \
+             is suppressed), got executions: {executions:?}"
+        );
+        drop(executions);
+
+        // ── dispatch_count is NOT shared ──────────────────────────────────
+        // A spent 3 (the repeat denial does not consume budget); B spent 2.
+        // A single shared slot could not hold both numbers at once.
+        assert_eq!(
+            dispatcher.run_dispatch_count("conv-A"),
+            3,
+            "A's per-run dispatch count must count only A's calls"
+        );
+        assert_eq!(
+            dispatcher.run_dispatch_count("conv-B"),
+            2,
+            "B's per-run dispatch count must count only B's calls"
+        );
+
+        // ── the journal issuance nonce is NOT clobbered ───────────────────
+        assert_eq!(
+            dispatcher.run_nonce_of("conv-A"),
+            nonce_a,
+            "B's begin_run must not re-stamp A's live run nonce"
+        );
+        assert_ne!(
+            dispatcher.run_nonce_of("conv-B"),
+            nonce_a,
+            "B's run must get its own issuance nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_run_in_one_conversation_leaves_another_conversations_budget_alone() {
+        // The narrow, non-concurrent statement of the same invariant: a
+        // dispatcher that has spent budget for conv-A keeps it when conv-B
+        // starts a run. Sequential, so it stays deterministic even if the
+        // concurrent test above ever gets flaky.
+        let dispatcher = echo_dispatcher();
+        let ctx_a = ctx_for("conv-A");
+        let ctx_b = ctx_for("conv-B");
+
+        dispatcher.begin_run(&ctx_a.conversation_id);
+        for i in 0..3 {
+            let block = format!(r#"{{"name": "echo", "args": {{"n": {i}}}}}"#);
+            let _ = dispatcher
+                .run_turn(
+                    &own(&model_output(&[block.as_str()])),
+                    &ctx_a,
+                    Binding::Public,
+                    false,
+                )
+                .await;
+        }
+        assert_eq!(dispatcher.run_dispatch_count("conv-A"), 3);
+
+        dispatcher.begin_run(&ctx_b.conversation_id);
+        assert_eq!(
+            dispatcher.run_dispatch_count("conv-A"),
+            3,
+            "conv-B's begin_run must not zero conv-A's budget"
+        );
+        assert_eq!(
+            dispatcher.run_dispatch_count("conv-B"),
+            0,
+            "conv-B starts its own run at zero"
         );
     }
 
@@ -4169,7 +4475,7 @@ mod tests {
         let (dispatcher, _storage, root) = journaled_dispatcher(Arc::clone(&runs), false);
         let args = serde_json::json!({"again": true});
 
-        dispatcher.begin_run(); // user message #1
+        dispatcher.begin_run(&ctx().conversation_id); // user message #1
         let a = dispatcher
             .dispatch(
                 &call("mutate_thing", args.clone()),
@@ -4195,7 +4501,7 @@ mod tests {
             "in-run double-fire executes once"
         );
 
-        dispatcher.begin_run(); // user message #2 — a fresh issuance
+        dispatcher.begin_run(&ctx().conversation_id); // user message #2 — a fresh issuance
         let c = dispatcher
             .dispatch(
                 &call("mutate_thing", args.clone()),
