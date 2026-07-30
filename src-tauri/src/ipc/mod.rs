@@ -4412,7 +4412,10 @@ mod tests {
             .expect("a persisted provider id resolves");
         assert_eq!(served.provider_id, "local-llm");
         assert_eq!(served.provider_name.as_deref(), Some("Local Llama"));
-        assert_eq!(served.base_url.as_deref(), Some("http://127.0.0.1:11434/v1"));
+        assert_eq!(
+            served.base_url.as_deref(),
+            Some("http://127.0.0.1:11434/v1")
+        );
     }
 
     #[test]

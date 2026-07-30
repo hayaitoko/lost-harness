@@ -51,7 +51,9 @@ impl OneShotServer {
         let raw = raw.into();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&requests);
         std::thread::spawn(move || {

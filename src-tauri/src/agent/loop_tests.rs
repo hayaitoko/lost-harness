@@ -1310,6 +1310,20 @@ fn b7_loop(
     Arc<Storage>,
     std::path::PathBuf,
 ) {
+    b7_loop_with(fake, &[])
+}
+
+/// `b7_loop`, plus `extra` providers registered in the same `ModelManager`.
+/// A reroute target has to be resolvable by `get_client`, so a test that
+/// exercises the RouteLocal branch must register the local endpoint too.
+fn b7_loop_with(
+    fake: Arc<FakeStreamer>,
+    extra: &[Provider],
+) -> (
+    crate::agent::loop_mod::AgentLoop,
+    Arc<Storage>,
+    std::path::PathBuf,
+) {
     use crate::agent::loop_mod::AgentLoop;
     use crate::classifier::RulesClassifier;
     use crate::models::ModelManager;
@@ -1320,6 +1334,9 @@ fn b7_loop(
     mm.add_provider(
         <FakeStreamer as crate::agent::loop_mod::ModelStreamer>::provider(&fake).clone(),
     );
+    for p in extra {
+        mm.add_provider(p.clone());
+    }
     let agent = AgentLoop::new(
         gate,
         mm,
@@ -1697,6 +1714,257 @@ async fn c7_cancel_message_aborts_an_in_flight_streaming_turn() {
     assert!(
         !agent.cancel_conversation("cc"),
         "the token is removed on turn exit"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ── Endpoint-routing spec (docs/plans/2026-07-29-endpoint-fix-and-self-update-
+// spec.md §"Item 1"): a turn goes to EXACTLY the provider the user selected,
+// or it fails loudly. Never a silent fallback to a different endpoint — a
+// wrong provider can be a wrong TRUST ZONE, not just a wrong vendor. ─────────
+
+/// A real `AgentLoop` with **no** streamer override: model calls go out over
+/// real HTTP to whatever `base_url` the selected provider carries.
+///
+/// This is the point. `with_model_streamer_override` replaces the transport
+/// wholesale, so a turn driven through it reaches the fake no matter which
+/// provider was chosen — it could not tell a correctly-routed turn from a
+/// misrouted one. Only a real socket can.
+fn live_loop(
+    providers: &[Provider],
+) -> (
+    crate::agent::loop_mod::AgentLoop,
+    Arc<Storage>,
+    std::path::PathBuf,
+) {
+    use crate::agent::loop_mod::AgentLoop;
+    use crate::classifier::RulesClassifier;
+    use crate::models::ModelManager;
+    let dir = tempdir();
+    let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+    let gate = PrivacyGate::new(Arc::new(RulesClassifier::new()));
+    let mm = Arc::new(ModelManager::new());
+    for p in providers {
+        mm.add_provider(p.clone());
+    }
+    let agent = AgentLoop::new(
+        gate,
+        mm,
+        Arc::clone(&storage),
+        Arc::new(echo_allow_dispatcher()),
+    );
+    (agent, storage, dir)
+}
+
+#[tokio::test]
+async fn unknown_provider_id_is_an_error_not_a_fallback() {
+    // A provider id the registry doesn't know is a hard stop. The failure mode
+    // this forbids: resolving it to *some* configured provider (the first one,
+    // the default one) and serving the turn from there — which is how a turn
+    // the user aimed at a local endpoint ends up on a cloud one.
+    let cloud = cloud_provider("cloudco");
+    let fake = Arc::new(FakeStreamer::new(
+        cloud.clone(),
+        sse_chunks_for("THIS MUST NEVER BE SENT"),
+    ));
+    let (agent, storage, dir) = b7_loop(Arc::clone(&fake));
+    b7_seed_conversation(&storage, "cu");
+
+    // 1. An id that simply isn't registered.
+    let err = agent
+        .process_message(
+            "hello".into(),
+            "cu".into(),
+            Binding::Public,
+            "not-a-registered-provider".into(),
+            "gpt-x".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .expect_err("an unknown provider id must error, never resolve to another provider");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unknown provider id: not-a-registered-provider"),
+        "the unknown id must be named: {msg}"
+    );
+    assert!(
+        !msg.contains("cloudco"),
+        "the error mentions the OTHER configured provider — smells like a fallback: {msg}"
+    );
+
+    // 2. An empty id — the shape the frontend selection bug produces. Still an
+    // error, but worded for the user rather than as the dangling
+    // `unknown provider id: ` it used to render.
+    let err = agent
+        .process_message(
+            "hello".into(),
+            "cu".into(),
+            Binding::Public,
+            String::new(),
+            "gpt-x".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .expect_err("an empty provider id must error, never fall back to the only provider");
+    let msg = format!("{err:#}");
+    assert_eq!(msg, crate::agent::loop_mod::NO_ENDPOINT_SELECTED);
+    assert!(
+        !msg.contains("unknown provider id"),
+        "the dangling internal message is back: {msg}"
+    );
+
+    // The load-bearing assertion: no transport was touched by either attempt.
+    assert!(
+        fake.captured().is_none(),
+        "a rejected turn must not reach ANY endpoint, but the streamer was called: {:?}",
+        fake.captured()
+    );
+    // And nothing was written to the transcript either.
+    let rows = storage
+        .open_profile("personal")
+        .unwrap()
+        .list_messages_by_conversation("cu")
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "a rejected turn must not persist rows, got: {rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn the_explicit_provider_is_the_one_contacted() {
+    use crate::test_support::{sse_chat_response, OneShotServer};
+
+    // Two real endpoints on two loopback ports. The decoy is registered FIRST
+    // and is deliberately the one the observed bug landed on: `list_providers`
+    // is `ORDER BY name`, so among the stock presets "Anthropic" sorts ahead of
+    // OpenAI/OpenRouter/LM Studio/Ollama, and any "just use the first
+    // configured provider" path silently serves every turn from it.
+    let decoy = OneShotServer::spawn(sse_chat_response("SERVED BY THE WRONG ENDPOINT"));
+    let chosen = OneShotServer::spawn(sse_chat_response("served by the chosen endpoint"));
+    let decoy_provider = Provider::new(
+        "anthropic",
+        "Anthropic",
+        decoy.base_url(),
+        None,
+        ProviderKind::Local,
+    );
+    let chosen_provider = Provider::new(
+        "openai",
+        "OpenAI",
+        chosen.base_url(),
+        None,
+        ProviderKind::Local,
+    );
+    let (agent, storage, dir) = live_loop(&[decoy_provider, chosen_provider]);
+    b7_seed_conversation(&storage, "cx");
+
+    let out = agent
+        .process_message(
+            "hello".into(),
+            "cx".into(),
+            Binding::Public,
+            "openai".into(),
+            "some-model".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .expect("the turn must reach the selected endpoint");
+
+    assert!(
+        out.contains("served by the chosen endpoint"),
+        "the reply came from the wrong endpoint: {out:?}"
+    );
+    let request_line = chosen
+        .first_request_line()
+        .expect("the selected provider must have been contacted");
+    assert!(
+        request_line.starts_with("POST /chat/completions"),
+        "expected the chat-completions POST, got: {request_line}"
+    );
+    assert!(
+        decoy.requests().is_empty(),
+        "the provider the user did NOT select was contacted: {:?}",
+        decoy.requests()
+    );
+    // The transcript agrees with the socket.
+    let rows = storage
+        .open_profile("personal")
+        .unwrap()
+        .list_messages_by_conversation("cx")
+        .unwrap();
+    let assistant = rows
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .expect("the turn persisted an assistant row");
+    assert_eq!(assistant.provider_id.as_deref(), Some("openai"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_privacy_reroute_stamps_the_local_provider_on_the_persisted_row() {
+    // The one legitimate way a turn is served by a provider other than the one
+    // the picker shows: the §7 gate overrode the choice. That override must be
+    // STAMPED, never silent — the persisted row names the endpoint that
+    // actually ran, which is what the UI's per-turn route indicator reads.
+    let cloud = cloud_provider("cloudco");
+    let local = local_provider("local-llm");
+    let fake = Arc::new(FakeStreamer::new(
+        cloud.clone(),
+        sse_chunks_for("handled on-device"),
+    ));
+    let (agent, storage, dir) = b7_loop_with(Arc::clone(&fake), std::slice::from_ref(&local));
+    b7_seed_conversation(&storage, "cl");
+    // Redaction OFF so the SSN takes the plain RouteLocal branch instead of
+    // partial delegation (`redact_send`, which legitimately stays on cloud).
+    // This test is about the reroute stamp, not about which branch fires.
+    storage
+        .open_profile("personal")
+        .unwrap()
+        .set_redaction_enabled(false)
+        .unwrap();
+
+    agent
+        .process_message(
+            "my SSN is 123-45-6789".into(),
+            "cl".into(),
+            Binding::Auto,
+            cloud.id.clone(), // the user picked the CLOUD provider
+            "gpt-x".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .expect("a rerouted turn still completes");
+
+    let rows = storage
+        .open_profile("personal")
+        .unwrap()
+        .list_messages_by_conversation("cl")
+        .unwrap();
+    let assistant = rows
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .expect("the rerouted turn persisted an assistant row");
+    assert_eq!(
+        assistant.provider_id.as_deref(),
+        Some("local-llm"),
+        "the row must name the endpoint that ACTUALLY served the turn, not the picker's choice"
+    );
+    assert_eq!(
+        assistant.routing_decision.as_deref(),
+        Some("route_local"),
+        "the override must be labelled, so the UI can show it"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
