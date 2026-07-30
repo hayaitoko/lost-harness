@@ -20,6 +20,9 @@
 //!                 (H-12); non-sensitive content passes, while a hit on the
 //!                 **un-tunable rules floor** yields `ConfirmRequired` — ONE
 //!                 send the user must authorise explicitly, which then expires.
+//!                 Like `Auto` and `Private`, this arm is about EGRESS: on a
+//!                 non-cloud endpoint nothing leaves the device, so there is
+//!                 nothing to confirm and the send is `Allow`ed.
 //!  - `Private` — the user explicitly opted in. Cloud endpoints are
 //!                 always `Block`ed.
 //!
@@ -46,6 +49,13 @@
 //! sit around as a standing allow. This mirrors the audio boundary's
 //! `AudioEgressGate::resolve_confirm` (`Once`-scope, single-use) rather than
 //! inventing a second policy.
+//!
+//! The banner → `confirm_public_send` → re-send round trip is the MESSAGE
+//! path's affordance. The TOOL path has no such banner, so
+//! `hooks::privacy_filter` resolves the same `ConfirmRequired` through the
+//! approval spine instead (`HookResult::Ask` → the approval dialog → a ledger
+//! grant pinned to that exact tool+args). Two surfaces, one verdict — see that
+//! module's docs for why it does not consume from this store.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -170,15 +180,32 @@ impl PublicSendConfirmations {
 /// the gate fails closed — cloud egress under `Auto` binding is always kept
 /// local. `health` is a shared `Arc`, so the IPC layer / UI banner observe the
 /// same flag the gate enforces on.
+///
+/// **There is exactly one gate.** `lib.rs` constructs it once (the message-egress
+/// gate) and hands `clone()`s to `AppState` and to the tool-hook chain, because
+/// `clone()` is the only construction that shares BOTH `health` and `confirms`.
+/// Constructing a second gate for another boundary re-opens the two bugs this
+/// type has already had: a never-degraded tool path (C-01) and a confirmation
+/// store the IPC command can grant into but the tool path can't read (H-12).
 #[derive(Clone)]
 pub struct PrivacyGate {
     classifier: Arc<dyn Classifier>,
     /// Shared, observable classifier health. When degraded, only the rules
     /// fallback is screening and cloud egress under `Auto` is refused (C-01).
     health: Arc<ClassifierHealth>,
-    /// H-12: outstanding one-send confirmations. Shared across `clone()` — a
-    /// delegated sub-agent's gate and the tool-hook gate consume from the same
-    /// store the IPC command grants into.
+    /// H-12: outstanding one-send confirmations.
+    ///
+    /// **Sharing is by `clone()` only.** `clone()` shares this `Arc`, so a
+    /// delegated sub-agent's gate and `AppState.gate` consume from the same
+    /// store `ipc::confirm_public_send` grants into. [`Self::with_health`] (and
+    /// therefore [`Self::new`] / [`Self::new_degraded`]) allocates a FRESH,
+    /// EMPTY store — a gate built that way cannot see another gate's grants.
+    /// That was a live bug: `lib.rs` built the tool-hook gate with
+    /// `with_health`, so an IPC-granted confirmation was unreachable from the
+    /// tool path. `lib.rs` now derives the tool-hook gate from the message gate
+    /// with `clone()`, which is the only construction that shares both this
+    /// store and `health`. Use [`Self::with_confirmations`] to share
+    /// deliberately when a clone isn't possible.
     confirms: Arc<PublicSendConfirmations>,
 }
 
@@ -197,9 +224,13 @@ impl PrivacyGate {
         Self::with_health(classifier, ClassifierHealth::healthy())
     }
 
-    /// Build a gate around `classifier` sharing an existing health flag. This is
-    /// the constructor `lib.rs` uses for **both** gates (message egress and the
-    /// tool-hook chain), so a degraded classifier degrades every path.
+    /// Build a gate around `classifier` sharing an existing health flag, so a
+    /// degraded classifier degrades every gate built from it (C-01).
+    ///
+    /// This shares `health` and NOT the confirmation store — the new gate starts
+    /// with an empty [`PublicSendConfirmations`]. `lib.rs` therefore calls this
+    /// exactly ONCE (the message-egress gate) and derives the tool-hook gate
+    /// from it with `clone()`; see the `confirms` field docs.
     pub fn with_health(classifier: Arc<dyn Classifier>, health: Arc<ClassifierHealth>) -> Self {
         Self {
             classifier,
@@ -304,7 +335,18 @@ impl PrivacyGate {
             // read `classification.spans`).
             Binding::Public => {
                 let classification = self.classifier.classify_with(text, cfg);
-                let d = if floor_hit(text) {
+                // The gate governs EGRESS. `Auto` and `Private` both consult
+                // `is_cloud_endpoint`; this arm used to ignore it, so a
+                // `Public`-bound send to a LOCAL endpoint still demanded a
+                // confirmation for content that never left the device (and, on
+                // the tool path, was then hard-denied). Nothing crosses the
+                // boundary on a non-cloud endpoint, so there is nothing to
+                // confirm — allow it, exactly like `Private` does. The
+                // classification is still surfaced so the redaction UI can show
+                // what was detected.
+                let d = if !is_cloud_endpoint {
+                    GateDecision::Allow
+                } else if floor_hit(text) {
                     let fingerprint = Self::public_send_fingerprint(text);
                     // A confirmation the user already gave for THIS text
                     // authorises exactly one send, and is consumed here.

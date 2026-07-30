@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
-use crate::classifier::{Classifier, ClassifierConfig};
+use crate::classifier::{Classifier, ClassifierConfig, ClassifierHealth};
 
 /// Whether a piece of speech (a TTS reply prefix, or raw STT audio) may be sent
 /// to a CLOUD speech service.
@@ -50,9 +50,21 @@ pub struct AudioEgressGate {
 }
 
 impl AudioEgressGate {
-    pub fn new(classifier: Arc<dyn Classifier>) -> Self {
+    /// `health` is the app's SHARED [`ClassifierHealth`] — the same `Arc` the
+    /// message-egress gate and the tool-hook gate hold.
+    ///
+    /// It is a required argument on purpose. This used to be
+    /// `new(classifier)` → `PrivacyGate::new(classifier)`, which builds a
+    /// permanently NON-degraded gate: C-01's fail-closed rule (a missing trained
+    /// ONNX ensemble must keep `Auto` + cloud on-device) could never fire at the
+    /// audio boundary. Nothing constructed this in production yet, so nothing was
+    /// bypassed — but wiring the voice loop up to a defaulted constructor would
+    /// have silently given the newest egress boundary the weakest gate. Passing
+    /// `ClassifierHealth::healthy()` is now an explicit, greppable choice rather
+    /// than the path of least resistance.
+    pub fn new(classifier: Arc<dyn Classifier>, health: Arc<ClassifierHealth>) -> Self {
         Self {
-            gate: PrivacyGate::new(classifier),
+            gate: PrivacyGate::with_health(classifier, health),
         }
     }
 
@@ -170,7 +182,10 @@ mod tests {
     use crate::classifier::RulesClassifier;
 
     fn gate() -> AudioEgressGate {
-        AudioEgressGate::new(Arc::new(RulesClassifier::new()))
+        AudioEgressGate::new(
+            Arc::new(RulesClassifier::new()),
+            ClassifierHealth::healthy(),
+        )
     }
     fn cfg() -> ClassifierConfig {
         ClassifierConfig::default()
@@ -207,6 +222,38 @@ mod tests {
                 &cfg()
             ),
             AudioEgressDecision::Withhold
+        );
+    }
+
+    /// F4 / C-01 at the AUDIO boundary: a degraded classifier (no trained ONNX
+    /// ensemble — the fresh-install shape) must keep `Auto` speech off a cloud
+    /// TTS even when the rules-only fallback finds nothing. This is the test the
+    /// old `PrivacyGate::new(classifier)` constructor made impossible to pass.
+    #[test]
+    fn a_degraded_classifier_withholds_cloud_tts_that_the_fallback_would_clear() {
+        let benign = "The weather looks clear today.";
+        // The fallback really does clear this text (so the assertion below is
+        // about the degraded flag, not about the classifier disagreeing).
+        assert_eq!(
+            gate().tts_egress(benign, &Binding::Auto, true, &cfg()),
+            AudioEgressDecision::Allow,
+            "control: a healthy audio gate speaks benign text to a cloud TTS"
+        );
+
+        let degraded = AudioEgressGate::new(
+            Arc::new(RulesClassifier::new()),
+            ClassifierHealth::degraded_with("classifier models missing"),
+        );
+        assert_eq!(
+            degraded.tts_egress(benign, &Binding::Auto, true, &cfg()),
+            AudioEgressDecision::Withhold,
+            "rules-only screening must not clear a cloud voice service"
+        );
+        // Local TTS is unaffected — fail-closed is about egress, not about
+        // bricking the voice loop.
+        assert_eq!(
+            degraded.tts_egress(benign, &Binding::Auto, false, &cfg()),
+            AudioEgressDecision::Allow
         );
     }
 

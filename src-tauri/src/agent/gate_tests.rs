@@ -109,6 +109,68 @@ fn public_binding_no_longer_blanket_overrides_pii_it_asks_for_one_confirm() {
     );
 }
 
+/// F1: the `Public` arm used to ignore `is_cloud_endpoint`, unlike `Auto` and
+/// `Private` which both consult it — so a `Public`-bound send to a LOCAL
+/// endpoint demanded a confirmation for content that never crossed the egress
+/// boundary (and on the tool path was then hard-denied). The gate governs
+/// EGRESS; make the three arms consistent.
+#[test]
+fn public_binding_asks_for_a_confirm_only_when_something_actually_egresses() {
+    let g = gate();
+    let cfg = ClassifierConfig::default();
+    let text = "my SSN is 123-45-6789";
+
+    // CONTROL: on a CLOUD endpoint the floor still demands one confirmation.
+    assert!(
+        matches!(
+            g.check(&Binding::Public, text, true, &cfg),
+            GateDecision::ConfirmRequired { .. }
+        ),
+        "control: cloud egress of a structured secret must still be confirmed"
+    );
+
+    // On a LOCAL endpoint nothing leaves the device → nothing to confirm.
+    assert_eq!(
+        g.check(&Binding::Public, text, false, &cfg),
+        GateDecision::Allow,
+        "an on-device send must not demand a cloud-egress confirmation"
+    );
+
+    // And the classification is still surfaced for the redaction UI.
+    let (d, classification) = g.check_detailed(&Binding::Public, text, false, &cfg);
+    assert_eq!(d, GateDecision::Allow);
+    assert!(
+        classification.is_some(),
+        "Public always surfaces a classification, cloud or not"
+    );
+}
+
+#[test]
+fn a_local_public_send_does_not_spend_an_outstanding_cloud_confirmation() {
+    // The confirmation the user gave is for the CLOUD send. A local send of the
+    // same text in between must not burn it (which is what happened when the
+    // Public arm consumed the grant before looking at the endpoint).
+    let g = gate();
+    let cfg = ClassifierConfig::default();
+    let text = "my SSN is 123-45-6789";
+    let fp = g.confirm_public_send(text);
+
+    assert_eq!(
+        g.check(&Binding::Public, text, false, &cfg),
+        GateDecision::Allow
+    );
+    assert!(
+        g.confirmations().holds(&fp),
+        "a local send must leave the cloud confirmation on file"
+    );
+    // ...and it is still spendable on the cloud send it was granted for.
+    assert_eq!(
+        g.check(&Binding::Public, text, true, &cfg),
+        GateDecision::Allow
+    );
+    assert!(!g.confirmations().holds(&fp), "the cloud send consumed it");
+}
+
 #[test]
 fn auto_private_text_routes_local_on_cloud() {
     let g = gate();
