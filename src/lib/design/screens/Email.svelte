@@ -69,6 +69,22 @@
     );
   }
 
+  // Re-read the connection state after a call failed. The failing call is what
+  // records it backend-side, so without this a failed read or send would leave
+  // both banners dark and show only the raw error. Only swaps on a real change,
+  // so the list effect settles instead of looping.
+  async function refreshConnectionState() {
+    const token = statusSeq;
+    try {
+      const fresh = await gmailSetupStatus($activeProfileId);
+      if (token === statusSeq && status && connectionStateChanged(fresh, status)) {
+        status = fresh;
+      }
+    } catch {
+      // Keep whatever error the caller already surfaced.
+    }
+  }
+
   // One effect owns the status check + the profile-switch reset (the
   // connection is per-profile, so switching drops the old profile's mail
   // state). `seq` tokens drop stale responses, like Files.svelte.
@@ -120,7 +136,6 @@
     const s = status;
     if (!s?.connected || s.needs_reconnect) return;
     const token = ++listSeq;
-    const statusToken = statusSeq; // capture status token to gate secondary status writes
     listLoading = true;
     listError = null;
     listEmail(profile)
@@ -131,22 +146,8 @@
         if (token !== listSeq) return;
         listError = String(err);
         // A dead grant or a disabled API is recorded backend-side — re-check
-        // once so the matching calm banner appears. Only swap status when the
-        // connection state actually changed; the effect then settles on rerun
-        // (no retry loop).
-        try {
-          const fresh = await gmailSetupStatus(profile);
-          if (
-            token === listSeq &&
-            statusToken === statusSeq &&
-            status &&
-            connectionStateChanged(fresh, status)
-          ) {
-            status = fresh;
-          }
-        } catch {
-          // keep the list error
-        }
+        // so the matching calm banner appears.
+        await refreshConnectionState();
       })
       .finally(() => {
         if (token === listSeq) listLoading = false;
@@ -163,7 +164,10 @@
       const d = await readEmail($activeProfileId, id);
       if (token === detailSeq) detail = d;
     } catch (err) {
-      if (token === detailSeq) detailError = String(err);
+      if (token === detailSeq) {
+        detailError = String(err);
+        void refreshConnectionState();
+      }
     } finally {
       if (token === detailSeq) detailLoading = false;
     }
@@ -219,6 +223,7 @@
       sentTo = composeTo.trim();
     } catch (err) {
       sendError = String(err);
+      void refreshConnectionState();
     } finally {
       sending = false;
     }

@@ -69,6 +69,24 @@
       });
   });
 
+  /// Re-read the connection state after a call failed.
+  ///
+  /// The failing call is what records the state backend-side, so without this
+  /// EVERY non-list failure — creating an event, ticking a task, a delete —
+  /// would leave both banners dark and show only raw `Google API HTTP 403`
+  /// text. Only swaps when something actually changed, so it can't churn.
+  async function refreshConnectionState() {
+    const token = statusSeq;
+    try {
+      const fresh = await gmailSetupStatus($activeProfileId);
+      if (token === statusSeq && (status == null || connectionStateChanged(fresh, status))) {
+        status = fresh;
+      }
+    } catch {
+      // Keep whatever error the caller already surfaced.
+    }
+  }
+
   const showReconnectBanner = $derived(
     status != null && status.connected && status.needs_reconnect,
   );
@@ -85,6 +103,8 @@
     try {
       await googleClearApiNotEnabled($activeProfileId);
     } catch (err) {
+      // A failed CLEAR is a local IPC problem, not a Google verdict — nothing
+      // to re-read about the connection.
       error = String(err);
     } finally {
       recheckingApi = false;
@@ -118,23 +138,8 @@
         if (token !== sequence) return;
         error = String(err);
         // A dead grant or a disabled API is recorded backend-side by the very
-        // call that just failed — re-check once so the matching banner lights.
-        // Only swap when the connection state actually changed, so this
-        // settles instead of looping.
-        const statusToken = statusSeq;
-        try {
-          const fresh = await gmailSetupStatus(profile);
-          if (
-            token === sequence &&
-            statusToken === statusSeq &&
-            status &&
-            connectionStateChanged(fresh, status)
-          ) {
-            status = fresh;
-          }
-        } catch {
-          // keep the load error
-        }
+        // call that just failed — re-check so the matching banner lights.
+        await refreshConnectionState();
       })
       .finally(() => {
         if (token === sequence) loading = false;
@@ -163,6 +168,7 @@
       eventEnd = "";
     } catch (err) {
       error = String(err);
+      void refreshConnectionState();
     } finally {
       creatingEvent = false;
     }
@@ -182,6 +188,7 @@
       taskNotes = "";
     } catch (err) {
       error = String(err);
+      void refreshConnectionState();
     } finally {
       creatingTask = false;
     }
@@ -194,6 +201,7 @@
       tasks = tasks.map((row) => (row.id === updated.id ? updated : row));
     } catch (err) {
       error = String(err);
+      void refreshConnectionState();
     }
   }
 
@@ -218,6 +226,7 @@
       }
     } catch (err) {
       error = String(err);
+      void refreshConnectionState();
     }
   }
 

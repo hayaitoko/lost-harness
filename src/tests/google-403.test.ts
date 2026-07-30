@@ -182,6 +182,41 @@ describe("Email + Planner — the two connection banners", () => {
     });
   }
 
+  /// The banner must light off the call that ACTUALLY failed, not only off a
+  /// list load. Here the initial status read is clean and only a create fails
+  /// — exactly the case that used to leave both banners dark and show nothing
+  /// but raw `Google API HTTP 403` text.
+  it("Planner: a failed create lights the banner, not just a failed list", async () => {
+    let disabled = false;
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "gmail_setup_status":
+          return status(
+            disabled ? { api_not_enabled: { console_url: CONSOLE_URL } } : {},
+          );
+        case "list_calendar_events":
+        case "list_google_tasks":
+          return [];
+        case "create_google_task":
+          // The failing call is what records the state backend-side.
+          disabled = true;
+          throw new Error("[google:api_not_enabled] Google API HTTP 403");
+        default:
+          return null;
+      }
+    });
+
+    const { getByPlaceholderText, getByText, queryByTestId } = render(Planner);
+    await waitFor(() => expect(queryByTestId("google-api-disabled-banner")).toBeNull());
+
+    await fireEvent.input(getByPlaceholderText("New task"), {
+      target: { value: "buy milk" },
+    });
+    await fireEvent.click(getByText("Add task"));
+
+    await waitFor(() => expect(queryByTestId("google-api-disabled-banner")).not.toBeNull());
+  });
+
   /// Planner's specific gap: it read no connection state, so it printed the
   /// raw backend error under fixed prose that told the user to reconnect —
   /// advice that is simply wrong for a disabled API.
