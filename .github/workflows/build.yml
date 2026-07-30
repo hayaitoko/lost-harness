@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# Every `run:` below is POSIX shell. macOS runners default to bash already, but
+# declaring it makes the contract explicit rather than inherited (L-03).
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # Lost Harness is a macOS-only, Apple-Silicon-only desktop app:
   #   * the vendored llama.cpp runtime ships as arm64 Mach-O only
@@ -131,6 +137,12 @@ jobs:
         working-directory: src-tauri
         run: cargo build --target aarch64-apple-darwin --verbose
 
+      # Passable as of the campaign's single sanctioned whole-tree `cargo fmt`
+      # commit; verified `cargo fmt --check` exits 0 on this tree.
+      - name: cargo fmt (formatting gate)
+        working-directory: src-tauri
+        run: cargo fmt --check
+
       - name: cargo clippy (correctness gate, aarch64)
         working-directory: src-tauri
         # The repository still carries non-correctness warning debt. Make
@@ -155,15 +167,26 @@ jobs:
       # Run direct rather than via the action so the audit.toml exception list
       # is the single source of truth (the action carries its own ignore inputs
       # and does not read that file). Lockfile-only check, so one OS is enough.
+      # NOTE: this step used to carry `if: matrix.os == 'ubuntu-latest'`, left over
+      # from the pre-P17 three-OS matrix. P17 removed the matrix, so `matrix.os`
+      # became an undefined context, the condition evaluated false, and this gate
+      # SILENTLY NEVER RAN. Removed — the audit is lockfile-only, so running it on
+      # the single macOS job is correct.
       - name: cargo audit (gate — exceptions in src-tauri/.cargo/audit.toml)
-        if: matrix.os == 'ubuntu-latest'
         working-directory: src-tauri
         run: |
           cargo install cargo-audit --locked --version ^0.22
           cargo audit
 
       # ── Frontend build ──────────────────────────────────────────────────
-      - name: Frontend build
+      - name: Frontend check, test and build
         run: |
           npm run check
+          npm test
           npm run build
+
+      # npm audit is a real gate: the postcss advisory (GHSA-r28c-9q8g-f849) is
+      # held at a fixed version by an `overrides` entry in package.json, so a
+      # regression here means that pin was lost. Verified exit 0 on this tree.
+      - name: npm audit (high and above)
+        run: npm audit --audit-level=high
