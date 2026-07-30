@@ -1,0 +1,146 @@
+[advisories]
+# ─────────────────────────────────────────────────────────────────────────────
+# CODIFIED AUDIT EXCEPTIONS  (packet P20 — findings H-11 / M-20)
+#
+# Every ID below is a DELIBERATE exception, not a backlog item that fell through.
+# `cargo audit` is a hard gate (see [output] deny = ["warnings"] at the bottom):
+# any advisory NOT listed here fails the build. That is the whole point of this
+# file — the noise is silenced so the signal is release-blocking.
+#
+# RULES FOR THIS FILE
+#   1. Nothing gets added without a rationale line and a REVISIT date.
+#   2. On the revisit date, re-run `cargo audit` with this file temporarily
+#      emptied and re-justify every entry that still fires. Entries that no
+#      longer fire get deleted.
+#   3. An exception with a past REVISIT date is a bug. Do not extend a date
+#      without re-checking the upstream constraint that justified it.
+#
+# GLOBAL REVISIT DATE: 2027-01-31
+#   Chosen as ~6 months out. The dominant constraint (GTK3) is expected to move
+#   only when Tauri's Linux webview leaves webkit2gtk/GTK3, which is not on a
+#   published timeline — so this is a re-justification checkpoint, not a
+#   predicted fix date.
+#
+#   !! THE REVISIT DATE IS A COMMENT ONLY — NOTHING ENFORCES IT. !!
+#   cargo-audit's `ignore` list is a flat array of advisory IDs with no expiry
+#   support: these entries never lapse, and CI will stay green past 2027-01-31
+#   without anyone noticing. (cargo-deny does support expiry, via
+#   `[[advisories.ignore]] { id, reason, expires }` — adopting cargo-deny is
+#   the only way to make this date enforceable, and it is not adopted here.)
+#   Until then, the only mechanism is a human opening this file on purpose.
+#
+# VERIFIED 2026-07-29 against Cargo.lock at campaign base eb17b94
+# (no `cargo update` was required for these advisories — see review-fixes/progress/P20.md):
+#   - `cargo audit` with this config → exit 0, clean
+#   - `cargo audit` on the same lock WITHOUT this config → 0 vulnerabilities,
+#     19 warnings (18 unmaintained, 1 unsound) — exactly the 19 IDs below
+# ─────────────────────────────────────────────────────────────────────────────
+ignore = [
+  # ───────────────────────────────────────────────────────────────────────────
+  # GROUP 1 — GTK3 / gtk-rs 0.18.x cluster.  Linux builds only.
+  #
+  # WHY IT CANNOT BE FIXED:
+  #   Tauri's Linux webview is `wry` → `webkit2gtk`. webkit2gtk is a GTK3 C
+  #   library and has no GTK4 port, so its Rust bindings are pinned to the
+  #   gtk-rs 0.18.x generation. The gtk-rs project deprecated the entire GTK3
+  #   binding set (upstream moved to gtk4-rs), which is why all of these fire
+  #   at once. Verified reverse-dependency chain (cargo tree -i glib
+  #   --target x86_64-unknown-linux-gnu):
+  #
+  #     lost-harness-product → tauri 2.11.5 → tauri-runtime-wry 2.11.4
+  #        → wry 0.55.1 → webkit2gtk 2.0.2 → gtk 0.18.2 → glib 0.18.5
+  #        (also via tao 0.35.3 → gtk, and muda 0.19.3 → gtk)
+  #
+  #   Bumping glib to 0.20 is a breaking change that gtk 0.18.2 will not accept,
+  #   so "upgrade glib" is not an available move — the whole Linux GUI chain
+  #   would have to move together, and its bottom (webkit2gtk) has nowhere to go.
+  #
+  # EXIT CONDITION: Tauri ships a Linux webview that is not GTK3-based
+  #   (webkitgtk-6.0 / GTK4), OR the project drops Linux as a target.
+  # REVISIT: 2027-01-31
+  #
+  # RUSTSEC-2024-0429 is the only *unsound* (not merely unmaintained) entry in
+  # this file. Residual risk assessed as acceptable: the unsoundness is in the
+  # Iterator/DoubleEndedIterator impls for `glib::VariantStrIter`. This app does
+  # not construct or iterate GVariant string arrays; the type is reachable only
+  # from glib-internal paths inside the GTK3 windowing stack, never from
+  # lost-harness code. Re-assess if we ever call glib's Variant API directly.
+  "RUSTSEC-2024-0429", # glib 0.18.5        — unsound: VariantStrIter UB
+  "RUSTSEC-2024-0413", # atk 0.18.2         — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0416", # atk-sys 0.18.2     — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0412", # gdk 0.18.2         — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0418", # gdk-sys 0.18.2     — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0411", # gdkwayland-sys 0.18.2 — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0417", # gdkx11 0.18.2      — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0414", # gdkx11-sys 0.18.2  — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0415", # gtk 0.18.2         — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0420", # gtk-sys 0.18.2     — unmaintained: GTK3 bindings
+  "RUSTSEC-2024-0419", # gtk3-macros 0.18.2 — unmaintained: GTK3 bindings
+
+  # proc-macro-error is a build-time-only proc-macro dependency of glib-macros,
+  # i.e. it is part of GROUP 1 and shares its exit condition. It never ships in
+  # the binary. Verified: cargo tree -i proc-macro-error →
+  #   glib-macros 0.18.5 → glib 0.18.5 → (GTK3 chain above)
+  # REVISIT: 2027-01-31 (with the rest of GROUP 1)
+  "RUSTSEC-2024-0370", # proc-macro-error 1.0.4 — unmaintained, build-time only
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # GROUP 2 — unic-* cluster, pulled in transitively by Tauri itself.
+  #
+  # WHY IT CANNOT BE FIXED HERE:
+  #   Verified chain: tauri 2.11.5 → tauri-utils 2.9.3 → urlpattern 0.3.0
+  #   → unic-ucd-ident → {unic-char-property, unic-char-range, unic-common,
+  #   unic-ucd-version}. tauri-utils pins urlpattern 0.3.x. Newer urlpattern
+  #   drops the unic-* dependencies, but adopting it is tauri-utils' call, not
+  #   ours — we have no version of Tauri available that does it, and patching
+  #   the graph with [patch.crates-io] to force it would be a far larger
+  #   correctness risk than the advisory itself (these are unmaintained
+  #   notices, not vulnerabilities).
+  # EXIT CONDITION: a Tauri release whose tauri-utils moves off urlpattern 0.3.
+  # REVISIT: 2027-01-31
+  "RUSTSEC-2025-0081", # unic-char-property 0.9.0 — unmaintained
+  "RUSTSEC-2025-0075", # unic-char-range 0.9.0    — unmaintained
+  "RUSTSEC-2025-0080", # unic-common 0.9.0        — unmaintained
+  "RUSTSEC-2025-0100", # unic-ucd-ident 0.9.0     — unmaintained
+  "RUSTSEC-2025-0098", # unic-ucd-version 0.9.0   — unmaintained
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # GROUP 3 — tokenizers transitives (privacy-classifier / ONNX path).
+  #
+  # WHY IT CANNOT BE FIXED HERE:
+  #   Verified chains:
+  #     tokenizers 0.20.4 → indicatif 0.17.11 → number_prefix 0.4.0
+  #     tokenizers 0.20.4 → macro_rules_attribute 0.2.2 → paste 1.0.15
+  #                       (and tokenizers → paste directly)
+  #   Both crates are at their final published versions — "unmaintained" here
+  #   means the author stopped, not that a newer fixed release exists, so there
+  #   is literally no upgrade target. Replacing them means our upstreams
+  #   (indicatif / tokenizers) switching, not us.
+  #   Neither is a vulnerability: number_prefix formats byte counts for a
+  #   progress bar; paste is a compile-time identifier-concatenation macro that
+  #   does not ship in the binary.
+  # EXIT CONDITION: tokenizers/indicatif drop these deps upstream.
+  # REVISIT: 2027-01-31
+  "RUSTSEC-2025-0119", # number_prefix 0.4.0 — unmaintained, final version
+  "RUSTSEC-2024-0436", # paste 1.0.15        — unmaintained, final version
+]
+
+# Keep informational advisories switched ON. Combined with the deny below and
+# the explicit ignore list above, this means: known-and-justified stays quiet,
+# anything new is loud and fails CI. Turning these categories off instead of
+# enumerating them would hide future unmaintained/unsound crates as well, which
+# is exactly the "quietly permanent" failure mode this file exists to prevent.
+informational_warnings = ["unmaintained", "unsound", "notice"]
+
+[output]
+# Hard gate. With the exceptions above codified, `cargo audit` exits non-zero on
+# ANY advisory that is not on the list — including a new unmaintained/unsound
+# crate. CI runs plain `cargo audit` and inherits this.
+deny = ["warnings"]
+format = "terminal"
+quiet = false
+show_tree = true
+
+[yanked]
+enabled = true
+update_index = true
