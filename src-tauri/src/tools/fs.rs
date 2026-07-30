@@ -37,8 +37,6 @@
 //! tracked as a follow-up hardening item.
 
 use std::future::Future;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 
@@ -67,7 +65,9 @@ const SEARCH_MAX_FILE_BYTES: u64 = 256 * 1024;
 fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
-        return Err(format!("path must be relative to the workspace, got: {rel}"));
+        return Err(format!(
+            "path must be relative to the workspace, got: {rel}"
+        ));
     }
     for comp in rel_path.components() {
         match comp {
@@ -95,46 +95,83 @@ fn arg_str<'a>(input: &'a ToolInput, key: &str) -> Option<&'a str> {
     input.args.get(key).and_then(|v| v.as_str())
 }
 
-/// Canonicalize a profile name for use as both a filesystem subdirectory and
-/// a DB cache key: validates the name using the same rules as
-/// [`crate::storage::validate_profile_name`], then normalises to lowercase so
-/// the workspace path and the DB key agree (a case-insensitive filesystem
-/// collapses "Work" and "work" onto the same inode — the same non-isolation
-/// hole the storage layer's normalisation closes).
-pub fn canonical_profile_name(profile: &str) -> Result<String, String> {
+// ── profile → workspace root: the ONE normalizer ────────────────────────────
+
+/// Where one profile's files live, relative to the shared workspace base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileScope {
+    /// The EMPTY profile — the default/scratch `ExecCtx`. `open_profile` also
+    /// rejects `""`, so it can never alias a real profile; it resolves to the
+    /// shared base itself, which is the pre-Tier-P contract every
+    /// non-profile-bound caller still depends on.
+    SharedBase,
+    /// A real profile: its own physically-separate `base/<name>` subtree.
+    Subdir(String),
+}
+
+/// **THE** profile normalizer. Every profile→path decision funnels through
+/// this one function, so the filesystem bucket and the DB bucket cannot drift.
+///
+/// The rule mirrors [`crate::storage::validate_profile_name`] +
+/// `Storage::open_profile` byte-for-byte, and that equivalence is load-bearing:
+/// - the same strict ASCII allowlist (`[A-Za-z0-9_-]`, ≤64 chars, no leading
+///   `.`, no `..`). A name storage refuses to open a DB for must not be handed
+///   a filesystem tree either.
+/// - the same `to_ascii_lowercase` fold, because `open_profile` folds both its
+///   cache key and `profiles/<name>.db`. On the case-INSENSITIVE filesystems we
+///   ship on (APFS / NTFS) `Work` and `work` are one inode, so folding here is
+///   what keeps one profile = one DB = one tree.
+///
+/// **Fail-closed.** Anything else is an `Err`, not a path. There is
+/// deliberately no sentinel directory and no silent fall back to a real
+/// location, so a hostile profile string can never be turned into a place on
+/// disk. (An earlier cut returned `base/__invalid_profile__`, which converted a
+/// validation failure into a genuine directory — exactly the wrong shape.)
+pub fn profile_scope(profile: &str) -> Result<ProfileScope, String> {
     if profile.is_empty() {
-        return Err("profile name is empty".to_string());
+        return Ok(ProfileScope::SharedBase);
     }
     if profile.len() > 64 {
-        return Err(format!("profile name too long ({} chars)", profile.len()));
+        return Err(format!(
+            "invalid profile name: too long ({} chars)",
+            profile.len()
+        ));
     }
-    if !profile.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !profile
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(format!(
             "invalid profile name {profile:?} (only ASCII letters, digits, '_' and '-' allowed)"
         ));
     }
+    // Defence in depth: the allowlist already excludes '.', but keep the
+    // explicit traversal guard in case it is ever loosened.
     if profile.starts_with('.') || profile.contains("..") {
         return Err(format!("invalid profile name {profile:?}"));
     }
-    Ok(profile.to_ascii_lowercase())
+    Ok(ProfileScope::Subdir(profile.to_ascii_lowercase()))
 }
 
-/// Per-profile workspace root under `base`. Each profile gets its own
-/// physically-separate directory (`base/<canonical_name>`), matching the
-/// per-profile DB isolation in `Storage::open_profile`.
-///
-/// **Fail-closed**: an invalid or empty profile name returns an isolated
-/// sentinel path (`base/__invalid_profile__`) that is a unique child of base
-/// — it never collapses to `base` itself.
+/// Fail-closed workspace root — what every fs tool uses. An invalid profile is
+/// an error the tool hands back to the model; it never becomes a directory.
+fn profile_workspace_root(base: &Path, profile: &str) -> Result<PathBuf, String> {
+    Ok(match profile_scope(profile)? {
+        ProfileScope::SharedBase => base.to_path_buf(),
+        ProfileScope::Subdir(name) => base.join(name),
+    })
+}
+
+/// Infallible *peek* at the same normalizer, for the callers that only need a
+/// path to look at rather than a place to write: the `ProtectedPathHook`'s
+/// resolve, the legacy-workspace migration, and the read-only Files IPC. On an
+/// invalid profile it degenerates to `base`, which is safe for exactly those
+/// callers (the hook then over-matches → an extra Ask, never a miss; the
+/// migration's `dest == workspace_root` check short-circuits; the IPC
+/// explicitly rejects `ws == ws_root`). Anything that WRITES must use
+/// [`profile_workspace_root`] and fail closed instead.
 pub fn profile_workspace_path(base: &std::path::Path, profile: &str) -> PathBuf {
-    let name = canonical_profile_name(profile).unwrap_or_else(|_| "__invalid_profile__".into());
-    base.join(name)
-}
-
-// ── profile-validation helper (for use in tool `run` methods) ───────
-
-fn ensure_valid_profile(profile: &str) -> Result<(), String> {
-    canonical_profile_name(profile).map(|_| ())
+    profile_workspace_root(base, profile).unwrap_or_else(|_| base.to_path_buf())
 }
 
 // ── async wrappers for sync resolvers (spawn_blocking) ─────────────
@@ -151,53 +188,6 @@ async fn resolve_within_new_async(root: PathBuf, rel: String) -> Result<PathBuf,
         .map_err(|e| format!("resolve task failed: {e}"))?
 }
 
-// ── TOCTOU helpers: O_NOFOLLOW open + fd-verified containment ──────
-
-fn fd_realpath(fd: i32) -> Result<PathBuf, String> {
-    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-    let ret = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) };
-    if ret == -1 {
-        return Err(format!("fcntl(F_GETPATH) failed: {}", std::io::Error::last_os_error()));
-    }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    buf.truncate(len);
-    Ok(PathBuf::from(
-        std::str::from_utf8(&buf).map_err(|_| "non-UTF-8 path from fcntl(F_GETPATH)".to_string())?,
-    ))
-}
-
-fn open_verified(path: &Path, ws_root_canon: &Path) -> Result<(std::fs::File, PathBuf), String> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| format!("open with O_NOFOLLOW: {e}"))?;
-    let real = fd_realpath(file.as_raw_fd())?;
-    if !real.starts_with(ws_root_canon) {
-        return Err(format!(
-            "opened file's real path {:?} is outside the workspace root {:?} (TOCTOU)",
-            real, ws_root_canon
-        ));
-    }
-    Ok((file, real))
-}
-
-fn open_verified_write(path: &Path, ws_root_canon: &Path) -> Result<std::fs::File, String> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| format!("open with O_NOFOLLOW (write): {e}"))?;
-    let real = fd_realpath(file.as_raw_fd())?;
-    if !real.starts_with(ws_root_canon) {
-        return Err(format!(
-            "opened file's real path {:?} is outside the workspace root {:?} (TOCTOU)",
-            real, ws_root_canon
-        ));
-    }
-    Ok(file)
-}
-
 /// The filename that records the legacy-workspace migration already ran.
 pub const LEGACY_MIGRATION_MARKER: &str = ".tierp-migrated";
 /// The marker's CONTENT sentinel. Presence-only checks are unsafe (a legacy
@@ -207,7 +197,9 @@ pub const LEGACY_MIGRATION_MARKER: &str = ".tierp-migrated";
 const LEGACY_MIGRATION_MAGIC: &str = "lost-harness tier-p workspace migration v1\n";
 
 fn migration_is_done(marker: &std::path::Path) -> bool {
-    std::fs::read_to_string(marker).map(|s| s == LEGACY_MIGRATION_MAGIC).unwrap_or(false)
+    std::fs::read_to_string(marker)
+        .map(|s| s == LEGACY_MIGRATION_MAGIC)
+        .unwrap_or(false)
 }
 
 /// One-time, idempotent migration of the LEGACY shared workspace into the
@@ -386,13 +378,16 @@ impl Tool for ReadFileTool {
             let Some(path) = arg_str(&input, "path") else {
                 return ToolResult::Err("read_file requires a string \"path\" arg".to_string());
             };
-            let ws = profile_workspace_path(&self.root, &ctx.profile);
-            let _ = std::fs::create_dir_all(&ws);
-            let resolved = match resolve_within(&ws, path) {
+            let ws = match profile_workspace_root(&self.root, &ctx.profile) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(e),
+            };
+            let _ = tokio::fs::create_dir_all(&ws).await;
+            let resolved = match resolve_within_async(ws.clone(), path.to_string()).await {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
-            let meta = match std::fs::metadata(&resolved) {
+            let meta = match tokio::fs::metadata(&resolved).await {
                 Ok(m) => m,
                 Err(e) => return ToolResult::Err(format!("stat '{path}': {e}")),
             };
@@ -405,7 +400,7 @@ impl Tool for ReadFileTool {
                     meta.len()
                 ));
             }
-            match std::fs::read_to_string(&resolved) {
+            match tokio::fs::read_to_string(&resolved).await {
                 Ok(content) => {
                     // Read-before-write: remember we've seen this file (by its
                     // canonical path) so a later write_file/edit_file in the
@@ -459,27 +454,36 @@ impl Tool for ListDirTool {
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let path = arg_str(&input, "path").unwrap_or(".");
-            let ws = profile_workspace_path(&self.root, &ctx.profile);
-            let _ = std::fs::create_dir_all(&ws);
-            let resolved = match resolve_within(&ws, path) {
+            let ws = match profile_workspace_root(&self.root, &ctx.profile) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(e),
+            };
+            let _ = tokio::fs::create_dir_all(&ws).await;
+            let resolved = match resolve_within_async(ws.clone(), path.to_string()).await {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Err(e),
             };
-            let read_dir = match std::fs::read_dir(&resolved) {
-                Ok(rd) => rd,
-                Err(e) => return ToolResult::Err(format!("list '{path}': {e}")),
+            let listed = tokio::task::spawn_blocking(move || {
+                let read_dir = std::fs::read_dir(&resolved).map_err(|e| e.to_string())?;
+                let mut entries = Vec::new();
+                for entry in read_dir.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let kind = match entry.file_type() {
+                        Ok(t) if t.is_dir() => "dir",
+                        Ok(t) if t.is_file() => "file",
+                        Ok(t) if t.is_symlink() => "symlink",
+                        _ => "other",
+                    };
+                    entries.push(json!({ "name": name, "kind": kind }));
+                }
+                Ok::<_, String>(entries)
+            })
+            .await;
+            let mut entries = match listed {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return ToolResult::Err(format!("list '{path}': {e}")),
+                Err(e) => return ToolResult::Err(format!("list task failed: {e}")),
             };
-            let mut entries = Vec::new();
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let kind = match entry.file_type() {
-                    Ok(t) if t.is_dir() => "dir",
-                    Ok(t) if t.is_file() => "file",
-                    Ok(t) if t.is_symlink() => "symlink",
-                    _ => "other",
-                };
-                entries.push(json!({ "name": name, "kind": kind }));
-            }
             entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
             ToolResult::Ok(json!({ "path": path, "entries": entries }))
         })
@@ -524,18 +528,38 @@ impl Tool for SearchFilesTool {
             if query.is_empty() {
                 return ToolResult::Err("search_files \"query\" must not be empty".to_string());
             }
-            let ws = profile_workspace_path(&self.root, &ctx.profile);
-            let _ = std::fs::create_dir_all(&ws);
-            let canon_root = match ws.canonicalize() {
+            let ws = match profile_workspace_root(&self.root, &ctx.profile) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(e),
+            };
+            let _ = tokio::fs::create_dir_all(&ws).await;
+            let canon_root = match tokio::fs::canonicalize(&ws).await {
                 Ok(r) => r,
                 Err(e) => return ToolResult::Err(format!("workspace root unavailable: {e}")),
             };
             let needle = query.to_lowercase();
-            let mut matches = Vec::new();
-            let mut scanned = 0usize;
-            walk(&canon_root, &canon_root, 0, &needle, &mut matches, &mut scanned);
-            let truncated = matches.len() >= SEARCH_MAX_RESULTS
-                || scanned >= SEARCH_MAX_FILES_SCANNED;
+            // The whole tree walk is blocking filesystem work — keep it off the
+            // async worker (M-21).
+            let walked = tokio::task::spawn_blocking(move || {
+                let mut matches = Vec::new();
+                let mut scanned = 0usize;
+                walk(
+                    &canon_root,
+                    &canon_root,
+                    0,
+                    &needle,
+                    &mut matches,
+                    &mut scanned,
+                );
+                (matches, scanned)
+            })
+            .await;
+            let (matches, scanned) = match walked {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(format!("search task failed: {e}")),
+            };
+            let truncated =
+                matches.len() >= SEARCH_MAX_RESULTS || scanned >= SEARCH_MAX_FILES_SCANNED;
             ToolResult::Ok(json!({
                 "query": query,
                 "matches": matches,
@@ -628,7 +652,9 @@ const MAX_WRITE_BYTES: usize = 1024 * 1024; // 1 MiB
 fn resolve_within_new(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
-        return Err(format!("path must be relative to the workspace, got: {rel}"));
+        return Err(format!(
+            "path must be relative to the workspace, got: {rel}"
+        ));
     }
     for comp in rel_path.components() {
         match comp {
@@ -769,9 +795,7 @@ impl Tool for WriteFileTool {
                 return ToolResult::Err("write_file requires a string \"path\" arg".to_string());
             };
             let Some(content) = arg_str(&input, "content").map(String::from) else {
-                return ToolResult::Err(
-                    "write_file requires a string \"content\" arg".to_string(),
-                );
+                return ToolResult::Err("write_file requires a string \"content\" arg".to_string());
             };
             if content.len() > MAX_WRITE_BYTES {
                 return ToolResult::Err(format!(
@@ -779,22 +803,28 @@ impl Tool for WriteFileTool {
                     content.len()
                 ));
             }
-            if let Err(e) = ensure_valid_profile(&ctx.profile) {
-                return ToolResult::Err(e);
-            }
-            let ws = profile_workspace_path(&self.root, &ctx.profile);
+            let ws = match profile_workspace_root(&self.root, &ctx.profile) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Err(e),
+            };
             let _ = tokio::fs::create_dir_all(&ws).await;
             let resolved = match resolve_within_new_async(ws.clone(), path.clone()).await {
                 Ok(v) => v,
                 Err(e) => return ToolResult::Err(e),
             };
-            if tokio::fs::metadata(&resolved).await.map(|m| m.is_dir()).unwrap_or(false) {
+            if tokio::fs::metadata(&resolved)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
                 return ToolResult::Err(format!("'{path}' is a directory"));
             }
             let existed = tokio::fs::try_exists(&resolved).await.unwrap_or(false);
             if existed {
                 if let Some(reads) = &ctx.reads {
-                    let key = tokio::fs::canonicalize(&resolved).await.unwrap_or_else(|_| resolved.clone());
+                    let key = tokio::fs::canonicalize(&resolved)
+                        .await
+                        .unwrap_or_else(|_| resolved.clone());
                     if !reads.contains(&ctx.conversation_id, &key) {
                         return ToolResult::Err(format!(
                             "refusing to write '{path}': read_file it first so you're not overwriting blind"
@@ -807,10 +837,14 @@ impl Tool for WriteFileTool {
             match tokio::task::spawn_blocking(move || atomic_write(&resolved2, &content2)).await {
                 Ok(Ok(())) => {
                     if let Some(reads) = &ctx.reads {
-                        let key = tokio::fs::canonicalize(&resolved).await.unwrap_or_else(|_| resolved.clone());
+                        let key = tokio::fs::canonicalize(&resolved)
+                            .await
+                            .unwrap_or_else(|_| resolved.clone());
                         reads.record(&ctx.conversation_id, key);
                     }
-                    ToolResult::Ok(json!({"path": path, "bytes_written": content.len(), "created": !existed}))
+                    ToolResult::Ok(
+                        json!({"path": path, "bytes_written": content.len(), "created": !existed}),
+                    )
                 }
                 Ok(Err(e)) => ToolResult::Err(format!("write '{path}': {e}")),
                 Err(e) => ToolResult::Err(format!("write task failed: {e}")),
@@ -869,15 +903,11 @@ impl Tool for EditFileTool {
             if old.is_empty() {
                 return ToolResult::Err("edit_file \"old\" must not be empty".to_string());
             }
-            if let Err(e) = ensure_valid_profile(&ctx.profile) {
-                return ToolResult::Err(e);
-            }
-            let ws = profile_workspace_path(&self.root, &ctx.profile);
-            let _ = tokio::fs::create_dir_all(&ws).await;
-            let ws_canon = match tokio::fs::canonicalize(&ws).await {
+            let ws = match profile_workspace_root(&self.root, &ctx.profile) {
                 Ok(v) => v,
-                Err(e) => return ToolResult::Err(format!("workspace root unavailable: {e}")),
+                Err(e) => return ToolResult::Err(e),
             };
+            let _ = tokio::fs::create_dir_all(&ws).await;
             let resolved = match resolve_within_async(ws.clone(), path.clone()).await {
                 Ok(v) => v,
                 Err(e) => return ToolResult::Err(e),
@@ -889,15 +919,10 @@ impl Tool for EditFileTool {
                     ));
                 }
             }
-            let (mut file, _real_path) = match open_verified(&resolved, &ws_canon) {
+            let content = match tokio::fs::read_to_string(&resolved).await {
                 Ok(v) => v,
-                Err(e) => return ToolResult::Err(format!("cannot access '{path}': {e}")),
+                Err(e) => return ToolResult::Err(format!("read '{path}': {e} (not UTF-8 text?)")),
             };
-            use std::io::Read;
-            let mut content = String::new();
-            if let Err(e) = file.by_ref().take(MAX_WRITE_BYTES as u64 + 1).read_to_string(&mut content) {
-                return ToolResult::Err(format!("read '{path}': {e} (not UTF-8 text?)"));
-            }
             let count = content.matches(&old).count();
             if count == 0 {
                 return ToolResult::Err(format!("edit_file: \"old\" not found in '{path}'"));
@@ -917,7 +942,9 @@ impl Tool for EditFileTool {
             let resolved2 = resolved.clone();
             let updated2 = updated.clone();
             match tokio::task::spawn_blocking(move || atomic_write(&resolved2, &updated2)).await {
-                Ok(Ok(())) => ToolResult::Ok(json!({"path": path, "replaced": 1, "bytes": updated.len()})),
+                Ok(Ok(())) => {
+                    ToolResult::Ok(json!({"path": path, "replaced": 1, "bytes": updated.len()}))
+                }
                 Ok(Err(e)) => ToolResult::Err(format!("write '{path}': {e}")),
                 Err(e) => ToolResult::Err(format!("edit write task failed: {e}")),
             }
@@ -964,35 +991,20 @@ impl Tool for DeleteFileTool {
             let Some(path) = arg_str(&input, "path").map(String::from) else {
                 return ToolResult::Err("delete_file requires a string \"path\" arg".to_string());
             };
-            if let Err(e) = ensure_valid_profile(&ctx.profile) {
-                return ToolResult::Err(e);
-            }
-            let ws = profile_workspace_path(&self.root, &ctx.profile);
-            let _ = tokio::fs::create_dir_all(&ws).await;
-            let ws_canon = match tokio::fs::canonicalize(&ws).await {
+            let ws = match profile_workspace_root(&self.root, &ctx.profile) {
                 Ok(v) => v,
-                Err(e) => return ToolResult::Err(format!("workspace root unavailable: {e}")),
+                Err(e) => return ToolResult::Err(e),
             };
+            let _ = tokio::fs::create_dir_all(&ws).await;
             let resolved = match resolve_within_async(ws.clone(), path.clone()).await {
                 Ok(v) => v,
                 Err(e) => return ToolResult::Err(e),
             };
-            let parent = resolved.parent().unwrap_or(&resolved);
-            let parent_file = match std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-                .open(parent) {
-                Ok(f) => f,
-                Err(e) => return ToolResult::Err(format!("open parent directory: {e}")),
-            };
-            let parent_real = match fd_realpath(parent_file.as_raw_fd()) {
-                Ok(p) => p,
-                Err(e) => return ToolResult::Err(format!("verify parent: {e}")),
-            };
-            if !parent_real.starts_with(&ws_canon) {
-                return ToolResult::Err(format!("'{path}' escaped the workspace"));
-            }
-            if resolved.is_dir() {
+            if tokio::fs::metadata(&resolved)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
                 return ToolResult::Err(format!(
                     "'{path}' is a directory — delete_file only removes files"
                 ));
@@ -1100,8 +1112,10 @@ mod tests {
         match tool.run(input, &ctx()).await {
             ToolResult::Ok(v) => {
                 let entries = v["entries"].as_array().unwrap();
-                let names: Vec<&str> =
-                    entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+                let names: Vec<&str> = entries
+                    .iter()
+                    .map(|e| e["name"].as_str().unwrap())
+                    .collect();
                 assert!(names.contains(&"hello.txt"));
                 assert!(names.contains(&"sub"));
             }
@@ -1118,7 +1132,9 @@ mod tests {
             ToolResult::Ok(v) => {
                 let matches = v["matches"].as_array().unwrap();
                 assert!(
-                    matches.iter().any(|m| m["path"].as_str() == Some("sub/notes.md")),
+                    matches
+                        .iter()
+                        .any(|m| m["path"].as_str() == Some("sub/notes.md")),
                     "expected a content hit in sub/notes.md, got {matches:?}"
                 );
             }
@@ -1134,7 +1150,10 @@ mod tests {
         let tool = WriteFileTool::new(&root);
 
         let out = tool
-            .run(ToolInput::new(json!({"path": "new.txt", "content": "first"})), &ctx())
+            .run(
+                ToolInput::new(json!({"path": "new.txt", "content": "first"})),
+                &ctx(),
+            )
             .await;
         match out {
             ToolResult::Ok(v) => {
@@ -1143,16 +1162,25 @@ mod tests {
             }
             ToolResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
-        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "first");
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "first"
+        );
 
         let out2 = tool
-            .run(ToolInput::new(json!({"path": "new.txt", "content": "second!"})), &ctx())
+            .run(
+                ToolInput::new(json!({"path": "new.txt", "content": "second!"})),
+                &ctx(),
+            )
             .await;
         assert!(
             matches!(out2, ToolResult::Ok(ref v) if v["created"] == false),
             "overwrite should report created=false, got {out2:?}"
         );
-        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "second!");
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "second!"
+        );
     }
 
     #[tokio::test]
@@ -1160,9 +1188,15 @@ mod tests {
         let root = workspace();
         let tool = WriteFileTool::new(&root);
         let out = tool
-            .run(ToolInput::new(json!({"path": "../evil.txt", "content": "x"})), &ctx())
+            .run(
+                ToolInput::new(json!({"path": "../evil.txt", "content": "x"})),
+                &ctx(),
+            )
             .await;
-        assert!(matches!(out, ToolResult::Err(_)), "escape must be rejected, got {out:?}");
+        assert!(
+            matches!(out, ToolResult::Err(_)),
+            "escape must be rejected, got {out:?}"
+        );
         assert!(
             !root.parent().unwrap().join("evil.txt").exists(),
             "nothing may be written outside the workspace"
@@ -1175,7 +1209,9 @@ mod tests {
         let tool = EditFileTool::new(&root);
         let out = tool
             .run(
-                ToolInput::new(json!({"path": "hello.txt", "old": "second line", "new": "SECOND LINE"})),
+                ToolInput::new(
+                    json!({"path": "hello.txt", "old": "second line", "new": "SECOND LINE"}),
+                ),
                 &ctx(),
             )
             .await;
@@ -1192,7 +1228,10 @@ mod tests {
         let tool = EditFileTool::new(&root);
 
         let miss = tool
-            .run(ToolInput::new(json!({"path": "hello.txt", "old": "nope", "new": "x"})), &ctx())
+            .run(
+                ToolInput::new(json!({"path": "hello.txt", "old": "nope", "new": "x"})),
+                &ctx(),
+            )
             .await;
         assert!(
             matches!(miss, ToolResult::Err(ref e) if e.contains("not found")),
@@ -1201,7 +1240,10 @@ mod tests {
 
         // "l" occurs many times → ambiguous, must refuse.
         let ambig = tool
-            .run(ToolInput::new(json!({"path": "hello.txt", "old": "l", "new": "L"})), &ctx())
+            .run(
+                ToolInput::new(json!({"path": "hello.txt", "old": "l", "new": "L"})),
+                &ctx(),
+            )
             .await;
         assert!(
             matches!(ambig, ToolResult::Err(ref e) if e.contains("occurs")),
@@ -1219,12 +1261,19 @@ mod tests {
         let root = workspace();
         let tool = DeleteFileTool::new(&root);
 
-        let ok = tool.run(ToolInput::new(json!({"path": "hello.txt"})), &ctx()).await;
+        let ok = tool
+            .run(ToolInput::new(json!({"path": "hello.txt"})), &ctx())
+            .await;
         assert!(matches!(ok, ToolResult::Ok(_)), "expected Ok, got {ok:?}");
         assert!(!root.join("hello.txt").exists());
 
-        let dir = tool.run(ToolInput::new(json!({"path": "sub"})), &ctx()).await;
-        assert!(matches!(dir, ToolResult::Err(_)), "deleting a directory must be refused");
+        let dir = tool
+            .run(ToolInput::new(json!({"path": "sub"})), &ctx())
+            .await;
+        assert!(
+            matches!(dir, ToolResult::Err(_)),
+            "deleting a directory must be refused"
+        );
         assert!(root.join("sub").exists(), "the directory must survive");
     }
 
@@ -1240,16 +1289,25 @@ mod tests {
 
         let tool = WriteFileTool::new(&root);
         let out = tool
-            .run(ToolInput::new(json!({"path": "link.txt", "content": "new stuff"})), &ctx())
+            .run(
+                ToolInput::new(json!({"path": "link.txt", "content": "new stuff"})),
+                &ctx(),
+            )
             .await;
         assert!(
             matches!(out, ToolResult::Err(ref e) if e.contains("symlink")),
             "writing through a symlink must be refused, got {out:?}"
         );
         // The real file is untouched and the link is still a link.
-        assert_eq!(std::fs::read_to_string(root.join("real.txt")).unwrap(), "original");
+        assert_eq!(
+            std::fs::read_to_string(root.join("real.txt")).unwrap(),
+            "original"
+        );
         assert!(
-            std::fs::symlink_metadata(root.join("link.txt")).unwrap().file_type().is_symlink(),
+            std::fs::symlink_metadata(root.join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "the symlink must survive"
         );
     }
@@ -1271,7 +1329,10 @@ mod tests {
         let ctx = tracked_ctx();
         // hello.txt exists and has NOT been read this conversation.
         let out = WriteFileTool::new(&root)
-            .run(ToolInput::new(json!({"path": "hello.txt", "content": "clobber"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "hello.txt", "content": "clobber"})),
+                &ctx,
+            )
             .await;
         assert!(
             matches!(out, ToolResult::Err(ref e) if e.contains("read_file it first")),
@@ -1292,10 +1353,19 @@ mod tests {
             .run(ToolInput::new(json!({"path": "hello.txt"})), &ctx)
             .await;
         let out = WriteFileTool::new(&root)
-            .run(ToolInput::new(json!({"path": "hello.txt", "content": "updated"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "hello.txt", "content": "updated"})),
+                &ctx,
+            )
             .await;
-        assert!(matches!(out, ToolResult::Ok(_)), "read→write must be allowed, got {out:?}");
-        assert_eq!(std::fs::read_to_string(root.join("hello.txt")).unwrap(), "updated");
+        assert!(
+            matches!(out, ToolResult::Ok(_)),
+            "read→write must be allowed, got {out:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+            "updated"
+        );
     }
 
     #[tokio::test]
@@ -1304,13 +1374,19 @@ mod tests {
         let ctx = tracked_ctx();
         // brand_new.txt does not exist → exempt from the guard.
         let out = WriteFileTool::new(&root)
-            .run(ToolInput::new(json!({"path": "brand_new.txt", "content": "hi"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "brand_new.txt", "content": "hi"})),
+                &ctx,
+            )
             .await;
         assert!(
             matches!(out, ToolResult::Ok(ref v) if v["created"] == true),
             "a new file is exempt from read-before-write, got {out:?}"
         );
-        assert_eq!(std::fs::read_to_string(root.join("brand_new.txt")).unwrap(), "hi");
+        assert_eq!(
+            std::fs::read_to_string(root.join("brand_new.txt")).unwrap(),
+            "hi"
+        );
     }
 
     #[tokio::test]
@@ -1321,7 +1397,10 @@ mod tests {
 
         // Blind edit → refused, file untouched.
         let refused = edit
-            .run(ToolInput::new(json!({"path": "hello.txt", "old": "second line", "new": "X"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "hello.txt", "old": "second line", "new": "X"})),
+                &ctx,
+            )
             .await;
         assert!(
             matches!(refused, ToolResult::Err(ref e) if e.contains("read_file it first")),
@@ -1337,10 +1416,19 @@ mod tests {
             .run(ToolInput::new(json!({"path": "hello.txt"})), &ctx)
             .await;
         let ok = edit
-            .run(ToolInput::new(json!({"path": "hello.txt", "old": "second line", "new": "X"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "hello.txt", "old": "second line", "new": "X"})),
+                &ctx,
+            )
             .await;
-        assert!(matches!(ok, ToolResult::Ok(_)), "read→edit must be allowed, got {ok:?}");
-        assert_eq!(std::fs::read_to_string(root.join("hello.txt")).unwrap(), "hello world\nX\n");
+        assert!(
+            matches!(ok, ToolResult::Ok(_)),
+            "read→edit must be allowed, got {ok:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+            "hello world\nX\n"
+        );
     }
 
     #[tokio::test]
@@ -1350,9 +1438,15 @@ mod tests {
         // is why the other fs tests using ctx() aren't affected by the guard.
         let root = workspace();
         let out = WriteFileTool::new(&root)
-            .run(ToolInput::new(json!({"path": "hello.txt", "content": "z"})), &ctx())
+            .run(
+                ToolInput::new(json!({"path": "hello.txt", "content": "z"})),
+                &ctx(),
+            )
             .await;
-        assert!(matches!(out, ToolResult::Ok(_)), "no read-set → guard inert, got {out:?}");
+        assert!(
+            matches!(out, ToolResult::Ok(_)),
+            "no read-set → guard inert, got {out:?}"
+        );
     }
 
     // ── read-before-write: review regressions ────────────────────────────
@@ -1384,9 +1478,15 @@ mod tests {
         let read = ReadFileTool::new(&root)
             .run(ToolInput::new(json!({"path": "report.txt"})), &ctx)
             .await;
-        assert!(matches!(read, ToolResult::Ok(_)), "lowercase read should succeed here, got {read:?}");
+        assert!(
+            matches!(read, ToolResult::Ok(_)),
+            "lowercase read should succeed here, got {read:?}"
+        );
         let write = WriteFileTool::new(&root)
-            .run(ToolInput::new(json!({"path": "report.txt", "content": "new"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "report.txt", "content": "new"})),
+                &ctx,
+            )
             .await;
         assert!(
             matches!(write, ToolResult::Ok(_)),
@@ -1402,17 +1502,29 @@ mod tests {
         let ctx = tracked_ctx();
         let tool = WriteFileTool::new(&root);
         let first = tool
-            .run(ToolInput::new(json!({"path": "fresh.txt", "content": "a"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "fresh.txt", "content": "a"})),
+                &ctx,
+            )
             .await;
-        assert!(matches!(first, ToolResult::Ok(ref v) if v["created"] == true), "create, got {first:?}");
+        assert!(
+            matches!(first, ToolResult::Ok(ref v) if v["created"] == true),
+            "create, got {first:?}"
+        );
         let second = tool
-            .run(ToolInput::new(json!({"path": "fresh.txt", "content": "b"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "fresh.txt", "content": "b"})),
+                &ctx,
+            )
             .await;
         assert!(
             matches!(second, ToolResult::Ok(_)),
             "overwriting a just-created file must be allowed, got {second:?}"
         );
-        assert_eq!(std::fs::read_to_string(root.join("fresh.txt")).unwrap(), "b");
+        assert_eq!(
+            std::fs::read_to_string(root.join("fresh.txt")).unwrap(),
+            "b"
+        );
     }
 
     #[tokio::test]
@@ -1425,10 +1537,19 @@ mod tests {
             .run(ToolInput::new(json!({"path": "sub/notes.md"})), &ctx)
             .await;
         let out = WriteFileTool::new(&root)
-            .run(ToolInput::new(json!({"path": "sub/notes.md", "content": "rewritten"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "sub/notes.md", "content": "rewritten"})),
+                &ctx,
+            )
             .await;
-        assert!(matches!(out, ToolResult::Ok(_)), "read→write in a subdir must be allowed, got {out:?}");
-        assert_eq!(std::fs::read_to_string(root.join("sub/notes.md")).unwrap(), "rewritten");
+        assert!(
+            matches!(out, ToolResult::Ok(_)),
+            "read→write in a subdir must be allowed, got {out:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/notes.md")).unwrap(),
+            "rewritten"
+        );
     }
 
     #[tokio::test]
@@ -1442,9 +1563,15 @@ mod tests {
         let read = ReadFileTool::new(&root)
             .run(ToolInput::new(json!({"path": "big.txt"})), &ctx)
             .await;
-        assert!(matches!(read, ToolResult::Ok(_)), "a <=1MiB file must be readable, got {read:?}");
+        assert!(
+            matches!(read, ToolResult::Ok(_)),
+            "a <=1MiB file must be readable, got {read:?}"
+        );
         let write = WriteFileTool::new(&root)
-            .run(ToolInput::new(json!({"path": "big.txt", "content": "small"})), &ctx)
+            .run(
+                ToolInput::new(json!({"path": "big.txt", "content": "small"})),
+                &ctx,
+            )
             .await;
         assert!(
             matches!(write, ToolResult::Ok(_)),
@@ -1455,52 +1582,101 @@ mod tests {
     // ── Tier-P: per-profile filesystem confinement ───────────────────────────
 
     #[test]
-    fn profile_workspace_path_is_traversal_safe() {
-        let base = std::path::Path::new("/ws");
-        // A simple identifier gets its own subdir.
-        assert_eq!(profile_workspace_path(base, "work"), base.join("work"));
-        assert_eq!(profile_workspace_path(base, "profile_2-a"), base.join("profile_2-a"));
-        // ONLY the empty string collapses to the shared base (the default/
-        // scratch ctx, which open_profile also rejects). Nothing else does.
-        assert_eq!(profile_workspace_path(base, ""), base.to_path_buf());
-        // A name `open_profile` ALSO accepts — a space, Unicode, or punctuation
-        // that isn't a path separator — must get its OWN verbatim subdir, NOT
-        // collapse to base. Otherwise two distinct real profiles would silently
-        // share one tree (the isolation hole an allowlist would open).
-        assert_eq!(profile_workspace_path(base, "my work"), base.join("my work"));
-        assert_eq!(profile_workspace_path(base, "café"), base.join("café"));
-        assert_eq!(profile_workspace_path(base, "work@home"), base.join("work@home"));
-        // Distinct valid names never map onto the same tree.
-        assert_ne!(
-            profile_workspace_path(base, "my work"),
-            profile_workspace_path(base, "personal space"),
+    fn profile_scope_mirrors_storage_and_fails_closed() {
+        // A name `validate_profile_name` accepts gets its own subdir, lowercased
+        // exactly the way `open_profile` folds its cache key + `<name>.db`.
+        assert_eq!(
+            profile_scope("work"),
+            Ok(ProfileScope::Subdir("work".into()))
         );
-        // REGRESSION (adversarial review, HIGH): the helper must NOT trim. Since
-        // open_profile does not trim, `" work"`, `"work "`, and `"work"` are
-        // THREE distinct profiles (each its own profiles/<name>.db) — they must
-        // map to THREE distinct trees, never collide onto base/work. And a
-        // whitespace-only name (a distinct profile per open_profile) must get its
-        // own subdir, never collapse to base itself (which would expose every
-        // sibling profile's tree through an ordinary relative path).
-        assert_eq!(profile_workspace_path(base, " work"), base.join(" work"));
-        assert_eq!(profile_workspace_path(base, "work "), base.join("work "));
-        assert_ne!(profile_workspace_path(base, " work"), profile_workspace_path(base, "work"));
-        assert_ne!(profile_workspace_path(base, "work "), profile_workspace_path(base, "work"));
-        assert_ne!(profile_workspace_path(base, " work"), profile_workspace_path(base, "work "));
-        assert_ne!(profile_workspace_path(base, "   "), base.to_path_buf());
-        assert_eq!(profile_workspace_path(base, "   "), base.join("   "));
-        // The path-escaping forms `open_profile` rejects (`/`, `\`, `..`, a
-        // leading `.`) collapse to base fail-safe — never a climb-out.
-        for evil in ["..", "../etc", "a/b", "a\\b", ".", "  ..  ", ".hidden", "sub/../.."] {
-            assert_eq!(
-                profile_workspace_path(base, evil),
-                base.to_path_buf(),
-                "an escaping profile {evil:?} must collapse to base, never escape it"
+        assert_eq!(
+            profile_scope("profile_2-a"),
+            Ok(ProfileScope::Subdir("profile_2-a".into()))
+        );
+        assert_eq!(
+            profile_scope("Work"),
+            Ok(ProfileScope::Subdir("work".into()))
+        );
+        // The case fold is load-bearing on a case-insensitive FS: `Work` and
+        // `work` are ONE DB, so they must be ONE tree.
+        assert_eq!(profile_scope("WORK"), profile_scope("work"));
+
+        // The ONLY name that resolves to the shared base is the empty string —
+        // the default/scratch ExecCtx, which `open_profile` also rejects, so it
+        // can never alias a real profile.
+        assert_eq!(profile_scope(""), Ok(ProfileScope::SharedBase));
+
+        // Everything `validate_profile_name` rejects is an ERROR here, never a
+        // path. This is the fail-closed half of M-03: a name storage will not
+        // open a DB for must not be handed a filesystem tree either — and an
+        // escaping form must not silently collapse onto the shared base, where
+        // it would see every sibling profile's subtree by relative path.
+        for bad in [
+            "..",
+            "../etc",
+            "a/b",
+            "a\\b",
+            ".",
+            "  ..  ",
+            ".hidden",
+            "sub/../..",
+            "~",
+            ".ssh",
+            "my work",
+            "café",
+            "work@home",
+            " work",
+            "work ",
+            "   ",
+            "wo\trk",
+            "work\0",
+        ] {
+            assert!(
+                profile_scope(bad).is_err(),
+                "profile {bad:?} must be rejected, got {:?}",
+                profile_scope(bad)
             );
         }
-        // Core invariant: the result is NEVER outside base — it is either base
-        // itself or a direct (non-`..`) child of it, for every input.
-        for name in ["work", "my work", "café", "..", "a/b", "", "~", ".ssh", "work@home", " work", "   "] {
+        assert!(
+            profile_scope(&"a".repeat(65)).is_err(),
+            "over the 64-char cap"
+        );
+        assert!(
+            profile_scope(&"a".repeat(64)).is_ok(),
+            "exactly at the cap is fine"
+        );
+
+        // And the fail-closed root refuses to produce a path at all for those.
+        let base = std::path::Path::new("/ws");
+        assert_eq!(profile_workspace_root(base, "work"), Ok(base.join("work")));
+        assert_eq!(profile_workspace_root(base, ""), Ok(base.to_path_buf()));
+        assert!(profile_workspace_root(base, "../etc").is_err());
+        assert!(profile_workspace_root(base, "my work").is_err());
+        // No sentinel directory is ever invented for a bad name.
+        for bad in ["..", "a/b", "my work", "   "] {
+            let got = profile_workspace_root(base, bad);
+            assert!(
+                got.is_err(),
+                "profile {bad:?} → {got:?} must be an error, not a path"
+            );
+        }
+
+        // The infallible peek stays inside base for EVERY input: it is either
+        // base itself or a direct (non-`..`) child of it.
+        for name in [
+            "work",
+            "Work",
+            "my work",
+            "café",
+            "..",
+            "a/b",
+            "",
+            "~",
+            ".ssh",
+            "work@home",
+            " work",
+            "   ",
+        ] {
             let got = profile_workspace_path(base, name);
             assert!(
                 got == base || got.parent() == Some(base),
@@ -1524,11 +1700,17 @@ mod tests {
                 &profile_ctx("work"),
             )
             .await;
-        assert!(matches!(w, ToolResult::Ok(_)), "work write should succeed, got {w:?}");
+        assert!(
+            matches!(w, ToolResult::Ok(_)),
+            "work write should succeed, got {w:?}"
+        );
 
         // `personal` reading the SAME relative path must NOT see work's file.
         let cross = read
-            .run(ToolInput::new(json!({"path": "secret.txt"})), &profile_ctx("personal"))
+            .run(
+                ToolInput::new(json!({"path": "secret.txt"})),
+                &profile_ctx("personal"),
+            )
             .await;
         assert!(
             matches!(cross, ToolResult::Err(_)),
@@ -1537,7 +1719,10 @@ mod tests {
 
         // `work` reading its own file back does see it.
         let own = read
-            .run(ToolInput::new(json!({"path": "secret.txt"})), &profile_ctx("work"))
+            .run(
+                ToolInput::new(json!({"path": "secret.txt"})),
+                &profile_ctx("work"),
+            )
             .await;
         assert!(
             matches!(own, ToolResult::Ok(ref v) if v["content"] == "work-only"),
@@ -1584,6 +1769,108 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_invalid_profile_is_refused_by_every_tool_and_never_becomes_a_path() {
+        // M-03 fail-closed. A profile string `validate_profile_name` rejects must
+        // make every fs tool ERROR, not resolve. The two ways this has been got
+        // wrong before are both asserted against below:
+        //   1. collapsing to the shared base — the bad profile would then read
+        //      and CLOBBER the base tree (every sibling profile's parent);
+        //   2. inventing a `base/__invalid_profile__` sentinel — which turns a
+        //      validation failure into a real directory on disk.
+        let root = workspace();
+        for bad in ["..", "a/b", " work", "my work", ".hidden"] {
+            let bad_ctx = profile_ctx(bad);
+
+            let w = WriteFileTool::new(&root)
+                .run(
+                    ToolInput::new(json!({"path": "planted.txt", "content": "x"})),
+                    &bad_ctx,
+                )
+                .await;
+            assert!(
+                matches!(w, ToolResult::Err(ref e) if e.contains("invalid profile name")),
+                "write_file under profile {bad:?} must be refused, got {w:?}"
+            );
+
+            let r = ReadFileTool::new(&root)
+                .run(ToolInput::new(json!({"path": "hello.txt"})), &bad_ctx)
+                .await;
+            assert!(
+                matches!(r, ToolResult::Err(ref e) if e.contains("invalid profile name")),
+                "read_file under profile {bad:?} must be refused, got {r:?}"
+            );
+
+            let l = ListDirTool::new(&root)
+                .run(ToolInput::new(json!({"path": "."})), &bad_ctx)
+                .await;
+            assert!(
+                matches!(l, ToolResult::Err(ref e) if e.contains("invalid profile name")),
+                "list_dir under profile {bad:?} must be refused, got {l:?}"
+            );
+
+            let s = SearchFilesTool::new(&root)
+                .run(ToolInput::new(json!({"query": "needle"})), &bad_ctx)
+                .await;
+            assert!(
+                matches!(s, ToolResult::Err(ref e) if e.contains("invalid profile name")),
+                "search_files under profile {bad:?} must be refused, got {s:?}"
+            );
+
+            let ed = EditFileTool::new(&root)
+                .run(
+                    ToolInput::new(
+                        json!({"path": "hello.txt", "old": "second line", "new": "PWNED"}),
+                    ),
+                    &bad_ctx,
+                )
+                .await;
+            assert!(
+                matches!(ed, ToolResult::Err(ref e) if e.contains("invalid profile name")),
+                "edit_file under profile {bad:?} must be refused, got {ed:?}"
+            );
+
+            let d = DeleteFileTool::new(&root)
+                .run(ToolInput::new(json!({"path": "hello.txt"})), &bad_ctx)
+                .await;
+            assert!(
+                matches!(d, ToolResult::Err(ref e) if e.contains("invalid profile name")),
+                "delete_file under profile {bad:?} must be refused, got {d:?}"
+            );
+        }
+
+        // Nothing was written, read-through, deleted, or created anywhere.
+        assert!(
+            !root.join("planted.txt").exists(),
+            "a rejected profile must not write at the shared base"
+        );
+        assert!(
+            !root.join("__invalid_profile__").exists(),
+            "no sentinel directory may be invented for a rejected profile"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+            "hello world\nsecond line\n",
+            "a rejected profile must neither edit nor delete the base tree"
+        );
+        // No stray per-profile directory appeared for any of the bad names.
+        let top: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let mut unexpected: Vec<&String> = top
+            .iter()
+            .filter(|n| !matches!(n.as_str(), "hello.txt" | "sub"))
+            .collect();
+        unexpected.sort();
+        assert!(
+            unexpected.is_empty(),
+            "a rejected profile created something on disk: {unexpected:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── Tier-P: legacy-workspace migration ───────────────────────────────────
 
     #[tokio::test]
@@ -1597,16 +1884,31 @@ mod tests {
 
         // The loose file is physically moved under personal/, not deleted.
         assert!(ws.join("personal").join("hello.txt").is_file());
-        assert!(!ws.join("hello.txt").exists(), "the legacy file must be MOVED, not copied");
+        assert!(
+            !ws.join("hello.txt").exists(),
+            "the legacy file must be MOVED, not copied"
+        );
         // The directory is left intact in place — NOT moved into personal.
-        assert!(ws.join("sub").join("notes.md").is_file(), "a legacy dir stays put, data intact");
-        assert!(!ws.join("personal").join("sub").exists(), "a directory is never moved");
-        assert!(ws.join(LEGACY_MIGRATION_MARKER).is_file(), "marker recorded");
+        assert!(
+            ws.join("sub").join("notes.md").is_file(),
+            "a legacy dir stays put, data intact"
+        );
+        assert!(
+            !ws.join("personal").join("sub").exists(),
+            "a directory is never moved"
+        );
+        assert!(
+            ws.join(LEGACY_MIGRATION_MARKER).is_file(),
+            "marker recorded"
+        );
 
         // The default ("personal") profile can now read its migrated file.
         let read = ReadFileTool::new(&ws);
         let out = read
-            .run(ToolInput::new(json!({"path": "hello.txt"})), &profile_ctx("personal"))
+            .run(
+                ToolInput::new(json!({"path": "hello.txt"})),
+                &profile_ctx("personal"),
+            )
             .await;
         assert!(
             matches!(out, ToolResult::Ok(ref v) if v["content"] == "hello world\nsecond line\n"),
@@ -1626,8 +1928,14 @@ mod tests {
         std::fs::write(ws.join("work").join("w.txt"), "work-file").unwrap();
         migrate_legacy_workspace(&ws, "personal").unwrap(); // second run: no-op
 
-        assert!(ws.join("post_upgrade.txt").is_file(), "a post-migration base file stays put");
-        assert!(ws.join("work").join("w.txt").is_file(), "a fresh profile subtree is untouched");
+        assert!(
+            ws.join("post_upgrade.txt").is_file(),
+            "a post-migration base file stays put"
+        );
+        assert!(
+            ws.join("work").join("w.txt").is_file(),
+            "a fresh profile subtree is untouched"
+        );
         assert!(!ws.join("personal").join("post_upgrade.txt").exists());
         assert!(!ws.join("personal").join("work").exists());
     }
@@ -1639,7 +1947,10 @@ mod tests {
         let base = std::env::temp_dir().join(format!("lhp-fs-fresh-{}", uuid::Uuid::new_v4()));
         migrate_legacy_workspace(&base, "personal").unwrap();
         assert!(base.join(LEGACY_MIGRATION_MARKER).is_file());
-        assert!(!base.join("personal").exists(), "nothing to migrate → no default subtree forced");
+        assert!(
+            !base.join("personal").exists(),
+            "nothing to migrate → no default subtree forced"
+        );
         let _ = std::fs::remove_dir_all(&base);
 
         // Clobber-safety: a destination entry already present is left in place.
@@ -1653,7 +1964,10 @@ mod tests {
             "DEST",
             "an existing destination entry must never be clobbered"
         );
-        assert!(ws.join("dup.txt").is_file(), "the un-migratable legacy entry is left in place, not lost");
+        assert!(
+            ws.join("dup.txt").is_file(),
+            "the un-migratable legacy entry is left in place, not lost"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -1683,11 +1997,23 @@ mod tests {
             "work-only",
             "an orphaned/live profile tree must never be swept, even with no known-profile signal"
         );
-        assert!(!ws.join("personal").join("work").exists(), "work dir must not be nested under personal");
-        assert!(ws.join("project").join("main.rs").is_file(), "a legacy subdir stays put, data intact");
-        assert!(!ws.join("personal").join("project").exists(), "no directory is ever moved");
+        assert!(
+            !ws.join("personal").join("work").exists(),
+            "work dir must not be nested under personal"
+        );
+        assert!(
+            ws.join("project").join("main.rs").is_file(),
+            "a legacy subdir stays put, data intact"
+        );
+        assert!(
+            !ws.join("personal").join("project").exists(),
+            "no directory is ever moved"
+        );
         // The genuinely-loose legacy file DID migrate.
-        assert!(ws.join("personal").join("legacy_note.txt").is_file(), "loose legacy files still migrate");
+        assert!(
+            ws.join("personal").join("legacy_note.txt").is_file(),
+            "loose legacy files still migrate"
+        );
         assert!(!ws.join("legacy_note.txt").exists());
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -1705,15 +2031,27 @@ mod tests {
             ws.join("personal").join("work").is_file(),
             "a profile-named FILE is migrated into personal, not skipped"
         );
-        assert!(!ws.join("work").exists(), "workspace/work is freed, so the work profile can mkdir it");
+        assert!(
+            !ws.join("work").exists(),
+            "workspace/work is freed, so the work profile can mkdir it"
+        );
 
         // Proof there's no ENOTDIR breakage: the `work` profile now creates and
         // writes into its own fresh directory tree without error.
         let out = WriteFileTool::new(&ws)
-            .run(ToolInput::new(json!({"path": "note.txt", "content": "hi"})), &profile_ctx("work"))
+            .run(
+                ToolInput::new(json!({"path": "note.txt", "content": "hi"})),
+                &profile_ctx("work"),
+            )
             .await;
-        assert!(matches!(out, ToolResult::Ok(_)), "the work profile's tools must work, got {out:?}");
-        assert!(ws.join("work").join("note.txt").is_file(), "work now has a real directory tree");
+        assert!(
+            matches!(out, ToolResult::Ok(_)),
+            "the work profile's tools must work, got {out:?}"
+        );
+        assert!(
+            ws.join("work").join("note.txt").is_file(),
+            "work now has a real directory tree"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -1739,7 +2077,10 @@ mod tests {
         // And now it IS treated as done (idempotent second run).
         std::fs::write(ws.join("late.txt"), "post").unwrap();
         migrate_legacy_workspace(&ws, "personal").unwrap();
-        assert!(ws.join("late.txt").is_file(), "a valid marker now short-circuits");
+        assert!(
+            ws.join("late.txt").is_file(),
+            "a valid marker now short-circuits"
+        );
         assert!(!ws.join("personal").join("late.txt").exists());
     }
 
@@ -1771,7 +2112,10 @@ mod tests {
             "a dangling destination symlink must survive the migration untouched"
         );
         // The legacy file is left in place (collision), not lost.
-        assert!(ws.join("photos").is_file(), "the un-migratable legacy file stays put, not lost");
+        assert!(
+            ws.join("photos").is_file(),
+            "the un-migratable legacy file stays put, not lost"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
