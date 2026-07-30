@@ -14,15 +14,16 @@
 //!
 //! Atomicity note: skills + agent types live in `global.db` while cron jobs live
 //! in the active profile's DB — two separate SQLite files, so a pack that spans
-//! both cannot be ONE transaction. Each side gets its own: a failure anywhere in
-//! the global segment rolls back every skill + agent type, and a failure
-//! anywhere in the cron segment rolls back every cron job. The one remaining
-//! non-atomic point is the seam between the two commits — if the global segment
-//! commits and the cron segment then fails, [`install_pack`] returns `Err` (no
-//! [`InstallReport`] at all) with the skills + agent types committed and zero
-//! cron jobs. Everything a pack installs is inert by design (skills + agent
-//! types `Pending`, cron jobs disabled), so that residue is reviewable in
-//! Settings, never armed.
+//! both cannot be ONE transaction. Instead both transactions are held open at
+//! once and the global one commits LAST (see [`install_pack`]'s `# Atomicity`),
+//! so any *error* — including a cron failure — rolls both back and a failed
+//! install lands nothing. The residual is not an error path but a *crash* in the
+//! one-`commit()`-wide window between the two commits, which could leave the
+//! cron jobs durable without the global rows. Everything a pack installs is
+//! inert by design (skills + agent types `Pending`, cron jobs disabled), so even
+//! that residue is reviewable in Settings, never armed. Note that a failing
+//! [`install_pack`] returns `Err` and no [`InstallReport`] — there is no
+//! partial-report path.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -317,14 +318,32 @@ fn check_list(
 /// is the caller's timestamp. Returns what landed.
 ///
 /// # Atomicity
-/// Two transactions, one per database. Skills + agent types are inserted in a
-/// single SQLite transaction on `global.db`; cron jobs in a single transaction
-/// on the profile's DB. A failure inside either segment rolls that whole segment
-/// back. The two files cannot share one transaction, so the seam between the
-/// commits is the one non-atomic point: if the cron segment fails after the
-/// global segment committed, this returns `Err` and the (inert) skills + agent
-/// types stay. The profile DB is opened *before* the global transaction starts,
-/// so a missing/invalid profile is caught before any mutation at all.
+/// Two transactions, one per database — `global.db` (skills + agent types) and
+/// the profile DB (cron jobs) are separate SQLite files, so they cannot share
+/// one transaction. Both transactions are opened BEFORE either commits, and the
+/// global one commits LAST:
+///
+/// 1. open the global transaction, insert skills + agent types;
+/// 2. open the cron transaction, insert the cron jobs;
+/// 3. commit cron;
+/// 4. commit global.
+///
+/// Any error at steps 1–3 propagates with the global transaction still open, so
+/// it rolls back on drop: a failed `install_pack` lands NOTHING in either file.
+/// The profile DB is also opened before step 1, so a missing/invalid profile is
+/// caught before any mutation at all.
+///
+/// The irreducible residual is a crash (process kill, power loss) in the window
+/// between the two commits at steps 3 and 4 — the cron jobs would be durable
+/// while the skills + agent types were not. Closing that would need a
+/// distributed commit protocol across the two files; it is not closed here. The
+/// window is one `commit()` call wide, and everything a pack installs is inert
+/// (skills/agent types `Pending`, cron jobs disabled), so the worst outcome is
+/// orphaned disabled cron jobs the user can delete in Settings.
+///
+/// Lock note: this is the only place that holds a `global.raw()` guard and a
+/// profile `raw()` guard at the same time, and it always takes global first, so
+/// there is no lock-order cycle to deadlock against.
 pub fn install_pack(
     storage: &Storage,
     profile: &str,
@@ -349,10 +368,19 @@ pub fn install_pack(
     let agent_types_count = pack.agent_types.len();
 
     // ── Global DB (skills + agent types) — atomic transaction ────────────────
-    if skills_count > 0 || agent_types_count > 0 {
-        let mut conn = global.raw();
-        let tx = conn.transaction()?;
+    // Opened here and committed LAST (after the cron transaction commits), so
+    // that a cron failure rolls this back instead of stranding half a pack.
+    let mut global_conn = if skills_count > 0 || agent_types_count > 0 {
+        Some(global.raw())
+    } else {
+        None
+    };
+    let mut global_tx = match global_conn.as_mut() {
+        Some(conn) => Some(conn.transaction()?),
+        None => None,
+    };
 
+    if let Some(tx) = global_tx.as_ref() {
         for s in &pack.skills {
             let caps_json =
                 serde_json::to_string(&s.capabilities_required).unwrap_or_else(|_| "[]".into());
@@ -404,16 +432,14 @@ pub fn install_pack(
                 ],
             )?;
         }
-
-        tx.commit()?;
     }
 
     // ── Profile DB (cron jobs) — its own atomic transaction ──────────────────
-    // A separate SQLite file, so this cannot join the global transaction above.
-    // It still gets a transaction of its own: a failure part-way through the
-    // loop must not leave half a pack's cron jobs behind. Raw SQL (rather than
-    // `insert_cron_job`) because the guard from `raw()` holds the connection
-    // mutex — calling another locking method here would deadlock.
+    // A separate SQLite file, so this cannot join the global transaction, which
+    // is still OPEN and unflushed at this point. If anything below fails, `?`
+    // returns and `global_tx` rolls back on drop — nothing lands anywhere. Raw
+    // SQL (rather than `insert_cron_job`) because the guard from `raw()` holds
+    // the connection mutex — calling another locking method here would deadlock.
     if let Some(db) = profile_db {
         if !pack.cron_jobs.is_empty() {
             let mut conn = db.raw();
@@ -439,6 +465,12 @@ pub fn install_pack(
             }
             tx.commit()?;
         }
+    }
+
+    // Global commits LAST. Everything above is already durable or already
+    // rolled back, so this is the only remaining failure point.
+    if let Some(tx) = global_tx.take() {
+        tx.commit()?;
     }
 
     Ok(InstallReport {
@@ -918,6 +950,74 @@ mod tests {
             db.list_cron_jobs().unwrap().len(),
             0,
             "the cron transaction must roll back the first job"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The reviewer's reproduction of M-13: a pack spanning BOTH databases where
+    /// the SECOND cron insert aborts. Under the old ordering (global commit
+    /// before the cron transaction opened) this left `skills=1, agent_types=1,
+    /// cron=0` committed while `install_pack` returned `Err` — a half-imported
+    /// pack. With the global commit moved after the cron commit, a cron failure
+    /// must roll the global segment back too, so NOTHING lands.
+    #[test]
+    fn a_cron_failure_rolls_back_the_global_rows_too() {
+        let (storage, root) = temp_storage();
+        let g = storage.global();
+        let db = storage.open_profile("personal").unwrap();
+
+        // Abort the SECOND cron insert only, so the first cron job — and, under
+        // the old ordering, an ALREADY-COMMITTED skill + agent type — precede it.
+        {
+            let conn = db.raw();
+            conn.execute_batch(
+                "CREATE TRIGGER packs_test_block_second_cron
+                 BEFORE INSERT ON cron_jobs WHEN NEW.name = 'Second job'
+                 BEGIN SELECT RAISE(ABORT, 'blocked by test trigger'); END;",
+            )
+            .unwrap();
+        }
+
+        let pack = Pack {
+            cron_jobs: vec![
+                PackCron {
+                    name: "First job".into(),
+                    prompt: "run the first job".into(),
+                    schedule: "0 2 * * *".into(),
+                },
+                PackCron {
+                    name: "Second job".into(),
+                    prompt: "run the second job".into(),
+                    schedule: "0 3 * * *".into(),
+                },
+            ],
+            ..sample_pack()
+        };
+        // The pack must actually span both DBs, or this proves nothing.
+        assert_eq!(pack.skills.len(), 1, "pack must carry a global skill");
+        assert_eq!(pack.agent_types.len(), 1, "pack must carry an agent type");
+
+        let err = install_pack(&storage, "personal", &pack, 100).unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by test trigger"),
+            "the failure must be the second cron insert, not an earlier bail: {err}"
+        );
+
+        // THE POINT: a failed import half-populates nothing.
+        assert_eq!(
+            g.list_skills().unwrap().len(),
+            0,
+            "a cron failure must roll back the pack's skills"
+        );
+        assert_eq!(
+            g.list_agent_types().unwrap().len(),
+            0,
+            "a cron failure must roll back the pack's agent types"
+        );
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            0,
+            "no cron job may survive the failed import"
         );
         let _ = std::fs::remove_dir_all(root);
     }
