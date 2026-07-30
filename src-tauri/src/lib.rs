@@ -1134,3 +1134,79 @@ fn build_tool_dispatcher(
         // work_items row before the effect (idempotency-keyed, crash-reconciled).
         .with_journal(Arc::new(journal_storage))
 }
+
+// ── C-01: the TOOL path must degrade with the message path ──────────────────
+
+/// This module exists for exactly one reason: `build_tool_dispatcher` builds the
+/// SECOND `PrivacyGate`, and before this packet it built it with
+/// `PrivacyGate::new(classifier)` — a fresh, never-degraded gate. So every tool
+/// call bypassed C-01's fail-closed rule while chat messages honoured it. The
+/// test drives the REAL dispatcher (real registry, real hook chain) rather than
+/// asserting on a constructor, so re-introducing the bug fails the suite.
+#[cfg(test)]
+mod tool_path_degraded_tests {
+    use std::sync::Arc;
+
+    use crate::agent::gate::Binding;
+    use crate::classifier::ClassifierHealth;
+    use crate::tools::calling::ToolCall;
+    use crate::tools::dispatch::ToolOutcome;
+    use crate::tools::ExecCtx;
+
+    fn dispatcher(health: Arc<ClassifierHealth>) -> (crate::tools::ToolDispatcher, std::path::PathBuf) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("lhp-tool-degraded-{}", uuid::Uuid::new_v4()));
+        let storage = crate::storage::Storage::open(&dir).expect("temp storage");
+        let d = super::build_tool_dispatcher(
+            &dir,
+            Arc::new(crate::classifier::RulesClassifier::new()),
+            health,
+            Arc::new(crate::hooks::ApprovalLedger::new()),
+            None,
+            storage,
+            None,
+            None,
+            None,
+            Arc::new(crate::models::ModelManager::new()),
+            Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
+            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+        );
+        (d, dir)
+    }
+
+    /// `system_status` is `RiskClass::Safe` (pre-trusted, no approval prompt) and
+    /// its args are benign, so the ONLY thing that can hold it back on a cloud
+    /// endpoint under `Auto` is the privacy filter's degraded fail-closed rule.
+    async fn status_outcome(health: Arc<ClassifierHealth>) -> ToolOutcome {
+        let (d, _dir) = dispatcher(health);
+        let call = ToolCall {
+            name: "system_status".to_string(),
+            args: serde_json::json!({}),
+        };
+        let ctx = ExecCtx {
+            conversation_id: "conv-degraded".to_string(),
+            profile: "personal".to_string(),
+            ..Default::default()
+        };
+        d.dispatch(&call, &ctx, Binding::Auto, true).await
+    }
+
+    #[tokio::test]
+    async fn a_degraded_classifier_holds_tool_calls_off_cloud_too() {
+        // CONTROL: healthy ⇒ the call runs on a cloud-endpoint turn.
+        let healthy = status_outcome(ClassifierHealth::healthy()).await;
+        assert!(
+            matches!(healthy, ToolOutcome::Ok(_)),
+            "control: a healthy classifier must let a Safe tool run, got {healthy:?}"
+        );
+
+        // C-01: degraded ⇒ the dispatcher reports the call must move on-device.
+        // `NeedsLocalReroute` (not `Denied`) is the correct shape: the tool was
+        // NOT run, and the caller may retry against a local endpoint.
+        let degraded = status_outcome(ClassifierHealth::degraded_with("models missing")).await;
+        assert!(
+            matches!(degraded, ToolOutcome::NeedsLocalReroute { .. }),
+            "a degraded classifier must not let the TOOL path egress, got {degraded:?}"
+        );
+    }
+}
