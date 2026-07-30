@@ -575,6 +575,33 @@ impl ToolDispatcher {
         state.run_nonce = Uuid::new_v4().to_string();
     }
 
+    /// HI2 test hook: this conversation's per-run dispatch counter (0 if it
+    /// has no entry). Exists so a test can assert that two concurrent runs
+    /// keep INDEPENDENT budgets rather than sharing one slot — the counter is
+    /// otherwise invisible until a ceiling denial fires 50 dispatches in.
+    #[cfg(test)]
+    pub(crate) fn run_dispatch_count(&self, conversation_id: &str) -> usize {
+        self.run_states
+            .lock()
+            .expect("run_states mutex poisoned")
+            .get(conversation_id)
+            .map(|s| s.dispatch_count)
+            .unwrap_or(0)
+    }
+
+    /// HI2 test hook: this conversation's journal issuance nonce (`""` if it
+    /// has no entry). Lets a test assert that another conversation's
+    /// `begin_run()` does not re-stamp a live run's nonce.
+    #[cfg(test)]
+    pub(crate) fn run_nonce_of(&self, conversation_id: &str) -> String {
+        self.run_states
+            .lock()
+            .expect("run_states mutex poisoned")
+            .get(conversation_id)
+            .map(|s| s.run_nonce.clone())
+            .unwrap_or_default()
+    }
+
     /// The system-prompt fragment teaching the fenced dialect and listing
     /// the tools available in this environment. `""` if there are none.
     pub fn catalog(&self) -> String {
@@ -2784,6 +2811,259 @@ mod tests {
             after_reset.content.contains("[tool echo → ok]"),
             "after begin_run(), the next dispatch should run, got: {}",
             after_reset.content
+        );
+    }
+
+    // ── HI2: concurrent runs against ONE shared dispatcher ────────────────
+    //
+    // P14 (M-08) replaced `AgentLoop`'s global `stream_lock` with a
+    // per-conversation lock map, so two conversations really do stream at the
+    // same time against the single `Arc<ToolDispatcher>` in `AppState`. These
+    // tests pin the consequence: run state must be per-conversation, not one
+    // shared slot.
+
+    /// A MUTATING tool (`RiskClass::Write`) that can be PARKED inside
+    /// `Tool::run`, so a test can hold conversation A's run genuinely in
+    /// flight while conversation B runs concurrently against the same
+    /// dispatcher. A call whose args carry `"park": true` signals `entered`
+    /// and then blocks on `release`; every other call returns immediately.
+    /// `runs` records the args of every execution that actually happened.
+    struct ParkableMutateTool {
+        runs: Arc<Mutex<Vec<serde_json::Value>>>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Tool for ParkableMutateTool {
+        fn name(&self) -> &str {
+            "mutate_thing"
+        }
+        fn risk(&self) -> RiskClass {
+            RiskClass::Write
+        }
+        fn requires(&self) -> &[Capability] {
+            &[]
+        }
+        fn run<'a>(
+            &'a self,
+            input: ToolInput,
+            _ctx: &'a ExecCtx,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+            self.runs
+                .lock()
+                .expect("runs mutex poisoned")
+                .push(input.args.clone());
+            let park = input
+                .args
+                .get("park")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                if park {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                ToolResult::Ok(input.args)
+            })
+        }
+    }
+
+    fn ctx_for(conversation_id: &str) -> ExecCtx {
+        ExecCtx {
+            conversation_id: conversation_id.to_string(),
+            ..ctx()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_runs_keep_independent_dedup_state() {
+        // Conversation A opens a run and dispatches the SAME mutating call
+        // twice, then parks inside a third call's `Tool::run`. While A is
+        // parked, conversation B calls `begin_run()` on the same dispatcher
+        // and dispatches its own calls. A then resumes and re-emits the
+        // identical mutating call a third time — the classic LLM repetition
+        // mode. It MUST still be suppressed by repeat detection.
+        //
+        // Under the pre-HI2 single shared `run_state` slot, B's `begin_run()`
+        // cleared A's fingerprint ring mid-run, so A's duplicate `mutate_thing
+        // {"x":1}` executed a THIRD time.
+        let runs: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ParkableMutateTool {
+            runs: Arc::clone(&runs),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        // No hook chain and no journal: the budget/repeat gate under test
+        // fires before either, so an empty chain keeps every other verdict
+        // out of the feedback.
+        let dispatcher = ToolDispatcher::new(registry, HookChain::new(), BodyEnv::empty());
+
+        let ctx_a = ctx_for("conv-A");
+        let ctx_b = ctx_for("conv-B");
+
+        // A's run opens first; capture its nonce so we can prove B never
+        // re-stamps it.
+        dispatcher.begin_run(&ctx_a.conversation_id);
+        let nonce_a = dispatcher.run_nonce_of("conv-A");
+        assert!(!nonce_a.is_empty(), "begin_run must stamp a nonce");
+
+        let dup = r#"{"name": "mutate_thing", "args": {"x": 1}}"#;
+        let parked = r#"{"name": "mutate_thing", "args": {"park": true}}"#;
+        // 4 blocks, under the per-TURN ceiling of 8:
+        //   1,2 → the duplicate dispatches that fill A's ring
+        //   3   → parks inside Tool::run; B interleaves here
+        //   4   → the repeat that must be denied after A resumes
+        let a_output = model_output(&[dup, dup, parked, dup]);
+
+        let a_run = async {
+            dispatcher
+                .run_turn(&own(&a_output), &ctx_a, Binding::Public, false)
+                .await
+                .feedback()
+        };
+
+        let b_run = async {
+            // Wait until A is genuinely parked INSIDE its third dispatch.
+            entered.notified().await;
+            assert_eq!(
+                dispatcher.run_dispatch_count("conv-A"),
+                3,
+                "A should have spent 3 dispatches before parking"
+            );
+
+            // B's run begins while A is in flight.
+            dispatcher.begin_run(&ctx_b.conversation_id);
+            let b_feedback = dispatcher
+                .run_turn(
+                    &own(&model_output(&[
+                        r#"{"name": "mutate_thing", "args": {"y": 9}}"#,
+                        r#"{"name": "mutate_thing", "args": {"y": 9}}"#,
+                    ])),
+                    &ctx_b,
+                    Binding::Public,
+                    false,
+                )
+                .await
+                .feedback();
+
+            // Let A resume into its 4th block.
+            release.notify_one();
+            b_feedback
+        };
+
+        let (a_feedback, b_feedback) = tokio::join!(a_run, b_run);
+
+        // ── B's own two calls ran (B is unaffected by A) ──────────────────
+        let b_sections = split_sections(&b_feedback.content);
+        assert_eq!(
+            b_sections
+                .iter()
+                .filter(|s| s.starts_with("[tool mutate_thing → ok]"))
+                .count(),
+            2,
+            "B's two calls should both run, got: {}",
+            b_feedback.content
+        );
+
+        // ── A's 4th block: the duplicate is STILL suppressed ──────────────
+        let a_sections = split_sections(&a_feedback.content);
+        assert_eq!(
+            a_sections.len(),
+            4,
+            "A's turn should report 4 sections, got: {}",
+            a_feedback.content
+        );
+        assert!(
+            a_sections[3].contains("→ denied by budget"),
+            "A's 4th call (a duplicate re-emitted after B began its run) must \
+             still be denied; got: {}",
+            a_sections[3]
+        );
+        assert!(
+            a_sections[3].contains("repeat detected — same call, same args"),
+            "A's 4th call must be denied by REPEAT detection specifically, got: {}",
+            a_sections[3]
+        );
+
+        // The strongest statement: the duplicate mutating action executed
+        // exactly twice, never a third time.
+        let dup_args = serde_json::json!({"x": 1});
+        let executions = runs.lock().expect("runs mutex poisoned");
+        assert_eq!(
+            executions.iter().filter(|a| **a == dup_args).count(),
+            2,
+            "the duplicate mutating call must execute exactly twice (the 3rd \
+             is suppressed), got executions: {executions:?}"
+        );
+        drop(executions);
+
+        // ── dispatch_count is NOT shared ──────────────────────────────────
+        // A spent 3 (the repeat denial does not consume budget); B spent 2.
+        // A single shared slot could not hold both numbers at once.
+        assert_eq!(
+            dispatcher.run_dispatch_count("conv-A"),
+            3,
+            "A's per-run dispatch count must count only A's calls"
+        );
+        assert_eq!(
+            dispatcher.run_dispatch_count("conv-B"),
+            2,
+            "B's per-run dispatch count must count only B's calls"
+        );
+
+        // ── the journal issuance nonce is NOT clobbered ───────────────────
+        assert_eq!(
+            dispatcher.run_nonce_of("conv-A"),
+            nonce_a,
+            "B's begin_run must not re-stamp A's live run nonce"
+        );
+        assert_ne!(
+            dispatcher.run_nonce_of("conv-B"),
+            nonce_a,
+            "B's run must get its own issuance nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_run_in_one_conversation_leaves_another_conversations_budget_alone() {
+        // The narrow, non-concurrent statement of the same invariant: a
+        // dispatcher that has spent budget for conv-A keeps it when conv-B
+        // starts a run. Sequential, so it stays deterministic even if the
+        // concurrent test above ever gets flaky.
+        let dispatcher = echo_dispatcher();
+        let ctx_a = ctx_for("conv-A");
+        let ctx_b = ctx_for("conv-B");
+
+        dispatcher.begin_run(&ctx_a.conversation_id);
+        for i in 0..3 {
+            let block = format!(r#"{{"name": "echo", "args": {{"n": {i}}}}}"#);
+            let _ = dispatcher
+                .run_turn(
+                    &own(&model_output(&[block.as_str()])),
+                    &ctx_a,
+                    Binding::Public,
+                    false,
+                )
+                .await;
+        }
+        assert_eq!(dispatcher.run_dispatch_count("conv-A"), 3);
+
+        dispatcher.begin_run(&ctx_b.conversation_id);
+        assert_eq!(
+            dispatcher.run_dispatch_count("conv-A"),
+            3,
+            "conv-B's begin_run must not zero conv-A's budget"
+        );
+        assert_eq!(
+            dispatcher.run_dispatch_count("conv-B"),
+            0,
+            "conv-B starts its own run at zero"
         );
     }
 
