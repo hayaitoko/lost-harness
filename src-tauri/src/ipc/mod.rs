@@ -838,6 +838,28 @@ fn set_provider_api_key_inner(state: &AppState, args: SetProviderApiKeyArgs) -> 
     state
         .provider_secrets
         .set(&args.provider_id, &args.api_key)?;
+    // Persist the presence marker, or the secret we just stored is unreachable
+    // after a restart. `hydrate_providers_from_storage` (lib.rs) reads the
+    // keychain ONLY when `ep.has_keychain_secret()`, i.e. when this column is
+    // set. The frontend always creates a provider with `api_key: null` and
+    // delivers the key through this command, so `add_provider` never writes the
+    // marker and this is the only place that can: without it every key is
+    // silently dropped on the next launch while still sitting in the keychain.
+    //
+    // Compensating on failure, the same shape `add_provider`/`update_provider`
+    // use: an orphaned keychain entry with no marker is exactly the state that
+    // produced this bug, so undo the secret rather than leave it dangling.
+    if let Err(e) = state
+        .storage
+        .global()
+        .mark_endpoint_secret_in_keychain(&args.provider_id)
+    {
+        let _ = state.provider_secrets.delete(&args.provider_id);
+        return Err(format!(
+            "stored the key but could not record it on the provider row, so it \
+             would not survive a restart; the key was removed again: {e}"
+        ));
+    }
     // Rotation must take effect NOW, not after a restart. The keychain is only
     // read at boot when seeding `ModelManager`; the live `Provider` (and the
     // `ModelClient` cached against it, which copies the key into its bearer
@@ -4583,6 +4605,54 @@ mod tests {
         assert!(
             secrets.live_ids().is_empty(),
             "no secret may be written for an unregistered provider"
+        );
+    }
+
+    /// HI-1 regression. The frontend always creates a provider with
+    /// `api_key: null` and delivers the key through `set_provider_api_key`.
+    /// That command wrote the keychain but never the `api_key_marker` column,
+    /// and boot hydration reads the keychain ONLY when the marker is set — so
+    /// every key was silently dropped on the next launch while still sitting in
+    /// the keychain, and the UI went on reporting the provider as configured.
+    #[test]
+    fn a_key_set_after_a_keyless_add_survives_a_restart() {
+        let (state, secrets) = test_state();
+
+        // Exactly the frontend's create path: add with no key, then set it.
+        let info = add_provider_inner(&state, add_args("OpenAI", None)).expect("add");
+        set_provider_api_key_inner(
+            &state,
+            SetProviderApiKeyArgs {
+                provider_id: info.id.clone(),
+                api_key: "sk-live".to_string(),
+            },
+        )
+        .expect("set key");
+
+        // The secret is in the store and the row now carries the marker.
+        assert_eq!(secrets.get(&info.id).unwrap().as_deref(), Some("sk-live"));
+        let row = state
+            .storage
+            .global()
+            .get_endpoint(&info.id)
+            .unwrap()
+            .expect("endpoint row");
+        assert!(
+            row.has_keychain_secret(),
+            "without the marker, boot hydration skips the keychain entirely"
+        );
+
+        // Simulate a restart: a fresh ModelManager hydrated from disk.
+        let fresh = crate::models::ModelManager::new();
+        crate::hydrate_providers_from_storage(&state.storage, &fresh, secrets.as_ref());
+        assert_eq!(
+            fresh
+                .get_provider(&info.id)
+                .expect("provider rehydrated")
+                .api_key
+                .as_deref(),
+            Some("sk-live"),
+            "the API key must survive a restart"
         );
     }
 }
