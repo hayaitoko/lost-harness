@@ -1746,6 +1746,42 @@ mod tests {
     }
 
     #[test]
+    fn manifest_state_wire_shape_is_stable_for_the_ui() {
+        // The renderer keys its provenance copy off this shape, so pin it.
+        assert_eq!(
+            serde_json::to_value(ManifestState::Verified {
+                revision: PINNED_REV.to_string()
+            })
+            .unwrap(),
+            serde_json::json!({ "state": "verified", "revision": PINNED_REV })
+        );
+        assert_eq!(
+            serde_json::to_value(ManifestState::Absent).unwrap(),
+            serde_json::json!({ "state": "absent" })
+        );
+        assert_eq!(
+            serde_json::to_value(ManifestState::NotListed).unwrap(),
+            serde_json::json!({ "state": "not_listed" })
+        );
+        assert_eq!(
+            serde_json::to_value(ManifestState::Invalid {
+                reason: "boom".to_string()
+            })
+            .unwrap(),
+            serde_json::json!({ "state": "invalid", "reason": "boom" })
+        );
+        // And the label enum the UI branches on.
+        assert_eq!(
+            serde_json::to_value(Provenance::Curated).unwrap(),
+            serde_json::json!("curated")
+        );
+        assert_eq!(
+            serde_json::to_value(Provenance::Community).unwrap(),
+            serde_json::json!("community")
+        );
+    }
+
+    #[test]
     fn a_verified_entry_replaces_hashes_and_drops_unlisted_files() {
         let mut files = BTreeMap::new();
         files.insert("listed-Q4_K_M.gguf".to_string(), "c".repeat(64));
