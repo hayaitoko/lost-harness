@@ -8,16 +8,23 @@
   // switcher, labels, and providers row are gone: Gmail only today, and the
   // screen says so. `needs_reconnect` surfaces as a calm banner, not an error
   // (Testing-status Google clients expire tokens ~every 7 days).
+  //
+  // TWO connection banners, never one: a scope-short grant is fixed by
+  // reconnecting, a Google API switched off in the user's Cloud project is
+  // not. Sharing one banner would offer Reconnect for a condition reconnecting
+  // cannot change — an infinite loop. See `GoogleApiDisabledBanner`.
   import { nav } from "$lib/design/nav.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import AppStatusBar from "../components/AppStatusBar.svelte";
   import Button from "../components/Button.svelte";
   import IconButton from "../components/IconButton.svelte";
   import GmailSetupWizard from "../components/GmailSetupWizard.svelte";
+  import GoogleApiDisabledBanner from "../components/GoogleApiDisabledBanner.svelte";
   import { activeProfileId } from "$lib/stores/profiles";
   import {
     gmailSetupStatus,
     gmailDisconnect,
+    googleClearApiNotEnabled,
     listEmail,
     readEmail,
     sendEmail,
@@ -50,6 +57,17 @@
   let confirmDisconnect = $state(false);
   let actionError: string | null = $state(null);
   let reconnecting = $state(false);
+  let recheckingApi = $state(false);
+
+  // Has the CONNECTION state (as opposed to the mail) changed? Both recoverable
+  // Google failures count, because both drive a banner.
+  function connectionStateChanged(a: GmailSetupStatus, b: GmailSetupStatus): boolean {
+    return (
+      a.needs_reconnect !== b.needs_reconnect ||
+      (a.api_not_enabled == null) !== (b.api_not_enabled == null) ||
+      (a.api_not_enabled?.console_url ?? null) !== (b.api_not_enabled?.console_url ?? null)
+    );
+  }
 
   // One effect owns the status check + the profile-switch reset (the
   // connection is per-profile, so switching drops the old profile's mail
@@ -69,6 +87,7 @@
       listLoading = false; // clear loading flag on profile switch
       actionError = null;
       reconnecting = false;
+      recheckingApi = false;
       confirmDisconnect = false;
       listSeq++;
       detailSeq++; // invalidate anything in flight for the old profile
@@ -89,6 +108,12 @@
 
   // Inbox listing — only when connected and the grant isn't known-dead
   // (attempting on a dead grant just spams failing token refreshes).
+  //
+  // NOT gated on `api_not_enabled`: that state is per-profile but its cause is
+  // per-API, so a disabled Tasks API (recorded by the Planner) must not stop
+  // the inbox from loading when Gmail itself is fine. If Gmail IS the disabled
+  // one, the attempt fails, the banner lights, and the re-check below finds no
+  // further change — so it settles rather than looping.
   $effect(() => {
     const profile = $activeProfileId;
     void listTick;
@@ -105,12 +130,18 @@
       .catch(async (err) => {
         if (token !== listSeq) return;
         listError = String(err);
-        // A dead grant marks needs_reconnect backend-side — re-check once so
-        // the calm banner appears. Only swap status when the flag actually
-        // changed; the effect then exits early on rerun (no retry loop).
+        // A dead grant or a disabled API is recorded backend-side — re-check
+        // once so the matching calm banner appears. Only swap status when the
+        // connection state actually changed; the effect then settles on rerun
+        // (no retry loop).
         try {
           const fresh = await gmailSetupStatus(profile);
-          if (token === listSeq && statusToken === statusSeq && status && fresh.needs_reconnect !== status.needs_reconnect) {
+          if (
+            token === listSeq &&
+            statusToken === statusSeq &&
+            status &&
+            connectionStateChanged(fresh, status)
+          ) {
             status = fresh;
           }
         } catch {
@@ -202,6 +233,29 @@
   const showBanner = $derived(
     status != null && status.connected && status.needs_reconnect && !reconnecting,
   );
+  // The OTHER recoverable 403. Separate banner, separate condition, no
+  // Reconnect button and no wizard — reconnecting cannot enable a disabled API.
+  const apiDisabled = $derived(
+    status != null && status.connected && !reconnecting ? status.api_not_enabled : null,
+  );
+
+  // "I've enabled it — check again": forget the sticky state, then retry. If
+  // the API is still off the next call re-records it and the banner returns —
+  // nothing is assumed fixed.
+  async function recheckApi() {
+    if (recheckingApi) return;
+    recheckingApi = true;
+    actionError = null;
+    try {
+      await googleClearApiNotEnabled($activeProfileId);
+    } catch (err) {
+      actionError = String(err);
+    } finally {
+      recheckingApi = false;
+    }
+    statusTick++;
+    listTick++;
+  }
 
   function fmtDate(raw: string): string {
     const d = new Date(raw);
@@ -272,6 +326,14 @@
         <div class="flex-1"></div>
         <Button onclick={() => (reconnecting = true)}>Reconnect</Button>
       </div>
+    {/if}
+
+    {#if apiDisabled}
+      <GoogleApiDisabledBanner
+        consoleUrl={apiDisabled.console_url}
+        checking={recheckingApi}
+        oncheckagain={() => void recheckApi()}
+      />
     {/if}
 
     {#if actionError}

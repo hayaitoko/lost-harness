@@ -1486,6 +1486,22 @@ export async function setMemorySettings(
 // (Testing-status Google clients expire refresh tokens after ~7 days) —
 // the UI renders a calm Reconnect, not an error.
 
+/** A Google API this profile needs is switched OFF in the user's own Google
+ *  Cloud project. Mirrors `GoogleApiDisabled` in `email/api_error.rs`.
+ *
+ *  Kept apart from `needs_reconnect` on purpose: reconnecting re-consents
+ *  scopes and can never enable a disabled API, so offering Reconnect here
+ *  would walk the user through the whole OAuth dance, fail identically, and
+ *  offer the same button again. This state gets its own banner, with a link
+ *  to the console instead of a Reconnect button. */
+export interface GoogleApiDisabled {
+  /** Google's own console activation link, validated backend-side (https +
+   *  a google.com host) before it is ever surfaced. `null` when the response
+   *  carried no usable link — the UI then points at the console in prose
+   *  rather than inventing a URL. */
+  console_url: string | null;
+}
+
 /** The Gmail setup/connection state for one profile. Mirrors `GmailSetupStatus`
  *  in `ipc/mod.rs` — everything the setup wizard + Email screen need. */
 export interface GmailSetupStatus {
@@ -1497,6 +1513,10 @@ export interface GmailSetupStatus {
   account_email: string | null;
   /** The stored authorization died (expired/revoked) — show a calm Reconnect. */
   needs_reconnect: boolean;
+  /** A Google API this profile needs is disabled in the user's Cloud project.
+   *  `null` means "not in that state". NEVER route this into the reconnect
+   *  banner or wizard — see `GoogleApiDisabled`. */
+  api_not_enabled: GoogleApiDisabled | null;
 }
 
 /** Result of `gmail_begin_connect`. Mirrors `GmailBeginConnect`. */
@@ -1548,7 +1568,22 @@ export async function gmailSetupStatus(profile: string): Promise<GmailSetupStatu
     connected: false,
     account_email: null,
     needs_reconnect: false,
+    api_not_enabled: null,
   };
+}
+
+/** Forget this profile's "a Google API is disabled" state so the next call
+ *  re-decides. Backs the banner's "I've enabled it — check again": the remedy
+ *  happens outside the app (in the Google console), so nothing the app can
+ *  observe would otherwise clear it. Nothing is assumed fixed — if the API is
+ *  still off, the next call re-records the state and the banner returns. */
+export async function googleClearApiNotEnabled(profile: string): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("google_clear_api_not_enabled", { args: { profile } });
+    return;
+  }
+  // Browser mode has no backend state to clear; the caller's reload is the
+  // whole behaviour there.
 }
 
 /** Store the user's own Google Cloud OAuth client (install-global; lands in
