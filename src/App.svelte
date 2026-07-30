@@ -27,6 +27,9 @@
   import ApprovalDialog from "$lib/components/ApprovalDialog.svelte";
   import AskHumanDialog from "$lib/components/AskHumanDialog.svelte";
   import Toasts from "$lib/components/Toasts.svelte";
+  // C-01: the app-level "screening is reduced" strip. Renders nothing when the
+  // trained classifier loaded, so healthy installs see no chrome.
+  import ClassifierHealthBanner from "$lib/design/components/ClassifierHealthBanner.svelte";
 
   // Only LIVE screens (see the ScreenId note in design/types.ts — Email is
   // live as of the 2026-07-24 email round; the Whiteboard/Editor/Onboarding/
@@ -75,6 +78,12 @@
 </script>
 
 <Current />
+
+<!-- C-01: degraded egress screening is a whole-app fact, not a per-screen one,
+     so the banner lives here. Pinned rather than in the layout flow: every
+     screen roots at `h-screen`, so an in-flow strip would push the app past the
+     viewport. Self-hiding when the classifier is healthy. -->
+<ClassifierHealthBanner />
 
 <!-- Backend-driven; renders only when the core raises a tool-approval prompt. -->
 <ApprovalDialog />
