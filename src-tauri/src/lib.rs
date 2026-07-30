@@ -26,6 +26,7 @@ mod queue; // M4 (Wave 4.4): the one-queue-model substrate (deferred work)
 mod secrets; // provider credentials: OS keychain + test seam + legacy migration
 mod storage; // M1+: SQLite, sqlite-vec, sled/redb
 mod tools; // M3: Tool registry + implementations
+mod updater; // Round-2 item 3: app self-update from the public GitHub releases
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -103,6 +104,18 @@ pub fn run() {
     tracing::info!("Lost Harness — M1 starting");
 
     tauri::Builder::default()
+        // The app's first and only Tauri plugins (round-2 item 3).
+        //
+        // `updater` is registered so `UpdaterExt` has its state; its own IPC
+        // commands are NOT reachable from the webview (no `updater:*` entry in
+        // capabilities/default.json) — every update check goes through
+        // `updater::check_now`, behind the Settings toggle.
+        //
+        // `process` supplies `plugin:process|restart` for the relaunch button
+        // after an update installs. That one IS webview-reachable, via
+        // `process:allow-restart`.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // Storage at ~/Documents/Lost-Harness/ (spec §2 default).
             // We resolve against $HOME for cross-platform safety; on macOS
@@ -509,6 +522,26 @@ pub fn run() {
             };
             app.manage(state);
 
+            // Round-2 item 3 — the launch-time update check.
+            //
+            // Registered state first (the pending `Update` a check finds, so
+            // the install click doesn't re-fetch), then the check itself:
+            // SPAWNED, never awaited, so the window opens at exactly the speed
+            // it did before this existed. Two gates inside
+            // `updater::run_launch_check` decide whether a single anonymous
+            // GET for `latest.json` is made at all — a dev build never checks,
+            // and neither does an install where the user turned the toggle
+            // off. Nothing installs without a click.
+            app.manage(crate::updater::PendingUpdate::default());
+            {
+                let update_check_enabled = app
+                    .state::<AppState>()
+                    .storage
+                    .global()
+                    .update_check_enabled();
+                crate::updater::spawn_launch_check(app.handle().clone(), update_check_enabled);
+            }
+
             // C3: bring persisted MCP servers back up in the background
             // (best-effort — a missing server binary logs and skips; the row
             // stays listed as not-running so the user can see + fix it).
@@ -591,6 +624,15 @@ pub fn run() {
             ipc::delete_skill,
             ipc::get_skill_reflect_enabled,
             ipc::set_skill_reflect_enabled,
+            // App self-update (round-2 item 3). `check_for_update` /
+            // `install_update` take a bare `AppHandle`, so like `send_message`
+            // and `download_model` they can't register under `MockRuntime` and
+            // are absent from `ipc::contract_tests`; the two toggle commands
+            // are there.
+            ipc::get_update_check_enabled,
+            ipc::set_update_check_enabled,
+            ipc::check_for_update,
+            ipc::install_update,
             ipc::list_seat_bindings,
             ipc::set_seat_binding,
             ipc::delete_seat_binding,

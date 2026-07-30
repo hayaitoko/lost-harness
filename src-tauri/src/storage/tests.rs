@@ -1932,3 +1932,72 @@ fn facts_missing_embedding_backfill_worklist() {
         "upsert must replace, not stack"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round-2 item 3 — the launch-time update-check toggle.
+//
+// Default ON is the *inverse* of `skill_reflect_enabled`'s default, and the
+// difference is deliberate (Lukas asked for the check to be on), so the default
+// is pinned by a test rather than left to be read off the implementation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn update_check_defaults_on_and_round_trips() {
+    let g = GlobalDb::open_in_memory().unwrap();
+
+    // Fresh install: no row at all, and the check is ON.
+    assert!(
+        g.get_app_setting("update_check_enabled").unwrap().is_none(),
+        "the default must come from an ABSENT row, not a seeded one"
+    );
+    assert!(g.update_check_enabled(), "default is ON");
+
+    g.set_update_check_enabled(false).unwrap();
+    assert!(!g.update_check_enabled());
+    assert_eq!(
+        g.get_app_setting("update_check_enabled")
+            .unwrap()
+            .as_deref(),
+        Some("0")
+    );
+
+    g.set_update_check_enabled(true).unwrap();
+    assert!(g.update_check_enabled());
+    assert_eq!(
+        g.get_app_setting("update_check_enabled")
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+}
+
+#[test]
+fn only_an_exact_zero_turns_the_update_check_off() {
+    // "absent or anything-but-0 means on" — so a garbled row can never silently
+    // disable the check while the Settings toggle still reads it as on. Both
+    // the UI and the launch path call this same function, so they cannot
+    // disagree about what is on.
+    let g = GlobalDb::open_in_memory().unwrap();
+    for raw in ["1", "true", "", "yes", "00", " 0"] {
+        g.set_app_setting("update_check_enabled", raw).unwrap();
+        assert!(g.update_check_enabled(), "{raw:?} should read as ON");
+    }
+    g.set_app_setting("update_check_enabled", "0").unwrap();
+    assert!(!g.update_check_enabled());
+}
+
+#[test]
+fn the_update_toggle_is_independent_of_skill_reflect() {
+    // Both live in `app_settings`; a key collision would silently couple two
+    // unrelated privacy switches.
+    let g = GlobalDb::open_in_memory().unwrap();
+    g.set_update_check_enabled(false).unwrap();
+    g.set_skill_reflect_enabled(true).unwrap();
+    assert!(!g.update_check_enabled());
+    assert!(g.skill_reflect_enabled());
+
+    g.set_update_check_enabled(true).unwrap();
+    g.set_skill_reflect_enabled(false).unwrap();
+    assert!(g.update_check_enabled());
+    assert!(!g.skill_reflect_enabled());
+}

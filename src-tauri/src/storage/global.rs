@@ -1605,6 +1605,38 @@ impl GlobalDb {
         self.set_app_setting(Self::SKILL_REFLECT_KEY, if enabled { "1" } else { "0" })
     }
 
+    /// The app_settings key for the launch-time update check (round-2 item 3).
+    /// Global (the app updates as a whole, not per profile), and stored HERE
+    /// rather than in the frontend's localStorage `settings` store because the
+    /// reader is Rust: the launch check runs in `lib.rs::run`'s setup, long
+    /// before — and independently of — any webview.
+    const UPDATE_CHECK_KEY: &'static str = "update_check_enabled";
+
+    /// Should the app check GitHub for a newer version when it launches?
+    ///
+    /// Defaults to **`true`** — the inverse of `skill_reflect_enabled`'s
+    /// opt-in default, because Lukas asked for the check to be on and the
+    /// egress it makes is a single anonymous version request, not user data.
+    /// The default is expressed as "absent means on": a stored value only
+    /// counts as `false` for exactly `"0"`, so an unreadable row fails SAFE in
+    /// the sense that matters for a privacy toggle's *user-visible* meaning —
+    /// the UI and the check read the same function, so they can never
+    /// disagree about what is on.
+    pub fn update_check_enabled(&self) -> bool {
+        self.get_app_setting(Self::UPDATE_CHECK_KEY)
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    }
+
+    /// Turn the launch-time update check on/off. When off, the app performs no
+    /// update-related network request at launch at all — see
+    /// `updater::run_launch_check`, which is where that is enforced and tested.
+    pub fn set_update_check_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_app_setting(Self::UPDATE_CHECK_KEY, if enabled { "1" } else { "0" })
+    }
+
     /// The app_settings key for the active-profile choice — the profile the UI
     /// was last switched to. Global (app-wide selection state, not per-profile),
     /// read on boot so the choice survives a restart.

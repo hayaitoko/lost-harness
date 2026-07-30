@@ -29,6 +29,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "resources": {
       "vendor/llama-cpp": "llama-cpp"
     },
@@ -39,5 +40,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYxQzM1N0U1MTE5MjZERUYKUldUdmJaSVI1VmZEWVRwZ3NEMmRSYkVsM2JwRHZtMWpSTHFoVkhUNFpaUjVXWjFYM2FraCswemsK",
+      "endpoints": [
+        "https://github.com/hayaitoko/lost-harness/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

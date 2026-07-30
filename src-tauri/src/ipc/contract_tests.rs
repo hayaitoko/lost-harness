@@ -149,6 +149,11 @@ fn test_app() -> App<MockRuntime> {
             ipc::delete_skill,
             ipc::get_skill_reflect_enabled,
             ipc::set_skill_reflect_enabled,
+            // Round-2 item 3. `check_for_update`/`install_update` take a
+            // bare `AppHandle` and so can't register under MockRuntime
+            // (same structural reason as send_message/download_model).
+            ipc::get_update_check_enabled,
+            ipc::set_update_check_enabled,
             ipc::list_seat_bindings,
             ipc::set_seat_binding,
             ipc::delete_seat_binding,
@@ -1348,6 +1353,7 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "set_skill_approval",
         "delete_skill",
         "set_skill_reflect_enabled",
+        "set_update_check_enabled",
         "list_seat_bindings",
         "set_seat_binding",
         "delete_seat_binding",
@@ -1412,6 +1418,7 @@ fn every_no_arg_command_dispatches() {
         "list_mcp_servers",
         "list_skills",
         "get_skill_reflect_enabled",
+        "get_update_check_enabled",
         "list_agent_types",
         "probe_hardware",
         "list_local_models",

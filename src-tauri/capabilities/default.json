@@ -3,9 +3,25 @@
   "identifier": "default",
   "description": "Default capabilities for Lost Harness M1 — allows the Svelte frontend to call our app-defined commands and use core event/window plugins.",
   "windows": ["main"],
+  "comment": [
+    "Plugin commands ARE ACL-gated (this app's ~90 hand-rolled commands are not), so a",
+    "plugin command the frontend calls must be listed here.",
+    "",
+    "`process:allow-restart` backs the one plugin command the webview actually invokes:",
+    "the relaunch button shown after an update installs (`plugin:process|restart`).",
+    "`process:allow-exit` is deliberately NOT granted — nothing needs the webview to be",
+    "able to kill the app.",
+    "",
+    "There is deliberately NO `updater:*` permission. tauri-plugin-updater's commands",
+    "(check / download / install) are driven from Rust only, so that the launch-check",
+    "toggle in Settings -> About is the single gate on update egress and can be proven",
+    "in `cargo test`. Granting `updater:default` here would open a second, ungated path",
+    "to the network from the webview. See src-tauri/src/updater/mod.rs."
+  ],
   "permissions": [
     "core:default",
     "core:event:default",
-    "core:window:default"
+    "core:window:default",
+    "process:allow-restart"
   ]
 }
