@@ -30,6 +30,9 @@
   // C-01: the app-level "screening is reduced" strip. Renders nothing when the
   // trained classifier loaded, so healthy installs see no chrome.
   import ClassifierHealthBanner from "$lib/design/components/ClassifierHealthBanner.svelte";
+  // Round-2 item 3: the "Update available" strip. Renders nothing until a check
+  // has actually found a newer version, so most launches show no chrome.
+  import UpdateBanner from "$lib/design/components/UpdateBanner.svelte";
 
   // Only LIVE screens (see the ScreenId note in design/types.ts — Email is
   // live as of the 2026-07-24 email round; the Whiteboard/Editor/Onboarding/
@@ -84,6 +87,11 @@
      screen roots at `h-screen`, so an in-flow strip would push the app past the
      viewport. Self-hiding when the classifier is healthy. -->
 <ClassifierHealthBanner />
+
+<!-- Round-2 item 3: an available update is a whole-app fact, so the offer lives
+     here rather than inside Settings. Pinned to the BOTTOM so it can never
+     collide with the (top-pinned) degraded-screening strip. Self-hiding. -->
+<UpdateBanner />
 
 <!-- Backend-driven; renders only when the core raises a tool-approval prompt. -->
 <ApprovalDialog />

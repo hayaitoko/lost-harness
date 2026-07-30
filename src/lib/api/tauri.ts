@@ -196,6 +196,7 @@ export const TOOL_APPROVAL_REQUEST_EVENT = "tool:approval_request";
 export const MEMORY_EVENT = "memory:event";
 export const LOCAL_REROUTE_EVENT = "stream:local_reroute";
 export const BUDGET_WARNING_EVENT = "stream:budget_warning";
+export const UPDATE_AVAILABLE_EVENT = "update:available";
 
 /**
  * Payload of `stream:local_reroute` (C5). Mirrors `LocalReroutePayload` in
@@ -1177,6 +1178,97 @@ export async function setSkillReflectEnabled(enabled: boolean): Promise<void> {
   if (isTauri()) {
     await tauriInvoke("set_skill_reflect_enabled", { args: { enabled } });
   }
+}
+
+// ── App self-update (round-2 item 3) ────────────────────────────────────────
+//
+// The updater plugin's own JS API is deliberately NOT used, and the webview is
+// not granted `updater:*` in capabilities/default.json. Every one of these
+// calls lands on a hand-rolled Rust command, so the launch-check toggle is the
+// only gate that has to hold. See `src-tauri/src/updater/mod.rs`.
+
+/** Mirrors `UpdateInfo` in `updater/mod.rs`. */
+export interface UpdateInfo {
+  /** The announced (newer) version, e.g. "0.1.1". */
+  version: string;
+  /** The version currently running. */
+  current_version: string;
+  /** Release notes from the manifest, if it carried any. */
+  notes: string | null;
+  /** Publish date from the manifest, if it carried one. */
+  date: string | null;
+}
+
+/** Mirrors `ManualCheckResult` — an internally tagged enum on `status`. */
+export type ManualCheckResult =
+  | ({ status: "available" } & UpdateInfo)
+  | { status: "up_to_date"; current_version: string };
+
+/**
+ * Is the launch-time update check on? Global; default **true**.
+ *
+ * Persisted in SQLite rather than localStorage because the reader is Rust: the
+ * check runs at launch, before any webview exists.
+ */
+export async function getUpdateCheckEnabled(): Promise<boolean> {
+  if (isTauri()) {
+    return tauriInvoke<boolean>("get_update_check_enabled", {});
+  }
+  return true;
+}
+
+/** Turn the launch-time update check on/off. */
+export async function setUpdateCheckEnabled(enabled: boolean): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("set_update_check_enabled", { args: { enabled } });
+  }
+}
+
+/**
+ * The Settings → About "Check for updates" button. Makes one anonymous request
+ * for the release manifest — the click is the consent, so this is not gated on
+ * the launch toggle.
+ */
+export async function checkForUpdate(): Promise<ManualCheckResult> {
+  if (isTauri()) {
+    return tauriInvoke<ManualCheckResult>("check_for_update");
+  }
+  return { status: "up_to_date", current_version: "0.1.0-m1-browser" };
+}
+
+/**
+ * Download, verify and stage the update the last check found. Only ever called
+ * from an explicit click — there is no silent-install path. A payload whose
+ * signature doesn't match the app's compiled-in public key is refused inside
+ * the plugin and surfaces here as a rejected promise.
+ */
+export async function installUpdate(): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("install_update");
+  }
+}
+
+/**
+ * Restart into the freshly installed version. This is the one plugin command
+ * the webview may call directly (`process:allow-restart` in
+ * capabilities/default.json) — restarting is not egress and guards no state.
+ */
+export async function relaunchApp(): Promise<void> {
+  if (isTauri()) {
+    await tauriInvoke("plugin:process|restart");
+  }
+}
+
+/** Fires when the launch-time check found a newer version. */
+export async function onUpdateAvailable(
+  callback: (info: UpdateInfo) => void,
+): Promise<UnlistenFn> {
+  if (isTauri()) {
+    return tauriListen<UpdateInfo>(UPDATE_AVAILABLE_EVENT, (event) => {
+      callback(event.payload);
+    });
+  }
+  return () => {};
 }
 
 /** A persisted "Always allow" rule. Mirrors `ToolRuleInfo` in `ipc/mod.rs`. */
