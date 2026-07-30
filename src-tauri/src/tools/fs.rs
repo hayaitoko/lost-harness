@@ -19,22 +19,32 @@
 //! ### Risk classes
 //! - **Safe** (read_file, list_dir, search_files): no approval needed.
 //! - **Write** (write_file, edit_file, delete_file): routes through the
-//!   approval spine (`RiskClass::Write`). All three also enforce a
-//!   read-before-write guard: an existing file must have been read in the
-//!   current conversation before it can be overwritten or deleted.
+//!   approval spine (`RiskClass::Write`). `write_file` and `edit_file` also
+//!   enforce a read-before-write guard — an existing file must have been read in
+//!   the current conversation before it can be overwritten or edited — so the
+//!   model cannot clobber content it never saw. `delete_file` does NOT: removal
+//!   is not a blind *edit*, and it is gated by approval like the other two.
 //!
-//! ### TOCTOU mitigations
-//! Paths are resolved via canonicalization, then every open uses `O_NOFOLLOW`
-//! on the last component so a symlink swapped between check and use causes
-//! `open()` to fail with `ELOOP`, preventing workspace escape. After opening,
-//! the descriptor's real path is verified against the workspace root via
-//! `fcntl(F_GETPATH)`. Write operations additionally verify containment of
-//! the opened descriptor.
+//! ### Confinement is descriptor-relative, not pathname-relative (M-04)
+//! Checking a *pathname* and then operating on that same pathname is two
+//! independent resolutions of one string. Anything that can create names in the
+//! workspace (the agent itself, or a concurrently running `shell_exec`) can swap
+//! a directory for a symlink in between, and the operation lands wherever the
+//! link now points — the check said one thing, the use did another.
 //!
-//! These mitigations narrow but do not eliminate the TOCTOU window — an
-//! intermediate directory symlink swap between canonicalize and openat walk
-//! remains possible. Full `openat(2)`-based descriptor-relative traversal is
-//! tracked as a follow-up hardening item.
+//! So on unix the workspace root is opened **once**, and `rel` is then walked one
+//! component at a time with `openat(2) | O_NOFOLLOW | O_CLOEXEC`. Each hop names
+//! an inode rather than a string to be re-resolved, a component that is (or
+//! becomes) a symlink fails the hop with `ELOOP` instead of redirecting it, and
+//! the final `openat`/`renameat`/`unlinkat`/`fstatat` is relative to the pinned
+//! parent descriptor. The thing checked IS the thing used, so there is no window
+//! to race. See [`confined`] for the details; [`Target`]/[`DirTarget`] are the
+//! handles the six tools use.
+//!
+//! Canonical pathnames survive in exactly one role: as the opaque key for the
+//! read-before-write set (it must carry the on-disk casing, so a case-insensitive
+//! filesystem doesn't falsely refuse a genuine read→write of one file). No byte
+//! is read, written or unlinked by pathname.
 
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -281,25 +291,47 @@ mod confined {
     }
 
     fn cname(name: &OsStr) -> Result<CString, String> {
-        CString::new(name.as_bytes())
-            .map_err(|_| "path component contains a NUL byte".to_string())
+        CString::new(name.as_bytes()).map_err(|_| "path component contains a NUL byte".to_string())
     }
 
     fn last_err(what: &str) -> String {
         format!("{what}: {}", std::io::Error::last_os_error())
     }
 
-    /// `openat(2)`, returning an owned descriptor.
-    fn openat(dirfd: BorrowedFd<'_>, name: &CStr, flags: libc::c_int) -> Result<OwnedFd, String> {
+    /// Mode for a file we create. `openat` is variadic and IGNORES the mode
+    /// unless `O_CREAT` is set, but it must be PASSED whenever `O_CREAT` is set —
+    /// omitting it leaves the kernel reading a garbage variadic slot, which
+    /// produces a file with arbitrary permissions (often unreadable). `0o600` is
+    /// then narrowed by the process umask, exactly as `std::fs::write`'s `0o666`
+    /// would be, but private by default: workspace files are the agent's, not the
+    /// world's.
+    const CREATE_MODE: libc::mode_t = 0o600;
+
+    /// `openat(2)`, returning an owned descriptor. `mode` MUST be `Some` iff
+    /// `flags` contains `O_CREAT`.
+    fn openat(
+        dirfd: BorrowedFd<'_>,
+        name: &CStr,
+        flags: libc::c_int,
+        mode: Option<libc::mode_t>,
+    ) -> Result<OwnedFd, String> {
+        debug_assert_eq!(
+            flags & libc::O_CREAT != 0,
+            mode.is_some(),
+            "openat: a mode must be supplied for exactly the O_CREAT opens"
+        );
         // SAFETY: `dirfd` is a live borrowed descriptor, `name` is a NUL-
-        // terminated C string that outlives the call, and the returned fd is
+        // terminated C string that outlives the call, the variadic mode argument
+        // is supplied whenever `O_CREAT` asks for one, and the returned fd is
         // immediately wrapped in `OwnedFd` so it is closed exactly once.
-        let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+        let fd = unsafe {
+            match mode {
+                Some(m) => libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags, m as libc::c_uint),
+                None => libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags),
+            }
+        };
         if fd < 0 {
-            return Err(last_err(&format!(
-                "open '{}'",
-                name.to_string_lossy()
-            )));
+            return Err(last_err(&format!("open '{}'", name.to_string_lossy())));
         }
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
@@ -322,10 +354,14 @@ mod confined {
     fn walk(root: &Path, rel: &str, keep_leaf: bool) -> Result<(OwnedFd, Option<CString>), String> {
         let comps = rel_components(rel)?;
         let mut dirfd = open_root(root)?;
-        let split = if keep_leaf { comps.len() } else { comps.len().saturating_sub(1) };
+        let split = if keep_leaf {
+            comps.len()
+        } else {
+            comps.len().saturating_sub(1)
+        };
         for comp in &comps[..split] {
             let name = cname(comp)?;
-            dirfd = openat(dirfd.as_fd(), &name, DIR_FLAGS).map_err(|e| {
+            dirfd = openat(dirfd.as_fd(), &name, DIR_FLAGS, None).map_err(|e| {
                 format!(
                     "cannot descend into '{}' (a symlinked or missing path component is refused): {e}",
                     comp.to_string_lossy()
@@ -335,9 +371,12 @@ mod confined {
         let leaf = if keep_leaf {
             None
         } else {
-            Some(cname(comps.last().copied().ok_or_else(|| {
-                format!("path has no filename: {rel}")
-            })?)?)
+            Some(cname(
+                comps
+                    .last()
+                    .copied()
+                    .ok_or_else(|| format!("path has no filename: {rel}"))?,
+            )?)
         };
         Ok((dirfd, leaf))
     }
@@ -393,6 +432,7 @@ mod confined {
             c.parent.as_fd(),
             &c.leaf,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            None,
         )?;
         Ok(std::fs::File::from(fd))
     }
@@ -412,11 +452,15 @@ mod confined {
             c.parent.as_fd(),
             &tmp_name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            Some(CREATE_MODE),
         )?;
         let mut file = std::fs::File::from(fd);
         // On ANY failure clean the temp entry up, so a failed write leaves the
         // workspace exactly as it was (no orphaned `.tmp` residue).
-        if let Err(e) = file.write_all(content.as_bytes()).and_then(|()| file.sync_all()) {
+        if let Err(e) = file
+            .write_all(content.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
             drop(file);
             unlink_name(&c.parent, &tmp_name);
             return Err(format!("write temp file: {e}"));
@@ -459,7 +503,9 @@ mod confined {
 
     /// Read the names + kinds of a pinned directory via `fdopendir`, so the
     /// listing comes from the descriptor and never from a re-walked pathname.
-    pub(super) fn read_dir(dirfd: &OwnedFd) -> Result<Vec<(std::ffi::OsString, EntryKind)>, String> {
+    pub(super) fn read_dir(
+        dirfd: &OwnedFd,
+    ) -> Result<Vec<(std::ffi::OsString, EntryKind)>, String> {
         // `fdopendir` takes OWNERSHIP of the descriptor it is handed, so give it
         // a dup and keep ours pinned for the caller's recursion.
         // SAFETY: `dirfd` is live; the dup is either handed to `fdopendir`
@@ -523,7 +569,7 @@ mod confined {
     /// Descend one already-listed subdirectory of a pinned directory, refusing
     /// to follow a symlink.
     pub(super) fn open_subdir(dirfd: &OwnedFd, name: &OsStr) -> Result<OwnedFd, String> {
-        openat(dirfd.as_fd(), &cname(name)?, DIR_FLAGS)
+        openat(dirfd.as_fd(), &cname(name)?, DIR_FLAGS, None)
     }
 
     /// Open one already-listed file of a pinned directory for reading, refusing
@@ -533,6 +579,7 @@ mod confined {
             dirfd.as_fd(),
             &cname(name)?,
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            None,
         )?;
         Ok(std::fs::File::from(fd))
     }
@@ -628,7 +675,9 @@ impl Target {
         }
         if let Some(len) = self.size() {
             if len > max_bytes {
-                return Err(format!("is {len} bytes, over the {max_bytes}-byte read limit"));
+                return Err(format!(
+                    "is {len} bytes, over the {max_bytes}-byte read limit"
+                ));
             }
         }
         #[cfg(unix)]
@@ -646,6 +695,12 @@ impl Target {
             return Err(format!("is over the {max_bytes}-byte read limit"));
         }
         Ok(content)
+    }
+
+    /// Does the leaf exist, and is it a directory? Decided without following a
+    /// symlink, so a link *to* a directory is not mistaken for one.
+    fn is_dir(&self) -> bool {
+        self.kind() == Some(EntryKind::Dir)
     }
 
     /// Atomically replace the leaf's contents.
@@ -985,7 +1040,9 @@ impl Tool for ReadFileTool {
                         "content": content,
                     }))
                 }
-                Err(e) => ToolResult::Err(format!("read '{path}': {e} (not UTF-8 text?)")),
+                // `Target::read_to_string` already says *why* (missing, a
+                // directory, a symlink, over the cap, not UTF-8).
+                Err(e) => ToolResult::Err(format!("read '{path}': {e}")),
             }
         })
     }
@@ -1029,22 +1086,19 @@ impl Tool for ListDirTool {
                 Err(e) => return ToolResult::Err(e),
             };
             let _ = tokio::fs::create_dir_all(&ws).await;
-            let resolved = match resolve_within_async(ws.clone(), path.to_string()).await {
-                Ok(p) => p,
-                Err(e) => return ToolResult::Err(e),
-            };
+            // Pin the directory itself with the descriptor walk and list it from
+            // that descriptor (`fdopendir`), so the listing describes the
+            // directory we validated rather than whatever the pathname resolves
+            // to by the time `read_dir` gets there.
+            let (ws2, path2) = (ws.clone(), path.to_string());
             let listed = tokio::task::spawn_blocking(move || {
-                let read_dir = std::fs::read_dir(&resolved).map_err(|e| e.to_string())?;
+                let dir = DirTarget::open(&ws2, &path2)?;
                 let mut entries = Vec::new();
-                for entry in read_dir.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let kind = match entry.file_type() {
-                        Ok(t) if t.is_dir() => "dir",
-                        Ok(t) if t.is_file() => "file",
-                        Ok(t) if t.is_symlink() => "symlink",
-                        _ => "other",
-                    };
-                    entries.push(json!({ "name": name, "kind": kind }));
+                for (name, kind) in dir.entries()? {
+                    entries.push(json!({
+                        "name": name.to_string_lossy().into_owned(),
+                        "kind": kind.as_str(),
+                    }));
                 }
                 Ok::<_, String>(entries)
             })
@@ -1103,29 +1157,20 @@ impl Tool for SearchFilesTool {
                 Err(e) => return ToolResult::Err(e),
             };
             let _ = tokio::fs::create_dir_all(&ws).await;
-            let canon_root = match tokio::fs::canonicalize(&ws).await {
-                Ok(r) => r,
-                Err(e) => return ToolResult::Err(format!("workspace root unavailable: {e}")),
-            };
             let needle = query.to_lowercase();
             // The whole tree walk is blocking filesystem work — keep it off the
             // async worker (M-21).
             let walked = tokio::task::spawn_blocking(move || {
+                let root = DirTarget::open(&ws, ".")?;
                 let mut matches = Vec::new();
                 let mut scanned = 0usize;
-                walk(
-                    &canon_root,
-                    &canon_root,
-                    0,
-                    &needle,
-                    &mut matches,
-                    &mut scanned,
-                );
-                (matches, scanned)
+                walk(&root, "", 0, &needle, &mut matches, &mut scanned);
+                Ok::<_, String>((matches, scanned))
             })
             .await;
             let (matches, scanned) = match walked {
-                Ok(v) => v,
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return ToolResult::Err(format!("search: {e}")),
                 Err(e) => return ToolResult::Err(format!("search task failed: {e}")),
             };
             let truncated =
@@ -1139,11 +1184,18 @@ impl Tool for SearchFilesTool {
     }
 }
 
-/// Recursive, bounded workspace walk. `rel` paths in results are relative to
-/// the workspace root so nothing leaks the absolute on-disk location.
+/// Recursive, bounded workspace walk. Descends through pinned DIRECTORY
+/// DESCRIPTORS (`dir`), never re-resolved pathnames, so a directory swapped for a
+/// symlink mid-walk cannot redirect the search out of the workspace. `prefix` is
+/// the display path relative to the workspace root ("" at the top), so results
+/// never leak the absolute on-disk location.
+///
+/// Symlinks are skipped entirely rather than followed — matching the previous
+/// behaviour (`read_dir`'s `file_type` is an lstat, so a link was neither `dir`
+/// nor `file`), and now enforced by the descriptor walk itself.
 fn walk(
-    root: &Path,
-    dir: &Path,
+    dir: &DirTarget,
+    prefix: &str,
     depth: usize,
     needle: &str,
     matches: &mut Vec<serde_json::Value>,
@@ -1155,46 +1207,49 @@ fn walk(
     {
         return;
     }
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
+    let Ok(entries) = dir.entries() else {
         return;
     };
-    for entry in read_dir.flatten() {
+    for (name, kind) in entries {
         if matches.len() >= SEARCH_MAX_RESULTS || *scanned >= SEARCH_MAX_FILES_SCANNED {
             return;
         }
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+        let rel = if prefix.is_empty() {
+            name.to_string_lossy().into_owned()
+        } else {
+            format!("{prefix}/{}", name.to_string_lossy())
         };
-        if file_type.is_dir() {
-            walk(root, &path, depth + 1, needle, matches, scanned);
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
+        match kind {
+            EntryKind::Dir => {
+                // `subdir` is an `openat` with `O_NOFOLLOW` off THIS descriptor:
+                // if the entry stopped being the directory we just listed, the
+                // descent fails instead of following the replacement.
+                if let Ok(child) = dir.subdir(&name) {
+                    walk(&child, &rel, depth + 1, needle, matches, scanned);
+                }
+                continue;
+            }
+            EntryKind::File => {}
+            // Symlinks and non-regular entries (fifos, sockets, devices) are not
+            // searched: opening them could block or escape.
+            EntryKind::Symlink | EntryKind::Other => continue,
         }
         *scanned += 1;
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
         let name_hit = rel.to_lowercase().contains(needle);
 
         // Content match — only for reasonably-sized files we can read as text.
+        // `read_file` caps the read itself, so an over-size or non-UTF-8 file
+        // simply yields no content hit (same outcome as the old size pre-check,
+        // without a second stat that could disagree with the read).
         let mut content_hit: Option<serde_json::Value> = None;
-        if let Ok(meta) = entry.metadata() {
-            if meta.len() <= SEARCH_MAX_FILE_BYTES {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    if let Some((lineno, line)) = text
-                        .lines()
-                        .enumerate()
-                        .find(|(_, l)| l.to_lowercase().contains(needle))
-                    {
-                        let snippet: String = line.trim().chars().take(200).collect();
-                        content_hit = Some(json!({ "line": lineno + 1, "snippet": snippet }));
-                    }
-                }
+        if let Ok(text) = dir.read_file(&name, SEARCH_MAX_FILE_BYTES) {
+            if let Some((lineno, line)) = text
+                .lines()
+                .enumerate()
+                .find(|(_, l)| l.to_lowercase().contains(needle))
+            {
+                let snippet: String = line.trim().chars().take(200).collect();
+                content_hit = Some(json!({ "line": lineno + 1, "snippet": snippet }));
             }
         }
 
@@ -1299,6 +1354,12 @@ pub(crate) fn canonicalize_best_effort(root: &Path, rel: &str) -> Option<PathBuf
 /// Write `content` to `target` atomically: write a temp file in the same
 /// directory, then rename over the target (rename is atomic on one
 /// filesystem, so a reader never sees a half-written file).
+///
+/// **Non-unix only.** On unix the equivalent runs against a pinned directory
+/// descriptor ([`confined::atomic_replace`]) so neither the temp file nor the
+/// rename target can be redirected by a swapped path component; this pathname
+/// version is the fallback for platforms without `openat`.
+#[cfg(not(unix))]
 fn atomic_write(target: &Path, content: &str) -> Result<(), String> {
     let dir = target
         .parent()
@@ -1378,18 +1439,36 @@ impl Tool for WriteFileTool {
                 Err(e) => return ToolResult::Err(e),
             };
             let _ = tokio::fs::create_dir_all(&ws).await;
+            // Lexical + canonical pre-check. It contributes the `..`/absolute
+            // rejection, the "parent must exist and stay inside the workspace"
+            // check, and — its only ongoing job — the canonical path used as the
+            // read-before-write set key. It does NOT decide where the bytes go.
             let resolved = match resolve_within_new_async(ws.clone(), path.clone()).await {
                 Ok(v) => v,
                 Err(e) => return ToolResult::Err(e),
             };
-            if tokio::fs::metadata(&resolved)
-                .await
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
+            // Pin the parent directory. Everything below acts on `target`, i.e.
+            // `*at()`-relative to that descriptor, so no pathname is resolved a
+            // second time and there is no check→use window to race.
+            let (ws2, path2) = (ws.clone(), path.clone());
+            let target = match tokio::task::spawn_blocking(move || Target::open(&ws2, &path2)).await
             {
-                return ToolResult::Err(format!("'{path}' is a directory"));
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => return ToolResult::Err(e),
+                Err(e) => return ToolResult::Err(format!("resolve task failed: {e}")),
+            };
+            // One `fstatat(AT_SYMLINK_NOFOLLOW)` decides all three questions.
+            let existing = target.kind();
+            match existing {
+                Some(EntryKind::Dir) => return ToolResult::Err(format!("'{path}' is a directory")),
+                Some(EntryKind::Symlink) => {
+                    return ToolResult::Err(format!(
+                        "'{path}' is a symlink — refusing to write through it (delete it first to replace it)"
+                    ))
+                }
+                _ => {}
             }
-            let existed = tokio::fs::try_exists(&resolved).await.unwrap_or(false);
+            let existed = existing.is_some();
             if existed {
                 if let Some(reads) = &ctx.reads {
                     let key = tokio::fs::canonicalize(&resolved)
@@ -1402,9 +1481,8 @@ impl Tool for WriteFileTool {
                     }
                 }
             }
-            let resolved2 = resolved.clone();
             let content2 = content.clone();
-            match tokio::task::spawn_blocking(move || atomic_write(&resolved2, &content2)).await {
+            match tokio::task::spawn_blocking(move || target.atomic_replace(&content2)).await {
                 Ok(Ok(())) => {
                     if let Some(reads) = &ctx.reads {
                         let key = tokio::fs::canonicalize(&resolved)
@@ -1489,33 +1567,47 @@ impl Tool for EditFileTool {
                     ));
                 }
             }
-            let content = match tokio::fs::read_to_string(&resolved).await {
-                Ok(v) => v,
-                Err(e) => return ToolResult::Err(format!("read '{path}': {e} (not UTF-8 text?)")),
-            };
-            let count = content.matches(&old).count();
-            if count == 0 {
-                return ToolResult::Err(format!("edit_file: \"old\" not found in '{path}'"));
-            }
-            if count > 1 {
-                return ToolResult::Err(format!(
-                    "edit_file: \"old\" occurs {count} times in '{path}' — make it unique (add surrounding context)"
-                ));
-            }
-            let updated = content.replacen(&old, &new, 1);
-            if updated.len() > MAX_WRITE_BYTES {
-                return ToolResult::Err(format!(
-                    "result is {} bytes, over the {MAX_WRITE_BYTES}-byte write limit",
-                    updated.len()
-                ));
-            }
-            let resolved2 = resolved.clone();
-            let updated2 = updated.clone();
-            match tokio::task::spawn_blocking(move || atomic_write(&resolved2, &updated2)).await {
-                Ok(Ok(())) => {
+            // Read-modify-write on ONE pinned parent descriptor: the file whose
+            // content we matched against is, by construction, the file we then
+            // replace. Doing it in a single blocking closure keeps that descriptor
+            // alive across both halves and keeps the (blocking) file I/O off the
+            // async worker (M-21).
+            let (ws2, path2) = (ws.clone(), path.clone());
+            let (old2, new2) = (old.clone(), new.clone());
+            let edited = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                let target = Target::open(&ws2, &path2)?;
+                // Same cap as `read_file`: a file the model cannot read in full is
+                // one it cannot edit safely either.
+                let content = target
+                    .read_to_string(MAX_READ_BYTES)
+                    .map_err(|e| format!("read '{path2}': {e}"))?;
+                let count = content.matches(&old2).count();
+                if count == 0 {
+                    return Err(format!("edit_file: \"old\" not found in '{path2}'"));
+                }
+                if count > 1 {
+                    return Err(format!(
+                        "edit_file: \"old\" occurs {count} times in '{path2}' — make it unique (add surrounding context)"
+                    ));
+                }
+                let updated = content.replacen(&old2, &new2, 1);
+                if updated.len() > MAX_WRITE_BYTES {
+                    return Err(format!(
+                        "result is {} bytes, over the {MAX_WRITE_BYTES}-byte write limit",
+                        updated.len()
+                    ));
+                }
+                target
+                    .atomic_replace(&updated)
+                    .map_err(|e| format!("write '{path2}': {e}"))?;
+                Ok(updated)
+            })
+            .await;
+            match edited {
+                Ok(Ok(updated)) => {
                     ToolResult::Ok(json!({"path": path, "replaced": 1, "bytes": updated.len()}))
                 }
-                Ok(Err(e)) => ToolResult::Err(format!("write '{path}': {e}")),
+                Ok(Err(e)) => ToolResult::Err(e),
                 Err(e) => ToolResult::Err(format!("edit write task failed: {e}")),
             }
         })
@@ -1566,22 +1658,27 @@ impl Tool for DeleteFileTool {
                 Err(e) => return ToolResult::Err(e),
             };
             let _ = tokio::fs::create_dir_all(&ws).await;
-            let resolved = match resolve_within_async(ws.clone(), path.clone()).await {
-                Ok(v) => v,
-                Err(e) => return ToolResult::Err(e),
-            };
-            if tokio::fs::metadata(&resolved)
-                .await
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-            {
-                return ToolResult::Err(format!(
-                    "'{path}' is a directory — delete_file only removes files"
-                ));
-            }
-            match tokio::task::spawn_blocking(move || std::fs::remove_file(&resolved)).await {
+            // Pin the parent, then `unlinkat` the leaf off that descriptor. Note
+            // this also fixes a real mis-targeting bug: the old code canonicalized
+            // the pathname first, so deleting a symlink FOLLOWED it and removed
+            // the link's target, leaving the link itself dangling. `unlinkat`
+            // removes exactly the name that was asked for.
+            let (ws2, path2) = (ws.clone(), path.clone());
+            let deleted = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let target = Target::open(&ws2, &path2)?;
+                if target.is_dir() {
+                    return Err(format!(
+                        "'{path2}' is a directory — delete_file only removes files"
+                    ));
+                }
+                target
+                    .unlink()
+                    .map_err(|e| format!("delete '{path2}': {e}"))
+            })
+            .await;
+            match deleted {
                 Ok(Ok(())) => ToolResult::Ok(json!({ "path": path, "deleted": true })),
-                Ok(Err(e)) => ToolResult::Err(format!("delete '{path}': {e}")),
+                Ok(Err(e)) => ToolResult::Err(e),
                 Err(e) => ToolResult::Err(format!("delete task failed: {e}")),
             }
         })
