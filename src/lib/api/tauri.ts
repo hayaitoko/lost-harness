@@ -754,8 +754,13 @@ export async function probeHardware(): Promise<HardwareProfile | null> {
 
 // ── M8 S2′/S3′ — HF model search + interactive calculator ──────────────────
 
-/** How much we vouch for a model's bytes (the compensating trust-root control). */
-export type Provenance = "trusted" | "community";
+/** How much we vouch for a model's bytes (the compensating trust-root control).
+ *  Wire values come from the backend's `#[serde(rename_all = "snake_case")]`
+ *  `Provenance` enum (src-tauri/src/models/hf_search.rs) — "curated" (verified
+ *  against a signed manifest) or "community" (everything else). Pinned on both
+ *  sides: see `manifest_state_wire_shape_is_stable_for_the_ui` in hf_search.rs
+ *  and src/tests/provenance.test.ts here. */
+export type Provenance = "curated" | "community";
 export type SearchSort = "downloads" | "likes" | "trending" | "last_modified";
 export type KvCacheQuant = "f16" | "q8_0" | "q4_0";
 export type Fit = "fits" | "tight" | "too_large";

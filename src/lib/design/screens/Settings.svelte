@@ -1631,8 +1631,8 @@
                           {r.publisher}{r.downloads != null ? ` · ${r.downloads.toLocaleString()} downloads` : ""}{r.likes != null ? ` · ${r.likes.toLocaleString()} likes` : ""}
                         </span>
                       </span>
-                      {#if r.provenance === "trusted"}
-                        <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">trusted</span>
+                      {#if r.provenance === "curated"}
+                        <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">curated</span>
                       {:else}
                         <span class="flex-shrink-0 rounded-[8px] bg-warn-soft px-[7px] py-px text-[10px] text-warn">community</span>
                       {/if}
