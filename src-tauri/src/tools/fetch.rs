@@ -150,6 +150,13 @@ async fn fetch_readable(raw: &str) -> Result<serde_json::Value, String> {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(USER_AGENT)
             .resolve_to_addrs(&hostname, &vetted)
+            // Without this the pin above is decorative: reqwest picks up
+            // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY at build time, and a proxied
+            // request is sent to the proxy, which resolves the hostname
+            // itself. The vetted address then receives nothing and the
+            // rebind TOCTOU is wide open. Proven by the regression test
+            // `a_configured_proxy_cannot_defeat_the_pinned_address`.
+            .no_proxy()
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
@@ -699,5 +706,75 @@ mod tests {
         assert!(resp.status().is_success());
 
         serve.await.unwrap();
+    }
+    #[tokio::test]
+    async fn a_configured_proxy_cannot_defeat_the_pinned_address() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        // Two listeners: the PINNED target and a PROXY sink.
+        let pinned = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pinned_addr = pinned.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let pinned_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+
+        let ph = pinned_hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = pinned.accept().await {
+                ph.fetch_add(1, Ordering::SeqCst);
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nPINNED")
+                    .await;
+            }
+        });
+        let xh = proxy_hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = proxy.accept().await {
+                xh.fetch_add(1, Ordering::SeqCst);
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nPROXY")
+                    .await;
+            }
+        });
+
+        // The production client shape from `fetch_url` above, plus an explicit
+        // proxy standing in for HTTP_PROXY/ALL_PROXY in the environment (reqwest
+        // reads those at build time; an explicit proxy exercises the same path
+        // without mutating process-global env from a parallel test).
+        // `.no_proxy()` must win, or the SSRF pin is decorative.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs("pinned-proxy-probe.local", &[pinned_addr])
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .no_proxy()
+            .build()
+            .unwrap();
+
+        let body = client
+            .get("http://pinned-proxy-probe.local/x")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            body, "PINNED",
+            "the vetted address must receive the request, not the proxy"
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            0,
+            "the proxy must receive no connection at all"
+        );
+        assert_eq!(pinned_hits.load(Ordering::SeqCst), 1);
     }
 }
