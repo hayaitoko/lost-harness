@@ -44,7 +44,12 @@
 //!   trait; transport behind [`gmail::GmailHttp`], authorization behind
 //!   [`gmail::TokenProvider`] (stage 2 implements it over the keychain +
 //!   [`oauth::refresh`]); pure fixture-tested parsers for everything else.
+//! - [`api_error`] — the pure classifier for non-2xx Google REST responses.
+//!   `oauth` classifies token-REFRESH failures; this classifies API-CALL
+//!   failures, which is a different question with different remedies (a
+//!   disabled Cloud API is not fixable by reconnecting).
 
+pub mod api_error;
 pub mod calendar;
 pub mod gmail;
 pub mod google;

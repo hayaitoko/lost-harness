@@ -282,7 +282,16 @@ impl GmailClient {
             (status, text) = self.http.request(method, url, &fresh, body).await?;
         }
         if !(200..300).contains(&status) {
-            anyhow::bail!("Gmail API HTTP {status}: {}", snippet(&text));
+            // Same recovery seam the Calendar/Tasks client uses: Gmail returns
+            // the identical 403 envelopes, so a scope-short grant here must
+            // light the same reconnect banner rather than dead-ending in raw
+            // `Gmail API HTTP 403` text. Unmatched statuses are untouched.
+            return Err(crate::email::api_error::google_api_error(
+                "Gmail API",
+                status,
+                &text,
+                &snippet(&text),
+            ));
         }
         Ok(text)
     }
@@ -968,6 +977,75 @@ mod tests {
             "refresh attempted once, never looped"
         );
         assert_eq!(http.calls.lock().unwrap().len(), 2);
+    }
+
+    /// Gmail returns the same 403 envelopes Calendar/Tasks do, so it needs the
+    /// same recovery seam: a scope-short grant must carry the reconnect
+    /// marker, a disabled API must carry the DISTINCT one (never the reconnect
+    /// one — reconnecting cannot switch an API on), and anything else must
+    /// keep the plain `Gmail API HTTP …` string it always had.
+    #[tokio::test]
+    async fn a_403_is_classified_into_its_recovery_state() {
+        const CONSOLE: &str =
+            "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=7";
+
+        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(
+            403,
+            r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+                {"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+                 "reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}"#,
+        )]));
+        let err = client
+            .0
+            .list_messages(None, 5)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER),
+            "got: {err}"
+        );
+
+        let disabled = format!(
+            r#"{{"error":{{"errors":[{{"reason":"accessNotConfigured",
+            "message":"Access Not Configured. Enable it by visiting {CONSOLE} then retry."}}],
+            "code":403}}}}"#
+        );
+        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(403, &disabled)]));
+        let err = client
+            .0
+            .list_messages(None, 5)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(crate::email::token_provider::API_NOT_ENABLED_MARKER),
+            "got: {err}"
+        );
+        assert!(
+            !err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER),
+            "got: {err}"
+        );
+        assert_eq!(
+            crate::email::token_provider::extract_enable_url(&err).as_deref(),
+            Some(CONSOLE)
+        );
+
+        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(
+            403,
+            r#"{"error":{"code":403,"message":"The caller does not have permission"}}"#,
+        )]));
+        let err = client
+            .0
+            .list_messages(None, 5)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("Gmail API HTTP 403: "), "got: {err}");
+        assert!(
+            !err.contains("[google:") && !err.contains("[gmail:"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

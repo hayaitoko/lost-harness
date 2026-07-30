@@ -28,6 +28,43 @@ use crate::secrets::ProviderSecretStore;
 /// survives copy edits.
 pub const NEEDS_RECONNECT_MARKER: &str = "[gmail:needs_reconnect]";
 
+/// Stable substring carried by every "this Google API is switched off in your
+/// own Cloud project" error (see [`crate::email::api_error`]).
+///
+/// DELIBERATELY DISTINCT from [`NEEDS_RECONNECT_MARKER`]: a reconnect
+/// re-consents scopes, and no amount of re-consenting can enable an API that
+/// the user's Google Cloud project has turned off. Driving the reconnect
+/// banner from this state would walk the user through the whole OAuth dance,
+/// fail identically, and offer the same button again — an infinite loop with
+/// no exit. The two states get two banners.
+pub const API_NOT_ENABLED_MARKER: &str = "[google:api_not_enabled]";
+
+/// Opening delimiter of the optional console-activation URL that rides beside
+/// [`API_NOT_ENABLED_MARKER`]: `[google:enable_url=https://…]`. The URL is
+/// validated before it is embedded (see
+/// [`crate::email::api_error::sanitize_console_url`]) — in particular it can
+/// never contain the `]` that terminates it here, so extraction is exact.
+const ENABLE_URL_OPEN: &str = "[google:enable_url=";
+const ENABLE_URL_CLOSE: char = ']';
+
+/// Wrap a (already validated) console URL for embedding in an error string.
+pub fn embed_enable_url(url: &str) -> String {
+    format!("{ENABLE_URL_OPEN}{url}{ENABLE_URL_CLOSE}")
+}
+
+/// The console-activation URL an error string carries, if any. Pure; the
+/// inverse of [`embed_enable_url`].
+pub fn extract_enable_url(err: &str) -> Option<String> {
+    let start = err.find(ENABLE_URL_OPEN)? + ENABLE_URL_OPEN.len();
+    let rest = &err[start..];
+    let end = rest.find(ENABLE_URL_CLOSE)?;
+    let url = &rest[..end];
+    if url.is_empty() {
+        return None;
+    }
+    Some(url.to_string())
+}
+
 /// Refresh this many seconds before the token actually expires, so a token
 /// handed to a request can't die mid-flight.
 const EXPIRY_MARGIN_SECS: u64 = 60;

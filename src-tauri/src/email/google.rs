@@ -91,7 +91,18 @@ impl GoogleClient {
         }
         if !(200..300).contains(&status) {
             let compact = text.chars().take(700).collect::<String>();
-            anyhow::bail!("Google API HTTP {status}: {compact}");
+            // The structural gap this closes: EVERY non-2xx used to bail with
+            // a marker-free plain string, so a real Google 403 could never
+            // trip the connection-state markers no matter how many callers
+            // checked for them. Classification happens HERE, once, for both
+            // recoverable 403s; an unmatched status still produces exactly the
+            // string it did before.
+            return Err(crate::email::api_error::google_api_error(
+                "Google API",
+                status,
+                &text,
+                &compact,
+            ));
         }
         if text.trim().is_empty() {
             return Ok(serde_json::Value::Null);
@@ -131,8 +142,14 @@ mod tests {
     }
 
     fn with_content_length(body: &[u8]) -> Vec<u8> {
+        with_status(200, "OK", body)
+    }
+
+    /// Same, with an explicit status line — the only way to drive the
+    /// non-2xx branch through the real transport.
+    fn with_status(code: u16, reason: &str, body: &[u8]) -> Vec<u8> {
         let mut out = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .into_bytes();
@@ -191,5 +208,86 @@ mod tests {
         let url = serve_once(with_content_length(br#"{"id":"evt-1"}"#)).await;
         let value = client.json(Method::Get, &url, None).await.unwrap();
         assert_eq!(value["id"], serde_json::json!("evt-1"));
+    }
+
+    const CONSOLE: &str =
+        "https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=42";
+
+    /// The finding this pins: `json` bailed with a marker-free plain string
+    /// for ANY non-2xx, so a real Google 403 could never light a banner — the
+    /// Planner just failed forever with raw `Google API HTTP 403` text.
+    ///
+    /// Driven through the REAL transport (loopback socket → reqwest → `json`),
+    /// not the pure classifier, so this covers the wiring and not just the
+    /// parse.
+    #[tokio::test]
+    async fn a_403_reaches_callers_with_the_right_marker_for_its_flavour() {
+        let client = GoogleClient::new(Box::new(FixedToken)).unwrap();
+
+        // Scope-short grant → the reconnect marker. Reconnecting re-consents
+        // all four scopes, so the reconnect banner is the honest remedy.
+        let scope_body = br#"{"error":{"code":403,
+            "message":"Request had insufficient authentication scopes.",
+            "status":"PERMISSION_DENIED","details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+             "reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT","domain":"googleapis.com"}]}}"#;
+        let url = serve_once(with_status(403, "Forbidden", scope_body)).await;
+        let err = client
+            .json(Method::Get, &url, None)
+            .await
+            .expect_err("a 403 is still a failure")
+            .to_string();
+        assert!(
+            err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER),
+            "got: {err}"
+        );
+        assert!(
+            !err.contains(crate::email::token_provider::API_NOT_ENABLED_MARKER),
+            "got: {err}"
+        );
+
+        // Disabled API → the DISTINCT marker plus Google's console link, and
+        // NOT the reconnect marker (that would loop the user forever).
+        let disabled_body = format!(
+            r#"{{"error":{{"errors":[{{"domain":"usageLimits","reason":"accessNotConfigured",
+            "message":"Access Not Configured.","extendedHelp":"{CONSOLE}"}}],"code":403}}}}"#
+        );
+        let url = serve_once(with_status(403, "Forbidden", disabled_body.as_bytes())).await;
+        let err = client
+            .json(Method::Get, &url, None)
+            .await
+            .expect_err("a 403 is still a failure")
+            .to_string();
+        assert!(
+            err.contains(crate::email::token_provider::API_NOT_ENABLED_MARKER),
+            "got: {err}"
+        );
+        assert!(
+            !err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER),
+            "reconnecting can never enable a disabled API: {err}"
+        );
+        assert_eq!(
+            crate::email::token_provider::extract_enable_url(&err).as_deref(),
+            Some(CONSOLE)
+        );
+
+        // An unmatched 403 keeps the pre-existing plain-string behaviour —
+        // no marker, no guess about which recovery applies.
+        let url = serve_once(with_status(
+            403,
+            "Forbidden",
+            br#"{"error":{"code":403,"message":"The caller does not have permission"}}"#,
+        ))
+        .await;
+        let err = client
+            .json(Method::Get, &url, None)
+            .await
+            .expect_err("a 403 is still a failure")
+            .to_string();
+        assert!(err.starts_with("Google API HTTP 403: "), "got: {err}");
+        assert!(
+            !err.contains("[google:") && !err.contains("[gmail:"),
+            "an unmatched 403 must carry no marker: {err}"
+        );
     }
 }
