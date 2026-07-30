@@ -20,11 +20,12 @@
 //!                 (H-12); non-sensitive content passes, while a hit on the
 //!                 **un-tunable rules floor** yields `ConfirmRequired` — ONE
 //!                 send the user must authorise explicitly, which then expires.
-//!                 Like `Auto` and `Private`, this arm is about EGRESS: on a
-//!                 non-cloud endpoint nothing leaves the device, so there is
-//!                 nothing to confirm and the send is `Allow`ed.
 //!  - `Private` — the user explicitly opted in. Cloud endpoints are
 //!                 always `Block`ed.
+//!
+//! All three arms are about EGRESS, so all three consult `is_cloud_endpoint`:
+//! on a non-cloud endpoint nothing leaves the device, so `Public` has nothing to
+//! confirm and `Private` has nothing to block — both `Allow`.
 //!
 //! The `GateDecision::RouteLocal` outcome is enforced by `is_private_endpoint`
 //! in `egress.rs` at the actual HTTP boundary.
