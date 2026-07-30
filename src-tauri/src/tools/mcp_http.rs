@@ -13,10 +13,15 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REDIRECT_HOPS: usize = 5;
 
-/// A validated Streamable HTTP endpoint. HTTPS is mandatory except for a
-/// loopback HTTP endpoint used for local development; credentials/fragments in
-/// URLs are rejected so they cannot leak into logs or persisted settings.
-pub fn validate_endpoint(raw: &str) -> Result<url::Url, String> {
+/// The URL rules that hold for EVERY destination this transport will talk to,
+/// whether the user typed it or a server redirected to it: HTTPS is mandatory
+/// except for a loopback HTTP endpoint used for local development, and
+/// credentials/fragments are rejected so they cannot leak into logs or
+/// persisted settings.
+///
+/// The query-string rule is deliberately NOT here — see [`validate_endpoint`]
+/// and [`validate_redirect_target`].
+fn validate_url_shape(raw: &str) -> Result<url::Url, String> {
     let url =
         url::Url::parse(raw.trim()).map_err(|_| "MCP endpoint must be a valid URL".to_string())?;
     if url.username() != "" || url.password().is_some() || url.fragment().is_some() {
@@ -27,10 +32,36 @@ pub fn validate_endpoint(raw: &str) -> Result<url::Url, String> {
             "MCP endpoints must use HTTPS (HTTP is allowed only for localhost)".to_string(),
         );
     }
+    Ok(url)
+}
+
+/// A validated Streamable HTTP endpoint as CONFIGURED BY THE USER.
+///
+/// On top of [`validate_url_shape`] a registered endpoint may not carry a query
+/// string: the MCP spec puts no request state in the URL, so a query on a
+/// hand-entered endpoint is far more likely to be a pasted secret (a token, an
+/// API key) that would then be persisted in the registration store and echoed
+/// into logs.
+pub fn validate_endpoint(raw: &str) -> Result<url::Url, String> {
+    let url = validate_url_shape(raw)?;
     if url.query().is_some() {
         return Err("MCP endpoint URLs may not contain a query string".to_string());
     }
     Ok(url)
+}
+
+/// A validated redirect target as ISSUED BY THE SERVER.
+///
+/// Same rules as a configured endpoint EXCEPT that a query string is allowed.
+/// A server-issued `Location` is a different case from a hand-entered endpoint:
+/// real MCP deployments 307 a request onto a session-bearing URL such as
+/// `…/mcp?session=abc`, and refusing that made every RPC fail with no recovery
+/// route. Nothing else is relaxed — the scheme rule (so no HTTPS→plain-HTTP
+/// hop), the credential/fragment rule, the per-hop address vetting and the
+/// hop limit all still apply, and the session header is still never forwarded
+/// across the boundary.
+fn validate_redirect_target(raw: &str) -> Result<url::Url, String> {
+    validate_url_shape(raw)
 }
 
 /// The exact destination a cached client is pinned to: the host key plus the
@@ -101,7 +132,7 @@ impl HttpMcpTransport {
                 return Ok(client.clone());
             }
         }
-        let client = build_pinned_client(&hop.host_key, &hop.addrs)?;
+        let client = build_pinned_client(&hop.host_key, &hop.addrs, None)?;
         *guard = Some((key, client.clone()));
         Ok(client)
     }
@@ -475,43 +506,55 @@ async fn vet_hop(url: &url::Url, allow_loopback: bool) -> Result<VettedHop, Stri
 
 /// Build a client whose resolution of `host` is PINNED to `addrs`. Redirects
 /// stay disabled — `post` follows them itself so every hop is re-vetted.
-fn build_pinned_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+///
+/// `proxy` is `None` on every production call site. It exists so the regression
+/// test can hand a proxy to the REAL builder and prove `.no_proxy()` below wins;
+/// without that seam the test would have to build its own client and the
+/// mutation that deletes `.no_proxy()` from production would survive.
+fn build_pinned_client(
+    host: &str,
+    addrs: &[SocketAddr],
+    proxy: Option<reqwest::Proxy>,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
         .timeout(RPC_TIMEOUT)
         .connect_timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, addrs)
+        .resolve_to_addrs(host, addrs);
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    builder
+        // Without this the pin above is DECORATIVE. reqwest reads
+        // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY at `build()` time; when any is set
+        // the socket goes to the proxy, which resolves the target hostname
+        // ITSELF at connect time. The vetted address then receives nothing and
+        // the DNS-rebind TOCTOU this transport exists to close is wide open.
+        //
+        // So MCP HTTP traffic deliberately does NOT honour a configured proxy:
+        // a guard whose whole purpose is choosing the destination address
+        // cannot permit an intermediary that re-resolves the name.
+        //
+        // Order matters — reqwest's `no_proxy()` CLEARS the proxy list, so it
+        // must come after any `.proxy(..)` above. Proven by
+        // `a_configured_proxy_cannot_defeat_the_pinned_address`.
+        .no_proxy()
         .build()
         .map_err(|e| format!("couldn't build MCP HTTP client: {e}"))
 }
 
 /// H-02: The URL-level rules for moving from one hop to the next: the target
-/// must pass full endpoint validation, and an HTTPS hop may never downgrade to
-/// plain HTTP (which would put the payload — and any session token — in clear).
+/// must pass redirect-target validation (everything a configured endpoint must
+/// pass except the no-query rule — see [`validate_redirect_target`]), and an
+/// HTTPS hop may never downgrade to plain HTTP (which would put the payload —
+/// and any session token — in clear).
 fn check_hop_transition(from: &url::Url, to: &url::Url) -> Result<(), String> {
-    validate_endpoint(to.as_str())
+    validate_redirect_target(to.as_str())
         .map_err(|e| format!("MCP redirect target rejected by endpoint validation: {e}"))?;
     if from.scheme() == "https" && to.scheme() != "https" {
         return Err("MCP redirect scheme downgrade from HTTPS is rejected".to_string());
     }
     Ok(())
-}
-
-/// H-02 / L-04: Does `url` point at a private or otherwise non-public
-/// destination? Domain names are resolved and EVERY returned address is
-/// classified; IPv4-mapped IPv6 forms such as `::ffff:10.0.0.1` are unwrapped by
-/// [`addr_permitted`], so an internal IPv4 cannot slip through as a v6 literal.
-///
-/// Kept as a request-free predicate for registration-time validation (and
-/// covered by tests), but the live request path deliberately does NOT call it:
-/// `post` calls [`vet_hop`], which answers the same question through the same
-/// `addr_permitted` gate AND returns the addresses to pin, so there is exactly
-/// one resolution per hop and the two can never disagree. Asking twice is the
-/// TOCTOU this packet closed.
-#[allow(dead_code)] // no in-crate caller by design; see above
-pub async fn is_private_destination(url: &url::Url) -> Result<bool, String> {
-    let addrs = resolve_addrs(url).await?;
-    Ok(addrs.iter().any(|a| !addr_permitted(a.ip(), false)))
 }
 
 fn parse_jsonrpc(raw: &[u8], id: i64) -> Result<serde_json::Value, String> {
@@ -827,17 +870,25 @@ mod tests {
         assert!(!addr_permitted(mapped_loop, false));
         assert!(addr_permitted(mapped_loop, true));
 
-        // is_private_destination: the named predicate reports it as private.
+        // vet_hop — the predicate the live path actually uses — classifies both.
+        // Both are IP literals, so `resolve_addrs` short-circuits DNS and this
+        // touches no network.
         assert!(
-            is_private_destination(&url::Url::parse("https://[::ffff:10.0.0.1]/mcp").unwrap())
-                .await
-                .unwrap(),
+            vet_hop(
+                &url::Url::parse("https://[::ffff:10.0.0.1]/mcp").unwrap(),
+                false
+            )
+            .await
+            .is_err(),
             "::ffff:10.0.0.1 must be classified private"
         );
         assert!(
-            !is_private_destination(&url::Url::parse("https://[2606:2800:220:1::1]/mcp").unwrap())
-                .await
-                .unwrap(),
+            vet_hop(
+                &url::Url::parse("https://[2606:2800:220:1::1]/mcp").unwrap(),
+                false
+            )
+            .await
+            .is_ok(),
             "a public v6 address must not be classified private"
         );
 
@@ -914,7 +965,7 @@ mod tests {
             "vet_hop must hand back the exact address it vetted"
         );
 
-        let pinned_a = build_pinned_client(HOST, &vetted.addrs).unwrap();
+        let pinned_a = build_pinned_client(HOST, &vetted.addrs, None).unwrap();
         let body_a = pinned_a
             .get(format!("http://{HOST}/mcp"))
             .send()
@@ -933,7 +984,7 @@ mod tests {
 
         // Only re-vetting and re-pinning changes the destination — proving the
         // destination is the pin, not the name.
-        let pinned_b = build_pinned_client(HOST, &[b.addr]).unwrap();
+        let pinned_b = build_pinned_client(HOST, &[b.addr], None).unwrap();
         let body_b = pinned_b
             .get(format!("http://{HOST}/mcp"))
             .send()
@@ -944,5 +995,186 @@ mod tests {
             .unwrap();
         assert!(body_b.contains(r#""B""#), "landed somewhere else: {body_b}");
         assert_eq!(a.heads().len(), 1, "A must not have been contacted again");
+    }
+
+    #[tokio::test]
+    async fn a_configured_proxy_cannot_defeat_the_pinned_address() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+
+        // Two listeners: the PINNED (vetted) target and a PROXY sink.
+        let pinned = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pinned_addr = pinned.local_addr().unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+
+        let pinned_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+
+        let ph = pinned_hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = pinned.accept().await {
+                ph.fetch_add(1, AtomicOrdering::SeqCst);
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nPINNED",
+                    )
+                    .await;
+            }
+        });
+        let xh = proxy_hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = proxy.accept().await {
+                xh.fetch_add(1, AtomicOrdering::SeqCst);
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nPROXY",
+                    )
+                    .await;
+            }
+        });
+
+        // The PRODUCTION builder, handed an explicit proxy. An explicit
+        // `.proxy(..)` exercises exactly the path `HTTP_PROXY`/`ALL_PROXY` take
+        // (reqwest reads those at `build()` time) without mutating
+        // process-global env from a test that runs in parallel with others.
+        // `build_pinned_client`'s `.no_proxy()` must win, or the pin — and the
+        // whole DNS-rebind guard — is decorative: the socket would go to the
+        // proxy, which resolves the hostname itself at connect time.
+        const HOST: &str = "mcp-proxy-probe.invalid";
+        let client = build_pinned_client(
+            HOST,
+            &[pinned_addr],
+            Some(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap()),
+        )
+        .unwrap();
+
+        let body = client
+            .get(format!("http://{HOST}/mcp"))
+            .send()
+            .await
+            .expect("the pinned request must reach the vetted address")
+            .text()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            body, "PINNED",
+            "the vetted address must receive the request, not the proxy"
+        );
+        assert_eq!(
+            proxy_hits.load(AtomicOrdering::SeqCst),
+            0,
+            "the proxy must receive no connection at all"
+        );
+        assert_eq!(pinned_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_target_may_carry_a_query_string() {
+        // Real MCP deployments 307 onto a session-bearing URL. Refusing that
+        // failed EVERY rpc with no recovery route, so a SERVER-issued target is
+        // allowed a query even though a user-CONFIGURED endpoint is not.
+        let server = spawn_server(|addr| {
+            vec![
+                redirect_response(&format!("http://{addr}/mcp?session=abc&x=1")),
+                json_response(r#"{"jsonrpc":"2.0","id":0,"result":{"ok":true}}"#),
+            ]
+        })
+        .await;
+        // The same URL as a configured endpoint is still refused — so this test
+        // can only pass because the redirect case is treated differently.
+        assert!(
+            validate_endpoint(&format!("http://{}/mcp?session=abc&x=1", server.addr)).is_err(),
+            "a configured endpoint must still refuse a query string"
+        );
+
+        let transport = HttpMcpTransport::from_validated(server.endpoint());
+        let result = transport
+            .rpc("tools/list", serde_json::json!({}), true)
+            .await;
+        assert_eq!(
+            result.expect("a 307 to a session-bearing URL must be followed")["ok"],
+            true
+        );
+
+        let heads = server.heads();
+        assert_eq!(heads.len(), 2, "one request per hop: {heads:?}");
+        assert!(
+            heads[1].starts_with("POST /mcp?session=abc&x=1 "),
+            "hop 1 must request the redirected path INCLUDING its query: {}",
+            heads[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_production_redirect_path_enforces_the_hop_gate() {
+        // Guards the CALL SITE of `check_hop_transition` inside `post()`, not
+        // just the helper: turning that `?` into an ignored Result must break
+        // this test. Server A redirects to a CREDENTIALED URL on server B —
+        // which `check_hop_transition` refuses, but which is otherwise
+        // perfectly reachable (loopback, plain HTTP, permitted address, and B
+        // answers a well-formed JSON-RPC result for this exact request id). So
+        // if the gate's result is ignored, the rpc SUCCEEDS and B is contacted.
+        let b = spawn_server(|_| {
+            vec![json_response(
+                r#"{"jsonrpc":"2.0","id":0,"result":{"ok":true}}"#,
+            )]
+        })
+        .await;
+        let b_addr = b.addr;
+        let a = spawn_server(move |_| {
+            vec![redirect_response(&format!(
+                "http://user:secret@{b_addr}/mcp"
+            ))]
+        })
+        .await;
+
+        let transport = HttpMcpTransport::from_validated(a.endpoint());
+        let err = transport
+            .rpc("tools/list", serde_json::json!({}), true)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("credentials or fragments"),
+            "the hop gate must refuse a credentialed redirect target: got {err}"
+        );
+        assert_eq!(
+            b.heads().len(),
+            0,
+            "the refused target must never be contacted"
+        );
+        assert_eq!(a.heads().len(), 1, "only hop 0 should have been sent");
+    }
+
+    #[test]
+    fn configured_endpoints_refuse_a_query_but_redirect_targets_do_not() {
+        // The asymmetry, stated directly.
+        assert!(validate_endpoint("https://example.com/mcp?token=secret").is_err());
+        assert!(validate_redirect_target("https://example.com/mcp?session=abc").is_ok());
+        assert!(
+            validate_endpoint("https://example.com/mcp").is_ok(),
+            "a query-free endpoint is unaffected"
+        );
+
+        // Everything else a redirect target must still satisfy.
+        assert!(
+            validate_redirect_target("https://user:pw@example.com/mcp").is_err(),
+            "credentials stay refused on a redirect target"
+        );
+        assert!(
+            validate_redirect_target("https://example.com/mcp#frag").is_err(),
+            "fragments stay refused on a redirect target"
+        );
+        assert!(
+            validate_redirect_target("http://example.com/mcp").is_err(),
+            "non-loopback plain HTTP stays refused on a redirect target"
+        );
+        assert!(
+            validate_redirect_target("http://127.0.0.1:3000/mcp?session=abc").is_ok(),
+            "a loopback HTTP redirect target with a query is the local-dev case"
+        );
     }
 }
