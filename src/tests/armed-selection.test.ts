@@ -58,11 +58,27 @@ const PROVIDERS = [
     trusted_by_name: false,
     supports_native_tools: true,
   },
+  // The row an EXISTING install still has in global.db. Removing the quick-add
+  // preset only helps new installs, and we deliberately don't migrate or delete
+  // the user's data — so this provider is configured, answers, lists nothing,
+  // and can never be selected. The picker owes the user that explanation.
+  {
+    id: "anthropic",
+    name: "Anthropic",
+    base_url: "https://api.anthropic.com/v1",
+    kind: "cloud",
+    is_private: false,
+    trusted_by_name: false,
+    supports_native_tools: true,
+  },
 ];
 
 const MODELS_BY_PROVIDER: Record<string, string[]> = {
   "my-box": ["qwen3-32b"],
   openai: ["gpt-4o"],
+  // Answers fine; lists nothing. A Bearer key against Anthropic's native API
+  // never yields an OpenAI-shaped model list.
+  anthropic: [],
 };
 
 /** Providers whose `list_models` currently refuses — an endpoint that is down,
@@ -155,7 +171,7 @@ const chip = () => screen.getByRole("button", { name: /thinking strength/i });
 const armedSend = () => screen.queryByRole("button", { name: /^Send via/ });
 
 async function settle() {
-  await waitFor(() => expect(providersStore.providers).toHaveLength(2));
+  await waitFor(() => expect(providersStore.providers).toHaveLength(3));
   await waitFor(() =>
     expect(chip().textContent).toMatch(/No model selected|·/),
   );
@@ -299,5 +315,39 @@ describe("composer chip — a listing that fails AFTER the user picked", () => {
       model: "qwen3-32b",
     });
     expect(armedSend()).not.toBeNull();
+  });
+});
+
+describe("picker notice — an endpoint that lists no models", () => {
+  it("explains that this app can't use it, not just that it is empty", async () => {
+    // "This endpoint listed no models." was true and useless: it reads like a
+    // transient blank, so the user waits for models that will never arrive. The
+    // notice has to name the actual dead end.
+    render(MainScreen);
+    await settle();
+    await fireEvent.click(chip());
+
+    const popover = await screen.findByRole("listbox");
+    await waitFor(() =>
+      expect(popover.textContent).toContain("listed no models"),
+    );
+    // What the user needs in order to act: the protocol requirement, and the
+    // two things they can do about it.
+    expect(popover.textContent).toContain("OpenAI-compatible");
+    expect(popover.textContent).toContain("/chat/completions");
+    expect(popover.textContent).toContain("/v1");
+    expect(popover.textContent).toMatch(/remove it/i);
+  });
+
+  it("keeps the dead endpoint LISTED rather than hiding it", async () => {
+    // Dropping an empty provider from the popover is what left a different
+    // endpoint armed and serving every turn, invisibly. It stays, with its
+    // reason.
+    render(MainScreen);
+    await settle();
+    await fireEvent.click(chip());
+
+    const popover = await screen.findByRole("listbox");
+    expect(popover.textContent).toContain("Anthropic");
   });
 });
