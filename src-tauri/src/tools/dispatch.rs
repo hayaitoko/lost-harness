@@ -1170,8 +1170,7 @@ impl ToolDispatcher {
                     // default entry on first use, same as the old single slot.
                     let fingerprint = ActionFingerprint::of(&call.name, &call.args);
                     let budget_denial: Option<(String, bool)> = {
-                        let mut states =
-                            self.run_states.lock().expect("run_states mutex poisoned");
+                        let mut states = self.run_states.lock().expect("run_states mutex poisoned");
                         let state = states.entry(ctx.conversation_id.clone()).or_default();
                         if state.dispatch_count >= PER_RUN_DISPATCH_CEILING {
                             Some((
