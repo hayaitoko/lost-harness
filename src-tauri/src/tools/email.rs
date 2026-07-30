@@ -19,12 +19,13 @@
 //! Per-profile: every call builds its client from `ctx.profile` at dispatch
 //! time, so a `work` chat can never read the `personal` mailbox.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use tokio::sync::Semaphore;
 
-use crate::email::gmail::{build_rfc822, GmailApi, GmailClient, ReqwestGmailHttp};
+use crate::email::gmail::{build_rfc822, GmailApi, GmailClient, ReqwestGmailHttp, TokenProvider};
 use crate::email::google::GoogleClient;
 use crate::email::oauth::TokenEndpoint;
 use crate::email::token_provider::{KeychainTokenProvider, NEEDS_RECONNECT_MARKER};
@@ -38,6 +39,11 @@ const SEARCH_MAX_CAP: u32 = 10;
 /// `email_read` body cap (chars) — a huge thread can't flood the context.
 const READ_BODY_CAP: usize = 40_000;
 
+/// How many `email_search` preview fetches may be in flight at once. Above 1
+/// so one slow message can't stall the rest of the page; small enough to stay
+/// a polite burst against Gmail's per-user rate limit.
+const SEARCH_CONCURRENCY: usize = 3;
+
 /// Shared constructor context for the three tools.
 #[derive(Clone)]
 pub struct EmailToolDeps {
@@ -49,17 +55,39 @@ pub struct EmailToolDeps {
     /// never light the screen's reconnect banner, since only the screen IPC
     /// path (`ipc::mod::note_reconnect_if_needed`) used to touch it.
     pub needs_reconnect: Arc<Mutex<HashSet<String>>>,
+    /// Per-profile cached token providers so the in-memory access-token cache
+    /// persists across successive tool calls for the same profile (rather than
+    /// forcing a fresh token refresh on every dispatch).
+    token_providers: Arc<Mutex<HashMap<String, Arc<KeychainTokenProvider>>>>,
 }
 
 impl EmailToolDeps {
-    /// A per-call Gmail client for `profile`. Cheap: two small structs; the
-    /// keychain reads happen lazily inside the token provider.
-    fn token_provider(&self, profile: &str) -> Box<KeychainTokenProvider> {
-        Box::new(KeychainTokenProvider::new(
-            profile,
-            Arc::clone(&self.secrets),
-            Arc::clone(&self.endpoint),
-        ))
+    pub fn new(
+        secrets: Arc<dyn ProviderSecretStore>,
+        endpoint: Arc<dyn TokenEndpoint>,
+        needs_reconnect: Arc<Mutex<HashSet<String>>>,
+    ) -> Self {
+        Self {
+            secrets,
+            endpoint,
+            needs_reconnect,
+            token_providers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A cached per-profile token provider. The inner access-token cache is
+    /// reused across calls so a fresh token isn't fetched on every dispatch.
+    fn token_provider(&self, profile: &str) -> Arc<KeychainTokenProvider> {
+        let mut map = self.token_providers.lock();
+        map.entry(profile.to_string())
+            .or_insert_with(|| {
+                Arc::new(KeychainTokenProvider::new(
+                    profile,
+                    Arc::clone(&self.secrets),
+                    Arc::clone(&self.endpoint),
+                ))
+            })
+            .clone()
     }
 
     fn client(&self, profile: &str) -> anyhow::Result<GmailClient> {
@@ -73,7 +101,22 @@ impl EmailToolDeps {
     /// Calendar and Tasks tools. It shares Gmail's keychain token/reconnect
     /// contract; it does not create a second credential store.
     pub(crate) fn google_client(&self, profile: &str) -> anyhow::Result<GoogleClient> {
-        GoogleClient::new(self.token_provider(profile))
+        GoogleClient::new(Box::new(SharedTokenProvider(self.token_provider(profile))))
+    }
+}
+
+/// Lets the SHARED per-profile token provider satisfy the owned
+/// `Box<dyn TokenProvider>` that `GoogleClient::new` takes, so Calendar/Tasks
+/// reuse the same access-token cache (and the same single-flight refresh) as
+/// Gmail instead of minting a private provider with a cold cache.
+struct SharedTokenProvider(Arc<KeychainTokenProvider>);
+
+impl TokenProvider for SharedTokenProvider {
+    fn access_token(
+        &self,
+        force_refresh: bool,
+    ) -> crate::email::BoxFuture<'_, anyhow::Result<String>> {
+        self.0.access_token(force_refresh)
     }
 }
 
@@ -84,6 +127,40 @@ pub(crate) fn note_reconnect_if_needed(deps: &EmailToolDeps, profile: &str, err:
     if err.contains(NEEDS_RECONNECT_MARKER) {
         deps.needs_reconnect.lock().insert(profile.to_string());
     }
+}
+
+/// Fetch header/snippet previews for `ids`, at most [`SEARCH_CONCURRENCY`] in
+/// flight.
+///
+/// Returns one entry per id, IN INPUT ORDER, each paired with its own id — so
+/// a failed fetch can still name the message it was for (a search result that
+/// says `"id": "?"` is useless to the agent and to the user).
+async fn fetch_previews(
+    client: Arc<dyn GmailApi>,
+    ids: Vec<String>,
+) -> Vec<(String, Result<crate::email::gmail::EmailMessage, String>)> {
+    let sem = Arc::new(Semaphore::new(SEARCH_CONCURRENCY));
+    let mut tasks = Vec::with_capacity(ids.len());
+    for id in ids.iter().cloned() {
+        let client = Arc::clone(&client);
+        let sem = Arc::clone(&sem);
+        tasks.push(tokio::spawn(async move {
+            match sem.acquire_owned().await {
+                Ok(_permit) => client.get_message_metadata(&id).await.map_err(|e| e.to_string()),
+                Err(_) => Err("the search fetch pool closed unexpectedly".to_string()),
+            }
+        }));
+    }
+    let mut out = Vec::with_capacity(tasks.len());
+    for (id, task) in ids.into_iter().zip(tasks) {
+        match task.await {
+            Ok(res) => out.push((id, res)),
+            // A join error means the fetch task panicked. Report it as a row
+            // error (with its real id) rather than taking the search down.
+            Err(e) => out.push((id, Err(format!("preview fetch failed: {e}")))),
+        }
+    }
+    out
 }
 
 // ── email_search ────────────────────────────────────────────────────────────
@@ -145,14 +222,14 @@ impl Tool for EmailSearchTool {
                 .map(|m| (m as u32).clamp(1, SEARCH_MAX_CAP))
                 .unwrap_or(5);
 
-            let client = match self.deps.client(&ctx.profile) {
+            let client: Arc<dyn GmailApi> = Arc::new(match self.deps.client(&ctx.profile) {
                 Ok(c) => c,
                 Err(e) => {
                     let msg = e.to_string();
                     note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
                     return ToolResult::Err(msg);
                 }
-            };
+            });
             let metas = match client.list_messages(query.as_deref(), max).await {
                 Ok(m) => m,
                 Err(e) => {
@@ -161,10 +238,14 @@ impl Tool for EmailSearchTool {
                     return ToolResult::Err(msg);
                 }
             };
-            // Fetch each hit for headers + snippet. Bounded by SEARCH_MAX_CAP.
-            let mut rows = Vec::new();
-            for meta in metas.iter().take(max as usize) {
-                match client.get_message(&meta.id).await {
+            // Bounded-concurrent preview fetches: headers + snippet via
+            // format=metadata (no body data), at most SEARCH_CONCURRENCY in
+            // flight, so one slow message doesn't stall the whole page.
+            let ids: Vec<String> =
+                metas.iter().take(max as usize).map(|m| m.id.clone()).collect();
+            let mut rows: Vec<serde_json::Value> = Vec::with_capacity(ids.len());
+            for (id, res) in fetch_previews(client, ids).await {
+                match res {
                     Ok(m) => rows.push(serde_json::json!({
                         "id": m.id,
                         "from": m.from,
@@ -172,9 +253,10 @@ impl Tool for EmailSearchTool {
                         "date": m.date,
                         "snippet": m.snippet,
                     })),
-                    // One bad message shouldn't sink the search — record it.
+                    // One bad message shouldn't sink the search — record it
+                    // against its real id so the agent can retry that one.
                     Err(e) => rows.push(serde_json::json!({
-                        "id": meta.id,
+                        "id": id,
                         "error": format!("couldn't fetch: {e}"),
                     })),
                 }
@@ -403,11 +485,11 @@ mod tests {
 
     #[test]
     fn risk_classes_match_the_trust_posture() {
-        let deps = EmailToolDeps {
-            secrets: Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
-            endpoint: Arc::new(NoopEndpoint),
-            needs_reconnect: empty_reconnect_set(),
-        };
+        let deps = EmailToolDeps::new(
+            Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
+            Arc::new(NoopEndpoint),
+            empty_reconnect_set(),
+        );
         assert_eq!(EmailSearchTool::new(deps.clone()).risk(), RiskClass::External);
         assert_eq!(EmailReadTool::new(deps.clone()).risk(), RiskClass::External);
         assert_eq!(EmailSendTool::new(deps.clone()).risk(), RiskClass::Dangerous);
@@ -432,11 +514,11 @@ mod tests {
 
     #[tokio::test]
     async fn unconfigured_profile_gets_a_setup_pointing_error_not_a_panic() {
-        let deps = EmailToolDeps {
-            secrets: Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
-            endpoint: Arc::new(NoopEndpoint),
-            needs_reconnect: empty_reconnect_set(),
-        };
+        let deps = EmailToolDeps::new(
+            Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
+            Arc::new(NoopEndpoint),
+            empty_reconnect_set(),
+        );
         let ctx = ExecCtx {
             profile: "personal".into(),
             ..Default::default()
@@ -469,6 +551,146 @@ mod tests {
         }
     }
 
+    /// A mailbox where one id ("slow") takes far longer than the rest, and
+    /// which records both the completion order and the high-water mark of
+    /// concurrent in-flight fetches.
+    struct PacedMailbox {
+        slow_id: String,
+        slow: std::time::Duration,
+        fast: std::time::Duration,
+        completed: Mutex<Vec<String>>,
+        in_flight: Mutex<usize>,
+        peak_in_flight: Mutex<usize>,
+        fail_id: Option<String>,
+    }
+
+    impl PacedMailbox {
+        fn new(fail_id: Option<&str>) -> Self {
+            Self {
+                slow_id: "slow".into(),
+                slow: std::time::Duration::from_millis(300),
+                fast: std::time::Duration::from_millis(40),
+                completed: Mutex::new(Vec::new()),
+                in_flight: Mutex::new(0),
+                peak_in_flight: Mutex::new(0),
+                fail_id: fail_id.map(String::from),
+            }
+        }
+    }
+
+    impl crate::email::gmail::GmailApi for PacedMailbox {
+        fn list_messages<'a>(
+            &'a self,
+            _query: Option<&'a str>,
+            _max: u32,
+        ) -> crate::email::BoxFuture<'a, anyhow::Result<Vec<crate::email::gmail::MessageMeta>>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn get_message<'a>(
+            &'a self,
+            _id: &'a str,
+        ) -> crate::email::BoxFuture<'a, anyhow::Result<crate::email::gmail::EmailMessage>> {
+            Box::pin(async { anyhow::bail!("not used by this test") })
+        }
+
+        fn get_message_metadata<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> crate::email::BoxFuture<'a, anyhow::Result<crate::email::gmail::EmailMessage>> {
+            Box::pin(async move {
+                {
+                    let mut n = self.in_flight.lock();
+                    *n += 1;
+                    let mut peak = self.peak_in_flight.lock();
+                    *peak = (*peak).max(*n);
+                }
+                let wait = if id == self.slow_id { self.slow } else { self.fast };
+                tokio::time::sleep(wait).await;
+                *self.in_flight.lock() -= 1;
+                self.completed.lock().push(id.to_string());
+                if self.fail_id.as_deref() == Some(id) {
+                    anyhow::bail!("Gmail API HTTP 404");
+                }
+                Ok(crate::email::gmail::EmailMessage {
+                    id: id.to_string(),
+                    from: "a@b.co".into(),
+                    to: "me@b.co".into(),
+                    subject: format!("subject for {id}"),
+                    date: "Tue, 1 Jul 2025 00:00:00 +0000".into(),
+                    snippet: "snip".into(),
+                    body_text: String::new(),
+                })
+            })
+        }
+
+        fn send<'a>(
+            &'a self,
+            _raw: &'a str,
+        ) -> crate::email::BoxFuture<'a, anyhow::Result<String>> {
+            Box::pin(async { anyhow::bail!("not used by this test") })
+        }
+
+        fn get_profile<'a>(&'a self) -> crate::email::BoxFuture<'a, anyhow::Result<String>> {
+            Box::pin(async { anyhow::bail!("not used by this test") })
+        }
+    }
+
+    /// The finding this pins: previews used to be fetched strictly one after
+    /// another, so a single slow message serialized the whole search. Now up
+    /// to SEARCH_CONCURRENCY run at once — the fast ones finish while the slow
+    /// one is still in flight — and the concurrency stays bounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_preview_does_not_stall_the_others() {
+        let mailbox = Arc::new(PacedMailbox::new(None));
+        let ids: Vec<String> =
+            vec!["slow".into(), "f1".into(), "f2".into(), "f3".into(), "f4".into()];
+
+        let started = std::time::Instant::now();
+        let out = fetch_previews(mailbox.clone(), ids.clone()).await;
+        let elapsed = started.elapsed();
+
+        // Results keep input order and each carries its own id.
+        assert_eq!(out.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(), ids);
+        assert!(out.iter().all(|(_, r)| r.is_ok()));
+
+        // The four fast fetches all completed before the slow one did.
+        let order = mailbox.completed.lock().clone();
+        assert_eq!(order.last().map(String::as_str), Some("slow"), "order was {order:?}");
+
+        // Concurrency stayed inside the semaphore's budget. Pinned to the
+        // literal 3, NOT to SEARCH_CONCURRENCY: comparing the observed peak
+        // against the constant that produced it is self-referential — it would
+        // keep passing if the bound were raised, which is exactly the change
+        // this assertion exists to catch.
+        assert_eq!(*mailbox.peak_in_flight.lock(), 3);
+
+        // Serial would be 300ms + 4×40ms = 460ms; bounded-concurrent is about
+        // the slow fetch's own latency. Generous bound to stay non-flaky.
+        assert!(
+            elapsed < std::time::Duration::from_millis(430),
+            "took {elapsed:?} — that's serial, not concurrent"
+        );
+    }
+
+    /// The finding this pins: the failed-preview row reported the literal id
+    /// `"?"`, so the agent could never retry or name the message that failed.
+    #[tokio::test]
+    async fn a_failed_preview_row_keeps_its_real_message_id() {
+        let mailbox = Arc::new(PacedMailbox::new(Some("f2")));
+        let ids: Vec<String> = vec!["f1".into(), "f2".into(), "f3".into()];
+        let out = fetch_previews(mailbox, ids).await;
+        let (id, res) = &out[1];
+        assert_eq!(id, "f2");
+        assert!(res.is_err(), "f2 was scripted to fail");
+        // The neighbours are unaffected and keep their own ids.
+        assert_eq!(out[0].0, "f1");
+        assert!(out[0].1.is_ok());
+        assert_eq!(out[2].0, "f3");
+        assert!(out[2].1.is_ok());
+    }
+
     /// The finding this pins: only the screen IPC path used to flip
     /// `needs_reconnect`, so an agent-only dead-token failure never lit the
     /// reconnect banner. Now the tool path inserts into the SAME shared set.
@@ -484,11 +706,11 @@ mod tests {
             .unwrap();
 
         let shared = empty_reconnect_set();
-        let deps = EmailToolDeps {
-            secrets: Arc::new(secrets),
-            endpoint: Arc::new(DeadGrantEndpoint),
-            needs_reconnect: Arc::clone(&shared),
-        };
+        let deps = EmailToolDeps::new(
+            Arc::new(secrets),
+            Arc::new(DeadGrantEndpoint),
+            Arc::clone(&shared),
+        );
         let ctx = ExecCtx {
             profile: "personal".into(),
             ..Default::default()

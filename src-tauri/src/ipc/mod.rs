@@ -3107,7 +3107,7 @@ fn email_client(
     let http = crate::email::gmail::ReqwestGmailHttp::new().map_err(|e| e.to_string())?;
     Ok(crate::email::gmail::GmailClient::new(
         Box::new(http),
-        Box::new(crate::email::token_provider::KeychainTokenProvider::new(
+        std::sync::Arc::new(crate::email::token_provider::KeychainTokenProvider::new(
             profile,
             std::sync::Arc::clone(&state.provider_secrets),
             endpoint,
@@ -3384,7 +3384,7 @@ pub async fn gmail_finish_connect(
     let http = crate::email::gmail::ReqwestGmailHttp::new().map_err(|e| e.to_string())?;
     let client = crate::email::gmail::GmailClient::new(
         Box::new(http),
-        Box::new(OneShot(tokens.access_token.clone())),
+        Arc::new(OneShot(tokens.access_token.clone())),
     );
     // Best-effort address capture. On failure, store NOTHING — a fabricated
     // "connected" placeholder would be a fake identity persisted as if it

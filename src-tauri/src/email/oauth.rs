@@ -192,22 +192,40 @@ pub trait TokenEndpoint: Send + Sync {
     fn post_form(&self, form: Vec<(String, String)>) -> BoxFuture<'_, anyhow::Result<(u16, String)>>;
 }
 
+/// Hard ceiling on a token-endpoint response body, in bytes.
+///
+/// WHY: an OAuth token response is a small JSON object — a few hundred bytes,
+/// or a short RFC 6749 error object. There is no legitimate reason for it to
+/// approach a megabyte, so a much tighter bound than the Gmail/Calendar fetch
+/// ceiling is appropriate here. Anything past it is refused rather than
+/// buffered.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// The real endpoint: one reqwest form POST to [`GOOGLE_TOKEN_URL`].
 pub struct HttpTokenEndpoint {
     client: reqwest::Client,
     url: String,
+    /// Response-body ceiling in bytes (see [`MAX_TOKEN_RESPONSE_BYTES`]). A
+    /// field rather than a bare const so tests can drive the refusal path
+    /// without allocating a megabyte.
+    max_response_bytes: usize,
 }
 
 impl HttpTokenEndpoint {
     /// Build the production endpoint. Short timeouts: a token POST is tiny,
     /// and a hung exchange must not eat the whole auth window.
     pub fn new() -> anyhow::Result<Self> {
+        Self::build(GOOGLE_TOKEN_URL.to_string(), MAX_TOKEN_RESPONSE_BYTES)
+    }
+
+    fn build(url: String, max_response_bytes: usize) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
                 .build()?,
-            url: GOOGLE_TOKEN_URL.to_string(),
+            url,
+            max_response_bytes,
         })
     }
 }
@@ -223,7 +241,16 @@ impl TokenEndpoint for HttpTokenEndpoint {
                 .await
                 .map_err(|e| anyhow::anyhow!("POST token endpoint failed: {e}"))?;
             let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            // Bounded, not `text().await.unwrap_or_default()`: the unbounded
+            // buffer let whatever answered this POST decide our memory usage,
+            // and swallowing a read failure produced an empty body that
+            // classification would read as a malformed-but-present response.
+            let body = super::gmail::read_body_capped(
+                resp,
+                self.max_response_bytes,
+                "OAuth token endpoint",
+            )
+            .await?;
             Ok((status, body))
         })
     }
@@ -969,5 +996,95 @@ mod tests {
         assert!(!g.contains("shhh"), "client secret must never Debug-print: {g}");
         let p = format!("{:?}", generate_pkce());
         assert!(!p.contains("verifier: \"") || p.contains("<redacted>"));
+    }
+
+    // -- the real reqwest token endpoint against a loopback server ----------
+
+    /// Serve exactly one raw HTTP response on a loopback port, then close.
+    async fn serve_once(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(&response).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn with_content_length(body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A chunked response — the size is NOT knowable up front, so only the
+    /// running-total gate can stop it.
+    fn chunked(total: usize, chunk: usize) -> Vec<u8> {
+        let mut out =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        let mut sent = 0;
+        while sent < total {
+            let n = chunk.min(total - sent);
+            out.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+            out.extend(std::iter::repeat(b'a').take(n));
+            out.extend_from_slice(b"\r\n");
+            sent += n;
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    /// The token endpoint had the same unbounded `resp.text()` the Gmail fetch
+    /// layer did — and it is reachable before any account is even connected.
+    /// It is now capped on the declared length and on the running total, and a
+    /// normal-sized token response still comes back intact.
+    #[tokio::test]
+    async fn oversized_token_endpoint_bodies_are_refused() {
+        // 1. Declared Content-Length over the cap → refused up front.
+        let url = serve_once(with_content_length(&vec![b'a'; 4096])).await;
+        let ep = HttpTokenEndpoint::build(url, 1024).unwrap();
+        let err = ep
+            .post_form(vec![("grant_type".into(), "refresh_token".into())])
+            .await
+            .expect_err("a 4 KiB token body must not pass a 1 KiB cap");
+        assert!(
+            err.to_string()
+                .contains("OAuth token endpoint response too large")
+                && err.to_string().contains("declared 4096"),
+            "got: {err}"
+        );
+
+        // 2. Chunked (no declared length) over the cap → refused mid-stream.
+        let url = serve_once(chunked(4096, 512)).await;
+        let ep = HttpTokenEndpoint::build(url, 1024).unwrap();
+        let err = ep
+            .post_form(vec![("grant_type".into(), "refresh_token".into())])
+            .await
+            .expect_err("a chunked 4 KiB token body must not pass a 1 KiB cap");
+        assert!(
+            err.to_string().contains("exceeded the 1024-byte cap"),
+            "got: {err}"
+        );
+
+        // 3. Control: a real-shaped token response under the cap round-trips.
+        let json = br#"{"access_token":"at-1","expires_in":3599}"#;
+        let url = serve_once(with_content_length(json)).await;
+        let ep = HttpTokenEndpoint::build(url, 1024).unwrap();
+        let (status, body) = ep
+            .post_form(vec![("grant_type".into(), "refresh_token".into())])
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, String::from_utf8(json.to_vec()).unwrap());
     }
 }

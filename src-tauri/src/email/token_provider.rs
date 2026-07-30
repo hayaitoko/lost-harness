@@ -39,6 +39,9 @@ pub struct KeychainTokenProvider {
     endpoint: Arc<dyn TokenEndpoint>,
     /// (access_token, hard expiry). Memory-only by design.
     cache: Mutex<Option<(String, Instant)>>,
+    /// Async single-flight lock: only one concurrent refresh per provider at
+    /// a time. Held across the network call + keychain write in `refresh_now`.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl KeychainTokenProvider {
@@ -52,6 +55,7 @@ impl KeychainTokenProvider {
             secrets,
             endpoint,
             cache: Mutex::new(None),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -94,9 +98,14 @@ impl KeychainTokenProvider {
                 // Google rarely rotates the refresh token; keep the stored one
                 // when the response omits it (S1 contract note #4).
                 if let Some(new_rt) = &tokens.refresh_token {
-                    let _ = self
-                        .secrets
-                        .set(&super::secret_gmail_refresh_token(&self.profile), new_rt);
+                    self.secrets
+                        .set(&super::secret_gmail_refresh_token(&self.profile), new_rt)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to persist rotated refresh token for profile {}: {e}",
+                                self.profile
+                            )
+                        })?;
                 }
                 let expiry = Instant::now()
                     + Duration::from_secs(
@@ -125,6 +134,20 @@ impl KeychainTokenProvider {
 impl TokenProvider for KeychainTokenProvider {
     fn access_token(&self, force_refresh: bool) -> BoxFuture<'_, anyhow::Result<String>> {
         Box::pin(async move {
+            // Fast path: cache hit with parking_lot (no await, no lock contention).
+            if !force_refresh {
+                if let Some((token, expiry)) = self.cache.lock().clone() {
+                    if Instant::now() < expiry {
+                        return Ok(token);
+                    }
+                }
+            }
+            // Single-flight: only one task enters the refresh path; others
+            // await the result.  The tokio mutex guard is held across the
+            // network call + keychain write in `refresh_now`.
+            let _guard = self.refresh_lock.lock().await;
+            // Double-check: another task may have refreshed the cache while
+            // we waited for the lock.
             if !force_refresh {
                 if let Some((token, expiry)) = self.cache.lock().clone() {
                     if Instant::now() < expiry {
@@ -242,6 +265,119 @@ mod tests {
         let p = KeychainTokenProvider::new("personal", store, endpoint);
         let err = p.access_token(false).await.unwrap_err().to_string();
         assert!(err.contains(NEEDS_RECONNECT_MARKER), "got: {err}");
+    }
+
+    /// A token endpoint that takes its time and counts how often it was hit —
+    /// the only way to see whether racing callers collapsed into one refresh.
+    struct SlowCountingEndpoint {
+        calls: std::sync::atomic::AtomicU32,
+        delay: Duration,
+    }
+
+    impl TokenEndpoint for SlowCountingEndpoint {
+        fn post_form(
+            &self,
+            _form: Vec<(String, String)>,
+        ) -> BoxFuture<'_, anyhow::Result<(u16, String)>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok((200, r#"{"access_token":"at-single","expires_in":3599}"#.to_string()))
+            })
+        }
+    }
+
+    /// The finding: without a single-flight gate, every concurrent tool call
+    /// that found a cold/expired cache fired its own refresh — N token
+    /// requests for one expiry, each one a chance to race the keychain write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_refreshes_collapse_into_one_token_request() {
+        let store = seeded_store();
+        let endpoint = Arc::new(SlowCountingEndpoint {
+            calls: std::sync::atomic::AtomicU32::new(0),
+            delay: Duration::from_millis(80),
+        });
+        let provider = Arc::new(KeychainTokenProvider::new("personal", store, endpoint.clone()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = Arc::clone(&provider);
+            handles.push(tokio::spawn(async move { p.access_token(false).await }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap().unwrap(), "at-single");
+        }
+        assert_eq!(
+            endpoint.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "8 racing callers must produce exactly one token request"
+        );
+    }
+
+    /// A store that reads fine but refuses to write the refresh token —
+    /// models a locked or denied OS keychain at the exact moment Google hands
+    /// back a ROTATED refresh token.
+    struct WriteFailStore {
+        inner: MemoryProviderSecretStore,
+    }
+
+    impl ProviderSecretStore for WriteFailStore {
+        fn get(&self, id: &str) -> Result<Option<String>, String> {
+            self.inner.get(id)
+        }
+        fn set(&self, id: &str, secret: &str) -> Result<(), String> {
+            if id == crate::email::secret_gmail_refresh_token("personal") {
+                return Err("keychain is locked".to_string());
+            }
+            self.inner.set(id, secret)
+        }
+        fn delete(&self, id: &str) -> Result<(), String> {
+            self.inner.delete(id)
+        }
+    }
+
+    /// The finding: the rotated-token write used to be `let _ = ...`. If it
+    /// failed, the OLD refresh token stayed on disk while Google had already
+    /// invalidated it — a silent, delayed disconnect. It must surface as an
+    /// error, and it must NOT leave a usable access token cached (which would
+    /// hide the breakage until the token expired).
+    #[tokio::test]
+    async fn a_failed_keychain_write_surfaces_and_does_not_cache_the_token() {
+        let inner = MemoryProviderSecretStore::default();
+        inner
+            .set(crate::email::SECRET_GMAIL_CLIENT_ID, "x.apps.googleusercontent.com")
+            .unwrap();
+        inner.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, "shhh").unwrap();
+        inner
+            .set(&crate::email::secret_gmail_refresh_token("personal"), "rt-1")
+            .unwrap();
+        let store = Arc::new(WriteFailStore { inner });
+        let endpoint = Arc::new(ScriptedEndpoint {
+            responses: Mutex::new(vec![
+                ok_tokens("at-1", Some("rt-2")),
+                ok_tokens("at-2", Some("rt-3")),
+            ]),
+            calls: Mutex::new(0),
+        });
+        let p = KeychainTokenProvider::new("personal", store.clone(), endpoint.clone());
+
+        let err = p.access_token(false).await.unwrap_err().to_string();
+        assert!(err.contains("failed to persist rotated refresh token"), "got: {err}");
+        assert!(err.contains("keychain is locked"), "the store's own reason survives: {err}");
+        // The old token is still what's on disk — we did not pretend otherwise.
+        assert_eq!(
+            store
+                .get(&crate::email::secret_gmail_refresh_token("personal"))
+                .unwrap()
+                .as_deref(),
+            Some("rt-1")
+        );
+        // Nothing was cached, so the next call retries rather than serving an
+        // access token whose refresh token we failed to record.
+        let err2 = p.access_token(false).await.unwrap_err().to_string();
+        assert!(err2.contains("failed to persist rotated refresh token"), "got: {err2}");
+        assert_eq!(*endpoint.calls.lock(), 2, "the failure was retried, not cached over");
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@
 //! hrefs, and layout are lost, and the output is still untrusted content
 //! (the dispatcher guard-wraps it like any tool result).
 
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -40,6 +41,20 @@ const MAX_RESULTS_CAP: u32 = 500;
 
 /// Bound on error-body snippets carried into error strings.
 const ERROR_SNIPPET_CHARS: usize = 300;
+
+/// Hard ceiling on a single Gmail API response body, in bytes.
+///
+/// WHY: `resp.text()` buffers whatever the server sends, so a hostile or
+/// runaway response could exhaust memory before any of our own caps (the
+/// `email_read` body cap) ever see it. Gmail's own message-size limit is
+/// 25 MB and `messages.get?format=full` returns oversized attachment parts as
+/// an `attachmentId` rather than inline data, so 32 MiB sits above anything
+/// legitimate while still being a bound. Exceeding it fails the request
+/// cleanly instead of buffering.
+///
+/// Shared with the sibling Google fetch layer (`super::google`), which has the
+/// same exposure through the same reqwest surface.
+pub(super) const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Public data shapes (what stage 2's tools serialize)
@@ -117,6 +132,11 @@ pub trait GmailApi: Send + Sync {
     /// headers + extracted body text.
     fn get_message<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<EmailMessage>>;
 
+    /// `GET /gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=...`
+    /// — lightweight: headers + snippet only, no body data. Use for search
+    /// previews where the full body is unnecessary.
+    fn get_message_metadata<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<EmailMessage>>;
+
     /// `POST /gmail/v1/users/me/messages/send` — send a raw RFC 822 message
     /// (build it with [`build_rfc822`]). Returns the sent message's id.
     /// IRREVERSIBLE — the tool wrapping this is `Dangerous` (see module docs).
@@ -136,17 +156,64 @@ pub trait GmailApi: Send + Sync {
 /// a hung call must not wedge an agent turn).
 pub struct ReqwestGmailHttp {
     client: reqwest::Client,
+    /// Response-body ceiling in bytes (see [`MAX_RESPONSE_BYTES`]). A field
+    /// rather than a bare const so tests can drive the refusal path with a
+    /// small body instead of allocating tens of megabytes.
+    max_response_bytes: usize,
 }
 
 impl ReqwestGmailHttp {
     pub fn new() -> anyhow::Result<Self> {
+        Self::with_response_cap(MAX_RESPONSE_BYTES)
+    }
+
+    fn with_response_cap(max_response_bytes: usize) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
                 .build()?,
+            max_response_bytes,
         })
     }
+}
+
+/// Buffer a response body with a hard byte ceiling.
+///
+/// Two gates: the declared `Content-Length` (cheap, refuses before a single
+/// body byte is read) and the running total while streaming (the honest one —
+/// a chunked or mis-declared response only reveals its size as it arrives).
+/// Either way we stop at `cap` rather than growing the buffer.
+///
+/// `what` names the caller's API in the error text ("Gmail API", "Google API",
+/// "OAuth token endpoint") — the same defect exists on every reqwest fetch
+/// layer in this module, so they all share this one implementation.
+pub(super) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+    what: &str,
+) -> anyhow::Result<String> {
+    if let Some(declared) = resp.content_length() {
+        if declared > cap as u64 {
+            anyhow::bail!(
+                "{what} response too large: declared {declared} bytes, cap is {cap} bytes"
+            );
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("reading the {what} response failed: {e}"))?
+    {
+        if buf.len() + chunk.len() > cap {
+            anyhow::bail!("{what} response too large: exceeded the {cap}-byte cap");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    // Lossy on purpose: the body is untrusted bytes, and a decode failure
+    // should surface as a parse error downstream, not a panic here.
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 impl GmailHttp for ReqwestGmailHttp {
@@ -171,7 +238,7 @@ impl GmailHttp for ReqwestGmailHttp {
                 .await
                 .map_err(|e| anyhow::anyhow!("{method:?} Gmail API failed: {e}"))?;
             let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_body_capped(resp, self.max_response_bytes, "Gmail API").await?;
             Ok((status, body))
         })
     }
@@ -181,12 +248,12 @@ impl GmailHttp for ReqwestGmailHttp {
 /// seams. All parsing is delegated to the pure helpers below.
 pub struct GmailClient {
     http: Box<dyn GmailHttp>,
-    tokens: Box<dyn TokenProvider>,
+    tokens: Arc<dyn TokenProvider>,
     base_url: String,
 }
 
 impl GmailClient {
-    pub fn new(http: Box<dyn GmailHttp>, tokens: Box<dyn TokenProvider>) -> Self {
+    pub fn new(http: Box<dyn GmailHttp>, tokens: Arc<dyn TokenProvider>) -> Self {
         Self {
             http,
             tokens,
@@ -257,6 +324,20 @@ impl GmailApi for GmailClient {
                 anyhow::bail!("malformed Gmail message id: {id:?}");
             }
             let url = format!("{}/gmail/v1/users/me/messages/{id}?format=full", self.base_url);
+            let body = self.execute(HttpMethod::Get, &url, None).await?;
+            parse_message(&body)
+        })
+    }
+
+    fn get_message_metadata<'a>(&'a self, id: &'a str) -> BoxFuture<'a, anyhow::Result<EmailMessage>> {
+        Box::pin(async move {
+            if !valid_message_id(id) {
+                anyhow::bail!("malformed Gmail message id: {id:?}");
+            }
+            let url = format!(
+                "{}/gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date",
+                self.base_url
+            );
             let body = self.execute(HttpMethod::Get, &url, None).await?;
             parse_message(&body)
         })
@@ -891,6 +972,92 @@ mod tests {
         assert_eq!(String::from_utf8(decoded).unwrap(), raw, "raw survives the encode");
     }
 
+    // -- the real reqwest transport against a loopback server ---------------
+
+    /// Serve exactly one raw HTTP response on a loopback port, then close.
+    /// Returns the bound `http://127.0.0.1:PORT` origin.
+    async fn serve_once(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the request line + headers so the client isn't reset
+                // before it can read our response.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(&response).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn with_content_length(body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A chunked response — the size is NOT knowable up front, so only the
+    /// running-total gate can stop it.
+    fn chunked(total: usize, chunk: usize) -> Vec<u8> {
+        let mut out =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        let mut sent = 0;
+        while sent < total {
+            let n = chunk.min(total - sent);
+            out.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+            out.extend(std::iter::repeat(b'a').take(n));
+            out.extend_from_slice(b"\r\n");
+            sent += n;
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    /// The finding: `resp.text()` buffered any body the server chose to send.
+    /// Now the fetch layer refuses past a byte ceiling — both when the length
+    /// is declared and when it only shows up while streaming.
+    #[tokio::test]
+    async fn oversized_response_bodies_are_refused_at_the_fetch_layer() {
+        let http = ReqwestGmailHttp::with_response_cap(1024).unwrap();
+
+        // 1. Declared Content-Length over the cap → refused up front.
+        let url = serve_once(with_content_length(&vec![b'a'; 4096])).await;
+        let err = http
+            .request(HttpMethod::Get, &url, "tok", None)
+            .await
+            .expect_err("a 4 KiB body must not pass a 1 KiB cap");
+        assert!(
+            err.to_string().contains("too large") && err.to_string().contains("declared 4096"),
+            "got: {err}"
+        );
+
+        // 2. Chunked (no declared length) over the cap → refused mid-stream.
+        let url = serve_once(chunked(4096, 512)).await;
+        let err = http
+            .request(HttpMethod::Get, &url, "tok", None)
+            .await
+            .expect_err("a chunked 4 KiB body must not pass a 1 KiB cap");
+        assert!(
+            err.to_string().contains("exceeded the 1024-byte cap"),
+            "got: {err}"
+        );
+
+        // 3. Control: a body under the cap still comes back intact.
+        let url = serve_once(with_content_length(br#"{"id":"m-1"}"#)).await;
+        let (status, body) = http.request(HttpMethod::Get, &url, "tok", None).await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, r#"{"id":"m-1"}"#);
+    }
+
     /// Build a client whose FakeHttp stays reachable for assertions.
     fn arc_client(
         http: FakeHttp,
@@ -917,7 +1084,7 @@ mod tests {
         }
         (
             (
-                GmailClient::new(Box::new(SharedHttp(http.clone())), Box::new(SharedTokens(tokens.clone()))),
+                GmailClient::new(Box::new(SharedHttp(http.clone())), Arc::new(SharedTokens(tokens.clone()))),
                 http,
             ),
             tokens,
