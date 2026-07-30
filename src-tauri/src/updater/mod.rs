@@ -260,7 +260,12 @@ pub async fn check_now<R: Runtime>(
         date: update.date.map(|d| d.to_string()),
     };
 
-    app.state::<PendingUpdate>().store(update);
+    // `try_state` rather than `state`: the latter panics when the type was
+    // never managed, and a wiring mistake in `lib.rs::run` should surface as a
+    // refused check, not as a panic inside a spawned launch task.
+    app.try_state::<PendingUpdate>()
+        .ok_or_else(|| "update state is not initialised".to_string())?
+        .store(update);
     Ok(Some(info))
 }
 

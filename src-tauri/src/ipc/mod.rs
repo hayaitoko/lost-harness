@@ -2275,7 +2275,8 @@ pub async fn check_for_update(app: AppHandle) -> Result<crate::updater::ManualCh
 /// this returns the error rather than installing anything.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
-    let pending = tauri::Manager::state::<crate::updater::PendingUpdate>(&app)
+    let pending = tauri::Manager::try_state::<crate::updater::PendingUpdate>(&app)
+        .ok_or_else(|| "Update state is not initialised.".to_string())?
         .take()
         .ok_or_else(|| "No update is staged — check for updates first.".to_string())?;
 
