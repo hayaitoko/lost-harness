@@ -61,7 +61,12 @@ export interface Message {
   routing_decision?: string | null;
   /** Model name that served this turn, when known. */
   model?: string | null;
-  /** Provider id that served this turn — cross-reference providersStore for its kind (local/cloud). */
+  /**
+   * Provider id that served this turn. Identity only — do NOT cross-reference
+   * `providersStore` to work out the trust zone: that reads the registry as it
+   * is now, and a provider that has since been edited or deleted would rewrite
+   * what a past turn was. The zone comes stamped on `served_by.zone`.
+   */
   provider_id?: string | null;
   /**
    * The endpoint that ACTUALLY served this turn (provider id + name +

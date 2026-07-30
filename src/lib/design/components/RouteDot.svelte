@@ -9,10 +9,13 @@
 
   let { route }: Props = $props();
 
-  const color = {
+  const color: Record<Route | "auto", string> = {
     local: "bg-local",
     cloud: "bg-cloud",
     blocked: "bg-blocked",
+    // An unrecorded route gets the warn fill, not the neutral one: neutral
+    // reads as "no routing yet", which is a different (and calmer) thing.
+    unknown: "bg-warn",
     auto: "bg-text-3",
   };
 </script>

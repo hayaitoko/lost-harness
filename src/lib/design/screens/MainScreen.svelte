@@ -26,7 +26,6 @@
   import {
     providersStore,
     setActiveModel,
-    getProvider,
     fetchModels,
     type Provider,
   } from "$lib/stores/providers.svelte";
@@ -496,10 +495,18 @@
     }
   }
 
-  // ── Routing: map a real message's gate outcome to the design's Route.
-  // "allow" means the gate let the request go to whichever endpoint was
-  // targeted — local or cloud depends on that provider's kind, so allow
-  // alone doesn't tell us the route; cross-reference providersStore.
+  // ── Routing: report a real message's trust zone.
+  //
+  // Every branch below reads a PERSISTED backend fact about that turn. Nothing
+  // here consults the live provider registry, and nothing falls through to a
+  // reassuring default.
+  //
+  // The bug this replaces did both: it looked the served provider up in
+  // `providersStore` and returned `"local"` whenever it couldn't find one. So
+  // a turn genuinely served by a public cloud endpoint rendered as a green
+  // "Local" badge the moment that endpoint was deleted — the privacy signal
+  // inverted. The trust zone of a past turn is a fact about the past, and it
+  // now arrives from the backend stamped on the turn (`served_by.zone`).
   function messageRoute(m: Message): Route {
     // H-12: `gate_confirm` also means nothing left the machine (pending the
     // user's one-send confirmation), so it reads as "held" too.
@@ -509,17 +516,31 @@
       m.routing_decision === "block"
     )
       return "blocked";
-    if (m.routing_decision === "route_local") return "local";
-    // redact_send: the safe remainder went to the cloud (sensitive spans stayed
-    // local) — surface it as a cloud route; the event bar explains the redaction.
+
+    // The authoritative answer: the zone the backend stamped on this turn when
+    // it ran, from the same `is_cloud` the privacy gate itself was given.
+    const zone = m.served_by?.zone;
+    if (zone === "cloud") return "cloud";
+    if (zone === "local") return "local";
+
+    // No stamped zone (a row older than the stamp). The only remaining
+    // evidence is the persisted routing decision — also a backend fact written
+    // with the row, not live state:
+    //   route_local / tool_reroute_local — the gate rerouted the turn, and
+    //     `enforce_local_routing` structurally proves the target was
+    //     is_local() && is_private().
+    //   redact_send — the safe remainder went to the cloud (sensitive spans
+    //     stayed local); the event bar explains the redaction.
+    if (
+      m.routing_decision === "route_local" ||
+      m.routing_decision === "tool_reroute_local"
+    )
+      return "local";
     if (m.routing_decision === "redact_send") return "cloud";
-    if (m.routing_decision === "allow") {
-      // served_by is the AUTHORITATIVE endpoint read back off the persisted
-      // row; m.provider_id is the composer's pre-send guess until it lands.
-      const provider = getProvider(m.served_by?.provider_id ?? m.provider_id ?? null);
-      if (provider) return provider.kind === "cloud" ? "cloud" : "local";
-    }
-    return "local";
+
+    // "allow" with no stamped zone tells us the gate permitted the turn, not
+    // where it went. Say so.
+    return "unknown";
   }
 
   /** The endpoint that actually served a turn: provider name + host.
@@ -545,10 +566,18 @@
   // it". The model string alone never says WHERE it ran — and on a reroute or
   // a redacted send the serving endpoint is a different one than the composer
   // shows, which is exactly the case worth surfacing.
+  // An exhaustive map, not a chained ternary: the ternary this replaces had an
+  // `else` arm, so adding a fourth Route silently labelled it "Held" — an
+  // unknown route would have claimed the turn was blocked.
+  const ROUTE_PREFIX: Record<Route, string> = {
+    local: "Local",
+    cloud: "Cloud",
+    blocked: "Held",
+    unknown: "Unknown route",
+  };
+
   function routeLabel(m: Message): string {
-    const route = messageRoute(m);
-    const prefix = route === "local" ? "Local" : route === "cloud" ? "Cloud" : "Held";
-    const parts = [prefix];
+    const parts = [ROUTE_PREFIX[messageRoute(m)]];
     const served = servedByLabel(m);
     if (served) parts.push(served);
     if (m.model) parts.push(m.model);
@@ -558,6 +587,15 @@
   /** Full endpoint URL for the badge tooltip — the detail that doesn't fit in
    *  a calm chip but settles "where did this go?" outright. */
   function routeTitle(m: Message): string | undefined {
+    if (messageRoute(m) === "unknown") {
+      // Say what we don't know and why, rather than leaving a bare chip. This
+      // is the honest end of the old silent "Local" default.
+      return (
+        "This turn was recorded before Lost Harness stamped the trust zone on " +
+        "each turn, so whether it stayed on this machine can't be confirmed." +
+        (m.served_by?.base_url ? ` Endpoint now: ${m.served_by.base_url}` : "")
+      );
+    }
     return m.served_by?.base_url ?? undefined;
   }
 

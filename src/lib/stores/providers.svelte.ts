@@ -40,7 +40,18 @@ export interface Provider {
    *  in the OS keychain and NEVER enters the renderer process. */
   hasApiKey: boolean;
   kind: ProviderKind;
-  /** Whether the backend classified the endpoint as private/LAN. */
+  /**
+   * Whether the backend classified the endpoint as private/LAN
+   * (`Provider::is_private()` — it parses `baseUrl`).
+   *
+   * This is the RIGHT notion of trust zone — it is the same bit the privacy
+   * gate consumes, whereas `kind` is a user-typed label with no enforcement
+   * power. But it describes the endpoint's configuration RIGHT NOW, so it must
+   * not be used to label a PAST turn: the turn's zone is stamped by the
+   * backend and arrives on `ServedBy.zone`. Use this only for statements about
+   * the current configuration (e.g. warning about an endpoint the user is
+   * about to select), never for the per-turn route badge.
+   */
   isPrivate: boolean;
   /** Q1: whether the endpoint supports OpenAI-style native structured tool calls. */
   supportsNativeTools: boolean;

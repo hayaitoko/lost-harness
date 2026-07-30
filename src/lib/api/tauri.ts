@@ -58,6 +58,21 @@ export interface ServedBy {
   provider_id: string;
   provider_name: string | null;
   base_url: string | null;
+  /**
+   * The trust zone this turn ACTUALLY ran in, stamped by the backend when the
+   * turn ran. The ONLY thing the route badge may colour itself from.
+   *
+   * Do not re-derive this from the provider store. `provider_name`/`base_url`
+   * describe the registry as it is NOW; this describes what happened THEN. The
+   * frontend used to compute the zone from the live provider's `kind` and fall
+   * through to "local" when the provider was gone, so deleting a cloud
+   * endpoint retroactively repainted every turn it had served as a reassuring
+   * green "Local".
+   *
+   * `null` means genuinely unknown (a row persisted before the backend stamped
+   * zones). Render that as an explicit UNKNOWN — never as "local".
+   */
+  zone: "local" | "cloud" | null;
 }
 
 /** Mirrors `SendMessageResponse` in ipc/mod.rs. */

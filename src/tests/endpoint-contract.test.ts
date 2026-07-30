@@ -115,6 +115,12 @@ beforeEach(async () => {
               PROVIDERS.find((p) => p.id === args!.provider_id)?.name ?? null,
             base_url:
               PROVIDERS.find((p) => p.id === args!.provider_id)?.base_url ?? null,
+            // The backend stamps the turn's trust zone from the endpoint's
+            // own privacy (`!is_private`), never from its `kind` label — both
+            // fixtures below are private addresses, so both are "local".
+            zone: PROVIDERS.find((p) => p.id === args!.provider_id)?.is_private
+              ? "local"
+              : "cloud",
           },
           completed_at: 0,
         };
@@ -319,6 +325,7 @@ describe("per-turn route indicator", () => {
           provider_id: "local-llm",
           provider_name: "Local llama",
           base_url: "http://127.0.0.1:11434/v1",
+          zone: "local",
         },
         completed_at: 0,
       };
