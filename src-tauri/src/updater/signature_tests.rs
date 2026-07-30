@@ -174,14 +174,17 @@ fn app_with_pubkey(pubkey: &str) -> App<MockRuntime> {
         .expect("mock app with the updater plugin")
 }
 
-/// A static-format `latest.json` announcing `version` at `url`/`signature`.
-fn manifest(version: &str, url: &str, signature: &str) -> Vec<u8> {
+/// A static-format `latest.json`, in **exactly the shape the release job in
+/// `.github/workflows/build.yml` emits** — same keys, same nesting, same
+/// `platforms` map. `target` is the platform key; the workflow writes
+/// `darwin-aarch64`.
+fn manifest(target: &str, version: &str, url: &str, signature: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "version": version,
-        "notes": "A visible marker change.",
+        "notes": format!("Lost Harness {version}"),
         "pub_date": "2026-07-30T00:00:00Z",
         "platforms": {
-            TEST_TARGET: { "url": url, "signature": signature }
+            target: { "signature": signature, "url": url }
         }
     }))
     .unwrap()
@@ -194,6 +197,16 @@ async fn check_and_download(
     payload: Vec<u8>,
     signature: &str,
 ) -> Result<Vec<u8>, String> {
+    check_and_download_for_target(TEST_TARGET, pubkey, version, payload, signature).await
+}
+
+async fn check_and_download_for_target(
+    target: &str,
+    pubkey: &str,
+    version: &str,
+    payload: Vec<u8>,
+    signature: &str,
+) -> Result<Vec<u8>, String> {
     // Bind first so the manifest can name the real port it will be served on.
     let mut server = LocalServer::bind().await;
     let payload_url = server.url("/payload.app.tar.gz");
@@ -201,7 +214,7 @@ async fn check_and_download(
     let mut routes = HashMap::new();
     routes.insert(
         "/latest.json".to_string(),
-        manifest(version, &payload_url, signature),
+        manifest(target, version, &payload_url, signature),
     );
     routes.insert("/payload.app.tar.gz".to_string(), payload);
     server.serve(routes);
@@ -209,7 +222,7 @@ async fn check_and_download(
     let app = app_with_pubkey(pubkey);
     let updater = app
         .updater_builder()
-        .target(TEST_TARGET)
+        .target(target)
         .endpoints(vec![server.url("/latest.json").parse().unwrap()])
         .map_err(|e| e.to_string())?
         .build()
@@ -304,6 +317,28 @@ async fn a_payload_signed_by_the_wrong_key_is_refused() {
     .await
     .expect_err("a payload signed by a different key MUST be refused");
     assert!(!err.is_empty());
+}
+
+#[tokio::test]
+async fn the_release_workflows_manifest_shape_is_one_the_updater_accepts() {
+    // `manifest()` is written to mirror the `jq` program in the release job of
+    // .github/workflows/build.yml, and the platform key here is the exact one
+    // that job writes. If either drifts, a tagged release would produce a
+    // manifest the shipped app can't read — this test is the tripwire.
+    //
+    // `darwin-aarch64` is also what a real arm64 macOS build derives for
+    // itself (`{os}-{arch}`), so this is the production lookup path.
+    let verified = check_and_download_for_target(
+        "darwin-aarch64",
+        &test_pubkey(),
+        "0.1.1",
+        payload_bytes(),
+        &payload_signature(),
+    )
+    .await
+    .expect("the shipped manifest shape must parse, resolve and verify");
+
+    assert_eq!(verified, payload_bytes());
 }
 
 #[tokio::test]
