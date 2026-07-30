@@ -3390,9 +3390,10 @@ mod tests {
     // ── H-07: the MCP install consent gate ──────────────────────────────────
     //
     // These drive `consume_mcp_install_nonce` / `issue_mcp_install_nonce`
-    // directly. That IS the gate `register_mcp_server` runs before anything
-    // else — the full `#[tauri::command]` can't be called in a unit test
-    // because `State<'_, AppState>` needs a running Tauri app.
+    // directly — the gate `register_mcp_server` runs before anything else —
+    // to cover the TTL/expiry edges cheaply. The command boundary itself
+    // (missing / forged / replayed nonce through `generate_handler!` and a real
+    // `AppState`) is covered in `ipc::contract_tests`.
 
     fn nonce_store() -> Mutex<std::collections::HashMap<String, Instant>> {
         Mutex::new(std::collections::HashMap::new())
