@@ -12,7 +12,7 @@ use serde_json::json;
 
 use crate::email::calendar::CalendarClient;
 use crate::email::tasks::TasksClient;
-use crate::tools::email::{note_reconnect_if_needed, EmailToolDeps};
+use crate::tools::email::{note_google_connection_failure, EmailToolDeps};
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
 const GOOGLE_DESTINATION: &str = "www.googleapis.com";
@@ -38,7 +38,7 @@ impl ProductivityToolDeps {
 
     fn error(&self, profile: &str, error: impl std::fmt::Display) -> ToolResult {
         let message = error.to_string();
-        note_reconnect_if_needed(&self.email, profile, &message);
+        note_google_connection_failure(&self.email, profile, &message);
         ToolResult::Err(message)
     }
 }

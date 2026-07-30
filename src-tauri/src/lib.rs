@@ -316,6 +316,12 @@ pub fn run() {
             // from the screen.
             let email_needs_reconnect =
                 Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+            // Same story for the OTHER recoverable Google failure: an API the
+            // user's own Cloud project has switched off. Kept apart from the
+            // set above because reconnecting can never enable a disabled API,
+            // so the two must drive two different banners.
+            let email_api_not_enabled: crate::ipc::ApiNotEnabledMap =
+                Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
             // §3 tool spine: workspace-confined read-only tools behind the
             // unified pretooluse hook chain, filtered by this body's caps.
@@ -341,6 +347,7 @@ pub fn run() {
                 Arc::clone(&model_manager),
                 Arc::clone(&provider_secrets),
                 Arc::clone(&email_needs_reconnect),
+                Arc::clone(&email_api_not_enabled),
             ));
 
             // C4: register every ALREADY-APPROVED skill as a callable Tool at
@@ -482,9 +489,10 @@ pub fn run() {
             let hardware = Arc::new(crate::models::hardware::probe());
             let state = AppState {
                 agent_loop,
-                email: Arc::new(crate::ipc::EmailRuntime::with_shared_reconnect(Arc::clone(
-                    &email_needs_reconnect,
-                ))),
+                email: Arc::new(crate::ipc::EmailRuntime::with_shared_state(
+                    Arc::clone(&email_needs_reconnect),
+                    Arc::clone(&email_api_not_enabled),
+                )),
                 model_manager,
                 storage,
                 provider_secrets,
@@ -627,6 +635,7 @@ pub fn run() {
             ipc::gmail_begin_connect,
             ipc::gmail_finish_connect,
             ipc::gmail_disconnect,
+            ipc::google_clear_api_not_enabled,
             ipc::list_email,
             ipc::read_email,
             ipc::send_email,
@@ -921,6 +930,7 @@ fn build_tool_dispatcher(
     provider_secrets: Arc<dyn crate::secrets::ProviderSecretStore>,
     // Shared with `ipc::EmailRuntime` — see the call site's comment in `run()`.
     email_needs_reconnect: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    email_api_not_enabled: crate::ipc::ApiNotEnabledMap,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -1026,6 +1036,7 @@ fn build_tool_dispatcher(
                 provider_secrets,
                 Arc::new(endpoint),
                 email_needs_reconnect,
+                email_api_not_enabled,
             );
             registry.register(Box::new(crate::tools::email::EmailSearchTool::new(
                 deps.clone(),
@@ -1255,6 +1266,7 @@ mod tool_path_degraded_tests {
             Arc::new(crate::models::ModelManager::new()),
             Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
             Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         );
         (d, dir)
     }

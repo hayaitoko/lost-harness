@@ -913,6 +913,10 @@ fn gmail_setup_status_and_client_paste_round_trip_through_real_ipc() {
     assert_eq!(got["connected"], false);
     assert_eq!(got["account_email"], Value::Null);
     assert_eq!(got["needs_reconnect"], false);
+    // The disabled-API state is a DISTINCT field, absent on a fresh install.
+    // Its own field (not a flavour of `needs_reconnect`) is the wire contract
+    // that lets the UI render a banner with no Reconnect button.
+    assert_eq!(got["api_not_enabled"], Value::Null);
 
     // A mispasted client id is a DOMAIN error pointing at the console page.
     let err = call(
