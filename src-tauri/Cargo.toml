@@ -45,6 +45,16 @@ regex = "1"
 url = "2"
 # sha256 for the TRM message-hash audit log (spec §3: never log plaintext).
 sha2 = "0.10"
+# Ed25519 verification for the signed curated-model manifest (H-08 / P09):
+# `models/hf_search.rs` uses VerifyingKey/Signature/Verifier to authenticate the
+# manifest before any model may be labelled Curated. Default features only — no
+# `pkcs8`, because the compiled-in public key is the raw 32 bytes in base64, not
+# a PEM/DER blob. Production SIGNING is an offline human step (openssl), never
+# done by the app; the test module uses SigningKey to sign throwaway fixtures.
+ed25519-dalek = "2"
+# Hex codec for the manifest `signature` field (the public key is base64 —
+# `base64` below — and the file digests are hex-compared as strings).
+hex = "0.4"
 # Email round (stage 1): PKCE S256 code-challenge encoding (RFC 7636) + Gmail
 # base64url message bodies / raw RFC 822 sends. sha2 above supplies the digest.
 base64 = "0.22"

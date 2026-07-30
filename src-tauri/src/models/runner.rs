@@ -2759,8 +2759,15 @@ mod tests {
         }
         use crate::models::hf_search::{self, SearchSort};
 
+        // No signed model manifest in this scratch dir, so the fail-closed
+        // provenance path (P09 / H-08) is what this E2E exercises: rows come
+        // back `Community` and the tree is listed at the mutable tip.
+        let manifest_dir =
+            std::env::temp_dir().join(format!("lhp-e2e-mf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+
         // 1. HF SEARCH — prove discovery returns real rows for the tiny model.
-        let hits = hf_search::search("qwen3 0.6b", SearchSort::Downloads, 20)
+        let hits = hf_search::search("qwen3 0.6b", SearchSort::Downloads, 20, &manifest_dir)
             .await
             .expect("HF search");
         assert!(!hits.is_empty(), "search returns rows for qwen3-0.6b");
@@ -2768,7 +2775,9 @@ mod tests {
         // 2. Resolve the specific tiny repo's quants; pick the SMALLEST complete
         //    single-file quant (kindest download) — carries the real lfs.oid sha.
         const REPO: &str = "Qwen/Qwen3-0.6B-GGUF";
-        let detail = hf_search::model_detail(REPO).await.expect("model detail");
+        let detail = hf_search::model_detail(REPO, &manifest_dir)
+            .await
+            .expect("model detail");
         let quant = detail
             .quants
             .iter()
