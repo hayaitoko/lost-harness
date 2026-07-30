@@ -1979,6 +1979,185 @@ mod tests {
         );
     }
 
+    // ── M-04: descriptor-relative confinement ────────────────────────────
+
+    /// Every tool refuses a path whose INTERMEDIATE component is a symlink, even
+    /// one pointing squarely inside the workspace.
+    ///
+    /// This is the property that closes the TOCTOU, expressed deterministically.
+    /// The old canonicalize-the-parent check happily accepted `alias/...` here:
+    /// `canonicalize("root/alias")` is `root/sub`, which `starts_with(root)`. But
+    /// "it resolved inside a moment ago" is not a fact that survives to the
+    /// `open()` — the link can be re-pointed in between. The descriptor walk does
+    /// not ask; a symlink component fails its `openat` with `ELOOP`, so there is
+    /// nothing left to re-point.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_path_component_is_refused_by_every_tool() {
+        let root = workspace(); // seeded with sub/notes.md
+        std::os::unix::fs::symlink(root.join("sub"), root.join("alias")).unwrap();
+
+        let read = ReadFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "alias/notes.md"})), &ctx())
+            .await;
+        assert!(
+            matches!(read, ToolResult::Err(_)),
+            "reading through a symlinked directory must be refused, got {read:?}"
+        );
+
+        let list = ListDirTool::new(&root)
+            .run(ToolInput::new(json!({"path": "alias"})), &ctx())
+            .await;
+        assert!(
+            matches!(list, ToolResult::Err(_)),
+            "listing through a symlinked directory must be refused, got {list:?}"
+        );
+
+        let write = WriteFileTool::new(&root)
+            .run(
+                ToolInput::new(json!({"path": "alias/planted.txt", "content": "x"})),
+                &ctx(),
+            )
+            .await;
+        assert!(
+            matches!(write, ToolResult::Err(_)),
+            "writing through a symlinked directory must be refused, got {write:?}"
+        );
+        assert!(
+            !root.join("sub").join("planted.txt").exists(),
+            "the refused write must not have landed via the link"
+        );
+
+        let edit = EditFileTool::new(&root)
+            .run(
+                ToolInput::new(json!({"path": "alias/notes.md", "old": "NEEDLE", "new": "PWNED"})),
+                &ctx(),
+            )
+            .await;
+        assert!(
+            matches!(edit, ToolResult::Err(_)),
+            "editing through a symlinked directory must be refused, got {edit:?}"
+        );
+
+        let del = DeleteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "alias/notes.md"})), &ctx())
+            .await;
+        assert!(
+            matches!(del, ToolResult::Err(_)),
+            "deleting through a symlinked directory must be refused, got {del:?}"
+        );
+
+        // Nothing above touched the real file, and the refusal is specifically
+        // about the symlink hop — the same file by its real path still works.
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub").join("notes.md")).unwrap(),
+            "a NEEDLE lives here\n"
+        );
+        let direct = ReadFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "sub/notes.md"})), &ctx())
+            .await;
+        assert!(
+            matches!(direct, ToolResult::Ok(_)),
+            "the real path must still be readable, got {direct:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The symlink swap itself, staged DETERMINISTICALLY rather than raced.
+    ///
+    /// A `write_file` is two steps: validate the path, then write it. The attack
+    /// is to change what the path means in between. So this test performs the
+    /// swap in exactly that gap, by hand:
+    ///
+    /// 1. pin the target — the "check", identical to what the tool does;
+    /// 2. replace the parent directory with a symlink pointing OUTSIDE the
+    ///    workspace, and PROVE the window is real by writing a decoy through the
+    ///    same pathname and finding it outside (without this the test could not
+    ///    fail and would prove nothing);
+    /// 3. do the "use" through the pinned descriptor and show it did not follow.
+    ///
+    /// A threaded version of this (a swapper loop racing `write_file.run`) was
+    /// tried first; it does catch a pathname-resolving regression, but only
+    /// probabilistically — it needed ~20 000 iterations and 2–4 s to do so
+    /// reliably. This staging is the same property, always caught, instantly.
+    #[cfg(unix)]
+    #[test]
+    fn a_swapped_directory_cannot_redirect_a_write_off_a_pinned_descriptor() {
+        let root = workspace();
+        // The escape destination: a sibling of the workspace, never inside it.
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("lhp-fs-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let swap = root.join("swap");
+        std::fs::create_dir_all(&swap).unwrap();
+
+        // 1. The CHECK: `swap` is a genuine directory inside the workspace, so
+        //    this is the resolution every tool would have accepted.
+        let target = Target::open(&root, "swap/loot.txt").expect("a real in-workspace directory");
+
+        // 2. The swap an attacker would race to land here.
+        std::fs::remove_dir_all(&swap).unwrap();
+        std::os::unix::fs::symlink(&outside, &swap).unwrap();
+        // The window is REAL: re-resolving the very path just validated now lands
+        // outside the workspace.
+        std::fs::write(swap.join("decoy.txt"), "escaped").unwrap();
+        assert!(
+            outside.join("decoy.txt").is_file(),
+            "the swap must actually redirect a pathname write, or this test proves nothing"
+        );
+
+        // 3. The USE, through the descriptor pinned in step 1. Whether the write
+        //    succeeds is not the point (the pinned directory is now unlinked, so
+        //    the kernel may refuse it) — the point is where it can NOT go.
+        let wrote = target.atomic_replace("loot");
+        assert!(
+            !outside.join("loot.txt").exists(),
+            "a swapped directory redirected a write off a pinned descriptor (write returned {wrote:?})"
+        );
+        // And the leaf's identity is still judged against the pinned parent, not
+        // the symlink's contents: `decoy.txt` is visible through the swapped
+        // pathname but must not be visible to the pinned target.
+        let decoy = Target::open(&root, "swap/decoy.txt");
+        assert!(
+            decoy.is_err() || decoy.unwrap().kind().is_none(),
+            "the swapped-in directory's entries must not become visible in the workspace"
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_file(&swap);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `delete_file` removes the name it was GIVEN. The old code canonicalized
+    /// first, which followed a symlink and unlinked the link's target — deleting a
+    /// file the caller never named and leaving the link dangling.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_file_unlinks_the_named_link_not_its_target() {
+        let root = workspace();
+        std::os::unix::fs::symlink(root.join("hello.txt"), root.join("link.txt")).unwrap();
+
+        let out = DeleteFileTool::new(&root)
+            .run(ToolInput::new(json!({"path": "link.txt"})), &ctx())
+            .await;
+        assert!(
+            matches!(out, ToolResult::Ok(_)),
+            "deleting a symlink itself is fine, got {out:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("link.txt")).is_err(),
+            "the link itself must be gone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("hello.txt")).unwrap(),
+            "hello world\nsecond line\n",
+            "the link's TARGET must survive — delete_file must not follow the link"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn write_tools_are_write_risk_read_tools_are_safe() {
         let root = workspace();
