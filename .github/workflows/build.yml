@@ -11,25 +11,91 @@ permissions:
   contents: read
 
 jobs:
+  # Lost Harness is a macOS-only, Apple-Silicon-only desktop app:
+  #   * the vendored llama.cpp runtime ships as arm64 Mach-O only
+  #     (src-tauri/vendor/llama-cpp/macos-arm64/),
+  #   * the computer-use backend is built on macOS Accessibility + CoreGraphics.
+  # There is therefore no ubuntu/windows job: those runners could not run any of
+  # the steps below (every cargo step is pinned to aarch64-apple-darwin), so
+  # listing them in a matrix was a false support claim rather than a real gate.
   build:
-    name: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
-
-    runs-on: ${{ matrix.os }}
+    name: macOS (arm64)
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ── Runner sanity ────────────────────────────────────────────────────
+      # macos-latest is Apple Silicon today. If GitHub ever repoints the label
+      # at an Intel image, fail loudly here instead of silently producing an
+      # x86_64 build that cannot load the vendored arm64 runtime.
+      - name: Assert macOS arm64 runner
+        run: |
+          set -euo pipefail
+          uname -sm
+          test "$(uname -s)" = "Darwin" || { echo "::error::this workflow only runs on macOS"; exit 1; }
+          test "$(uname -m)" = "arm64"  || { echo "::error::this workflow only runs on Apple Silicon (arm64)"; exit 1; }
+
+      # ── Vendored runtime vs. documented minimum macOS (H-10 gate) ────────
+      # README.md promises a minimum macOS version via a machine-readable
+      # `MIN_MACOS=<x.y>` marker. Every vendored Mach-O file must declare
+      # exactly that value in its LC_BUILD_VERSION `minos` field, and must be
+      # arm64-only. If llama.cpp is re-vendored against a different deployment
+      # target without updating the README (or vice versa), this step fails.
+      - name: Vendored runtime matches documented minimum macOS
+        run: |
+          set -euo pipefail
+          # `|| true`: with `set -o pipefail` a non-matching grep would abort
+          # the step before the explanatory error below can be printed.
+          expected="$( { grep -o 'MIN_MACOS=[0-9][0-9.]*' README.md || true; } | head -1 | cut -d= -f2)"
+          if [ -z "${expected}" ]; then
+            echo "::error file=README.md::missing machine-readable 'MIN_MACOS=<version>' marker"
+            exit 1
+          fi
+          echo "README.md promises minimum macOS ${expected}"
+
+          vendor_dir="src-tauri/vendor/llama-cpp/macos-arm64"
+          status=0
+          checked=0
+          for f in "${vendor_dir}"/*; do
+            case "${f}" in
+              *.dylib|*/llama-server) ;;
+              *) continue ;;
+            esac
+            checked=$((checked + 1))
+
+            minos="$(otool -l "${f}" | awk '/LC_BUILD_VERSION/{seen=1} seen && /^ *minos /{print $2; exit}')"
+            if [ -z "${minos}" ]; then
+              echo "::error file=${f}::no LC_BUILD_VERSION load command found"
+              status=1
+            elif [ "${minos}" != "${expected}" ]; then
+              echo "::error file=${f}::declares minos ${minos}, README promises ${expected}"
+              status=1
+            fi
+
+            archs="$(lipo -archs "${f}")"
+            if [ "${archs}" != "arm64" ]; then
+              echo "::error file=${f}::expected arm64-only, found '${archs}'"
+              status=1
+            fi
+
+            echo "  ${f}: minos=${minos:-none} archs=${archs}"
+          done
+
+          if [ "${checked}" -eq 0 ]; then
+            echo "::error::no vendored Mach-O files found under ${vendor_dir}"
+            exit 1
+          fi
+          echo "checked ${checked} vendored binaries"
+          exit "${status}"
 
       # ── Rust toolchain ───────────────────────────────────────────────────
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: aarch64-apple-darwin
 
       - name: Cache cargo registry & target
         uses: actions/cache@v4
@@ -38,30 +104,17 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}
+          key: macos-arm64-cargo-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            macos-arm64-cargo-
 
       - name: Cache cargo build (sccache)
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/sccache
-            "%LOCALAPPDATA%\sccache"
-            "~/.cache/sccache"
-          key: ${{ runner.os }}-sccache-${{ matrix.os }}
-
-      # ── Linux system deps (WebKitGTK for Tauri's webview) ───────────────
-      - name: Install Linux system dependencies
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf
+            ~/Library/Caches/Mozilla.sccache
+          key: macos-arm64-sccache
 
       # ── Node toolchain ──────────────────────────────────────────────────
       - name: Setup Node.js
@@ -73,21 +126,21 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      # ── Rust checks ─────────────────────────────────────────────────────
-      - name: cargo build
+      # ── Rust checks (arm64-only — no x86_64 runtime files exist) ───────
+      - name: cargo build (aarch64)
         working-directory: src-tauri
-        run: cargo build --verbose
+        run: cargo build --target aarch64-apple-darwin --verbose
 
-      - name: cargo clippy (correctness gate)
+      - name: cargo clippy (correctness gate, aarch64)
         working-directory: src-tauri
         # The repository still carries non-correctness warning debt. Make
         # correctness findings release-blocking now; tighten to `-D warnings`
         # once the tracked warning backlog is cleared.
-        run: cargo clippy --all-targets -- -D clippy::correctness
+        run: cargo clippy --target aarch64-apple-darwin --all-targets -- -D clippy::correctness
 
-      - name: cargo test
+      - name: cargo test (aarch64)
         working-directory: src-tauri
-        run: cargo test --verbose
+        run: cargo test --target aarch64-apple-darwin --verbose
 
       - name: cargo audit (advisory)
         uses: rustsec/audit-check@v2.0.0
