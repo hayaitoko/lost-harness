@@ -520,6 +520,11 @@ mod confined {
             unsafe { libc::close(dup) };
             return Err(err);
         }
+        // `dup` SHARES the file offset with `dirfd`, so a previous listing would
+        // leave this one starting at EOF and silently return nothing. Rewind so
+        // the call is idempotent.
+        // SAFETY: `dirp` is a valid open DIR*.
+        unsafe { libc::rewinddir(dirp) };
         let mut out = Vec::new();
         loop {
             // SAFETY: `dirp` is a valid open DIR*; the returned dirent is owned
@@ -2127,6 +2132,38 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_file(&swap);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Listing a pinned directory twice must give the same answer. `fdopendir`
+    /// takes ownership of the descriptor handed to it, so `read_dir` passes it a
+    /// `dup` — and a `dup` SHARES the file offset, which leaves a second listing
+    /// starting at EOF and silently returning an EMPTY directory unless it
+    /// rewinds first.
+    #[cfg(unix)]
+    #[test]
+    fn listing_a_pinned_directory_twice_gives_the_same_entries() {
+        let root = workspace(); // hello.txt + sub/
+        let dir = DirTarget::open(&root, ".").unwrap();
+        let mut first: Vec<String> = dir
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        let mut second: Vec<String> = dir
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        first.sort();
+        second.sort();
+        assert!(
+            first.contains(&"hello.txt".to_string()),
+            "the seeded file must be listed, got {first:?}"
+        );
+        assert_eq!(second, first, "a second listing must not come back short");
         let _ = std::fs::remove_dir_all(&root);
     }
 
