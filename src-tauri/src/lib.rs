@@ -579,6 +579,7 @@ pub fn run() {
             ipc::add_provider,
             ipc::update_provider,
             ipc::remove_provider,
+            ipc::set_provider_api_key,
             ipc::list_models,
             ipc::send_message,
             ipc::resolve_tool_approval,

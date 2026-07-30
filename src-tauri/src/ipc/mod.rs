@@ -40,8 +40,8 @@ use uuid::Uuid;
 
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
-use crate::email::gmail::GmailApi as _; // trait methods on GmailClient (email round)
 use crate::agent::result_sink::{ResultSink, TauriResultSink};
+use crate::email::gmail::GmailApi as _; // trait methods on GmailClient (email round)
 use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget, PermissionMode, ToolRule};
 use crate::ipc::approval::ApprovalRegistry;
 use crate::ipc::ask_human::AskHumanRegistry;
@@ -111,7 +111,10 @@ pub struct AppState {
 /// tokens arrive separately via the `stream:token` event.
 #[derive(Debug, Clone, Serialize)]
 pub struct SendMessageResponse {
-    pub message_id: String,
+    /// Id of the persisted assistant row. `null` when there is no such row to
+    /// point at (see `routing_unavailable`) — never a placeholder, so the
+    /// frontend can't adopt an id that addresses nothing.
+    pub message_id: Option<String>,
     pub content: String,
     pub conversation_id: String,
     /// "personal" | "work" | "school" | "developer" — the profile the
@@ -119,8 +122,74 @@ pub struct SendMessageResponse {
     pub profile: String,
     /// "allow" | "route_local" — which branch of the gate served this
     /// message. Frontend uses this to label the chip / banner.
-    pub routing_decision: String,
+    ///
+    /// M-22: `null`, never a stand-in, when the persisted decision could not
+    /// be read. A fabricated value here is a privacy-UI lie: the routing badge
+    /// is how the user learns whether their text left the machine.
+    pub routing_decision: Option<String>,
+    /// Present *only* on the degraded path, naming why `message_id` /
+    /// `routing_decision` are `null`. Absent from the JSON on the happy path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_unavailable: Option<RoutingUnavailable>,
     pub completed_at: i64,
+}
+
+/// Why a completed `send_message` has no persisted routing decision to
+/// report. Serialized in snake_case on `SendMessageResponse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingUnavailable {
+    /// The profile database could not be opened for the read-back.
+    ProfileDbUnavailable,
+    /// The conversation's messages could not be queried.
+    MessageQueryFailed,
+    /// The read succeeded but the turn persisted no assistant row — the
+    /// normal shape of a gate *block*, where nothing was written.
+    NoAssistantRow,
+}
+
+/// What the post-turn read-back yielded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoutingLookup {
+    Resolved {
+        message_id: String,
+        routing_decision: String,
+    },
+    Unavailable(RoutingUnavailable),
+}
+
+impl RoutingLookup {
+    /// The three `SendMessageResponse` fields this outcome authorizes:
+    /// `(message_id, routing_decision, routing_unavailable)`. `send_message`
+    /// builds its payload through here rather than matching inline, so the
+    /// unit tests below exercise the mapping the command actually uses —
+    /// there is no second copy of it to drift.
+    fn into_parts(self) -> (Option<String>, Option<String>, Option<RoutingUnavailable>) {
+        match self {
+            RoutingLookup::Resolved {
+                message_id,
+                routing_decision,
+            } => (Some(message_id), Some(routing_decision), None),
+            RoutingLookup::Unavailable(why) => (None, None, Some(why)),
+        }
+    }
+}
+
+/// Map the outcome of the post-turn profile-db read onto what we are willing
+/// to tell the frontend. Pure so it stays unit-tested: the bug this replaced
+/// substituted `("", "unknown")` into an otherwise-successful payload, which
+/// no test could see because the substitution happened inline in the command.
+fn routing_lookup(rows: Result<Vec<Message>, RoutingUnavailable>) -> RoutingLookup {
+    match rows {
+        Err(why) => RoutingLookup::Unavailable(why),
+        Ok(rows) => match latest_assistant_routing(&rows) {
+            Some((message_id, routing_decision)) => RoutingLookup::Resolved {
+                message_id,
+                routing_decision,
+            },
+            None => RoutingLookup::Unavailable(RoutingUnavailable::NoAssistantRow),
+        },
+    }
 }
 
 /// Mirrors a `Provider` row for the model picker (§4). API key is
@@ -145,7 +214,8 @@ impl From<Provider> for ProviderInfo {
         // Compute `is_private` first — it takes `&self` and we want to
         // move `id`/`name`/`base_url`/`kind` afterwards.
         let is_private = p.is_private();
-        let trusted_by_name = crate::agent::egress::is_private_endpoint_trusted_by_name(&p.base_url);
+        let trusted_by_name =
+            crate::agent::egress::is_private_endpoint_trusted_by_name(&p.base_url);
         Self {
             id: p.id,
             name: p.name,
@@ -305,10 +375,10 @@ fn default_binding() -> String {
 
 // ── Commands ─────────────────────────────────────────────────────────────
 
-/// Returns the app version string.
+/// Returns the app version string from Cargo.toml.
 #[tauri::command]
 pub fn get_app_version() -> String {
-    "0.1.0-m1".to_string()
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 /// Returns the id of the currently active profile — the one the user last
@@ -475,42 +545,167 @@ pub fn list_providers(state: State<'_, AppState>) -> Result<Vec<ProviderInfo>, S
         .collect())
 }
 
+/// Does `host` name a machine on this device or this LAN, such that talking
+/// to it over cleartext `http` never puts a bearer key on the public
+/// internet?
+///
+/// This is an *address* test, not a string test. The previous version asked
+/// `host.starts_with("127.")`, which `http://127.evil.com` satisfies — a
+/// public DNS name that would have been handed the provider's API key over
+/// plaintext HTTP. Everything here goes through `url::Host`, so a name is
+/// only ever accepted when it is the literal `localhost`; anything else must
+/// be an IP literal that the standard library agrees is loopback or
+/// private.
+///
+/// Accepted for cleartext:
+/// - the name `localhost` (and nothing else — `localhost.evil.com`,
+///   `127.evil.com`, `10.evil.com` are all `Domain`s and all rejected)
+/// - IPv4 loopback `127.0.0.0/8`, RFC 1918 (`10/8`, `172.16/12`,
+///   `192.168/16`), link-local `169.254/16`, CGNAT/Tailscale `100.64/10`
+/// - IPv6 loopback `::1`, unique-local `fc00::/7`, link-local `fe80::/10`
+///
+/// The RFC 1918 / CGNAT ranges are here deliberately: the product's own
+/// contract test and the documented deployment (a llama.cpp server on the
+/// user's LAN, e.g. `http://10.0.0.100:8000/v1`) add providers over
+/// cleartext HTTP on the local network. Requiring `is_loopback()` alone
+/// would have made every LAN endpoint unaddable. Private *names*
+/// (`.local`, `.lan`, `.ts.net`) stay rejected for cleartext even though
+/// `agent::egress` treats them as private, because a name is resolved by
+/// whatever DNS/mDNS answers first and cannot be trusted to hold a
+/// cleartext bearer key.
+fn host_allows_cleartext(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => {
+            let o = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                // 100.64.0.0/10 — CGNAT, which Tailscale hands out.
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        url::Host::Ipv6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                // fc00::/7 unique-local, fe80::/10 link-local. Both have
+                // unstable std predicates, so they're spelled out here.
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Validate a provider base URL.
+///
+/// Rejects:
+/// - Unparsable URLs.
+/// - Embedded credentials (`user:pass@host`).
+/// - Fragments (`#`).
+/// - Empty/ambiguous hosts.
+/// - Non-HTTPS schemes for anything that isn't a loopback/private *address*
+///   (see [`host_allows_cleartext`]) — so users can point at a local or LAN
+///   LM Studio / Ollama / llama.cpp server without TLS, while a public host
+///   can never be handed a bearer key in cleartext.
+fn validate_base_url(raw: &str) -> Result<(), String> {
+    let url = url::Url::parse(raw).map_err(|e| format!("invalid base URL: {e}"))?;
+
+    // Reject embedded credentials — bearer keys should never be in the URL.
+    if url.username() != "" || url.password().is_some() {
+        return Err("base URL must not contain embedded credentials (user:password@)".into());
+    }
+
+    // Reject fragments — server has no use for them.
+    if url.fragment().is_some() {
+        return Err("base URL must not contain a fragment (#)".into());
+    }
+
+    // Reject empty / ambiguous hosts. `url::Url::host` gives the *parsed*
+    // host (Domain / Ipv4 / Ipv6), which is what the cleartext decision below
+    // needs — `host_str` would hand back a bare string and invite another
+    // prefix test.
+    let Some(host) = url.host() else {
+        return Err("base URL has no host".into());
+    };
+    if matches!(host, url::Host::Domain(d) if d.is_empty()) {
+        return Err("base URL has no host".into());
+    }
+
+    // Scheme check: require HTTPS unless the host is a loopback/private
+    // address. See `host_allows_cleartext` — this is an address test, not a
+    // string-prefix test.
+    match url.scheme() {
+        "https" => {}                                // always OK
+        "http" if host_allows_cleartext(&host) => {} // OK for local/LAN servers
+        "http" => {
+            return Err(
+                "cleartext http:// is only allowed for loopback or private-network addresses (localhost, 127.x, 10.x, 172.16–31.x, 192.168.x, 169.254.x, 100.64–127.x, ::1, fc00::/7, fe80::/10) — public endpoints must use HTTPS"
+                    .into(),
+            );
+        }
+        other => {
+            return Err(format!(
+                "unsupported URL scheme \"{other}\" (expected https or http)"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub fn add_provider(
     state: State<'_, AppState>,
     args: AddProviderArgs,
 ) -> Result<ProviderInfo, String> {
+    add_provider_inner(&state, args)
+}
+
+/// Body of [`add_provider`], taking `&AppState` instead of `State` so it is
+/// reachable from unit tests (a `State` can only be minted by a live Tauri
+/// app). The command above is a one-line forwarder.
+fn add_provider_inner(state: &AppState, args: AddProviderArgs) -> Result<ProviderInfo, String> {
     let kind = parse_kind(&args.kind)?;
+    validate_base_url(&args.base_url)?;
     let id = Uuid::new_v4().to_string();
-    let provider = Provider::new(
-        id.clone(),
-        args.name,
-        args.base_url,
-        args.api_key,
-        kind,
-    )
-    .with_native_tools(args.supports_native_tools);
-    if let Some(secret) = provider.api_key.as_deref() {
+    let provider = Provider::new(id.clone(), args.name, args.base_url, args.api_key, kind)
+        .with_native_tools(args.supports_native_tools);
+    let wrote_secret = if let Some(secret) = provider.api_key.as_deref() {
         state.provider_secrets.set(&id, secret)?;
+        true
+    } else {
+        false
+    };
+    // Persist metadata BEFORE publishing in-memory success. A storage
+    // failure is surfaced to the caller (not silently swallowed) so the
+    // frontend can show an error instead of a provider that vanishes on
+    // restart.
+    let persisted = state
+        .storage
+        .global()
+        .insert_endpoint(&crate::storage::Endpoint {
+            id: id.clone(),
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            api_key_marker: provider
+                .api_key
+                .as_ref()
+                .map(|_| crate::secrets::KEYCHAIN_MARKER.to_vec()),
+            kind: args.kind.clone(),
+            created_at: chrono::Utc::now().timestamp(),
+            supports_native_tools: provider.supports_native_tools,
+        });
+    if let Err(e) = persisted {
+        // M-05: the keychain write happened first, so a failed insert would
+        // otherwise strand a secret under an id no row (and no UI) will ever
+        // mention again — unreachable, undeletable, and still holding a live
+        // API key. Compensate, exactly as `update_provider` does on its own
+        // persist failure.
+        if wrote_secret {
+            let _ = state.provider_secrets.delete(&id);
+        }
+        return Err(format!("failed to persist endpoint: {e}"));
     }
     state.model_manager.add_provider(provider.clone());
-    // Persist so the flag (and the endpoint) survive a restart and hydrate
-    // back on next boot. Best-effort: a storage failure logs but the
-    // in-memory provider still works for this session.
-    if let Err(e) = state.storage.global().insert_endpoint(&crate::storage::Endpoint {
-        id: id.clone(),
-        name: provider.name.clone(),
-        base_url: provider.base_url.clone(),
-        api_key_marker: provider
-            .api_key
-            .as_ref()
-            .map(|_| crate::secrets::KEYCHAIN_MARKER.to_vec()),
-        kind: args.kind.clone(),
-        created_at: chrono::Utc::now().timestamp(),
-        supports_native_tools: provider.supports_native_tools,
-    }) {
-        tracing::warn!(error = %e, "failed to persist endpoint (in-memory only this session)");
-    }
     Ok(provider.into())
 }
 
@@ -520,29 +715,24 @@ pub fn update_provider(
     args: UpdateProviderArgs,
 ) -> Result<ProviderInfo, String> {
     let kind = parse_kind(&args.kind)?;
+    validate_base_url(&args.base_url)?;
     let existing = state
         .model_manager
         .get_provider(&args.id)
         .ok_or_else(|| format!("unknown provider: {}", args.id))?;
+
+    // Snapshot the old secret so we can restore it if persistence fails.
+    let old_secret = state.provider_secrets.get(&args.id).ok().flatten();
+
     let api_key = args.api_key.or(existing.api_key);
-    let provider = Provider::new(
-        args.id.clone(),
-        args.name,
-        args.base_url,
-        api_key,
-        kind,
-    )
-    .with_native_tools(args.supports_native_tools);
+    let provider = Provider::new(args.id.clone(), args.name, args.base_url, api_key, kind)
+        .with_native_tools(args.supports_native_tools);
+
+    // Persist metadata BEFORE publishing in-memory success.
+    // Keychain and DB must both succeed before the provider is visible.
     if let Some(secret) = provider.api_key.as_deref() {
         state.provider_secrets.set(&args.id, secret)?;
     }
-    // `ModelManager::add_provider` replaces by id and drops the cached
-    // client, so the next request is built from the new base URL/key.
-    state.model_manager.add_provider(provider.clone());
-    // Persist with the same best-effort discipline as add_provider. An
-    // UPDATE matching no row means the endpoint was never persisted (e.g.
-    // the insert failed at add time) — insert it so the edit still
-    // survives a restart.
     let api_key_marker = provider
         .api_key
         .as_ref()
@@ -562,19 +752,35 @@ pub fn update_provider(
             if updated {
                 return Ok(());
             }
-            state.storage.global().insert_endpoint(&crate::storage::Endpoint {
-                id: args.id.clone(),
-                name: provider.name.clone(),
-                base_url: provider.base_url.clone(),
-                api_key_marker,
-                kind: args.kind.clone(),
-                created_at: chrono::Utc::now().timestamp(),
-                supports_native_tools: provider.supports_native_tools,
-            })
+            state
+                .storage
+                .global()
+                .insert_endpoint(&crate::storage::Endpoint {
+                    id: args.id.clone(),
+                    name: provider.name.clone(),
+                    base_url: provider.base_url.clone(),
+                    api_key_marker,
+                    kind: args.kind.clone(),
+                    created_at: chrono::Utc::now().timestamp(),
+                    supports_native_tools: provider.supports_native_tools,
+                })
         });
     if let Err(e) = persisted {
-        tracing::warn!(error = %e, "failed to persist endpoint update (in-memory only this session)");
+        // Restore the old secret on failure so the keychain stays
+        // consistent with the rolled-back DB / memory state.
+        match old_secret {
+            Some(ref s) => {
+                let _ = state.provider_secrets.set(&args.id, s);
+            }
+            None => {
+                let _ = state.provider_secrets.delete(&args.id);
+            }
+        }
+        return Err(format!("failed to persist endpoint update: {e}"));
     }
+
+    // Publish in-memory success only after durable storage is updated.
+    state.model_manager.add_provider(provider.clone());
     Ok(provider.into())
 }
 
@@ -583,12 +789,14 @@ pub fn remove_provider(state: State<'_, AppState>, id: String) -> Result<bool, S
     if state.model_manager.get_provider(&id).is_none() {
         return Err(format!("unknown provider: {id}"));
     }
-    state.provider_secrets.delete(&id)?;
+    // Delete durable state first: DB before keychain, so a mid-failure
+    // leaves the two consistent (keychain entry has no backing row).
     state
         .storage
         .global()
         .delete_endpoint(&id)
         .map_err(|e| e.to_string())?;
+    state.provider_secrets.delete(&id)?;
     state.model_manager.remove_provider(&id);
     Ok(true)
 }
@@ -596,6 +804,47 @@ pub fn remove_provider(state: State<'_, AppState>, id: String) -> Result<bool, S
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderIdArgs {
     pub provider_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetProviderApiKeyArgs {
+    pub provider_id: String,
+    pub api_key: String,
+}
+
+/// One-shot command: update a provider's API key in the OS credential store
+/// without re-registering the provider. Used by packet P04 for key rotation.
+#[tauri::command]
+pub fn set_provider_api_key(
+    state: State<'_, AppState>,
+    args: SetProviderApiKeyArgs,
+) -> Result<(), String> {
+    set_provider_api_key_inner(&state, args)
+}
+
+/// Body of [`set_provider_api_key`], taking `&AppState` so it is unit-testable
+/// without a live Tauri app.
+fn set_provider_api_key_inner(state: &AppState, args: SetProviderApiKeyArgs) -> Result<(), String> {
+    let existing = state
+        .model_manager
+        .get_provider(&args.provider_id)
+        .ok_or_else(|| format!("unknown provider: {}", args.provider_id))?;
+    state
+        .provider_secrets
+        .set(&args.provider_id, &args.api_key)?;
+    // Rotation must take effect NOW, not after a restart. The keychain is only
+    // read at boot when seeding `ModelManager`; the live `Provider` (and the
+    // `ModelClient` cached against it, which copies the key into its bearer
+    // header) would otherwise keep signing requests with the revoked key for
+    // the rest of the session. `add_provider` replaces the record by id and
+    // drops the cached client, so the next `get_client` rebuilds with the new
+    // key.
+    let rotated = Provider {
+        api_key: Some(args.api_key),
+        ..existing
+    };
+    state.model_manager.add_provider(rotated);
+    Ok(())
 }
 
 #[tauri::command]
@@ -692,14 +941,20 @@ pub async fn send_message(
     // that process_message stamped on it (one of "allow" / "route_local"),
     // so the frontend's RoutingBadge is honest on a live send instead of
     // only after a reload.
+    //
+    // M-22: each way this read can come up empty is reported as itself. It
+    // used to collapse into `("", "unknown")` inside an `Ok(..)` payload,
+    // which told the frontend "the turn succeeded and here is its routing" —
+    // with a message id addressing nothing and a decision nobody made.
     let rows = state
         .storage
         .open_profile(&profile)
-        .ok()
-        .and_then(|db| db.list_messages_by_conversation(&conversation_id).ok())
-        .unwrap_or_default();
-    let (message_id, routing_decision) = latest_assistant_routing(&rows)
-        .unwrap_or_else(|| (Uuid::new_v4().to_string(), "allow".to_string()));
+        .map_err(|_| RoutingUnavailable::ProfileDbUnavailable)
+        .and_then(|db| {
+            db.list_messages_by_conversation(&conversation_id)
+                .map_err(|_| RoutingUnavailable::MessageQueryFailed)
+        });
+    let (message_id, routing_decision, routing_unavailable) = routing_lookup(rows).into_parts();
 
     Ok(SendMessageResponse {
         message_id,
@@ -707,6 +962,7 @@ pub async fn send_message(
         conversation_id,
         profile,
         routing_decision,
+        routing_unavailable,
         completed_at: chrono::Utc::now().timestamp_millis().max(started),
     })
 }
@@ -892,9 +1148,10 @@ pub fn set_skill_approval(
             let tool_name = crate::tools::skills::skill_tool_name(&skill.name);
             match skill.approval_status {
                 crate::storage::SkillApproval::Approved => {
-                    if let Some(tool) =
-                        crate::tools::skills::SkillTool::for_skill(&skill, Arc::clone(&state.storage))
-                    {
+                    if let Some(tool) = crate::tools::skills::SkillTool::for_skill(
+                        &skill,
+                        Arc::clone(&state.storage),
+                    ) {
                         state.tools.hot_register(Box::new(tool));
                     }
                 }
@@ -1014,9 +1271,16 @@ pub async fn get_model_detail(args: GetModelDetailArgs) -> Result<ModelDetailRes
             Ok((s, notes)) => (Some(s), notes),
             Err(e) => (None, vec![format!("Couldn't read model architecture: {e}")]),
         },
-        None => (None, vec!["No downloadable quant found for this model.".to_string()]),
+        None => (
+            None,
+            vec!["No downloadable quant found for this model.".to_string()],
+        ),
     };
-    Ok(ModelDetailResponse { detail, spec, spec_notes })
+    Ok(ModelDetailResponse {
+        detail,
+        spec,
+        spec_notes,
+    })
 }
 
 /// Args for [`calculate_model_fit`] — the model's architecture spec (from
@@ -1059,10 +1323,16 @@ pub fn get_sandbox_config(
     args: GetSandboxConfigArgs,
 ) -> Result<crate::hooks::SandboxConfig, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
     // `?` propagates a corrupt-row Err; `unwrap_or_default` only fills the
     // UNSET (None) case with the library default.
-    Ok(db.get_sandbox_config().map_err(|e| e.to_string())?.unwrap_or_default())
+    Ok(db
+        .get_sandbox_config()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1081,8 +1351,12 @@ pub fn set_sandbox_config(
 ) -> Result<crate::hooks::SandboxConfig, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     validate_sandbox_config(&args.config)?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
-    db.set_sandbox_config(&args.config).map_err(|e| e.to_string())?;
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    db.set_sandbox_config(&args.config)
+        .map_err(|e| e.to_string())?;
     Ok(args.config)
 }
 
@@ -1090,10 +1364,20 @@ pub fn set_sandbox_config(
 /// entries (a blank domain/socket/command is never meaningful and would just be
 /// dead weight the shell path has to skip). Fail closed on bad input.
 fn validate_sandbox_config(cfg: &crate::hooks::SandboxConfig) -> Result<(), String> {
-    if cfg.network.allowed_domains.iter().any(|d| d.trim().is_empty()) {
+    if cfg
+        .network
+        .allowed_domains
+        .iter()
+        .any(|d| d.trim().is_empty())
+    {
         return Err("sandbox_config: allowed_domains entries must not be empty".into());
     }
-    if cfg.network.allow_unix_sockets.iter().any(|s| s.trim().is_empty()) {
+    if cfg
+        .network
+        .allow_unix_sockets
+        .iter()
+        .any(|s| s.trim().is_empty())
+    {
         return Err("sandbox_config: allow_unix_sockets entries must not be empty".into());
     }
     if cfg.excluded_commands.iter().any(|c| c.trim().is_empty()) {
@@ -1121,8 +1405,13 @@ pub fn get_budget_settings(
     args: GetBudgetSettingsArgs,
 ) -> Result<BudgetSettings, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
-    Ok(BudgetSettings { cap_usd: db.budget_cap().map_err(|e| e.to_string())? })
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
+    Ok(BudgetSettings {
+        cap_usd: db.budget_cap().map_err(|e| e.to_string())?,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1141,9 +1430,14 @@ pub fn set_budget_settings(
     args: SetBudgetSettingsArgs,
 ) -> Result<BudgetSettings, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
     db.set_budget_cap(args.cap_usd).map_err(|e| e.to_string())?;
-    Ok(BudgetSettings { cap_usd: db.budget_cap().map_err(|e| e.to_string())? })
+    Ok(BudgetSettings {
+        cap_usd: db.budget_cap().map_err(|e| e.to_string())?,
+    })
 }
 
 /// Clear the cap entirely (uncapped).
@@ -1153,7 +1447,10 @@ pub fn reset_budget_settings(
     args: GetBudgetSettingsArgs,
 ) -> Result<BudgetSettings, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    let db = state.storage.open_profile(&args.profile).map_err(|e| e.to_string())?;
+    let db = state
+        .storage
+        .open_profile(&args.profile)
+        .map_err(|e| e.to_string())?;
     db.reset_budget_cap().map_err(|e| e.to_string())?;
     Ok(BudgetSettings { cap_usd: None })
 }
@@ -1220,7 +1517,11 @@ pub async fn register_mcp_server(
     // segment itself; letting two servers share it would let the EARLIER one
     // silently pre-claim (and answer for) the later one's tool names.
     let new_seg = crate::tools::mcp::sanitize_name_segment(args.name.trim());
-    let existing = state.storage.global().list_mcp_servers().map_err(|e| e.to_string())?;
+    let existing = state
+        .storage
+        .global()
+        .list_mcp_servers()
+        .map_err(|e| e.to_string())?;
     if let Some(clash) = existing
         .iter()
         .find(|r| crate::tools::mcp::sanitize_name_segment(&r.name) == new_seg)
@@ -1249,8 +1550,8 @@ pub async fn register_mcp_server(
             "remote".to_string()
         } else {
             match args.tier.as_deref() {
-            Some("local") => "local".to_string(),
-            _ => "remote".to_string(), // ambiguous ⇒ remote (the stricter tier)
+                Some("local") => "local".to_string(),
+                _ => "remote".to_string(), // ambiguous ⇒ remote (the stricter tier)
             }
         },
         trusted_read_only: args.trusted_read_only,
@@ -1281,7 +1582,11 @@ pub async fn register_mcp_server(
 /// The persisted MCP servers, annotated with live status.
 #[tauri::command]
 pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>, String> {
-    let rows = state.storage.global().list_mcp_servers().map_err(|e| e.to_string())?;
+    let rows = state
+        .storage
+        .global()
+        .list_mcp_servers()
+        .map_err(|e| e.to_string())?;
     let live = state.mcp.servers.lock();
     Ok(rows
         .into_iter()
@@ -1316,7 +1621,11 @@ pub async fn remove_mcp_server(
     args: RemoveMcpServerArgs,
 ) -> Result<bool, String> {
     crate::tools::mcp_stdio::tear_down_server(&args.id, &state.tools, &state.mcp).await;
-    state.storage.global().delete_mcp_server(&args.id).map_err(|e| e.to_string())
+    state
+        .storage
+        .global()
+        .delete_mcp_server(&args.id)
+        .map_err(|e| e.to_string())
 }
 
 // ── cancel_message (C7 — M6 Slice 4a: cooperative turn cancellation) ────────
@@ -1351,7 +1660,13 @@ pub struct LocalModelInfo {
 
 impl From<crate::storage::ModelEntry> for LocalModelInfo {
     fn from(m: crate::storage::ModelEntry) -> Self {
-        Self { id: m.id, name: m.name, path: m.path, size_bytes: m.size_bytes, status: m.status }
+        Self {
+            id: m.id,
+            name: m.name,
+            path: m.path,
+            size_bytes: m.size_bytes,
+            status: m.status,
+        }
     }
 }
 
@@ -1393,8 +1708,10 @@ pub async fn remove_local_model(
     }
     let global = state.storage.global();
     if let Ok(Some(m)) = global.get_model(&args.id) {
-        // Best-effort file delete (the row removal is the source of truth).
-        let _ = std::fs::remove_file(&m.path);
+        // Delete the file FIRST. If this fails, keep the DB row (so the user
+        // can retry) and surface the error instead of orphaning gigabytes of
+        // GGUF on disk with no catalog entry.
+        std::fs::remove_file(&m.path).map_err(|e| format!("failed to delete model file: {e}"))?;
     }
     global.delete_model(&args.id).map_err(|e| e.to_string())
 }
@@ -1455,8 +1772,16 @@ pub async fn download_model(
     let quant = detail
         .quants
         .into_iter()
-        .find(|q| q.complete && q.files.first().is_some_and(|f| f.filename == args.first_filename))
-        .ok_or_else(|| "the selected GGUF is no longer present or is incomplete; refresh the model details".to_string())?;
+        .find(|q| {
+            q.complete
+                && q.files
+                    .first()
+                    .is_some_and(|f| f.filename == args.first_filename)
+        })
+        .ok_or_else(|| {
+            "the selected GGUF is no longer present or is incomplete; refresh the model details"
+                .to_string()
+        })?;
     if quant.files.len() != 1 {
         return Err(
             "split GGUF files are not yet supported by the verified local runner; choose a single-file quant"
@@ -1479,7 +1804,12 @@ pub async fn download_model(
     let final_path = dir.join(format!("{id}.gguf"));
     let partial = dir.join(format!("{id}.gguf.partial"));
 
-    if let Some(existing) = state.storage.global().get_model(&id).map_err(|e| e.to_string())? {
+    if let Some(existing) = state
+        .storage
+        .global()
+        .get_model(&id)
+        .map_err(|e| e.to_string())?
+    {
         if existing.status == "ready" && std::path::Path::new(&existing.path).is_file() {
             return Ok(DownloadedModelInfo {
                 id: existing.id,
@@ -1496,7 +1826,11 @@ pub async fn download_model(
     crate::models::download::download_to_partial(&file.url, &partial, move |downloaded, total| {
         let _ = app_for_progress.emit(
             "model:download-progress",
-            DownloadProgress { id: id_for_progress.clone(), downloaded, total },
+            DownloadProgress {
+                id: id_for_progress.clone(),
+                downloaded,
+                total,
+            },
         );
     })
     .await
@@ -1508,7 +1842,11 @@ pub async fn download_model(
 
     let model = crate::storage::ModelEntry {
         id,
-        name: format!("{} · {}", detail.id, quant.quant.as_deref().unwrap_or("GGUF")),
+        name: format!(
+            "{} · {}",
+            detail.id,
+            quant.quant.as_deref().unwrap_or("GGUF")
+        ),
         path: final_path.to_string_lossy().to_string(),
         size_bytes: file.size_bytes as i64,
         quantization: quant.quant,
@@ -1516,7 +1854,11 @@ pub async fn download_model(
         sha256: file.sha256,
         status: "ready".to_string(),
     };
-    state.storage.global().insert_model(&model).map_err(|e| e.to_string())?;
+    state
+        .storage
+        .global()
+        .insert_model(&model)
+        .map_err(|e| e.to_string())?;
 
     Ok(DownloadedModelInfo {
         id: model.id,
@@ -1533,6 +1875,10 @@ pub struct InstallPackArgs {
     pub json: String,
 }
 
+/// Maximum bytes for a single pack-import JSON payload. Prevents OOM from
+/// an oversized or malicious pack file (used by packet P13).
+const PACK_IMPORT_MAX_BYTES: usize = 1_000_000;
+
 /// Install a Capability Pack (Wave 4.5): register its skills + agent types
 /// (GLOBAL) + cron jobs (this profile) at once. Everything lands INERT — skills
 /// + agent types `Pending` (review in Settings → Skills / Agent types), cron
@@ -1542,6 +1888,12 @@ pub fn install_pack(
     state: State<'_, AppState>,
     args: InstallPackArgs,
 ) -> Result<crate::packs::InstallReport, String> {
+    if args.json.len() > PACK_IMPORT_MAX_BYTES {
+        return Err(format!(
+            "pack JSON exceeds maximum size ({} bytes)",
+            PACK_IMPORT_MAX_BYTES
+        ));
+    }
     let pack = crate::packs::parse_pack(&args.json).map_err(|e| e.to_string())?;
     crate::packs::install_pack(
         &state.storage,
@@ -1755,7 +2107,9 @@ pub fn get_usage_summary(
         .storage
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
-    db.usage_summary().map(Into::into).map_err(|e| e.to_string())
+    db.usage_summary()
+        .map(Into::into)
+        .map_err(|e| e.to_string())
 }
 
 /// Deliver the user's answer to a parked `ask_human` question. Touches only the
@@ -1914,8 +2268,7 @@ pub fn set_classifier_settings(
         .storage
         .open_profile(&args.profile)
         .map_err(|e| e.to_string())?;
-    let cfg =
-        crate::classifier::ClassifierConfig::from_ui(args.strictness, &args.uncertainty_band);
+    let cfg = crate::classifier::ClassifierConfig::from_ui(args.strictness, &args.uncertainty_band);
     db.set_classifier_config(&cfg).map_err(|e| e.to_string())?;
     let redaction = db.redaction_enabled().map_err(|e| e.to_string())?;
     Ok(ClassifierSettingsInfo::from_parts(cfg, redaction))
@@ -2196,7 +2549,10 @@ mod explain_tests {
         let (label, hard) = category_display("PROPRIETARY");
         assert!(hard, "proprietary is a hard-block category");
         assert_eq!(label, "confidential / proprietary");
-        assert!(!category_display("PII_CONTACT").1, "contact info is not hard");
+        assert!(
+            !category_display("PII_CONTACT").1,
+            "contact info is not hard"
+        );
     }
 
     #[test]
@@ -2215,7 +2571,9 @@ mod explain_tests {
         );
         // A credential span → never-persist (dropped).
         assert_eq!(
-            route_memory_sensitivity(&clf.classify("my api key is sk-ABCD1234efgh5678ijkl9012mnop3456")),
+            route_memory_sensitivity(
+                &clf.classify("my api key is sk-ABCD1234efgh5678ijkl9012mnop3456")
+            ),
             MemoryRoute::NeverPersist
         );
         // Sensitive-but-durable PII (an SSN — PII_ID, not a credential) → local.
@@ -2248,7 +2606,10 @@ fn bucket_str(b: crate::storage::MemoryBucket) -> &'static str {
     }
 }
 
-fn to_memory_info(fact: crate::storage::MemoryFact, bucket: crate::storage::MemoryBucket) -> MemoryInfo {
+fn to_memory_info(
+    fact: crate::storage::MemoryFact,
+    bucket: crate::storage::MemoryBucket,
+) -> MemoryInfo {
     MemoryInfo {
         id: fact.id,
         content: fact.content,
@@ -2281,7 +2642,11 @@ pub fn list_memory(
         .memory_db_for_profile(&args.profile)
         .map_err(|e| e.to_string())?
         .list_memory_by_profile(&args.profile, true)
-        .map(|rows| rows.into_iter().map(|(f, b)| to_memory_info(f, b)).collect())
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(f, b)| to_memory_info(f, b))
+                .collect()
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -2463,7 +2828,8 @@ pub fn set_memory_settings(
         semantic_search_enabled: args.semantic_search_enabled,
         walled: args.walled,
     };
-    db.set_memory_settings(&settings).map_err(|e| e.to_string())?;
+    db.set_memory_settings(&settings)
+        .map_err(|e| e.to_string())?;
     Ok(MemorySettingsInfo::from(settings))
 }
 
@@ -2598,7 +2964,8 @@ pub fn delete_cron_job(
 /// In-flight OAuth dances + soft state for the email round.
 pub struct EmailRuntime {
     /// profile → the pending loopback-listener auth (consumed by finish).
-    pending: parking_lot::Mutex<std::collections::HashMap<String, crate::email::oauth::PendingAuth>>,
+    pending:
+        parking_lot::Mutex<std::collections::HashMap<String, crate::email::oauth::PendingAuth>>,
     /// Profiles whose last Gmail call failed with a dead grant. An
     /// `Arc<Mutex<_>>` rather than a bare `Mutex` so this same set can be
     /// handed to `tools::email::EmailToolDeps` (see
@@ -2646,7 +3013,10 @@ fn email_endpoint() -> Result<std::sync::Arc<dyn crate::email::oauth::TokenEndpo
 }
 
 /// A per-profile Gmail client over the keychain token provider.
-fn email_client(state: &AppState, profile: &str) -> Result<crate::email::gmail::GmailClient, String> {
+fn email_client(
+    state: &AppState,
+    profile: &str,
+) -> Result<crate::email::gmail::GmailClient, String> {
     let endpoint = email_endpoint()?;
     let http = crate::email::gmail::ReqwestGmailHttp::new().map_err(|e| e.to_string())?;
     Ok(crate::email::gmail::GmailClient::new(
@@ -2662,7 +3032,10 @@ fn email_client(state: &AppState, profile: &str) -> Result<crate::email::gmail::
 /// A per-profile authenticated Google JSON client. Calendar and Tasks share
 /// Gmail's keychain-backed OAuth session, but have their own narrow REST
 /// clients and IPC surfaces.
-fn google_client(state: &AppState, profile: &str) -> Result<crate::email::google::GoogleClient, String> {
+fn google_client(
+    state: &AppState,
+    profile: &str,
+) -> Result<crate::email::google::GoogleClient, String> {
     let endpoint = email_endpoint()?;
     crate::email::google::GoogleClient::new(Box::new(
         crate::email::token_provider::KeychainTokenProvider::new(
@@ -2674,19 +3047,33 @@ fn google_client(state: &AppState, profile: &str) -> Result<crate::email::google
     .map_err(|e| e.to_string())
 }
 
-fn calendar_client(state: &AppState, profile: &str) -> Result<crate::email::calendar::CalendarClient, String> {
-    Ok(crate::email::calendar::CalendarClient::new(google_client(state, profile)?))
+fn calendar_client(
+    state: &AppState,
+    profile: &str,
+) -> Result<crate::email::calendar::CalendarClient, String> {
+    Ok(crate::email::calendar::CalendarClient::new(google_client(
+        state, profile,
+    )?))
 }
 
-fn tasks_client(state: &AppState, profile: &str) -> Result<crate::email::tasks::TasksClient, String> {
-    Ok(crate::email::tasks::TasksClient::new(google_client(state, profile)?))
+fn tasks_client(
+    state: &AppState,
+    profile: &str,
+) -> Result<crate::email::tasks::TasksClient, String> {
+    Ok(crate::email::tasks::TasksClient::new(google_client(
+        state, profile,
+    )?))
 }
 
 /// Notes a NeedsReconnect failure for `profile` when `err` carries the marker,
 /// so `gmail_setup_status` can drive the calm reconnect UI.
 fn note_reconnect_if_needed(state: &AppState, profile: &str, err: &str) {
     if err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER) {
-        state.email.needs_reconnect.lock().insert(profile.to_string());
+        state
+            .email
+            .needs_reconnect
+            .lock()
+            .insert(profile.to_string());
     }
 }
 
@@ -2775,7 +3162,9 @@ pub fn set_gmail_client(
         return Err("the client secret is empty — copy it from the same Credentials page".into());
     }
     let s = &state.provider_secrets;
-    let previous_id = s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?;
+    let previous_id = s
+        .get(crate::email::SECRET_GMAIL_CLIENT_ID)
+        .map_err(|e| e.to_string())?;
     let client_changed = previous_id.as_deref().is_some_and(|prev| prev != id);
     if client_changed {
         if let Ok(names) = state.storage.list_profile_names() {
@@ -2787,8 +3176,10 @@ pub fn set_gmail_client(
             }
         }
     }
-    s.set(crate::email::SECRET_GMAIL_CLIENT_ID, id).map_err(|e| e.to_string())?;
-    s.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, secret).map_err(|e| e.to_string())?;
+    s.set(crate::email::SECRET_GMAIL_CLIENT_ID, id)
+        .map_err(|e| e.to_string())?;
+    s.set(crate::email::SECRET_GMAIL_CLIENT_SECRET, secret)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2808,21 +3199,34 @@ pub async fn gmail_begin_connect(
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     let s = &state.provider_secrets;
     let (Some(client_id), Some(client_secret)) = (
-        s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?,
-        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET).map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_ID)
+            .map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET)
+            .map_err(|e| e.to_string())?,
     ) else {
         return Err("paste your Google OAuth client first (Settings → Email setup)".into());
     };
-    let gcp = crate::email::oauth::GcpClient { client_id, client_secret };
-    let pending = crate::email::oauth::begin_auth(&gcp).await.map_err(|e| e.to_string())?;
+    let gcp = crate::email::oauth::GcpClient {
+        client_id,
+        client_secret,
+    };
+    let pending = crate::email::oauth::begin_auth(&gcp)
+        .await
+        .map_err(|e| e.to_string())?;
     let auth_url = pending.auth_url.clone();
-    state.email.pending.lock().insert(args.profile.clone(), pending);
+    state
+        .email
+        .pending
+        .lock()
+        .insert(args.profile.clone(), pending);
 
     // Best-effort browser launch; the UI also shows the URL for copy/paste
     // (the honest fallback on other OSes or if `open` fails).
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("/usr/bin/open").arg(&auth_url).spawn();
+        let _ = std::process::Command::new("/usr/bin/open")
+            .arg(&auth_url)
+            .spawn();
     }
 
     Ok(GmailBeginConnect { auth_url })
@@ -2853,27 +3257,32 @@ pub async fn gmail_finish_connect(
         .ok_or_else(|| "no connection attempt in progress — click Connect first".to_string())?;
     let s = &state.provider_secrets;
     let (Some(client_id), Some(client_secret)) = (
-        s.get(crate::email::SECRET_GMAIL_CLIENT_ID).map_err(|e| e.to_string())?,
-        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET).map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_ID)
+            .map_err(|e| e.to_string())?,
+        s.get(crate::email::SECRET_GMAIL_CLIENT_SECRET)
+            .map_err(|e| e.to_string())?,
     ) else {
         return Err("the Google OAuth client was removed mid-connect — start over".into());
     };
-    let gcp = crate::email::oauth::GcpClient { client_id, client_secret };
+    let gcp = crate::email::oauth::GcpClient {
+        client_id,
+        client_secret,
+    };
     let endpoint = email_endpoint()?;
     let tokens = pending
         .finish(endpoint.as_ref(), &gcp)
         .await
         .map_err(|e| e.to_string())?;
-    let refresh = tokens
-        .refresh_token
-        .clone()
-        .ok_or_else(|| {
-            "Google didn't return a refresh token — remove the app's access at \
+    let refresh = tokens.refresh_token.clone().ok_or_else(|| {
+        "Google didn't return a refresh token — remove the app's access at \
              myaccount.google.com/permissions and connect again"
-                .to_string()
-        })?;
-    s.set(&crate::email::secret_gmail_refresh_token(&args.profile), &refresh)
-        .map_err(|e| e.to_string())?;
+            .to_string()
+    })?;
+    s.set(
+        &crate::email::secret_gmail_refresh_token(&args.profile),
+        &refresh,
+    )
+    .map_err(|e| e.to_string())?;
 
     // One profile call with the fresh access token to capture the address.
     struct OneShot(String);
@@ -2896,7 +3305,10 @@ pub async fn gmail_finish_connect(
     // were real. A missing address is an honest, UI-tolerated state.
     let account_email = client.get_profile().await.ok();
     if let Some(email) = &account_email {
-        let _ = s.set(&crate::email::secret_gmail_account_email(&args.profile), email);
+        let _ = s.set(
+            &crate::email::secret_gmail_account_email(&args.profile),
+            email,
+        );
     }
     state.email.needs_reconnect.lock().remove(&args.profile);
     Ok(GmailConnected { account_email })
@@ -3189,7 +3601,13 @@ pub struct GoogleTaskInfo {
 
 impl From<crate::email::tasks::Task> for GoogleTaskInfo {
     fn from(task: crate::email::tasks::Task) -> Self {
-        Self { id: task.id, title: task.title, notes: task.notes, due: task.due, completed: task.completed }
+        Self {
+            id: task.id,
+            title: task.title,
+            notes: task.notes,
+            due: task.due,
+            completed: task.completed,
+        }
     }
 }
 
@@ -3339,7 +3757,11 @@ pub fn list_workspace_files(
     if sub.split('/').any(|c| c == ".." || c.starts_with('\\')) || sub.starts_with('/') {
         return Err("invalid subpath".into());
     }
-    let dir = if sub.is_empty() { ws.clone() } else { ws.join(sub) };
+    let dir = if sub.is_empty() {
+        ws.clone()
+    } else {
+        ws.join(sub)
+    };
 
     // Canonicalize-confine: the listed dir must still live under the
     // workspace after symlink resolution.
@@ -3387,8 +3809,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_version_is_m1_tag() {
-        assert_eq!(get_app_version(), "0.1.0-m1");
+    fn app_version_is_from_cargo() {
+        assert_eq!(get_app_version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -3474,7 +3896,10 @@ mod tests {
     fn latest_assistant_routing_reads_the_real_decision() {
         // The regression this guards: a live send must surface the real
         // persisted decision (e.g. "route_local"), not a hardcoded "allow".
-        let rows = vec![msg("u1", "user", None), msg("a1", "assistant", Some("route_local"))];
+        let rows = vec![
+            msg("u1", "user", None),
+            msg("a1", "assistant", Some("route_local")),
+        ];
         let (id, decision) = latest_assistant_routing(&rows).expect("assistant present");
         assert_eq!(id, "a1");
         assert_eq!(decision, "route_local");
@@ -3495,7 +3920,10 @@ mod tests {
             msg("a2", "assistant", Some("route_local")),
         ];
         let (id, decision) = latest_assistant_routing(&rows).unwrap();
-        assert_eq!(id, "a2", "must pick the newest assistant row, not the first");
+        assert_eq!(
+            id, "a2",
+            "must pick the newest assistant row, not the first"
+        );
         assert_eq!(decision, "route_local");
     }
 
@@ -3503,5 +3931,475 @@ mod tests {
     fn latest_assistant_routing_is_none_without_an_assistant_row() {
         let rows = vec![msg("u1", "user", None)];
         assert!(latest_assistant_routing(&rows).is_none());
+    }
+
+    // ── M-22: send_message reports the read-back honestly ──────────────
+
+    #[test]
+    fn routing_lookup_resolves_a_persisted_assistant_row() {
+        let rows = vec![msg("a1", "assistant", Some("route_local"))];
+        assert_eq!(
+            routing_lookup(Ok(rows)),
+            RoutingLookup::Resolved {
+                message_id: "a1".to_string(),
+                routing_decision: "route_local".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn routing_lookup_distinguishes_every_way_the_read_back_can_fail() {
+        // The bug this replaced flattened all three of these into
+        // `("", "unknown")` inside an Ok payload. Each must stay its own
+        // reportable reason.
+        assert_eq!(
+            routing_lookup(Ok(vec![msg("u1", "user", None)])),
+            RoutingLookup::Unavailable(RoutingUnavailable::NoAssistantRow)
+        );
+        assert_eq!(
+            routing_lookup(Err(RoutingUnavailable::ProfileDbUnavailable)),
+            RoutingLookup::Unavailable(RoutingUnavailable::ProfileDbUnavailable)
+        );
+        assert_eq!(
+            routing_lookup(Err(RoutingUnavailable::MessageQueryFailed)),
+            RoutingLookup::Unavailable(RoutingUnavailable::MessageQueryFailed)
+        );
+    }
+
+    /// Build the response exactly the way `send_message` does — same
+    /// `into_parts` call, not a re-implementation of it — so the serialized
+    /// shapes asserted below are the shapes the frontend actually receives.
+    fn response_for(lookup: RoutingLookup) -> SendMessageResponse {
+        let (message_id, routing_decision, routing_unavailable) = lookup.into_parts();
+        SendMessageResponse {
+            message_id,
+            content: "hi".to_string(),
+            conversation_id: "c1".to_string(),
+            profile: "personal".to_string(),
+            routing_decision,
+            routing_unavailable,
+            completed_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_degraded_send_response_never_fabricates_a_routing_decision() {
+        let json = serde_json::to_value(response_for(RoutingLookup::Unavailable(
+            RoutingUnavailable::ProfileDbUnavailable,
+        )))
+        .unwrap();
+        // No placeholder id, no invented decision — both explicitly null.
+        assert_eq!(json["message_id"], serde_json::Value::Null);
+        assert_eq!(json["routing_decision"], serde_json::Value::Null);
+        // And the failure is named, so the UI can suppress the routing badge
+        // on purpose instead of rendering a decision nobody made.
+        assert_eq!(json["routing_unavailable"], "profile_db_unavailable");
+        let raw = serde_json::to_string(&response_for(RoutingLookup::Unavailable(
+            RoutingUnavailable::NoAssistantRow,
+        )))
+        .unwrap();
+        assert!(
+            !raw.contains("unknown"),
+            "the old fabricated \"unknown\" decision is back: {raw}"
+        );
+    }
+
+    #[test]
+    fn a_resolved_send_response_carries_the_decision_and_omits_the_failure_field() {
+        let json = serde_json::to_value(response_for(RoutingLookup::Resolved {
+            message_id: "a1".to_string(),
+            routing_decision: "route_local".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(json["message_id"], "a1");
+        assert_eq!(json["routing_decision"], "route_local");
+        assert!(
+            json.get("routing_unavailable").is_none(),
+            "happy path must not carry a failure field: {json}"
+        );
+    }
+
+    // ── H-06: cleartext is gated on the ADDRESS, not on a string prefix ──
+
+    #[test]
+    fn cleartext_http_is_refused_for_hosts_that_only_look_local() {
+        // Every one of these passed the old `host.starts_with("127.")` /
+        // `"localhost"` string tests or is the same class of trick, and every
+        // one resolves through public DNS. Accepting any of them ships the
+        // provider's bearer key over plaintext HTTP to a stranger.
+        for hostile in [
+            "http://127.evil.com/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "http://localhost.evil.com/v1",
+            "http://10.evil.com/v1",
+            "http://192.168.1.1.evil.com/v1",
+            "http://172.16.evil.com/v1",
+            "http://100.64.evil.com/v1",
+            "http://evil.com/127.0.0.1/v1",
+        ] {
+            let err = match validate_base_url(hostile) {
+                Ok(()) => panic!("hostile lookalike host was ACCEPTED: {hostile}"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("cleartext"),
+                "expected the cleartext refusal for {hostile}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_http_is_allowed_for_real_loopback_and_lan_addresses() {
+        for ok in [
+            "http://localhost:1234/v1",
+            "http://LocalHost:1234/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://127.9.9.9:1234/v1",
+            // Decimal form of 127.0.0.1. No string test can see this; only
+            // parsing the host as an address does.
+            "http://2130706433:1234/v1",
+            "http://[::1]:8080/v1",
+            "http://10.0.0.100:8000/v1",
+            "http://192.168.1.50:11434/v1",
+            "http://172.20.4.4:8000/v1",
+            "http://169.254.7.7:8000/v1",
+            "http://100.85.52.127:8000/v1",
+        ] {
+            assert!(
+                validate_base_url(ok).is_ok(),
+                "local/LAN endpoint must stay addable over http: {ok} — {:?}",
+                validate_base_url(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn public_endpoints_must_use_https_and_https_is_always_accepted() {
+        for public_cleartext in [
+            "http://api.openai.com/v1",
+            // 8.8.8.8 and 172.32.x are outside every private range — the
+            // boundary just past 172.16/12.
+            "http://8.8.8.8/v1",
+            "http://172.32.0.1/v1",
+            "http://11.0.0.1/v1",
+        ] {
+            assert!(
+                validate_base_url(public_cleartext).is_err(),
+                "public cleartext endpoint must be refused: {public_cleartext}"
+            );
+        }
+        for tls in [
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1",
+            // TLS to a lookalike name is fine — the key is encrypted and the
+            // certificate is the server's problem, not ours.
+            "https://127.evil.com/v1",
+        ] {
+            assert!(
+                validate_base_url(tls).is_ok(),
+                "https endpoint must be accepted: {tls}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_rejects_credentials_fragments_and_odd_schemes() {
+        assert!(validate_base_url("https://user:pass@api.openai.com/v1").is_err());
+        assert!(validate_base_url("https://api.openai.com/v1#frag").is_err());
+        assert!(validate_base_url("ftp://api.openai.com/v1").is_err());
+        assert!(validate_base_url("file:///etc/passwd").is_err());
+        assert!(validate_base_url("not a url").is_err());
+    }
+
+    // ── H-06 (client side): a redirect must never carry the bearer key ──
+
+    /// One-shot HTTP server on an ephemeral loopback port. Answers the first
+    /// request with `raw` and closes. Returns the bound port.
+    fn one_shot_server(raw: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(raw.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn the_model_client_does_not_follow_redirects() {
+        // A 302 is how a compromised or misconfigured endpoint moves an
+        // authenticated request somewhere else; reqwest's default policy would
+        // replay it (up to 10 hops). `ModelClient::new` disables redirects, so
+        // the 302 must surface as the error instead of being followed to the
+        // destination — which here would answer with a valid model list and
+        // make `list_models` succeed.
+        let destination = one_shot_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 30\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"redirected\"}]}",
+        );
+        let hop = one_shot_server_redirecting_to(destination);
+        let provider = Provider::new(
+            "p1",
+            "Hop",
+            format!("http://127.0.0.1:{hop}"),
+            Some("sk-secret".into()),
+            ProviderKind::Local,
+        );
+        let client = crate::models::client::ModelClient::new(provider).expect("build client");
+        let err = client
+            .list_models()
+            .await
+            .expect_err("a 302 must not be followed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("302"),
+            "expected the redirect to surface as a 302 error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("redirected"),
+            "the redirect was followed to its destination: {msg}"
+        );
+    }
+
+    /// A server that 302s to `port`. Separate from `one_shot_server` because
+    /// the Location header is built at runtime.
+    fn one_shot_server_redirecting_to(port: u16) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let hop = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/models\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        hop
+    }
+
+    // ── M-05 / rotation: provider mutations against a real AppState ─────
+
+    use crate::secrets::ProviderSecretStore as _; // get/set/delete on the doubles
+
+    /// Credential-store double that also records deletions, so a test can
+    /// assert the *compensating* delete happened (and against which id) —
+    /// `secrets::MemoryProviderSecretStore` only exposes the surviving values.
+    #[derive(Default)]
+    struct RecordingSecretStore {
+        values: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        deleted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingSecretStore {
+        /// Ids that currently hold a secret.
+        fn live_ids(&self) -> Vec<String> {
+            let mut ids: Vec<String> = self.values.lock().unwrap().keys().cloned().collect();
+            ids.sort();
+            ids
+        }
+
+        fn deleted_ids(&self) -> Vec<String> {
+            self.deleted.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::secrets::ProviderSecretStore for RecordingSecretStore {
+        fn get(&self, endpoint_id: &str) -> Result<Option<String>, String> {
+            Ok(self.values.lock().unwrap().get(endpoint_id).cloned())
+        }
+        fn set(&self, endpoint_id: &str, secret: &str) -> Result<(), String> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(endpoint_id.to_string(), secret.to_string());
+            Ok(())
+        }
+        fn delete(&self, endpoint_id: &str) -> Result<(), String> {
+            self.values.lock().unwrap().remove(endpoint_id);
+            self.deleted.lock().unwrap().push(endpoint_id.to_string());
+            Ok(())
+        }
+    }
+
+    /// A minimal but real `AppState`: on-disk temp storage, empty
+    /// `ModelManager`, recording secret store. No Tauri app — the command
+    /// bodies live in `*_inner(&AppState, ..)` precisely so this works.
+    fn test_state() -> (AppState, Arc<RecordingSecretStore>) {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("lhp-ipc-p05-{}", Uuid::new_v4()));
+        let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+        let model_manager = Arc::new(ModelManager::new());
+        let secrets = Arc::new(RecordingSecretStore::default());
+        let tools = Arc::new(crate::tools::ToolDispatcher::empty());
+        let gate = crate::agent::gate::PrivacyGate::new(Arc::new(
+            crate::classifier::HeuristicClassifier::new(),
+        ));
+        let agent_loop = Arc::new(AgentLoop::new(
+            gate,
+            Arc::clone(&model_manager),
+            Arc::clone(&storage),
+            Arc::clone(&tools),
+        ));
+        let state = AppState {
+            agent_loop,
+            email: Arc::new(EmailRuntime::new()),
+            model_manager,
+            storage,
+            provider_secrets: Arc::clone(&secrets) as Arc<dyn crate::secrets::ProviderSecretStore>,
+            approvals: Arc::new(ApprovalRegistry::new()),
+            ask_human: Arc::new(AskHumanRegistry::new()),
+            classifier: Arc::new(crate::classifier::HeuristicClassifier::new()),
+            embedder: None,
+            tools,
+            mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new()),
+            hardware: Arc::new(Default::default()),
+            #[cfg(feature = "local-runner")]
+            local_runner: None,
+        };
+        (state, secrets)
+    }
+
+    fn add_args(name: &str, api_key: Option<&str>) -> AddProviderArgs {
+        AddProviderArgs {
+            name: name.to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: api_key.map(str::to_string),
+            kind: "cloud".to_string(),
+            supports_native_tools: false,
+        }
+    }
+
+    #[test]
+    fn add_provider_deletes_the_keychain_entry_when_the_db_insert_fails() {
+        let (state, secrets) = test_state();
+        // Force the insert to fail for real: drop the table the write targets.
+        // (`insert_endpoint` then errors with "no such table: endpoints".)
+        state
+            .storage
+            .global()
+            .raw()
+            .execute_batch("DROP TABLE endpoints")
+            .expect("drop endpoints table");
+
+        let err = add_provider_inner(&state, add_args("OpenAI", Some("sk-orphan")))
+            .expect_err("a failed insert must fail the command");
+        assert!(err.contains("failed to persist endpoint"), "got: {err}");
+
+        // The compensating delete is the whole point: without it the secret
+        // stays in the credential store under a random uuid that no endpoint
+        // row, and therefore no UI, will ever name again.
+        assert!(
+            secrets.live_ids().is_empty(),
+            "orphaned provider secret left behind: {:?}",
+            secrets.live_ids()
+        );
+        assert_eq!(
+            secrets.deleted_ids().len(),
+            1,
+            "expected exactly one compensating delete, saw {:?}",
+            secrets.deleted_ids()
+        );
+        assert!(
+            state.model_manager.list_providers().is_empty(),
+            "a provider that failed to persist must not be published in memory"
+        );
+    }
+
+    #[test]
+    fn add_provider_keeps_the_secret_when_the_insert_succeeds() {
+        // Guards the compensation from over-firing: the happy path must still
+        // leave the key in the store.
+        let (state, secrets) = test_state();
+        let info = add_provider_inner(&state, add_args("OpenAI", Some("sk-live")))
+            .expect("add must succeed");
+        assert_eq!(
+            secrets.get(&info.id).unwrap().as_deref(),
+            Some("sk-live"),
+            "the stored key must survive a successful add"
+        );
+        assert_eq!(state.model_manager.list_providers().len(), 1);
+    }
+
+    #[test]
+    fn rotating_a_key_takes_effect_without_a_restart() {
+        let (state, secrets) = test_state();
+        let info = add_provider_inner(&state, add_args("OpenAI", Some("sk-old")))
+            .expect("add must succeed");
+
+        // Prime the client cache the way a real session does — this is the
+        // handle that had baked the old key into its bearer header.
+        let cached = state
+            .model_manager
+            .get_client(&info.id)
+            .expect("client builds");
+        assert_eq!(cached.provider().api_key.as_deref(), Some("sk-old"));
+
+        set_provider_api_key_inner(
+            &state,
+            SetProviderApiKeyArgs {
+                provider_id: info.id.clone(),
+                api_key: "sk-new".to_string(),
+            },
+        )
+        .expect("rotation must succeed");
+
+        assert_eq!(
+            secrets.get(&info.id).unwrap().as_deref(),
+            Some("sk-new"),
+            "the credential store must hold the new key"
+        );
+        // Without the in-memory refresh both of these still say "sk-old" for
+        // the rest of the session: the keychain is only read at boot.
+        assert_eq!(
+            state
+                .model_manager
+                .get_provider(&info.id)
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("sk-new"),
+            "the live provider still carries the rotated-out key"
+        );
+        assert_eq!(
+            state
+                .model_manager
+                .get_client(&info.id)
+                .unwrap()
+                .provider()
+                .api_key
+                .as_deref(),
+            Some("sk-new"),
+            "the cached client still signs requests with the rotated-out key"
+        );
+        // The rest of the record must be untouched by a key rotation.
+        let after = state.model_manager.get_provider(&info.id).unwrap();
+        assert_eq!(after.name, "OpenAI");
+        assert_eq!(after.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn rotating_an_unknown_provider_writes_nothing() {
+        let (state, secrets) = test_state();
+        let err = set_provider_api_key_inner(
+            &state,
+            SetProviderApiKeyArgs {
+                provider_id: "nope".to_string(),
+                api_key: "sk-new".to_string(),
+            },
+        )
+        .expect_err("unknown provider must be rejected");
+        assert!(err.contains("unknown provider"), "got: {err}");
+        assert!(
+            secrets.live_ids().is_empty(),
+            "no secret may be written for an unregistered provider"
+        );
     }
 }

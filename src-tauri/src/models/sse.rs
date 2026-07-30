@@ -80,6 +80,16 @@ pub struct SseStream {
     finished: bool,
 }
 
+/// Maximum length of a single SSE line (including the `data:` prefix and
+/// trailing newline). Lines beyond this are treated as malformed and
+/// skipped (M-01).
+const MAX_LINE_LENGTH: usize = 16 * 1024; // 16 KiB
+
+/// Maximum total bytes the SSE buffer can accumulate before we refuse to
+/// append more data. Prevents OOM from a provider that streams an
+/// unbounded preamble (M-01).
+const MAX_BUFFER_SIZE: usize = 512 * 1024; // 512 KiB
+
 impl SseStream {
     /// Wrap a reqwest `bytes_stream()` so the caller can `await` chunks of
     /// the SSE body. We map each `Bytes` chunk into a `Vec<u8>` so the
@@ -89,9 +99,7 @@ impl SseStream {
     pub fn new(response: reqwest::Response) -> Self {
         // Map each `Bytes` chunk into a `Vec<u8>` so the stream's item
         // type doesn't require the `bytes` crate in our direct deps.
-        let mapped = response
-            .bytes_stream()
-            .map(|res| res.map(|b| b.to_vec()));
+        let mapped = response.bytes_stream().map(|res| res.map(|b| b.to_vec()));
         Self {
             inner: Box::pin(mapped),
             buffer: String::new(),
@@ -134,6 +142,15 @@ impl SseStream {
             // Buffer is empty of complete lines. Pull more bytes.
             match self.inner.next().await {
                 Some(Ok(bytes)) => {
+                    // Enforce a cumulative buffer cap so a provider that
+                    // streams an unbounded invalid preamble cannot OOM us
+                    // (M-01).
+                    if self.buffer.len() + bytes.len() > MAX_BUFFER_SIZE {
+                        self.finished = true;
+                        return Some(SseEvent::Error(
+                            "SSE buffer exceeded maximum size (512 KiB)".into(),
+                        ));
+                    }
                     // It's a protocol violation to send invalid UTF-8 mid-stream,
                     // but `from_utf8_lossy` keeps us resilient against buggy
                     // providers (some inject raw bytes for heartbeats).
@@ -172,6 +189,12 @@ impl SseStream {
         // Strip optional \r for CRLF streams.
         if line.ends_with('\r') {
             line.pop();
+        }
+        // Enforce per-line length cap. Lines that exceed MAX_LINE_LENGTH
+        // are skipped (treated as a no-op keep-alive) rather than being
+        // parsed and potentially OOM-ing the caller (M-01).
+        if line.len() > MAX_LINE_LENGTH {
+            return Some(SseEvent::KeepAlive);
         }
         Some(self.parse_line(&line))
     }
