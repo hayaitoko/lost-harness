@@ -764,7 +764,7 @@ fn dirs_home_fallback() -> Option<PathBuf> {
 /// Existing in-memory providers (e.g. ones added in this session) are
 /// preserved — `add_provider` replaces by id, so loading from disk is
 /// a no-op for anything that matches by id.
-fn hydrate_providers_from_storage(
+pub(crate) fn hydrate_providers_from_storage(
     storage: &Storage,
     mm: &ModelManager,
     secrets: &dyn crate::secrets::ProviderSecretStore,
