@@ -308,12 +308,15 @@
     const groups: ModelGroup[] = [];
     const owner = new Map<string, { providerId: string; name: string }>();
     for (const { provider, result } of perProvider) {
-      // De-duplicate within one endpoint's listing: `key` is
-      // `providerId::name`, so an endpoint that returns the same model name
-      // twice would produce two identical keys and throw `each_key_duplicate`
-      // in the (always-mounted) popover — the same crash class as a duplicate
-      // group key, one level down.
-      const models = result.ok ? [...new Set(result.models)] : [];
+      // `key` is `providerId::name`, so an endpoint that returns the same model
+      // name twice would produce two identical keys and throw
+      // `each_key_duplicate` in the (always-mounted) popover — the same crash
+      // class as a duplicate group key, one level down. There is deliberately
+      // no `new Set(...)` here any more: `fetchModels` guarantees distinct
+      // names for EVERY consumer, so Settings → Models is safe too. De-duping
+      // per call site is how Settings kept crashing after the composer was
+      // "fixed".
+      const models = result.ok ? result.models : [];
       for (const name of models) {
         owner.set(modelKey(provider.id, name), { providerId: provider.id, name });
       }

@@ -182,8 +182,10 @@ export const providersStore = $state({
   },
 });
 
-// Cache of fetched models per provider id — avoids re-fetching on every
-// picker open. The installed app never substitutes a baked-in model list.
+// Cache of fetched models per provider id — so the provider-list effect that
+// drives listing can re-run without re-contacting every endpoint. The installed
+// app never substitutes a baked-in model list. Only DISTINCT names are stored
+// (see `fetchModels`).
 const modelCache = new Map<string, string[]>();
 
 function persistProviders(): void {
@@ -373,13 +375,26 @@ function describeError(err: unknown): string {
 /**
  * Fetches the model list for a provider via the backend IPC.
  *
- * Only successes are cached. Pass `{ refresh: true }` to go past the cache —
- * wired to the model picker opening, so a model added on a live endpoint
- * shows up without restarting the app.
+ * Only successes are cached. Pass `{ refresh: true }` to go past the cache.
+ * That refresh is NOT a side effect of opening the model picker — opening the
+ * picker contacts nothing (see `MainScreen.refreshModelGroups`); it is wired to
+ * the picker's explicit "Refresh" button, so a model added on a live endpoint
+ * shows up without restarting the app and without silent egress.
  *
  * A failure is REPORTED, never swallowed, and never cached: the caller must be
  * able to tell the user "couldn't list models" instead of quietly hiding the
  * endpoint they picked.
+ *
+ * **The returned names are DISTINCT.** Every consumer keys a list by model
+ * name — the composer's picker (`providerId::name`) and the Settings → Models
+ * `<Select>` (`item.value`) — and Svelte throws `each_key_duplicate` on a
+ * repeated key, which blanks the whole screen. An endpoint listing the same id
+ * twice is perfectly legal on the wire (a proxy fanning out to two upstreams
+ * does it routinely), so the guarantee belongs here, where the list is
+ * produced, not at each call site: the composer was patched once and Settings
+ * still crashed. The backend dedupes too (`models::client::distinct_model_ids`)
+ * — this covers the browser-fallback bridge and any endpoint reached by a
+ * client that isn't ours.
  */
 export async function fetchModels(
   providerId: string,
@@ -390,7 +405,9 @@ export async function fetchModels(
     if (cached) return { ok: true, models: cached };
   }
   try {
-    const models = await api.listModels(providerId);
+    // First-seen order kept: the endpoint's own ordering is meaningful, so
+    // this only ever drops later repeats.
+    const models = [...new Set(await api.listModels(providerId))];
     modelCache.set(providerId, models);
     return { ok: true, models };
   } catch (err) {

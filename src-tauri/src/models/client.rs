@@ -154,6 +154,29 @@ struct ModelEntry {
     id: String,
 }
 
+/// Collapse a `GET /models` listing to DISTINCT ids, first-seen order kept.
+///
+/// Nothing in the OpenAI-compatible spec forbids an endpoint from listing the
+/// same id twice, and real ones do — a proxy that fans out to several upstreams
+/// (LiteLLM, OpenRouter-style gateways, two llama.cpp servers behind one route)
+/// happily returns `gpt-4o` once per upstream. The frontend keys its model
+/// lists by name, so a duplicate id is not cosmetic there: it throws
+/// `each_key_duplicate` and takes the whole screen down.
+///
+/// Deduping HERE, at the point the list is produced, is what makes every
+/// consumer safe at once — the composer's picker, Settings → Models, and any
+/// future caller. Patching one call site only moves the crash to the next one
+/// (which is exactly what happened: the composer was fixed, Settings still
+/// crashed).
+///
+/// Order is preserved rather than sorted: the endpoint's own ordering is
+/// meaningful (`ensure_running` and the cron path both take `[0]` as "the
+/// model this endpoint leads with"), so this only ever REMOVES later repeats.
+pub(super) fn distinct_model_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter().filter(|id| seen.insert(id.clone())).collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
@@ -195,8 +218,13 @@ impl ModelClient {
         &self.provider
     }
 
-    /// `GET {base_url}/models` — return the list of model ids the provider
-    /// exposes. Used by the model picker (§4) and by `list_models_for`.
+    /// `GET {base_url}/models` — return the DISTINCT model ids the provider
+    /// exposes, in the order the endpoint listed them. Used by the model picker
+    /// (§4) and by `list_models_for`.
+    ///
+    /// See [`distinct_model_ids`] for why the dedup lives here and not in the
+    /// UI: an endpoint that lists one id twice used to crash whichever screen
+    /// keyed its list by model name.
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let url = format!("{}/models", self.provider.base_url.trim_end_matches('/'));
         let mut req = self.client.get(&url);
@@ -215,7 +243,7 @@ impl ModelClient {
         let body: ModelsResponse = capped_json_body(&mut resp)
             .await
             .context("list_models: failed to decode response JSON")?;
-        Ok(body.data.into_iter().map(|m| m.id).collect())
+        Ok(distinct_model_ids(body.data.into_iter().map(|m| m.id)))
     }
 
     /// `POST {base_url}/chat/completions` with `stream: true`. Returns the

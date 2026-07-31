@@ -11,6 +11,7 @@
 
 use tokio_stream;
 
+use super::client::distinct_model_ids;
 use super::client::ChatMessage;
 use super::manager::ModelManager;
 use super::provider::{Provider, ProviderKind, TrustZone};
@@ -53,6 +54,53 @@ fn provider_is_local_matches_kind() {
     assert!(!cloud.is_local());
     assert!(!custom_public.is_local());
     assert!(!custom_private.is_local());
+}
+
+// ── `GET /models` de-duplication ───────────────────────────────────────────
+
+#[test]
+fn list_models_reports_each_id_once_in_endpoint_order() {
+    // A gateway that fans one route out to several upstreams (LiteLLM, a pair
+    // of llama.cpp servers behind one proxy) legally lists the same id once per
+    // upstream. Every frontend list is keyed by model name, so a repeat is not
+    // cosmetic — Svelte throws `each_key_duplicate` and blanks the screen. The
+    // list is deduped where it is PRODUCED so no consumer has to remember to.
+    let listed = vec![
+        "gpt-4o".to_string(),
+        "qwen3-32b".to_string(),
+        "gpt-4o".to_string(),
+        "qwen3-32b".to_string(),
+        "gpt-4o".to_string(),
+    ];
+    assert_eq!(
+        distinct_model_ids(listed),
+        vec!["gpt-4o".to_string(), "qwen3-32b".to_string()],
+        "each id exactly once, in the order the endpoint first listed it"
+    );
+}
+
+#[test]
+fn list_models_keeps_the_endpoint_s_own_ordering() {
+    // Order is load-bearing, not incidental: `run_cron` and the memory/skill
+    // extractors all take `[0]` as "the model this endpoint leads with", so
+    // this may only ever REMOVE later repeats — never sort, never reorder.
+    let listed = vec![
+        "zeta".to_string(),
+        "alpha".to_string(),
+        "zeta".to_string(),
+        "mu".to_string(),
+    ];
+    assert_eq!(
+        distinct_model_ids(listed),
+        vec!["zeta".to_string(), "alpha".to_string(), "mu".to_string()]
+    );
+}
+
+#[test]
+fn list_models_leaves_a_clean_listing_untouched() {
+    let listed = vec!["a".to_string(), "b".to_string()];
+    assert_eq!(distinct_model_ids(listed.clone()), listed);
+    assert!(distinct_model_ids(Vec::<String>::new()).is_empty());
 }
 
 #[test]
