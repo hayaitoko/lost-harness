@@ -83,6 +83,7 @@
     getUpdateCheckEnabled,
     setUpdateCheckEnabled,
     checkForUpdate,
+    describeUpdateCheckError,
   } from "$lib/api/tauri";
   import { setAvailableUpdate, clearAvailableUpdate } from "$lib/stores/update";
 
@@ -1181,7 +1182,11 @@
         updateCheckNote = "You're on the latest version.";
       }
     } catch (err) {
-      updateCheckNote = `Couldn't reach GitHub: ${String(err)}`;
+      // Not every failure here is a network failure — `check_now` also refuses
+      // a manifest whose download URL isn't this project's release asset, and
+      // that must not render as "GitHub was flaky, try again". See
+      // `describeUpdateCheckError`.
+      updateCheckNote = describeUpdateCheckError(err);
     } finally {
       checkingForUpdate = false;
     }
@@ -2485,7 +2490,7 @@
 
             <SettingRow
               title="Check for updates when the app opens"
-              desc="Sends one request to github.com asking which version is newest. It carries no conversations, no files, no account — just the question. Nothing downloads or installs until you say so."
+              desc="Asks github.com which version is newest. GitHub serves that answer by redirecting to its own file host, so it's two requests — github.com, then objects.githubusercontent.com. Neither carries conversations, files or an account, just the question. Nothing downloads or installs until you say so."
             >
               {#snippet control()}
                 <Toggle

@@ -94,11 +94,13 @@ the OpenAI-compatible provider in Lost Harness. The standard endpoint is
 ## Releases and updating
 
 The app can update itself from this repository's public GitHub releases. On
-launch it makes at most one anonymous request — for a version manifest,
-carrying no conversations, files or account — and only if the **Settings →
-About** toggle is on. Nothing downloads or installs without a click, and a
-payload is refused unless it is signed by the project's key and comes from this
-repository's own release assets.
+launch it makes at most one anonymous check for a version manifest, and only if
+the **Settings → About** toggle is on. That check is two HTTP requests, because
+the manifest is a release asset and GitHub answers those with a redirect to its
+own object CDN — `github.com`, then `objects.githubusercontent.com`. Both are
+GitHub's; neither carries conversations, files or an account. Nothing downloads
+or installs without a click, and a payload is refused unless it is signed by the
+project's key and comes from this repository's own release assets.
 
 Cutting a release is a `vX.Y.Z` tag: CI builds, signs, verifies the signature
 against the public key the app ships, and opens a **draft** release for a human

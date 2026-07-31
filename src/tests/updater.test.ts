@@ -31,6 +31,8 @@ import {
   checkForUpdate,
   installUpdate,
   relaunchApp,
+  describeUpdateCheckError,
+  UPDATE_DOWNLOAD_REFUSED,
   type UpdateInfo,
 } from "$lib/api/tauri";
 import { availableUpdate, clearAvailableUpdate, setAvailableUpdate } from "$lib/stores/update";
@@ -124,6 +126,52 @@ describe("update IPC contract", () => {
   it("surfaces a refused install as a rejection rather than swallowing it", async () => {
     tauri.invoke.mockRejectedValue("signature verification failed");
     await expect(installUpdate()).rejects.toBe("signature verification failed");
+  });
+});
+
+// ── A security refusal is not a network blip ────────────────────────────────
+//
+// `check_for_update` rejects with a bare string, so "the manifest pointed the
+// download somewhere we won't fetch from" and "GitHub is unreachable" arrive
+// identically. Settings → About used to render both as `Couldn't reach GitHub`,
+// which is exactly backwards for the first one: nothing was unreachable, the
+// app refused. `describeUpdateCheckError` is the seam that tells them apart and
+// this is where that is pinned.
+
+describe("what Settings → About says when a check fails", () => {
+  it("passes a download-URL refusal through as itself", async () => {
+    // The literal message `updater::ensure_permitted_download_url` produces.
+    const refusal =
+      "This update's download link points somewhere unexpected, so it was refused. " +
+      "Updates may only be downloaded from https://github.com/hayaitoko/lost-harness/releases/download/…";
+
+    const note = describeUpdateCheckError(refusal);
+
+    expect(note).toBe(refusal);
+    expect(note).not.toMatch(/Couldn't reach GitHub/);
+  });
+
+  it("still reports a genuine reachability failure as one", async () => {
+    for (const err of [
+      "error sending request for url (https://github.com/…): dns error",
+      "expected value at line 1 column 1",
+      new Error("Network request failed"),
+    ]) {
+      expect(describeUpdateCheckError(err)).toMatch(/^Couldn't reach GitHub: /);
+    }
+  });
+
+  it("keys off the phrase Rust actually sends", async () => {
+    // The two constants are hand-kept in step; `updater::tests::
+    // a_refusal_is_identifiable_to_the_frontend` asserts the Rust half starts
+    // with this, so a reworded refusal fails there rather than silently
+    // downgrading to the network message here.
+    expect(UPDATE_DOWNLOAD_REFUSED).toBe(
+      "This update's download link points somewhere unexpected",
+    );
+    expect(describeUpdateCheckError(`${UPDATE_DOWNLOAD_REFUSED}, so it was refused.`)).not.toMatch(
+      /Couldn't reach GitHub/,
+    );
   });
 });
 

@@ -16,16 +16,26 @@ the whole thing is driven from Rust rather than from the plugin's JS API.
 
 ### The launch check
 
-On launch the app makes **at most one** network request related to updates: an
-anonymous `GET` for `latest.json` at
+On launch the app makes **at most one** update check — and none at all if the
+toggle is off. The check is an anonymous `GET` for `latest.json` at
 
 ```
 https://github.com/hayaitoko/lost-harness/releases/latest/download/latest.json
 ```
 
-It carries no conversations, no files, no account, no identifiers of ours — just
-the request. What comes back is a version string, a download URL, a signature
-and (optionally) release notes.
+**That is two HTTP requests, to two hosts.** `latest.json` is a *release asset*,
+and GitHub answers release-asset requests with a `302` to its own object CDN
+(`objects.githubusercontent.com`, sometimes `release-assets.githubusercontent.com`);
+the client follows the redirect. Anywhere the egress is described to a user —
+README, Settings → About — it has to be described that way. The endpoint is left
+as it is rather than moved somewhere redirect-free: GitHub's REST API returns its
+own JSON shape rather than a Tauri manifest, and hosting the manifest off GitHub
+would add a second place a release could be tampered with. Naming the redirect is
+the honest fix.
+
+Neither request carries conversations, files, an account, or identifiers of ours
+— just the request. What comes back is a version string, a download URL, a
+signature and (optionally) release notes.
 
 Two gates stand in front of that request, both in
 `updater::run_launch_check`:
@@ -83,19 +93,30 @@ construction.
 3. **Download host.** `latest.json` is remote input, and `platforms.<target>.url`
    inside it can say anything. `updater::is_permitted_download_url` requires
    `https`, no userinfo, host exactly `github.com`, the default port, and a path
-   under `/hayaitoko/lost-harness/releases/download/`. Checked in `check_now`
+   under `/hayaitoko/lost-harness/releases/download/` whose every remaining
+   segment is a plain asset name *once percent-decoded*. Checked in `check_now`
    before an offer is ever staged, and again in `install_update` as the last
    statement before bytes move.
 
-   The signature already protected *integrity* without this; what it adds is
-   that the stated egress is the actual egress. "One request to github.com" is a
-   claim the About pane makes to the user, and constraint 3 is what makes it
-   true of the download and not just of the manifest.
+   The decode matters, and the reason is counter-intuitive. `Url::parse` already
+   collapses dot segments in **every** spelling the URL standard recognises,
+   percent-encoded ones included (`..`, `%2e%2e`, `.%2e`, `%2E%2E`), so a URL
+   that climbs out of the prefix has already lost the prefix by the time it is
+   checked. What parsing leaves alone is an escape that is not a whole segment:
+   `…/releases/download/%2f..%2f..%2fother/x.tar.gz` keeps the prefix verbatim
+   and decodes to a climb. `updater::tests::an_escape_that_survives_parsing_cannot_smuggle_a_climb_past_the_prefix`
+   is the test; malformed and double-encoded escapes are refused rather than
+   guessed at.
 
-   One honest caveat: GitHub answers a release-asset request with a redirect to
-   its own object CDN (`objects.githubusercontent.com`), and the HTTP client
-   follows it. That hop is GitHub's own, not a host the manifest chose — which
-   is the property being defended here.
+   The signature already protected *integrity* without this; what it adds is
+   that the stated egress is the actual egress — that a swapped manifest cannot
+   redirect the download to a host of its choosing.
+
+   The one hop the app does **not** choose: GitHub answers a release-asset
+   request with a redirect to its own object CDN
+   (`objects.githubusercontent.com`), and the HTTP client follows it. That hop is
+   GitHub's own, and it applies to the manifest check as much as to the payload
+   — see the top of this document.
 
 ### The webview cannot reach the network
 

@@ -1225,15 +1225,52 @@ export async function setUpdateCheckEnabled(enabled: boolean): Promise<void> {
 }
 
 /**
- * The Settings → About "Check for updates" button. Makes one anonymous request
- * for the release manifest — the click is the consent, so this is not gated on
- * the launch toggle.
+ * The Settings → About "Check for updates" button. Asks GitHub anonymously for
+ * the release manifest — the click is the consent, so this is not gated on the
+ * launch toggle.
+ *
+ * That is **two** requests, not one: the manifest is a release asset, and GitHub
+ * answers those with a redirect to its own object CDN
+ * (`objects.githubusercontent.com`), which the HTTP client follows. Both hosts
+ * are GitHub's; neither request carries conversations, files or an account. See
+ * `updater::check_now` for why the endpoint is left as it is.
  */
 export async function checkForUpdate(): Promise<ManualCheckResult> {
   if (isTauri()) {
     return tauriInvoke<ManualCheckResult>("check_for_update");
   }
   return { status: "up_to_date", current_version: "0.1.0-m1-browser" };
+}
+
+/**
+ * Opening phrase of the Rust-side refusal in
+ * `updater::ensure_permitted_download_url`, mirroring its
+ * `DOWNLOAD_REFUSED_PREFIX` constant.
+ *
+ * `check_for_update` rejects with a bare string, so a refused download URL and
+ * an unreachable GitHub are the same shape on this side. They are not the same
+ * event, and only one of them is the user's problem.
+ */
+export const UPDATE_DOWNLOAD_REFUSED = "This update's download link points somewhere unexpected";
+
+/**
+ * Turn a rejected {@link checkForUpdate} into the line Settings → About shows.
+ *
+ * Exists so the distinction is testable without mounting the whole Settings
+ * screen. Two outcomes, and conflating them was the bug:
+ *
+ * - **A refusal.** The manifest named a download URL that is not this project's
+ *   GitHub release asset, and the app declined to fetch it. Nothing was
+ *   unreachable — this is the guard doing its job, and it is the one message a
+ *   user must actually read. Rust already wrote it as a complete sentence, so
+ *   it is passed through untouched.
+ * - **Anything else.** Offline, DNS, a 404, a manifest that won't parse. Those
+ *   really are "couldn't reach GitHub", and they are not the user's problem to
+ *   solve beyond trying again later.
+ */
+export function describeUpdateCheckError(error: unknown): string {
+  const message = String(error);
+  return message.includes(UPDATE_DOWNLOAD_REFUSED) ? message : `Couldn't reach GitHub: ${message}`;
 }
 
 /**
