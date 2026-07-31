@@ -277,12 +277,28 @@ impl GmailClient {
         let (mut status, mut text) = self.http.request(method, url, &token, body).await?;
         if status == 401 {
             let fresh = self.tokens.access_token(true).await.map_err(|e| {
-                anyhow::anyhow!("Gmail rejected the access token and refresh failed: {e}")
+                // `.context` and NOT `anyhow!("…{e}")`: the refresh failure
+                // may BE the typed dead-grant one, and the connection state is
+                // recorded by downcasting it. Rebuilding the error from its
+                // text would keep the words and lose the meaning.
+                let detail = e.to_string();
+                e.context(format!(
+                    "Gmail rejected the access token and refresh failed: {detail}"
+                ))
             })?;
             (status, text) = self.http.request(method, url, &fresh, body).await?;
         }
         if !(200..300).contains(&status) {
-            anyhow::bail!("Gmail API HTTP {status}: {}", snippet(&text));
+            // Same recovery seam the Calendar/Tasks client uses: Gmail returns
+            // the identical 403 envelopes, so a scope-short grant here must
+            // light the same reconnect banner rather than dead-ending in raw
+            // `Gmail API HTTP 403` text. Unmatched statuses are untouched.
+            return Err(crate::email::api_error::google_api_error(
+                crate::email::api_error::GoogleApi::Gmail,
+                status,
+                &text,
+                &snippet(&text),
+            ));
         }
         Ok(text)
     }
@@ -968,6 +984,100 @@ mod tests {
             "refresh attempted once, never looped"
         );
         assert_eq!(http.calls.lock().unwrap().len(), 2);
+    }
+
+    /// Gmail returns the same 403 envelopes Calendar/Tasks do, so it needs the
+    /// same recovery seam: a scope-short grant must classify as
+    /// ScopeInsufficient, a disabled API as ApiNotEnabled AGAINST GMAIL (never
+    /// the reconnect verdict — reconnecting cannot switch an API on), and
+    /// anything else must keep the plain `Gmail API HTTP …` string it had.
+    #[tokio::test]
+    async fn a_403_is_classified_into_its_recovery_state() {
+        use crate::email::api_error::{google_api_error_of, GoogleApi, GoogleApiFailure};
+        const CONSOLE: &str =
+            "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=7";
+
+        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(
+            403,
+            r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+                {"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+                 "reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}"#,
+        )]));
+        let err = client.0.list_messages(None, 5).await.unwrap_err();
+        let classified = google_api_error_of(&err).expect("a typed classification");
+        assert_eq!(classified.failure, GoogleApiFailure::ScopeInsufficient);
+        assert_eq!(classified.api, GoogleApi::Gmail);
+
+        let disabled = format!(
+            r#"{{"error":{{"errors":[{{"reason":"accessNotConfigured",
+            "message":"Access Not Configured. Enable it by visiting {CONSOLE} then retry."}}],
+            "code":403}}}}"#
+        );
+        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(403, &disabled)]));
+        let err = client.0.list_messages(None, 5).await.unwrap_err();
+        let classified = google_api_error_of(&err).expect("a typed classification");
+        assert_eq!(
+            classified.failure,
+            GoogleApiFailure::ApiNotEnabled {
+                console_url: Some(CONSOLE.to_string())
+            }
+        );
+        assert_eq!(classified.api, GoogleApi::Gmail);
+
+        let (client, _tokens) = arc_client(FakeHttp::scripted(vec![(
+            403,
+            r#"{"error":{"code":403,"message":"The caller does not have permission"}}"#,
+        )]));
+        let err = client.0.list_messages(None, 5).await.unwrap_err();
+        assert_eq!(
+            google_api_error_of(&err).map(|e| e.failure.clone()),
+            Some(GoogleApiFailure::Other)
+        );
+        let text = err.to_string();
+        assert!(text.starts_with("Gmail API HTTP 403: "), "got: {text}");
+        assert!(
+            !text.contains("[google:") && !text.contains("[gmail:"),
+            "got: {text}"
+        );
+    }
+
+    /// The 401-retry path wraps a refresh failure in its own prose. It must do
+    /// that with `.context(…)`, which KEEPS the typed cause downcastable — a
+    /// `format!("…{e}")` rebuild would drop the payload on the floor and the
+    /// reconnect banner would never light on this path.
+    #[tokio::test]
+    async fn a_dead_grant_behind_a_401_keeps_its_typed_cause() {
+        use crate::email::token_provider::NeedsReconnect;
+
+        struct DeadOnRefresh;
+        impl TokenProvider for DeadOnRefresh {
+            fn access_token(&self, force_refresh: bool) -> BoxFuture<'_, anyhow::Result<String>> {
+                Box::pin(async move {
+                    if force_refresh {
+                        Err(anyhow::Error::new(NeedsReconnect {
+                            profile: "personal".into(),
+                        }))
+                    } else {
+                        Ok("stale".to_string())
+                    }
+                })
+            }
+        }
+
+        let http = FakeHttp::scripted(vec![(401, "no")]);
+        let client = GmailClient::new(Box::new(http), Arc::new(DeadOnRefresh));
+        let err = client.list_messages(None, 5).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<NeedsReconnect>(),
+            Some(&NeedsReconnect {
+                profile: "personal".into()
+            }),
+            "got: {err}"
+        );
+        // …and the human still gets both halves of the story.
+        let text = err.to_string();
+        assert!(text.contains("Gmail rejected the access token"), "{text}");
+        assert!(text.contains("Reconnect in Settings"), "{text}");
     }
 
     #[tokio::test]

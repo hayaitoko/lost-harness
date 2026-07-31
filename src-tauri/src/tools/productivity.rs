@@ -10,9 +10,10 @@ use std::pin::Pin;
 use chrono::{Duration, Utc};
 use serde_json::json;
 
+use crate::email::api_error::GoogleApi;
 use crate::email::calendar::CalendarClient;
 use crate::email::tasks::TasksClient;
-use crate::tools::email::{note_reconnect_if_needed, EmailToolDeps};
+use crate::tools::email::{observe_google_call, EmailToolDeps};
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
 const GOOGLE_DESTINATION: &str = "www.googleapis.com";
@@ -36,10 +37,24 @@ impl ProductivityToolDeps {
         Ok(TasksClient::new(self.email.google_client(profile)?))
     }
 
-    fn error(&self, profile: &str, error: impl std::fmt::Display) -> ToolResult {
-        let message = error.to_string();
-        note_reconnect_if_needed(&self.email, profile, &message);
-        ToolResult::Err(message)
+    /// Record what the call proved about the connection (from the TYPED
+    /// failure, never its text) and hand back the tool result. `api` is what a
+    /// SUCCESS is evidence about — Calendar working says nothing about Tasks.
+    fn observe<T>(
+        &self,
+        profile: &str,
+        api: GoogleApi,
+        outcome: anyhow::Result<T>,
+    ) -> Result<T, ToolResult> {
+        observe_google_call(&self.email, profile, api, outcome).map_err(ToolResult::Err)
+    }
+
+    /// A failure with nothing to succeed at (building the client). Recorded
+    /// the same typed way, so a dead grant surfaced here still lights the
+    /// banner.
+    fn error(&self, profile: &str, error: anyhow::Error) -> ToolResult {
+        self.email.google.observe_failure(profile, &error);
+        ToolResult::Err(error.to_string())
     }
 }
 
@@ -118,16 +133,19 @@ async fn calendar_list(
         Ok(client) => client,
         Err(error) => return deps.error(&ctx.profile, error),
     };
-    match client
-        .list_upcoming(
-            Utc::now(),
-            Utc::now() + Duration::days(days),
-            list_limit(&args),
-        )
-        .await
-    {
+    match deps.observe(
+        &ctx.profile,
+        GoogleApi::Calendar,
+        client
+            .list_upcoming(
+                Utc::now(),
+                Utc::now() + Duration::days(days),
+                list_limit(&args),
+            )
+            .await,
+    ) {
         Ok(events) => ToolResult::Ok(json!({ "events": events, "count": events.len() })),
-        Err(error) => deps.error(&ctx.profile, error),
+        Err(failed) => failed,
     }
 }
 
@@ -154,9 +172,13 @@ async fn calendar_create(
         Ok(client) => client,
         Err(error) => return deps.error(&ctx.profile, error),
     };
-    match client.create(&title, &description, &start, &end).await {
+    match deps.observe(
+        &ctx.profile,
+        GoogleApi::Calendar,
+        client.create(&title, &description, &start, &end).await,
+    ) {
         Ok(event) => ToolResult::Ok(json!({ "created": event })),
-        Err(error) => deps.error(&ctx.profile, error),
+        Err(failed) => failed,
     }
 }
 
@@ -173,9 +195,9 @@ async fn calendar_delete(
         Ok(client) => client,
         Err(error) => return deps.error(&ctx.profile, error),
     };
-    match client.delete(&id).await {
+    match deps.observe(&ctx.profile, GoogleApi::Calendar, client.delete(&id).await) {
         Ok(()) => ToolResult::Ok(json!({ "deleted": true, "id": id })),
-        Err(error) => deps.error(&ctx.profile, error),
+        Err(failed) => failed,
     }
 }
 
@@ -188,9 +210,13 @@ async fn task_list(
         Ok(client) => client,
         Err(error) => return deps.error(&ctx.profile, error),
     };
-    match client.list(list_limit(&args)).await {
+    match deps.observe(
+        &ctx.profile,
+        GoogleApi::Tasks,
+        client.list(list_limit(&args)).await,
+    ) {
         Ok(tasks) => ToolResult::Ok(json!({ "tasks": tasks, "count": tasks.len() })),
-        Err(error) => deps.error(&ctx.profile, error),
+        Err(failed) => failed,
     }
 }
 
@@ -216,9 +242,13 @@ async fn task_create(
         Ok(client) => client,
         Err(error) => return deps.error(&ctx.profile, error),
     };
-    match client.create(&title, &notes, due.as_deref()).await {
+    match deps.observe(
+        &ctx.profile,
+        GoogleApi::Tasks,
+        client.create(&title, &notes, due.as_deref()).await,
+    ) {
         Ok(task) => ToolResult::Ok(json!({ "created": task })),
-        Err(error) => deps.error(&ctx.profile, error),
+        Err(failed) => failed,
     }
 }
 
@@ -239,9 +269,13 @@ async fn task_complete(
         Ok(client) => client,
         Err(error) => return deps.error(&ctx.profile, error),
     };
-    match client.set_completed(&id, completed).await {
+    match deps.observe(
+        &ctx.profile,
+        GoogleApi::Tasks,
+        client.set_completed(&id, completed).await,
+    ) {
         Ok(task) => ToolResult::Ok(json!({ "task": task })),
-        Err(error) => deps.error(&ctx.profile, error),
+        Err(failed) => failed,
     }
 }
 
@@ -258,9 +292,9 @@ async fn task_delete(
         Ok(client) => client,
         Err(error) => return deps.error(&ctx.profile, error),
     };
-    match client.delete(&id).await {
+    match deps.observe(&ctx.profile, GoogleApi::Tasks, client.delete(&id).await) {
         Ok(()) => ToolResult::Ok(json!({ "deleted": true, "id": id })),
-        Err(error) => deps.error(&ctx.profile, error),
+        Err(failed) => failed,
     }
 }
 

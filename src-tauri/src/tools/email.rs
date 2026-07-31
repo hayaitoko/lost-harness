@@ -19,16 +19,17 @@
 //! Per-profile: every call builds its client from `ctx.profile` at dispatch
 //! time, so a `work` chat can never read the `personal` mailbox.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
+use crate::email::api_error::GoogleApi;
 use crate::email::gmail::{build_rfc822, GmailApi, GmailClient, ReqwestGmailHttp, TokenProvider};
 use crate::email::google::GoogleClient;
 use crate::email::oauth::TokenEndpoint;
-use crate::email::token_provider::{KeychainTokenProvider, NEEDS_RECONNECT_MARKER};
+use crate::email::token_provider::KeychainTokenProvider;
 use crate::secrets::ProviderSecretStore;
 use crate::tools::{Capability, ExecCtx, RiskClass, Tool, ToolInput, ToolResult};
 
@@ -49,12 +50,11 @@ const SEARCH_CONCURRENCY: usize = 3;
 pub struct EmailToolDeps {
     pub secrets: Arc<dyn ProviderSecretStore>,
     pub endpoint: Arc<dyn TokenEndpoint>,
-    /// Profiles whose last Gmail call failed with a dead grant — the SAME
-    /// `Arc` as `ipc::EmailRuntime`'s set (see that type's doc comment).
-    /// Without this being shared, an agent-only dead-token failure would
-    /// never light the screen's reconnect banner, since only the screen IPC
-    /// path (`ipc::mod::note_reconnect_if_needed`) used to touch it.
-    pub needs_reconnect: Arc<Mutex<HashSet<String>>>,
+    /// The recoverable-failure state for every profile — the SAME `Arc` as
+    /// `ipc::EmailRuntime`'s (see that type's doc comment). Without it being
+    /// shared, an agent-only failure would never light the screen's banners,
+    /// since only the screen IPC path used to record anything.
+    pub google: crate::ipc::GoogleConnection,
     /// Per-profile cached token providers so the in-memory access-token cache
     /// persists across successive tool calls for the same profile (rather than
     /// forcing a fresh token refresh on every dispatch).
@@ -65,12 +65,12 @@ impl EmailToolDeps {
     pub fn new(
         secrets: Arc<dyn ProviderSecretStore>,
         endpoint: Arc<dyn TokenEndpoint>,
-        needs_reconnect: Arc<Mutex<HashSet<String>>>,
+        google: crate::ipc::GoogleConnection,
     ) -> Self {
         Self {
             secrets,
             endpoint,
-            needs_reconnect,
+            google,
             token_providers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -120,13 +120,55 @@ impl TokenProvider for SharedTokenProvider {
     }
 }
 
-/// If `err` carries [`NEEDS_RECONNECT_MARKER`], flip the shared reconnect
-/// flag for `profile` — mirrors `ipc::mod::note_reconnect_if_needed` so the
-/// agent tool path lights the same banner the screen IPC path does.
-pub(crate) fn note_reconnect_if_needed(deps: &EmailToolDeps, profile: &str, err: &str) {
-    if err.contains(NEEDS_RECONNECT_MARKER) {
-        deps.needs_reconnect.lock().insert(profile.to_string());
+/// Record what a Google call proved, and turn the outcome into what a tool
+/// hands back.
+///
+/// The agent path used to duplicate the screen path's recording logic (and
+/// its blind spots) in a second copy that read error TEXT. Both paths now call
+/// the one shared, typed implementation in `email::connection_state`, so a
+/// failure the agent hits lights the same banner the screens light, and a
+/// success the agent gets clears the same stale state.
+pub(crate) fn observe_google_call<T>(
+    deps: &EmailToolDeps,
+    profile: &str,
+    api: GoogleApi,
+    outcome: anyhow::Result<T>,
+) -> Result<T, String> {
+    match outcome {
+        Ok(value) => {
+            deps.google.observe_success(profile, api);
+            Ok(value)
+        }
+        Err(err) => {
+            deps.google.observe_failure(profile, &err);
+            Err(err.to_string())
+        }
     }
+}
+
+/// A step that never reaches Google — building the client, assembling the HTTP
+/// stack. Only its FAILURE is evidence.
+///
+/// [`EmailToolDeps::client`] is a pure constructor: `GmailClient::new` sends
+/// nothing. Handing it to [`observe_google_call`] therefore recorded a
+/// SUCCESSFUL Gmail call with zero proof that anything succeeded — so merely
+/// dispatching `email_search` wiped a real "Gmail is switched off" state and
+/// darkened its banner before a single request left the machine, and the state
+/// only came back when the call that followed actually failed. Only a
+/// completed API call may count as proof.
+///
+/// The failing half still records: a dead grant hit while minting the token
+/// provider is a real verdict, and reaches `observe_failure` the same typed
+/// way. (This is what `productivity.rs`'s client-build path already does.)
+pub(crate) fn observe_local_step<T>(
+    deps: &EmailToolDeps,
+    profile: &str,
+    outcome: anyhow::Result<T>,
+) -> Result<T, String> {
+    outcome.map_err(|err| {
+        deps.google.observe_failure(profile, &err);
+        err.to_string()
+    })
 }
 
 /// Fetch header/snippet previews for `ids`, at most [`SEARCH_CONCURRENCY`] in
@@ -135,10 +177,21 @@ pub(crate) fn note_reconnect_if_needed(deps: &EmailToolDeps, profile: &str, err:
 /// Returns one entry per id, IN INPUT ORDER, each paired with its own id — so
 /// a failed fetch can still name the message it was for (a search result that
 /// says `"id": "?"` is useless to the agent and to the user).
+///
+/// Each row's error stays an `anyhow::Error`, NOT a `String`: these are real
+/// Google calls, so one of them can carry the typed 403 verdict, and
+/// stringifying it inside the spawned task destroyed that verdict before
+/// [`GoogleConnectionState::observe_failure`] could read it. The whole point of
+/// this workstream is that no connector call can fail with a connection-state
+/// error and leave the banner dark; a per-row `"couldn't fetch: …"` string was
+/// exactly that hole. The caller records the verdict, then renders the text.
+///
+/// [`GoogleConnectionState::observe_failure`]:
+///     crate::email::connection_state::GoogleConnectionState::observe_failure
 async fn fetch_previews(
     client: Arc<dyn GmailApi>,
     ids: Vec<String>,
-) -> Vec<(String, Result<crate::email::gmail::EmailMessage, String>)> {
+) -> Vec<(String, anyhow::Result<crate::email::gmail::EmailMessage>)> {
     let sem = Arc::new(Semaphore::new(SEARCH_CONCURRENCY));
     let mut tasks = Vec::with_capacity(ids.len());
     for id in ids.iter().cloned() {
@@ -146,11 +199,8 @@ async fn fetch_previews(
         let sem = Arc::clone(&sem);
         tasks.push(tokio::spawn(async move {
             match sem.acquire_owned().await {
-                Ok(_permit) => client
-                    .get_message_metadata(&id)
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(_) => Err("the search fetch pool closed unexpectedly".to_string()),
+                Ok(_permit) => client.get_message_metadata(&id).await,
+                Err(_) => Err(anyhow::anyhow!("the search fetch pool closed unexpectedly")),
             }
         }));
     }
@@ -160,7 +210,8 @@ async fn fetch_previews(
             Ok(res) => out.push((id, res)),
             // A join error means the fetch task panicked. Report it as a row
             // error (with its real id) rather than taking the search down.
-            Err(e) => out.push((id, Err(format!("preview fetch failed: {e}")))),
+            // It carries no Google verdict — nothing reached Google.
+            Err(e) => out.push((id, Err(anyhow::anyhow!("preview fetch failed: {e}")))),
         }
     }
     out
@@ -229,21 +280,20 @@ impl Tool for EmailSearchTool {
                 .map(|m| (m as u32).clamp(1, SEARCH_MAX_CAP))
                 .unwrap_or(5);
 
-            let client: Arc<dyn GmailApi> = Arc::new(match self.deps.client(&ctx.profile) {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = e.to_string();
-                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
-                    return ToolResult::Err(msg);
-                }
-            });
-            let metas = match client.list_messages(query.as_deref(), max).await {
+            let client: Arc<dyn GmailApi> = Arc::new(
+                match observe_local_step(&self.deps, &ctx.profile, self.deps.client(&ctx.profile)) {
+                    Ok(c) => c,
+                    Err(msg) => return ToolResult::Err(msg),
+                },
+            );
+            let metas = match observe_google_call(
+                &self.deps,
+                &ctx.profile,
+                GoogleApi::Gmail,
+                client.list_messages(query.as_deref(), max).await,
+            ) {
                 Ok(m) => m,
-                Err(e) => {
-                    let msg = e.to_string();
-                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
-                    return ToolResult::Err(msg);
-                }
+                Err(msg) => return ToolResult::Err(msg),
             };
             // Bounded-concurrent preview fetches: headers + snippet via
             // format=metadata (no body data), at most SEARCH_CONCURRENCY in
@@ -265,10 +315,20 @@ impl Tool for EmailSearchTool {
                     })),
                     // One bad message shouldn't sink the search — record it
                     // against its real id so the agent can retry that one.
-                    Err(e) => rows.push(serde_json::json!({
-                        "id": id,
-                        "error": format!("couldn't fetch: {e}"),
-                    })),
+                    //
+                    // The row is not fatal to the search, but it IS evidence
+                    // about the connection: a per-message fetch is a real Gmail
+                    // call, so it can come back "this API is switched off" or
+                    // "this grant is dead". Observe it before flattening it to
+                    // text, or that verdict dies here and the banner stays dark
+                    // while every row says "couldn't fetch".
+                    Err(e) => {
+                        self.deps.google.observe_failure(&ctx.profile, &e);
+                        rows.push(serde_json::json!({
+                            "id": id,
+                            "error": format!("couldn't fetch: {e}"),
+                        }));
+                    }
                 }
             }
             ToolResult::Ok(serde_json::json!({ "results": rows, "count": rows.len() }))
@@ -328,15 +388,20 @@ impl Tool for EmailReadTool {
             let Some(id) = input.args.get("id").and_then(|v| v.as_str()) else {
                 return ToolResult::Err("email_read needs an id (from email_search)".into());
             };
-            let client = match self.deps.client(&ctx.profile) {
+            let client = match observe_local_step(
+                &self.deps,
+                &ctx.profile,
+                self.deps.client(&ctx.profile),
+            ) {
                 Ok(c) => c,
-                Err(e) => {
-                    let msg = e.to_string();
-                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
-                    return ToolResult::Err(msg);
-                }
+                Err(msg) => return ToolResult::Err(msg),
             };
-            match client.get_message(id).await {
+            match observe_google_call(
+                &self.deps,
+                &ctx.profile,
+                GoogleApi::Gmail,
+                client.get_message(id).await,
+            ) {
                 Ok(m) => {
                     let mut body = m.body_text;
                     if body.chars().count() > READ_BODY_CAP {
@@ -352,11 +417,7 @@ impl Tool for EmailReadTool {
                         "body": body,
                     }))
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
-                    ToolResult::Err(msg)
-                }
+                Err(msg) => ToolResult::Err(msg),
             }
         })
     }
@@ -453,25 +514,26 @@ impl Tool for EmailSendTool {
                 Ok(r) => r,
                 Err(e) => return ToolResult::Err(e.to_string()),
             };
-            let client = match self.deps.client(&ctx.profile) {
+            let client = match observe_local_step(
+                &self.deps,
+                &ctx.profile,
+                self.deps.client(&ctx.profile),
+            ) {
                 Ok(c) => c,
-                Err(e) => {
-                    let msg = e.to_string();
-                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
-                    return ToolResult::Err(msg);
-                }
+                Err(msg) => return ToolResult::Err(msg),
             };
-            match client.send(&raw).await {
+            match observe_google_call(
+                &self.deps,
+                &ctx.profile,
+                GoogleApi::Gmail,
+                client.send(&raw).await,
+            ) {
                 Ok(id) => ToolResult::Ok(serde_json::json!({
                     "sent": true,
                     "message_id": id,
                     "to": to,
                 })),
-                Err(e) => {
-                    let msg = format!("send failed: {e}");
-                    note_reconnect_if_needed(&self.deps, &ctx.profile, &msg);
-                    ToolResult::Err(msg)
-                }
+                Err(msg) => ToolResult::Err(format!("send failed: {msg}")),
             }
         })
     }
@@ -499,8 +561,8 @@ mod tests {
         }
     }
 
-    fn empty_reconnect_set() -> Arc<Mutex<HashSet<String>>> {
-        Arc::new(Mutex::new(HashSet::new()))
+    fn fresh_connection_state() -> crate::ipc::GoogleConnection {
+        Arc::new(crate::email::connection_state::GoogleConnectionState::new())
     }
 
     #[test]
@@ -508,7 +570,7 @@ mod tests {
         let deps = EmailToolDeps::new(
             Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
             Arc::new(NoopEndpoint),
-            empty_reconnect_set(),
+            fresh_connection_state(),
         );
         assert_eq!(
             EmailSearchTool::new(deps.clone()).risk(),
@@ -543,7 +605,7 @@ mod tests {
         let deps = EmailToolDeps::new(
             Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
             Arc::new(NoopEndpoint),
-            empty_reconnect_set(),
+            fresh_connection_state(),
         );
         let ctx = ExecCtx {
             profile: "personal".into(),
@@ -559,8 +621,8 @@ mod tests {
     }
 
     /// A token endpoint that always answers with a dead grant (Google's
-    /// `invalid_grant`), so `KeychainTokenProvider::refresh_now` bails with
-    /// `NEEDS_RECONNECT_MARKER` — the exact shape a revoked/expired
+    /// `invalid_grant`), so `KeychainTokenProvider::refresh_now` bails with the
+    /// typed `NeedsReconnect` — the exact failure a revoked/expired
     /// Testing-mode refresh token produces in production.
     struct DeadGrantEndpoint;
     impl TokenEndpoint for DeadGrantEndpoint {
@@ -577,6 +639,12 @@ mod tests {
         }
     }
 
+    /// Google's real "this API is switched off in your project" 403 body.
+    const SERVICE_DISABLED_BODY: &str = r#"{"error":{"code":403,
+        "status":"PERMISSION_DENIED","details":[
+        {"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+         "reason":"SERVICE_DISABLED"}]}}"#;
+
     /// A mailbox where one id ("slow") takes far longer than the rest, and
     /// which records both the completion order and the high-water mark of
     /// concurrent in-flight fetches.
@@ -588,6 +656,9 @@ mod tests {
         in_flight: Mutex<usize>,
         peak_in_flight: Mutex<usize>,
         fail_id: Option<String>,
+        /// Fail `fail_id` the way Gmail really fails a switched-off API — with
+        /// the TYPED verdict — rather than with plain prose.
+        fail_typed: bool,
     }
 
     impl PacedMailbox {
@@ -600,6 +671,14 @@ mod tests {
                 in_flight: Mutex::new(0),
                 peak_in_flight: Mutex::new(0),
                 fail_id: fail_id.map(String::from),
+                fail_typed: false,
+            }
+        }
+
+        fn failing_typed(fail_id: &str) -> Self {
+            Self {
+                fail_typed: true,
+                ..Self::new(Some(fail_id))
             }
         }
     }
@@ -643,6 +722,14 @@ mod tests {
                 *self.in_flight.lock() -= 1;
                 self.completed.lock().push(id.to_string());
                 if self.fail_id.as_deref() == Some(id) {
+                    if self.fail_typed {
+                        return Err(crate::email::api_error::google_api_error(
+                            GoogleApi::Gmail,
+                            403,
+                            SERVICE_DISABLED_BODY,
+                            "snip",
+                        ));
+                    }
                     anyhow::bail!("Gmail API HTTP 404");
                 }
                 Ok(crate::email::gmail::EmailMessage {
@@ -735,6 +822,48 @@ mod tests {
         assert!(out[2].1.is_ok());
     }
 
+    /// The finding this pins: the per-message preview fetch used to
+    /// `.map_err(|e| e.to_string())` INSIDE the spawned task, so a real Gmail
+    /// 403 arrived at the caller as prose. Every row then read
+    /// `"couldn't fetch: …"`, nothing was recordable, and the banner stayed
+    /// dark — the exact "a connector call fails with a connection-state error
+    /// and no banner lights" hole this workstream claims not to have.
+    ///
+    /// Both halves of what `email_search` now does are asserted: the row error
+    /// is still downcastable to the typed verdict, and handing that error to
+    /// the SHARED connection state (as the tool does) lights the disabled-API
+    /// state the screens read.
+    #[tokio::test]
+    async fn a_typed_403_on_a_preview_row_survives_to_the_connection_state() {
+        let mailbox = Arc::new(PacedMailbox::failing_typed("f2"));
+        let ids: Vec<String> = vec!["f1".into(), "f2".into(), "f3".into()];
+        let out = fetch_previews(mailbox, ids).await;
+
+        let (id, res) = &out[1];
+        assert_eq!(id, "f2");
+        let err = res.as_ref().expect_err("f2 was scripted to fail");
+        let verdict = crate::email::api_error::google_api_error_of(err)
+            .expect("the typed verdict must survive the spawned task, not be stringified");
+        assert_eq!(
+            verdict.failure,
+            crate::email::api_error::GoogleApiFailure::ApiNotEnabled { console_url: None }
+        );
+
+        // What the tool does with it: observe, then render the text.
+        let google = fresh_connection_state();
+        google.observe_failure("personal", err);
+        let disabled = google
+            .disabled_apis("personal")
+            .expect("a switched-off API must be recorded, not swallowed as a row string");
+        assert_eq!(
+            disabled.apis.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![GoogleApi::Gmail.wire()]
+        );
+
+        // The neighbours still succeed — observing does not sink the search.
+        assert!(out[0].1.is_ok() && out[2].1.is_ok());
+    }
+
     /// The finding this pins: only the screen IPC path used to flip
     /// `needs_reconnect`, so an agent-only dead-token failure never lit the
     /// reconnect banner. Now the tool path inserts into the SAME shared set.
@@ -757,7 +886,7 @@ mod tests {
             )
             .unwrap();
 
-        let shared = empty_reconnect_set();
+        let shared = fresh_connection_state();
         let deps = EmailToolDeps::new(
             Arc::new(secrets),
             Arc::new(DeadGrantEndpoint),
@@ -772,12 +901,160 @@ mod tests {
             .run(ToolInput::new(serde_json::json!({})), &ctx)
             .await;
         match out {
-            ToolResult::Err(e) => assert!(e.contains(NEEDS_RECONNECT_MARKER), "got: {e}"),
+            ToolResult::Err(e) => assert!(e.contains("Reconnect in Settings"), "got: {e}"),
             other => panic!("expected a NeedsReconnect error, got {other:?}"),
         }
         assert!(
-            shared.lock().contains("personal"),
-            "the agent tool path must flip the shared reconnect flag, not a private one"
+            shared.needs_reconnect("personal"),
+            "the agent tool path must flip the SHARED reconnect state, not a private one"
         );
+    }
+
+    /// The finding this pins: this file DUPLICATED the screen path's
+    /// recording logic, so the agent-tool path (email_search/email_read/
+    /// email_send and, through `productivity.rs`, every Calendar/Tasks tool)
+    /// had the identical blind spot the screen path had — a disabled-API 403
+    /// recorded nothing, and the agent could only hand the user raw
+    /// `Google API HTTP 403` text.
+    ///
+    /// There is now ONE implementation, called with the TYPED error; this
+    /// asserts the agent path reaches it, in both directions of the separation
+    /// (neither 403 may set the other's state) and in both directions of the
+    /// disabled state (a success is what clears it).
+    #[test]
+    fn the_tool_path_records_both_403_states_and_never_confuses_them() {
+        use crate::email::api_error::google_api_error;
+        const CONSOLE: &str =
+            "https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=3";
+
+        let shared = fresh_connection_state();
+        let deps = EmailToolDeps::new(
+            Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
+            Arc::new(NoopEndpoint),
+            Arc::clone(&shared),
+        );
+
+        let scope: Result<(), String> = observe_google_call(
+            &deps,
+            "personal",
+            GoogleApi::Calendar,
+            Err(google_api_error(
+                GoogleApi::Calendar,
+                403,
+                r#"{"error":{"errors":[{"reason":"insufficientPermissions"}],"code":403}}"#,
+                "snip",
+            )),
+        );
+        assert!(scope.is_err(), "the tool still reports the failure");
+        assert!(shared.needs_reconnect("personal"));
+        assert_eq!(
+            shared.disabled_apis("personal"),
+            None,
+            "a scope-short grant is not a disabled API"
+        );
+
+        let shared = fresh_connection_state();
+        let deps = EmailToolDeps::new(
+            Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
+            Arc::new(NoopEndpoint),
+            Arc::clone(&shared),
+        );
+        let _: Result<(), String> = observe_google_call(
+            &deps,
+            "work",
+            GoogleApi::Calendar,
+            Err(google_api_error(
+                GoogleApi::Calendar,
+                403,
+                &format!(
+                    r#"{{"error":{{"code":403,"status":"PERMISSION_DENIED","details":[
+                {{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}},
+                {{"@type":"type.googleapis.com/google.rpc.Help","links":[
+                  {{"url":"{CONSOLE}"}}]}}]}}}}"#
+                ),
+                "snip",
+            )),
+        );
+        assert!(
+            !shared.needs_reconnect("work"),
+            "the agent path must not send the user into a reconnect loop either"
+        );
+        assert_eq!(
+            shared.disabled_apis("work"),
+            Some(crate::email::connection_state::GoogleApiDisabled {
+                apis: vec![crate::email::connection_state::DisabledApi {
+                    id: "calendar",
+                    label: "Google Calendar",
+                    console_url: Some(CONSOLE.to_string()),
+                }],
+            })
+        );
+
+        // A later Calendar call that WORKS is the evidence that clears it, on
+        // the agent path exactly as on the screen path.
+        let _ = observe_google_call(&deps, "work", GoogleApi::Calendar, Ok(()));
+        assert_eq!(shared.disabled_apis("work"), None);
+    }
+
+    /// The finding this pins: all three tools handed the CLIENT BUILD to
+    /// `observe_google_call`, and `EmailToolDeps::client` is a pure
+    /// constructor — `GmailClient::new` sends nothing. Its `Ok` was therefore
+    /// recorded as a successful Gmail call, so merely dispatching a tool wiped
+    /// a real "Gmail is switched off" state (and darkened its banner) with no
+    /// evidence whatsoever. Only a completed API call may count as proof.
+    ///
+    /// Driven through the real `run` of each tool: the profile is
+    /// unconfigured, so the client builds fine and the first call that
+    /// actually reaches for a token fails with an UNCLASSIFIED error — which
+    /// records nothing. Anything that changed the state here can only have
+    /// come from the build.
+    #[tokio::test]
+    async fn merely_building_the_client_is_not_proof_that_gmail_is_switched_on() {
+        use crate::email::api_error::google_api_error;
+        const DISABLED: &str = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}"#;
+
+        let ctx = ExecCtx {
+            profile: "personal".into(),
+            ..Default::default()
+        };
+        for (name, args) in [
+            ("email_search", serde_json::json!({})),
+            ("email_read", serde_json::json!({ "id": "m1" })),
+            (
+                "email_send",
+                serde_json::json!({ "to": "a@b.co", "subject": "s", "body": "b" }),
+            ),
+        ] {
+            let shared = fresh_connection_state();
+            shared.observe_failure(
+                "personal",
+                &google_api_error(GoogleApi::Gmail, 403, DISABLED, "snip"),
+            );
+            assert!(
+                shared.disabled_apis("personal").is_some(),
+                "{name}: precondition — Gmail starts out recorded as switched off"
+            );
+
+            let deps = EmailToolDeps::new(
+                Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
+                Arc::new(NoopEndpoint),
+                Arc::clone(&shared),
+            );
+            let input = ToolInput::new(args);
+            let out = match name {
+                "email_search" => EmailSearchTool::new(deps).run(input, &ctx).await,
+                "email_read" => EmailReadTool::new(deps).run(input, &ctx).await,
+                _ => EmailSendTool::new(deps).run(input, &ctx).await,
+            };
+            assert!(
+                matches!(out, ToolResult::Err(_)),
+                "{name}: nothing could reach Gmail, so the tool must report a failure — got {out:?}"
+            );
+            assert!(
+                shared.disabled_apis("personal").is_some(),
+                "{name}: a dispatch that never reached Google cleared the disabled-API state"
+            );
+        }
     }
 }

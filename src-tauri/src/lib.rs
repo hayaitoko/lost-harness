@@ -309,15 +309,15 @@ pub fn run() {
                     std::time::Duration::from_secs(600),
                 ));
 
-            // The email round's needs-reconnect set, created ONCE here and
-            // shared between the agent tool path (threaded into
+            // The email round's recoverable-failure state (dead grant, and
+            // the APIs a Cloud project has switched off), created ONCE here
+            // and shared between the agent tool path (threaded into
             // `build_tool_dispatcher` → `EmailToolDeps`, below) and the
             // screen IPC path (`ipc::EmailRuntime`, at `AppState`
-            // construction) — a dead Gmail grant hit from EITHER path must
-            // flip the SAME flag, or the reconnect banner only ever lights
-            // from the screen.
-            let email_needs_reconnect =
-                Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+            // construction) — a failure hit from EITHER path must land where
+            // BOTH look, or a banner only ever lights from the screen.
+            let google_connection: crate::ipc::GoogleConnection =
+                Arc::new(crate::email::connection_state::GoogleConnectionState::new());
 
             // §3 tool spine: workspace-confined read-only tools behind the
             // unified pretooluse hook chain, filtered by this body's caps.
@@ -342,7 +342,7 @@ pub fn run() {
                 Some(Arc::clone(&human_prompter)),
                 Arc::clone(&model_manager),
                 Arc::clone(&provider_secrets),
-                Arc::clone(&email_needs_reconnect),
+                Arc::clone(&google_connection),
             ));
 
             // C4: register every ALREADY-APPROVED skill as a callable Tool at
@@ -484,8 +484,8 @@ pub fn run() {
             let hardware = Arc::new(crate::models::hardware::probe());
             let state = AppState {
                 agent_loop,
-                email: Arc::new(crate::ipc::EmailRuntime::with_shared_reconnect(Arc::clone(
-                    &email_needs_reconnect,
+                email: Arc::new(crate::ipc::EmailRuntime::with_shared_state(Arc::clone(
+                    &google_connection,
                 ))),
                 model_manager,
                 storage,
@@ -629,6 +629,7 @@ pub fn run() {
             ipc::gmail_begin_connect,
             ipc::gmail_finish_connect,
             ipc::gmail_disconnect,
+            ipc::google_clear_api_not_enabled,
             ipc::list_email,
             ipc::read_email,
             ipc::send_email,
@@ -922,7 +923,7 @@ fn build_tool_dispatcher(
     model_manager: Arc<ModelManager>,
     provider_secrets: Arc<dyn crate::secrets::ProviderSecretStore>,
     // Shared with `ipc::EmailRuntime` — see the call site's comment in `run()`.
-    email_needs_reconnect: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    google_connection: crate::ipc::GoogleConnection,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -1027,7 +1028,7 @@ fn build_tool_dispatcher(
             let deps = crate::tools::email::EmailToolDeps::new(
                 provider_secrets,
                 Arc::new(endpoint),
-                email_needs_reconnect,
+                google_connection,
             );
             registry.register(Box::new(crate::tools::email::EmailSearchTool::new(
                 deps.clone(),
@@ -1256,7 +1257,7 @@ mod tool_path_degraded_tests {
             None,
             Arc::new(crate::models::ModelManager::new()),
             Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
-            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            Arc::new(crate::email::connection_state::GoogleConnectionState::new()),
         );
         (d, dir)
     }

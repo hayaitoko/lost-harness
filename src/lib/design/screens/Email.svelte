@@ -8,29 +8,47 @@
   // switcher, labels, and providers row are gone: Gmail only today, and the
   // screen says so. `needs_reconnect` surfaces as a calm banner, not an error
   // (Testing-status Google clients expire tokens ~every 7 days).
+  //
+  // TWO connection banners, never one: a scope-short grant is fixed by
+  // reconnecting, a Google API switched off in the user's Cloud project is
+  // not. Sharing one banner would offer Reconnect for a condition reconnecting
+  // cannot change — an infinite loop. See `GoogleApiDisabledBanner`.
   import { nav } from "$lib/design/nav.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import AppStatusBar from "../components/AppStatusBar.svelte";
   import Button from "../components/Button.svelte";
   import IconButton from "../components/IconButton.svelte";
   import GmailSetupWizard from "../components/GmailSetupWizard.svelte";
+  import GoogleApiDisabledBanner from "../components/GoogleApiDisabledBanner.svelte";
   import { activeProfileId } from "$lib/stores/profiles";
   import {
-    gmailSetupStatus,
     gmailDisconnect,
     listEmail,
     readEmail,
     sendEmail,
-    type GmailSetupStatus,
+    type GoogleApiId,
     type EmailSummary,
     type EmailDetail,
   } from "$lib/api/tauri";
+  import { GoogleConnection, disabledFor } from "$lib/design/googleConnection.svelte";
 
   // ── connection status (per profile) ────────────────────────────────────────
-  let status = $state<GmailSetupStatus | null>(null);
-  let statusError: string | null = $state(null);
+  //
+  // The reading, the token discipline that keeps the newest read authoritative,
+  // and the "adopt this fresh status?" rule all live in ONE shared place —
+  // Planner holds the same thing. The two screens used to keep private copies
+  // that had already drifted apart on the never-read-anything case.
+  const conn = new GoogleConnection();
+  const status = $derived(conn.status);
+  const statusError = $derived(conn.error);
+  const recheckingApi = $derived(conn.checking);
   let statusTick = $state(0);
-  let statusSeq = 0;
+
+  /// The APIs this screen can actually re-test — which is also exactly what it
+  /// may put in a banner. A re-check here must not clear a Calendar/Tasks state
+  /// that only the Planner will ever retry, and a banner here must not name one
+  /// either: the button under it would clear and retry Gmail.
+  const EMAIL_APIS: GoogleApiId[] = ["gmail"];
 
   // ── inbox list ─────────────────────────────────────────────────────────────
   let emails = $state<EmailSummary[]>([]);
@@ -53,14 +71,15 @@
 
   // One effect owns the status check + the profile-switch reset (the
   // connection is per-profile, so switching drops the old profile's mail
-  // state). `seq` tokens drop stale responses, like Files.svelte.
+  // state). Stale responses are dropped inside `conn`, by the same token rule
+  // every other read there follows.
   let lastProfile: string | null = null;
   $effect(() => {
     const profile = $activeProfileId;
     void statusTick; // manual re-check hook (connect / disconnect / reconnect)
     if (profile !== lastProfile) {
       lastProfile = profile;
-      status = null; // gate the UI on a fresh check for the new profile
+      conn.reset(); // gate the UI on a fresh check for the new profile
       emails = [];
       selectedId = null;
       detail = null;
@@ -73,49 +92,41 @@
       listSeq++;
       detailSeq++; // invalidate anything in flight for the old profile
     }
-    const token = ++statusSeq;
-    statusError = null;
-    gmailSetupStatus(profile)
-      .then((s) => {
-        if (token === statusSeq) status = s;
-      })
-      .catch((err) => {
-        if (token === statusSeq) {
-          statusError = String(err);
-          status = null;
-        }
-      });
+    void conn.read(profile);
   });
 
   // Inbox listing — only when connected and the grant isn't known-dead
   // (attempting on a dead grant just spams failing token refreshes).
+  //
+  // NOT gated on `api_not_enabled`: that state is per-profile but its cause is
+  // per-API, so a disabled Tasks API (recorded by the Planner) must not stop
+  // the inbox from loading when Gmail itself is fine. If Gmail IS the disabled
+  // one, the attempt fails, the banner lights, and the re-check below finds no
+  // further change — so it settles rather than looping.
   $effect(() => {
     const profile = $activeProfileId;
     void listTick;
     const s = status;
     if (!s?.connected || s.needs_reconnect) return;
     const token = ++listSeq;
-    const statusToken = statusSeq; // capture status token to gate secondary status writes
     listLoading = true;
     listError = null;
     listEmail(profile)
-      .then((rows) => {
-        if (token === listSeq) emails = rows;
+      .then(async (rows) => {
+        if (token !== listSeq) return;
+        emails = rows;
+        // BOTH outcomes are re-checked, because the backend records on both:
+        // a listing that WORKED is proof Gmail is switched on, and drops the
+        // disabled state for it. Without this the banner kept rendering a
+        // state the backend had already thrown away.
+        await conn.refresh(profile);
       })
       .catch(async (err) => {
         if (token !== listSeq) return;
         listError = String(err);
-        // A dead grant marks needs_reconnect backend-side — re-check once so
-        // the calm banner appears. Only swap status when the flag actually
-        // changed; the effect then exits early on rerun (no retry loop).
-        try {
-          const fresh = await gmailSetupStatus(profile);
-          if (token === listSeq && statusToken === statusSeq && status && fresh.needs_reconnect !== status.needs_reconnect) {
-            status = fresh;
-          }
-        } catch {
-          // keep the list error
-        }
+        // A dead grant or a disabled API is recorded backend-side — re-check
+        // so the matching calm banner appears.
+        await conn.refresh(profile);
       })
       .finally(() => {
         if (token === listSeq) listLoading = false;
@@ -130,9 +141,15 @@
     detail = null;
     try {
       const d = await readEmail($activeProfileId, id);
-      if (token === detailSeq) detail = d;
+      if (token === detailSeq) {
+        detail = d;
+        void conn.refresh($activeProfileId);
+      }
     } catch (err) {
-      if (token === detailSeq) detailError = String(err);
+      if (token === detailSeq) {
+        detailError = String(err);
+        void conn.refresh($activeProfileId);
+      }
     } finally {
       if (token === detailSeq) detailLoading = false;
     }
@@ -186,8 +203,10 @@
     try {
       await sendEmail($activeProfileId, composeTo.trim(), composeSubject.trim(), composeBody);
       sentTo = composeTo.trim();
+      void conn.refresh($activeProfileId);
     } catch (err) {
       sendError = String(err);
+      void conn.refresh($activeProfileId);
     } finally {
       sending = false;
     }
@@ -202,6 +221,38 @@
   const showBanner = $derived(
     status != null && status.connected && status.needs_reconnect && !reconnecting,
   );
+  // The OTHER recoverable 403. Separate banner, separate condition, no
+  // Reconnect button and no wizard — reconnecting cannot enable a disabled API.
+  //
+  // Scoped to EMAIL_APIS: the state is per-profile, so it can also hold a
+  // Calendar or Tasks entry the Planner (or an agent tool) recorded. Rendering
+  // those here produced a banner this screen's own button could not act on —
+  // it announced "Google Calendar isn't switched on" above a re-check that
+  // clears and retries Gmail. Planner shows its two; this shows its one.
+  const apiDisabled = $derived(
+    status != null && status.connected && !reconnecting
+      ? disabledFor(status, EMAIL_APIS)
+      : null,
+  );
+
+  // "I've enabled it — check again": forget the state for THIS screen's API,
+  // then retry. If it is still off the retry re-records it and the banner
+  // returns — nothing is assumed fixed.
+  async function recheckApi() {
+    actionError = null;
+    const failed = await conn.clearDisabled($activeProfileId, EMAIL_APIS);
+    if (failed !== null) {
+      // A failed CLEAR is a local IPC problem, not a Google verdict: nothing
+      // changed backend-side, so there is nothing new to retry or re-read.
+      actionError = failed;
+      return;
+    }
+    // Order doesn't matter — every read claims a token and the newest wins —
+    // but the retry is what re-records a still-disabled API, and the status
+    // read is what renders whatever it recorded.
+    listTick++;
+    statusTick++;
+  }
 
   function fmtDate(raw: string): string {
     const d = new Date(raw);
@@ -272,6 +323,14 @@
         <div class="flex-1"></div>
         <Button onclick={() => (reconnecting = true)}>Reconnect</Button>
       </div>
+    {/if}
+
+    {#if apiDisabled}
+      <GoogleApiDisabledBanner
+        apis={apiDisabled.apis}
+        checking={recheckingApi}
+        oncheckagain={() => void recheckApi()}
+      />
     {/if}
 
     {#if actionError}

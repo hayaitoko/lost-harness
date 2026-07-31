@@ -31,7 +31,18 @@ describe("Gmail OAuth — IPC contracts", () => {
       connected: false,
       account_email: null,
       needs_reconnect: false,
+      api_not_enabled: null,
     });
+  });
+
+  it("api_not_enabled is a SEPARATE state from needs_reconnect", async () => {
+    // The two recoverable 403s must not share a field. Reconnecting fixes a
+    // scope-short grant; it can never enable an API the user's Google Cloud
+    // project has switched off, so folding them together would offer a
+    // Reconnect button that loops forever.
+    const status = await gmailSetupStatus("personal");
+    expect(status.api_not_enabled).toBeNull();
+    expect("needs_reconnect" in status && "api_not_enabled" in status).toBe(true);
   });
 
   it("gmailSetupStatus is per-profile", async () => {
@@ -77,6 +88,7 @@ describe("Gmail OAuth — setup status data contract", () => {
       connected: false,
       account_email: "user@example.com",
       needs_reconnect: true,
+      api_not_enabled: null,
     };
 
     expect(status.needs_reconnect).toBe(true);
@@ -90,6 +102,7 @@ describe("Gmail OAuth — setup status data contract", () => {
       connected: true,
       account_email: null,
       needs_reconnect: false,
+      api_not_enabled: null,
     };
 
     // Per the backend contract: null when the connect succeeded but the
@@ -107,12 +120,14 @@ describe("Gmail OAuth — per-profile isolation", () => {
       connected: true,
       account_email: "personal@example.com",
       needs_reconnect: false,
+      api_not_enabled: null,
     };
     const workStatus: GmailSetupStatus = {
       client_configured: true,
       connected: false,
       account_email: null,
       needs_reconnect: true,
+      api_not_enabled: null,
     };
 
     expect(personalStatus.connected).toBe(true);

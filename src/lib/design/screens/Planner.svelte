@@ -2,11 +2,20 @@
   // Planner — the real Google Calendar + Google Tasks surface for the active
   // profile. Both APIs reuse the profile's Google OAuth connection from Email;
   // no sample events or local-only task state is ever rendered as live data.
+  //
+  // Connection state: this screen used to read NONE of it — it dumped the raw
+  // backend error string under fixed prose telling the user to "connect or
+  // reconnect from Email", whether or not that was the actual problem, and
+  // whether or not it could possibly help. It now reads `GmailSetupStatus` like
+  // Email does and shows the SAME two banners: reconnect for a scope-short
+  // grant, and a console pointer for an API switched off in the user's Google
+  // Cloud project (which reconnecting can never fix).
   import { nav } from "$lib/design/nav.svelte";
   import Sidebar from "../components/Sidebar.svelte";
   import AppStatusBar from "../components/AppStatusBar.svelte";
   import Button from "../components/Button.svelte";
   import IconButton from "../components/IconButton.svelte";
+  import GoogleApiDisabledBanner from "../components/GoogleApiDisabledBanner.svelte";
   import { activeProfileId } from "$lib/stores/profiles";
   import {
     listCalendarEvents,
@@ -17,8 +26,10 @@
     setGoogleTaskCompleted,
     deleteGoogleTask,
     type CalendarEventInfo,
+    type GoogleApiId,
     type GoogleTaskInfo,
   } from "$lib/api/tauri";
+  import { GoogleConnection, disabledFor } from "$lib/design/googleConnection.svelte";
 
   let events = $state<CalendarEventInfo[]>([]);
   let tasks = $state<GoogleTaskInfo[]>([]);
@@ -26,6 +37,62 @@
   let error: string | null = $state(null);
   let refreshTick = $state(0);
   let sequence = 0;
+
+  // ── connection state (per profile) — the SAME implementation Email uses ───
+  //
+  // Reading it, dropping stale reads, and deciding whether a re-read replaces
+  // what we hold are all one shared thing now. Two private copies had already
+  // drifted: this screen adopted a fresh status when it held none and Email
+  // discarded it, and nothing said which was right.
+  const conn = new GoogleConnection();
+  const status = $derived(conn.status);
+  const recheckingApi = $derived(conn.checking);
+  let statusTick = $state(0);
+
+  /// The APIs this screen can actually re-test — which is also exactly what it
+  /// may put in a banner. Its re-check must not clear a Gmail state that only
+  /// the Email screen will ever retry, and its banner must not name one either:
+  /// the button under it would clear and retry Calendar and Tasks.
+  const PLANNER_APIS: GoogleApiId[] = ["calendar", "tasks"];
+
+  $effect(() => {
+    const profile = $activeProfileId;
+    void statusTick;
+    // A failed status read is not worth an error of its own here — the loads
+    // below carry their own errors, and `conn` leaves the banners dark rather
+    // than claiming a connection state it could not read.
+    void conn.read(profile);
+  });
+
+  const showReconnectBanner = $derived(
+    status != null && status.connected && status.needs_reconnect,
+  );
+  // Scoped to PLANNER_APIS: the state is per-profile, so it can also hold a
+  // Gmail entry the Email screen (or an agent tool) recorded. Rendering that
+  // here produced a banner this screen's own button could not act on — it
+  // announced "Gmail isn't switched on" above a re-check that clears and
+  // retries Calendar and Tasks.
+  const apiDisabled = $derived(
+    status != null && status.connected ? disabledFor(status, PLANNER_APIS) : null,
+  );
+
+  /// Forget the disabled-API state for THIS screen's APIs, then reload. If one
+  /// is still off, the reload re-records it and the banner returns — nothing
+  /// is assumed fixed.
+  async function recheckApi() {
+    const failed = await conn.clearDisabled($activeProfileId, PLANNER_APIS);
+    if (failed !== null) {
+      // A failed CLEAR is a local IPC problem, not a Google verdict — nothing
+      // changed backend-side, so there is nothing new to reload or re-read.
+      error = failed;
+      return;
+    }
+    // Order doesn't matter — every read claims a token and the newest wins —
+    // but the reload is what re-records a still-disabled API, and the status
+    // read is what renders whatever it recorded.
+    refreshTick++;
+    statusTick++;
+  }
 
   let eventTitle = $state("");
   let eventStart = $state("");
@@ -43,13 +110,23 @@
     loading = true;
     error = null;
     Promise.all([listCalendarEvents(profile), listGoogleTasks(profile)])
-      .then(([nextEvents, nextTasks]) => {
+      .then(async ([nextEvents, nextTasks]) => {
         if (token !== sequence) return;
         events = nextEvents;
         tasks = nextTasks;
+        // BOTH outcomes are re-checked, because the backend records on both:
+        // loads that WORKED are proof Calendar and Tasks are switched on, and
+        // drop the disabled state for them. Without this the banner kept
+        // rendering a state the backend had already thrown away, until the
+        // user pressed "check again" by hand.
+        await conn.refresh(profile);
       })
-      .catch((err) => {
-        if (token === sequence) error = String(err);
+      .catch(async (err) => {
+        if (token !== sequence) return;
+        error = String(err);
+        // A dead grant or a disabled API is recorded backend-side by the very
+        // call that just failed — re-check so the matching banner lights.
+        await conn.refresh(profile);
       })
       .finally(() => {
         if (token === sequence) loading = false;
@@ -76,8 +153,10 @@
       eventTitle = "";
       eventStart = "";
       eventEnd = "";
+      void conn.refresh($activeProfileId);
     } catch (err) {
       error = String(err);
+      void conn.refresh($activeProfileId);
     } finally {
       creatingEvent = false;
     }
@@ -95,8 +174,10 @@
       tasks = [...tasks, task];
       taskTitle = "";
       taskNotes = "";
+      void conn.refresh($activeProfileId);
     } catch (err) {
       error = String(err);
+      void conn.refresh($activeProfileId);
     } finally {
       creatingTask = false;
     }
@@ -107,8 +188,10 @@
     try {
       const updated = await setGoogleTaskCompleted($activeProfileId, task.id, !task.completed);
       tasks = tasks.map((row) => (row.id === updated.id ? updated : row));
+      void conn.refresh($activeProfileId);
     } catch (err) {
       error = String(err);
+      void conn.refresh($activeProfileId);
     }
   }
 
@@ -131,8 +214,10 @@
         await deleteGoogleTask($activeProfileId, id);
         tasks = tasks.filter((task) => task.id !== id);
       }
+      void conn.refresh($activeProfileId);
     } catch (err) {
       error = String(err);
+      void conn.refresh($activeProfileId);
     }
   }
 
@@ -162,12 +247,47 @@
       </IconButton>
     </header>
 
+    {#if showReconnectBanner}
+      <!-- calm reconnect banner — routine, not an error. The wizard lives on
+           the Email screen, so this points there rather than duplicating it. -->
+      <div
+        class="flex flex-shrink-0 items-center gap-3 border-b border-border bg-surface-2 px-[18px] py-2"
+        role="status"
+        aria-live="polite"
+        data-testid="planner-reconnect-banner"
+      >
+        <span class="text-[12px] text-text-2">
+          Google needs a quick reconnect — routine for personal Google clients.
+          Calendar and Tasks use the same connection as Mail.
+        </span>
+        <div class="flex-1"></div>
+        <Button onclick={() => nav.go("email")}>Reconnect in Email</Button>
+      </div>
+    {/if}
+
+    {#if apiDisabled}
+      <GoogleApiDisabledBanner
+        apis={apiDisabled.apis}
+        checking={recheckingApi}
+        oncheckagain={() => void recheckApi()}
+      />
+    {/if}
+
     <div class="min-h-0 flex-1 overflow-y-auto">
       <div class="mx-auto grid max-w-[1000px] gap-6 px-6 pb-12 pt-6 lg:grid-cols-2">
         {#if error}
-          <div class="lg:col-span-2 rounded-[var(--r)] border border-warn/30 bg-warn-soft px-3 py-2.5 text-[12.5px] text-text">
+          <div class="lg:col-span-2 rounded-[var(--r)] border border-border-strong bg-surface-2 px-3 py-2.5 text-[12.5px] text-text">
             {error}
-            <span class="text-text-2">Connect or reconnect Google from Email if this profile has not granted Calendar and Tasks access.</span>
+            {#if !showReconnectBanner && apiDisabled == null}
+              <!-- Only guess at a remedy when the connection state gave us
+                   none. When a banner above already names the real problem,
+                   repeating "reconnect from Email" here would be noise at
+                   best and wrong at worst. -->
+              <span class="text-text-2">
+                If this profile hasn't granted Calendar and Tasks access, connect
+                or reconnect Google from Email.
+              </span>
+            {/if}
           </div>
         {/if}
 
