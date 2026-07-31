@@ -584,8 +584,8 @@ mod tests {
     }
 
     /// A token endpoint that always answers with a dead grant (Google's
-    /// `invalid_grant`), so `KeychainTokenProvider::refresh_now` bails with
-    /// `NEEDS_RECONNECT_MARKER` — the exact shape a revoked/expired
+    /// `invalid_grant`), so `KeychainTokenProvider::refresh_now` bails with the
+    /// typed `NeedsReconnect` — the exact failure a revoked/expired
     /// Testing-mode refresh token produces in production.
     struct DeadGrantEndpoint;
     impl TokenEndpoint for DeadGrantEndpoint {

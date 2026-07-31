@@ -3587,8 +3587,10 @@ pub async fn list_email(
     }
     if rows.is_empty() && !metas.is_empty() {
         let err = last_err.unwrap_or_else(|| anyhow::anyhow!("every message fetch failed"));
-        return observe_google_call::<()>(&state, &args.profile, GoogleApi::Gmail, Err(err))
-            .map(|()| Vec::new());
+        // Same typed recorder, straight: there is no success half to observe
+        // here (the listing above already cleared Gmail if it worked).
+        state.email.google.observe_failure(&args.profile, &err);
+        return Err(err.to_string());
     }
     Ok(rows)
 }

@@ -44,7 +44,8 @@ works either way with no code change.
   + get_profile. 401-retry-once.
 - `src-tauri/src/email/token_provider.rs` — `KeychainTokenProvider`:
   per-profile, in-memory access-token cache, rotated refresh tokens persisted,
-  `NeedsReconnect` carried via `NEEDS_RECONNECT_MARKER`.
+  `NeedsReconnect` carried as a typed error (`token_provider::NeedsReconnect`),
+  which `email/connection_state.rs` downcasts — never a marker in prose.
 - `src-tauri/src/email/mod.rs` — keychain key contract (the single source of
   truth for account-key strings). **Secrets have redacting `Debug` impls,
   locked by tests — do not add `derive(Debug)`.**
