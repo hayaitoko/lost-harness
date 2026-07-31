@@ -64,6 +64,51 @@ pub(crate) const NO_ENDPOINT_SELECTED: &str =
 pub(crate) const NO_MODEL_SELECTED: &str =
     "no model is selected for this endpoint — pick a model in the composer";
 
+// ── Delegated helper runs ─────────────────────────────────────────────────
+
+/// What one `run_subagent` produced: the helper's answer, plus the trust zone
+/// it ACTUALLY ran in.
+///
+/// The zone travels with the result on purpose. The work runner posts a note
+/// about this run into the PARENT conversation, and that note needs a zone —
+/// but it is written after the run has finished, so anything it looks up then
+/// is the registry as it is *now*, not as it was when the turn was served. That
+/// is the exact defect `messages.endpoint_zone` (profile schema v12) exists to
+/// remove: edit or delete the provider mid-run and the note would claim
+/// whatever the replacement row says, up to and including a reassuring "local"
+/// for a turn that egressed. So the zone is carried, never re-derived.
+#[derive(Debug, Clone)]
+pub struct SubagentRun {
+    /// The helper's final text (or, on a gate block, its explanation).
+    pub text: String,
+    /// The zone the helper's own turns were stamped with, or `None` when the
+    /// run persisted no turn at all (a gate block before any row was written).
+    /// `None` must render as UNKNOWN — never as "local".
+    pub zone: Option<TrustZone>,
+}
+
+/// Fold a helper run's persisted rows into one zone for the note posted back
+/// into the parent conversation.
+///
+/// **Any cloud round makes the whole run cloud.** The note carries the helper's
+/// output, and the privacy-relevant question about it is "did this work touch
+/// an endpoint off my machine?" — one round that did is enough for the answer
+/// to be yes, even if a mid-run privacy reroute finished the job locally.
+///
+/// `None` when no row carries a zone: an empty run, or rows from before v12.
+/// Deliberately not defaulted to `Local`.
+pub(crate) fn zone_of_run(rows: &[Message]) -> Option<TrustZone> {
+    let mut seen_local = false;
+    for row in rows {
+        match row.endpoint_zone.as_deref().and_then(TrustZone::parse) {
+            Some(TrustZone::Cloud) => return Some(TrustZone::Cloud),
+            Some(TrustZone::Local) => seen_local = true,
+            None => {}
+        }
+    }
+    seen_local.then_some(TrustZone::Local)
+}
+
 // ── Event payloads ────────────────────────────────────────────────────────
 
 /// Payload of the `stream:token` event. Mirrors what the Svelte frontend
@@ -682,11 +727,7 @@ impl AgentLoop {
         }
     }
 
-    /// This loop's provider registry. Exposed so the work runner can stamp the
-    /// trust zone of a helper's endpoint onto the note it posts back into the
-    /// parent conversation — a zone must come from the endpoint that actually
-    /// ran, at the time it ran, never from whatever the registry holds when the
-    /// transcript is later rendered.
+    /// This loop's provider registry.
     pub(crate) fn model_manager(&self) -> &ModelManager {
         &self.model_manager
     }
@@ -732,7 +773,7 @@ impl AgentLoop {
         profile: &str,
         binding: Binding,
         task: &str,
-    ) -> Result<String> {
+    ) -> Result<SubagentRun> {
         let belt: std::collections::HashSet<String> = tools_allowlist.iter().cloned().collect();
         let restricted = Arc::new(self.tools.restricted(&belt));
         let mut sub = AgentLoop::new(
@@ -794,13 +835,22 @@ impl AgentLoop {
             )
             .await;
 
+        // The zone the helper ACTUALLY ran in, read off its own persisted rows
+        // BEFORE they are deleted below — see `SubagentRun::zone`. This is the
+        // only moment those rows exist, which is precisely why the zone has to
+        // be captured here rather than looked up afterwards.
+        let zone = db
+            .list_messages_by_conversation(&sub_conv_id)
+            .map(|rows| zone_of_run(&rows))
+            .unwrap_or(None);
+
         // Wave 4.3c review fix: the sub-conversation is scratch space, not a
         // first-class chat — delete it (its messages cascade via the FK) so
         // delegated helper runs don't pile up junk conversations in the sidebar
         // or grow storage unboundedly. Best-effort (the result is already
         // captured), and runs whether the helper succeeded or errored.
         let _ = db.delete_conversation(&sub_conv_id);
-        result
+        result.map(|text| SubagentRun { text, zone })
     }
 
     /// Run one cron job's prompt as an unattended, HEADLESS, LOCAL-only turn

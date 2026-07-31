@@ -1295,9 +1295,17 @@ async fn run_subagent_blocks_a_cloud_seat_under_a_private_binding_without_touchi
     .expect("run_subagent must be blocked at the gate — never hang reaching a cloud endpoint")
     .expect("run_subagent returns Ok(reason) on a gate Block, never Err");
 
+    let text = outcome.text;
     assert!(
-        outcome.to_lowercase().contains("private") && outcome.to_lowercase().contains("cloud"),
-        "a cloud-seated helper under Private must be blocked before any client is touched, got: {outcome}"
+        text.to_lowercase().contains("private") && text.to_lowercase().contains("cloud"),
+        "a cloud-seated helper under Private must be blocked before any client is touched, got: {text}"
+    );
+    // A blocked run never reached an endpoint, so it has no zone to report. The
+    // note the work runner posts must therefore read UNKNOWN — a gate block is
+    // emphatically not evidence that anything ran locally.
+    assert_eq!(
+        outcome.zone, None,
+        "a run that was blocked before any turn was persisted must claim no zone"
     );
 }
 
@@ -2088,4 +2096,69 @@ async fn the_stamped_zone_follows_the_endpoint_not_the_declared_kind() {
         "kind=Cloud on a loopback base_url is still a local turn"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+// ── A delegated helper's zone is folded from its OWN turns ──────────────────
+
+/// One persisted row with just the field under test set.
+fn zone_row(zone: Option<&str>) -> Message {
+    Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        conversation_id: "sub".to_string(),
+        role: "assistant".to_string(),
+        content: String::new(),
+        model: None,
+        provider_id: None,
+        routing_decision: None,
+        endpoint_zone: zone.map(str::to_string),
+        thinking_content: None,
+        error: None,
+        aborted: false,
+        created_at: 0,
+    }
+}
+
+#[test]
+fn a_helper_run_that_touched_cloud_at_all_is_reported_as_cloud() {
+    use crate::agent::loop_mod::zone_of_run;
+    use crate::models::TrustZone;
+
+    // A helper's run can change zone mid-flight: the first round goes to the
+    // cloud seat it was dispatched to, then a tool result forces the rest local.
+    // The note posted back into the parent carries that run's OUTPUT, and the
+    // question the badge answers about it is "did this work leave my machine?".
+    // One round that did is enough for the answer to be yes.
+    let rows = vec![
+        zone_row(Some("cloud")),
+        zone_row(Some("local")),
+        zone_row(Some("local")),
+    ];
+    assert_eq!(zone_of_run(&rows), Some(TrustZone::Cloud));
+
+    // Order must not matter — a late cloud round counts the same as an early one.
+    let rows = vec![zone_row(Some("local")), zone_row(Some("cloud"))];
+    assert_eq!(zone_of_run(&rows), Some(TrustZone::Cloud));
+}
+
+#[test]
+fn a_helper_run_that_stayed_local_is_reported_as_local() {
+    use crate::agent::loop_mod::zone_of_run;
+    use crate::models::TrustZone;
+
+    let rows = vec![zone_row(Some("local")), zone_row(Some("local"))];
+    assert_eq!(zone_of_run(&rows), Some(TrustZone::Local));
+}
+
+#[test]
+fn a_helper_run_with_nothing_to_go_on_reports_no_zone_rather_than_local() {
+    use crate::agent::loop_mod::zone_of_run;
+    use crate::models::TrustZone;
+
+    // No rows at all (a gate block before anything was persisted), and rows
+    // whose zone is missing or unrecognised. Every one of these is UNKNOWN.
+    // Defaulting any of them to Local is exactly the reassuring lie the stamped
+    // zone exists to remove.
+    assert_eq!(zone_of_run(&[]), None);
+    assert_eq!(zone_of_run(&[zone_row(None)]), None);
+    assert_eq!(zone_of_run(&[zone_row(Some("somewhere-else"))]), None);
 }

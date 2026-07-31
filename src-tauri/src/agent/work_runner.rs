@@ -391,30 +391,44 @@ async fn run_one_item(
     // human-facing note posted into the parent). Success, failure, AND timeout
     // all post SOMETHING back — the user must never see "dispatched" then
     // silence (Wave 4.3c review fix).
-    let (state, result_json, error, note): (WorkState, Option<String>, Option<String>, String) =
-        match outcome {
-            Ok(Ok(text)) => (
-                WorkState::Done,
-                Some(text.clone()),
-                None,
-                format!("**[helper: {agent_name}]**\n\n{text}"),
-            ),
-            Ok(Err(e)) => {
-                let e = e.to_string();
-                (
-                    WorkState::Failed,
-                    None,
-                    Some(e.clone()),
-                    format!("**[helper: {agent_name}] failed:** {e}"),
-                )
-            }
-            Err(_elapsed) => (
+    //
+    // `zone` is the trust zone the helper's OWN turns were stamped with,
+    // carried out of `run_subagent` (`SubagentRun::zone`). A failed or timed-out
+    // run has no completed turn to speak for, so it carries `None` — rendered as
+    // UNKNOWN, never as "local".
+    #[allow(clippy::type_complexity)]
+    let (state, result_json, error, note, zone): (
+        WorkState,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<crate::models::TrustZone>,
+    ) = match outcome {
+        Ok(Ok(run)) => (
+            WorkState::Done,
+            Some(run.text.clone()),
+            None,
+            format!("**[helper: {agent_name}]**\n\n{}", run.text),
+            run.zone,
+        ),
+        Ok(Err(e)) => {
+            let e = e.to_string();
+            (
                 WorkState::Failed,
                 None,
-                Some("helper timed out".to_string()),
-                format!("**[helper: {agent_name}] timed out** and was stopped."),
-            ),
-        };
+                Some(e.clone()),
+                format!("**[helper: {agent_name}] failed:** {e}"),
+                None,
+            )
+        }
+        Err(_elapsed) => (
+            WorkState::Failed,
+            None,
+            Some("helper timed out".to_string()),
+            format!("**[helper: {agent_name}] timed out** and was stopped."),
+            None,
+        ),
+    };
 
     // Lukas decision #2: the outcome lands in the PARENT conversation as a
     // labeled message. `routing_decision = "delegated"` marks it so the main
@@ -429,13 +443,19 @@ async fn run_one_item(
             model: Some(model.clone()),
             provider_id: Some(provider_id.clone()),
             routing_decision: Some("delegated".to_string()),
-            // The trust zone the HELPER ran in, read off the endpoint it used
-            // while that run is still the present. `None` (→ rendered as
-            // UNKNOWN, never as "local") if the provider went away mid-run.
-            endpoint_zone: agent_loop
-                .model_manager()
-                .get_provider(&provider_id)
-                .map(|p| p.trust_zone().as_str().to_string()),
+            // The trust zone the HELPER ran in — carried out of the run itself,
+            // stamped on its own turns at send time by the same `is_cloud` the
+            // gate was given.
+            //
+            // This used to be `model_manager().get_provider(&provider_id)`
+            // evaluated HERE, after the run finished: a registry lookup, not a
+            // fact about the turn. Edit the provider's base URL or delete it
+            // while the helper is running and the note recorded whatever the
+            // registry said afterwards — a cloud helper's output could be filed
+            // as "local". That is precisely what stamping the zone on the row
+            // (profile schema v12) exists to prevent, so the last live lookup
+            // is gone. `None` renders as UNKNOWN, never as "local".
+            endpoint_zone: zone.map(|z| z.as_str().to_string()),
             thinking_content: None,
             error: None,
             aborted: false,
@@ -1141,6 +1161,139 @@ mod tests {
             "spend ${:.2} must stop within one round's cost of the $2.00 cap",
             summary.known_cost_usd
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ── The helper note's trust zone is HISTORY, not a registry lookup ───────
+
+    /// A streamer that rewrites the provider registry MID-RUN — the user edits
+    /// the endpoint (or deletes and re-adds it) while a helper is working.
+    ///
+    /// It answers as the cloud endpoint the helper was dispatched to, but by the
+    /// time the run returns, provider `cloudco` points at a loopback URL, i.e.
+    /// `trust_zone()` now says Local. Any code that asks the registry AFTER the
+    /// run records "local" for a turn that went to `api.cloudco.example`.
+    struct RegistrySwappingStreamer {
+        provider: Provider,
+        mm: Arc<ModelManager>,
+    }
+
+    impl ModelStreamer for RegistrySwappingStreamer {
+        fn provider(&self) -> &Provider {
+            &self.provider
+        }
+        fn stream<'a>(
+            &'a self,
+            _m: &'a str,
+            _msgs: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>>
+        {
+            let mm = Arc::clone(&self.mm);
+            Box::pin(async move {
+                // Same id, private base URL: exactly what an edit in
+                // Settings → Models produces.
+                mm.add_provider(Provider::new(
+                    "cloudco",
+                    "Cloud",
+                    "http://127.0.0.1:11434/v1",
+                    None,
+                    ProviderKind::Local,
+                ));
+                let delta =
+                    serde_json::json!({ "choices": [{ "delta": { "content": "done" } }] })
+                        .to_string();
+                let chunks: Vec<Vec<u8>> = vec![
+                    format!("data: {delta}\n").into_bytes(),
+                    b"data: [DONE]\n".to_vec(),
+                ];
+                Ok(SseStream::from_byte_stream(tokio_stream::iter(
+                    chunks.into_iter().map(Ok::<Vec<u8>, reqwest::Error>),
+                )))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_helper_note_records_the_zone_the_run_actually_used() {
+        // THE regression. The note posted back into the parent conversation used
+        // to take its zone from `model_manager().get_provider(..)` evaluated
+        // AFTER the run finished — the registry as it is NOW, not the endpoint
+        // that served the turn. Repoint (or delete) the provider mid-run and a
+        // helper that talked to a public cloud endpoint got filed as "local".
+        //
+        // The whole point of stamping the zone on the row (profile schema v12)
+        // is that a past turn's trust zone is a fact about the past.
+        let (storage, root) = temp_storage();
+        let storage = Arc::new(storage);
+        let db = storage.open_profile("personal").unwrap();
+
+        let mm = Arc::new(ModelManager::new());
+        mm.add_provider(cloud());
+        let streamer = Arc::new(RegistrySwappingStreamer {
+            provider: cloud(),
+            mm: Arc::clone(&mm),
+        });
+        let agent = Arc::new(
+            AgentLoop::new(
+                PrivacyGate::new(Arc::new(RulesClassifier::new())),
+                Arc::clone(&mm),
+                Arc::clone(&storage),
+                Arc::new(crate::tools::ToolDispatcher::empty()),
+            )
+            .with_model_streamer_override(streamer),
+        );
+
+        // The parent conversation the helper's outcome is posted into.
+        let now = 1_000_000;
+        let parent = "parent-conv".to_string();
+        db.create_conversation(&crate::storage::Conversation {
+            id: parent.clone(),
+            name: "Parent".into(),
+            pinned: false,
+            binding: "public".into(),
+            folder_id: None,
+            color: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+        let mut item = dispatch_item(now);
+        item.target_conversation_id = Some(parent.clone());
+        db.insert_work_item(&item).unwrap();
+        let claimed = db.claim_next_due_work(now).unwrap().expect("claimed");
+
+        let budget_lock: BudgetLock = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        run_one_item(
+            agent,
+            Arc::clone(&db),
+            "personal".into(),
+            claimed,
+            budget_lock,
+        )
+        .await;
+
+        // Sanity: the swap really happened, so a post-hoc lookup WOULD have
+        // answered "local" — the test is exercising the live hazard, not a
+        // hypothetical one.
+        assert_eq!(
+            mm.get_provider("cloudco").map(|p| p.trust_zone()),
+            Some(crate::models::TrustZone::Local),
+            "the registry must read Local by now for this test to mean anything"
+        );
+
+        let note = db
+            .list_messages_by_conversation(&parent)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.routing_decision.as_deref() == Some("delegated"))
+            .expect("the helper's outcome is posted into the parent conversation");
+        assert_eq!(
+            note.endpoint_zone.as_deref(),
+            Some("cloud"),
+            "the note must record the zone the helper actually ran in"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 }
