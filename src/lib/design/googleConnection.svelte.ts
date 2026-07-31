@@ -21,8 +21,8 @@
 // The screens only ever re-read after a failure, so the clearing half never
 // reached the UI: once the user enabled the API in the console and the next
 // call went through, the backend dropped the state and the banner went on
-// rendering the stale one until a manual re-check. `refreshAfterSuccess` is
-// the missing half.
+// rendering the stale one until a manual re-check. Re-reading after a SUCCESS
+// too — through the same `refresh` — is the missing half.
 
 import {
   gmailSetupStatus,
@@ -138,9 +138,27 @@ export class GoogleConnection {
     }
   }
 
-  /** Re-read after a call FAILED. The failing call is what records the state
-   *  backend-side, so without this a failed read, send, or create would leave
-   *  both banners dark and show only the raw error. */
+  /** Re-read after a call DECIDED something — either way.
+   *
+   *  A failure records the state backend-side, so without a re-read a failed
+   *  read, send, or create would leave both banners dark and show only the raw
+   *  error. A success records too: it is proof the API it reached is switched
+   *  on, and the backend drops that API's disabled state on the spot, so
+   *  without a re-read the banner kept rendering a state the backend had
+   *  already thrown away until the user pressed "check again" by hand.
+   *
+   *  There is deliberately no cheap skip for "this screen holds no
+   *  disabled-API claim, so a success can only re-confirm what we hold". That
+   *  reasoning is wrong: the read is of the WHOLE profile status, so it also
+   *  REVEALS a state some other path recorded since this screen last looked —
+   *  precisely the agent-tool case this work added. An agent's Tasks call
+   *  records "Tasks is off" while the Planner sits open holding nothing; the
+   *  user's next Planner action is a Calendar one, it succeeds, and a skip
+   *  here would leave the Tasks banner dark. The price of not skipping is one
+   *  local status read per user-initiated action.
+   *
+   *  `shouldAdopt` still gates the WRITE, so a re-read that finds the
+   *  connection unchanged cannot churn the effects watching it. */
   async refresh(profile: string): Promise<void> {
     const token = this.#claim();
     try {
@@ -148,31 +166,9 @@ export class GoogleConnection {
       if (token === this.#seq && shouldAdopt(fresh, this.status)) this.status = fresh;
     } catch {
       // Keep whatever error the caller already surfaced — a failed re-read is
-      // not a new fact about the connection.
-      // (`refreshAfterSuccess` funnels through here, so this holds for it too:
-      // a status read that fails is not evidence the call that succeeded
-      // didn't.)
+      // not a new fact about the connection. (Nor, on the success path, is a
+      // status read that fails any evidence the call that succeeded didn't.)
     }
-  }
-
-  /** Re-read after a call SUCCEEDED.
-   *
-   *  A completed call is proof the API it reached is switched on, and the
-   *  backend drops that API's disabled state on the spot. The screen has to
-   *  re-read or it never learns: this is the half that was missing, so after
-   *  the user enabled the API in the console and the very next call went
-   *  through, the banner kept rendering a state the backend had already
-   *  thrown away, until they pressed "check again" by hand.
-   *
-   *  Skipped when the screen holds no disabled-API claim, because that is the
-   *  only state a success can change — `observe_success` deliberately does not
-   *  touch `needs_reconnect` (a call on a cached access token is no evidence
-   *  the stored grant came back). With nothing claimed there is nothing a
-   *  re-read could clear, so it would be a round trip that can only re-confirm
-   *  what we hold. */
-  async refreshAfterSuccess(profile: string): Promise<void> {
-    if (this.status?.api_not_enabled == null) return;
-    await this.refresh(profile);
   }
 
   /** "I've enabled it — check again": forget the disabled state for the APIs

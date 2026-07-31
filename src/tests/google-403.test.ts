@@ -401,6 +401,59 @@ describe("Email + Planner — the two connection banners", () => {
     await waitFor(() => expect(queryByTestId("google-api-disabled-banner")).not.toBeNull());
   });
 
+  /// The re-read after a SUCCESS reveals as well as clears. `refresh` used to
+  /// be skipped on the success path whenever the screen held no disabled-API
+  /// claim, justified as "with nothing claimed there is nothing a re-read
+  /// could clear". But the read is of the WHOLE profile status, so it also
+  /// surfaces a state another path recorded since this screen last looked —
+  /// the agent-tool case this work exists for. Here an agent's Tasks call
+  /// records "Tasks is off" while the Planner sits open holding nothing, and
+  /// the user's next Planner action is a CALENDAR one that succeeds. With the
+  /// skip in place the Tasks banner stayed dark.
+  it("Planner: a success reveals a state an agent tool recorded meanwhile", async () => {
+    // What the backend holds. Nothing at first — the Planner's own load works.
+    let disabled = false;
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "gmail_setup_status":
+          return status(disabled ? { api_not_enabled: disabledState(["tasks"]) } : {});
+        case "list_calendar_events":
+          return [
+            {
+              id: "ev-1",
+              summary: "standup",
+              description: "",
+              start: "2026-07-30T09:00:00Z",
+              end: "2026-07-30T09:15:00Z",
+              all_day: false,
+            },
+          ];
+        case "list_google_tasks":
+          return [];
+        // A CALENDAR call: it succeeds, and says nothing about Tasks.
+        case "delete_calendar_event":
+          return null;
+        default:
+          return null;
+      }
+    });
+
+    const { getByText, queryByTestId } = render(Planner);
+    await waitFor(() => expect(getByText("standup")).toBeInTheDocument());
+    expect(queryByTestId("google-api-disabled-banner")).toBeNull();
+
+    // An agent tool calls Google Tasks and gets the 403. The screen is not
+    // told; it holds a clean status and has no failing call of its own.
+    disabled = true;
+
+    // Two-click confirm on the event delete — a Calendar call that WORKS.
+    await fireEvent.click(getByText("Delete"));
+    await fireEvent.click(getByText("Confirm?"));
+    await settle();
+
+    expect(queryByTestId("google-api-disabled-banner")).not.toBeNull();
+  });
+
   /// The re-check race. Pressing "I've enabled it — check again" starts TWO
   /// things: a status read (the state was just cleared, so it reads clean) and
   /// a retry (which fails, re-records the state, and re-reads). If the stale

@@ -119,7 +119,7 @@
         // drop the disabled state for them. Without this the banner kept
         // rendering a state the backend had already thrown away, until the
         // user pressed "check again" by hand.
-        await conn.refreshAfterSuccess(profile);
+        await conn.refresh(profile);
       })
       .catch(async (err) => {
         if (token !== sequence) return;
@@ -153,7 +153,7 @@
       eventTitle = "";
       eventStart = "";
       eventEnd = "";
-      void conn.refreshAfterSuccess($activeProfileId);
+      void conn.refresh($activeProfileId);
     } catch (err) {
       error = String(err);
       void conn.refresh($activeProfileId);
@@ -174,7 +174,7 @@
       tasks = [...tasks, task];
       taskTitle = "";
       taskNotes = "";
-      void conn.refreshAfterSuccess($activeProfileId);
+      void conn.refresh($activeProfileId);
     } catch (err) {
       error = String(err);
       void conn.refresh($activeProfileId);
@@ -188,7 +188,7 @@
     try {
       const updated = await setGoogleTaskCompleted($activeProfileId, task.id, !task.completed);
       tasks = tasks.map((row) => (row.id === updated.id ? updated : row));
-      void conn.refreshAfterSuccess($activeProfileId);
+      void conn.refresh($activeProfileId);
     } catch (err) {
       error = String(err);
       void conn.refresh($activeProfileId);
@@ -214,7 +214,7 @@
         await deleteGoogleTask($activeProfileId, id);
         tasks = tasks.filter((task) => task.id !== id);
       }
-      void conn.refreshAfterSuccess($activeProfileId);
+      void conn.refresh($activeProfileId);
     } catch (err) {
       error = String(err);
       void conn.refresh($activeProfileId);
