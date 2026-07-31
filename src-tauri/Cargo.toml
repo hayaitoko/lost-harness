@@ -18,6 +18,24 @@ tauri-build = { version = "2.6", features = [] }
 
 [dependencies]
 tauri = { version = "2.11", features = [] }
+# App self-update (round-2 item 3). The official Tauri v2 updater: fetches the
+# `latest.json` manifest + the signed `.app.tar.gz` from the app's PUBLIC GitHub
+# releases, verifies the minisign signature against the `pubkey` in
+# tauri.conf.json, then stages the install. `tauri-plugin-process` supplies the
+# post-install relaunch. Both are driven from RUST ONLY — see `updater/mod.rs`
+# for why (the launch check has to be gate-able and testable in `cargo test`,
+# which a webview-side JS plugin call would bypass).
+#
+# Default features are `rustls-tls` + `zip`: rustls avoids adding a second TLS
+# stack story on top of reqwest's, and `zip` is what unpacks the macOS
+# `.app.tar.gz` payload. `native-tls` is deliberately NOT enabled.
+tauri-plugin-updater = "2.10"
+tauri-plugin-process = "2.3"
+# Version comparison for the update banner. Already in the lock tree (tauri's
+# own build graph); promoted to a direct dep because `updater::is_strictly_newer`
+# is the app's own second gate on top of the plugin's comparison — we never
+# offer a same-or-older "update", whatever a manifest claims.
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

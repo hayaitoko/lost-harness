@@ -3,10 +3,16 @@ name: build
 on:
   push:
     branches: [main]
+    # Round-2 item 3: a `vX.Y.Z` tag is what publishes an updatable release.
+    # The `release` job at the bottom is gated on this and on `build` passing,
+    # so a tag can never ship a bundle that failed the gates above it.
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
+# Read-only by default. The `release` job raises this to `contents: write` for
+# itself only — nothing else in this file may write to the repository.
 permissions:
   contents: read
 
@@ -190,3 +196,271 @@ jobs:
       # regression here means that pin was lost. Verified exit 0 on this tree.
       - name: npm audit (high and above)
         run: npm audit --audit-level=high
+
+  # ── Release (tag-triggered) ────────────────────────────────────────────────
+  #
+  # Round-2 item 3. Pushing `vX.Y.Z` builds the arm64 macOS bundle, signs the
+  # updater payload with the minisign key held in Actions secrets, composes the
+  # `latest.json` the shipped app fetches, and attaches both to a GitHub
+  # Release. `src-tauri/tauri.conf.json`'s `version` is the source of truth —
+  # the tag must agree with it or this job fails before building anything.
+  #
+  # `needs: build` is deliberate: a tag cannot publish a bundle whose tests,
+  # clippy-correctness, fmt or audit gates did not pass.
+  #
+  # NOT done here, and worth knowing: the `.app` is not Apple-codesigned or
+  # notarized (this repo has no Developer ID configured). The minisign
+  # signature the updater verifies is a different thing entirely — it proves
+  # the payload came from Lukas's key, not that Gatekeeper will accept a fresh
+  # download. That gap is pre-existing and out of scope for this item.
+  release:
+    name: Release (macOS arm64)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assert macOS arm64 runner
+        run: |
+          set -euo pipefail
+          uname -sm
+          test "$(uname -s)" = "Darwin" || { echo "::error::this workflow only runs on macOS"; exit 1; }
+          test "$(uname -m)" = "arm64"  || { echo "::error::this workflow only runs on Apple Silicon (arm64)"; exit 1; }
+
+      # The version the app reports, the version in the manifest and the tag
+      # must be one value. A mismatch here would ship a release the running app
+      # either ignores forever or re-offers on every launch.
+      - name: Tag matches tauri.conf.json version
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          cargo_v="$(grep -m1 '^version = ' src-tauri/Cargo.toml | cut -d'"' -f2)"
+          echo "tag=${tag} tauri.conf.json=${conf} Cargo.toml=${cargo_v}"
+          if [ "${tag}" != "${conf}" ]; then
+            echo "::error::tag v${tag} does not match tauri.conf.json version ${conf}"
+            exit 1
+          fi
+          if [ "${cargo_v}" != "${conf}" ]; then
+            echo "::error::Cargo.toml version ${cargo_v} does not match tauri.conf.json ${conf} (get_app_version reads Cargo.toml)"
+            exit 1
+          fi
+          echo "version=${tag}" >> "$GITHUB_OUTPUT"
+
+      # The updater refuses any payload whose signature doesn't verify against
+      # the pubkey compiled into the app, so an unset signing secret would
+      # produce a release nobody can install. Fail before spending the build.
+      - name: Signing secrets are present
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set on this repository"
+            exit 1
+          fi
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set on this repository"
+            exit 1
+          fi
+          echo "both signing secrets are set (values not printed)"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: macos-arm64-cargo-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}
+          restore-keys: |
+            macos-arm64-cargo-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # `createUpdaterArtifacts: true` in tauri.conf.json makes this emit
+      # `<product>.app.tar.gz` and `<product>.app.tar.gz.sig` alongside the
+      # .app/.dmg. The two env vars below are the ONLY place the private key is
+      # used; it never lands on disk.
+      - name: Build and sign the arm64 bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target aarch64-apple-darwin
+
+      # Compose `latest.json` by hand rather than reaching for a release action.
+      # The shape is small and the updater's parser is strict about it
+      # (tauri-plugin-updater's RemoteRelease: `version`, optional `notes`,
+      # optional RFC-3339 `pub_date`, and a `platforms` map keyed by
+      # `{os}-{arch}`), so writing it here keeps what ships reviewable.
+      #
+      # The asset is renamed to a space-free filename: GitHub rewrites spaces in
+      # uploaded asset names, which would silently break the URL in the manifest.
+      - name: Stage the updater artifacts
+        id: stage
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          bundle_dir="src-tauri/target/aarch64-apple-darwin/release/bundle/macos"
+
+          archive="$(ls "${bundle_dir}"/*.app.tar.gz 2>/dev/null | head -1 || true)"
+          if [ -z "${archive}" ]; then
+            echo "::error::no .app.tar.gz produced — is bundle.createUpdaterArtifacts still true?"
+            ls -la "${bundle_dir}" || true
+            exit 1
+          fi
+          if [ ! -f "${archive}.sig" ]; then
+            echo "::error::${archive} has no .sig — the build did not sign the updater payload"
+            exit 1
+          fi
+
+          mkdir -p dist-release
+          asset="Lost-Harness_${version}_aarch64.app.tar.gz"
+          cp "${archive}" "dist-release/${asset}"
+          cp "${archive}.sig" "dist-release/${asset}.sig"
+
+          signature="$(cat "dist-release/${asset}.sig")"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}/${asset}"
+
+          # `--arg` everywhere: the signature is base64 and the notes are free
+          # text, neither of which may be interpolated into the jq program.
+          jq -n \
+            --arg version "${version}" \
+            --arg notes "Lost Harness ${version}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg url "${url}" \
+            --arg signature "${signature}" \
+            '{
+               version: $version,
+               notes: $notes,
+               pub_date: $pub_date,
+               platforms: {
+                 "darwin-aarch64": { signature: $signature, url: $url }
+               }
+             }' > dist-release/latest.json
+
+          echo "staged:"
+          ls -la dist-release
+          echo "manifest:"
+          jq '.platforms["darwin-aarch64"].signature = "<redacted>"' dist-release/latest.json
+
+      # ── The gate that decides whether this release is installable at all ──
+      #
+      # Everything above proves a signature was PRODUCED. It does not prove the
+      # signature verifies against the public key compiled into the app, and
+      # those are different facts: `TAURI_SIGNING_PRIVATE_KEY` is a repository
+      # secret, `plugins.updater.pubkey` is a string in tauri.conf.json, and
+      # nothing keeps them in step. Rotate the key, paste it into the wrong
+      # secret, or update the config without re-signing, and every step above
+      # still passes — while every installed copy of the app REFUSES the
+      # release, silently, forever. That is the worst failure mode this feature
+      # has, because it looks like success from here.
+      #
+      # So verify it, with the same minisign the updater implements, against
+      # the pubkey the app actually ships rather than against the secret that
+      # signed it.
+      #
+      # Formats (both are base64 wrappers, which is why the decode step exists):
+      #   * `plugins.updater.pubkey` is base64 of a minisign `.pub` FILE
+      #     (comment line + key line), not of the raw key bytes.
+      #   * the emitted `.sig` is base64 of a minisign `.sig` FILE
+      #     (untrusted comment, signature, trusted comment, global signature).
+      - name: Signature verifies against the pubkey this build ships
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          asset="Lost-Harness_${version}_aarch64.app.tar.gz"
+
+          brew list minisign >/dev/null 2>&1 || brew install minisign
+          minisign -v
+
+          node -e '
+            const fs = require("fs");
+            const conf = require("./src-tauri/tauri.conf.json");
+            const pubkey = conf.plugins?.updater?.pubkey;
+            if (!pubkey) throw new Error("plugins.updater.pubkey is missing from tauri.conf.json");
+            fs.writeFileSync("verify.pub", Buffer.from(pubkey, "base64"));
+            const sig = fs.readFileSync(process.argv[1], "utf8").trim();
+            fs.writeFileSync("verify.sig", Buffer.from(sig, "base64"));
+          ' "dist-release/${asset}.sig"
+
+          # The key id, not the key material — both halves are public anyway,
+          # and having it in the log is what makes a rotation mismatch legible.
+          echo "shipped pubkey: $(head -1 verify.pub)"
+
+          if ! minisign -V -m "dist-release/${asset}" -p verify.pub -x verify.sig; then
+            echo "::error::the signed artifact does NOT verify against plugins.updater.pubkey in src-tauri/tauri.conf.json"
+            echo "::error::every installed copy of the app would refuse this release. The signing key and the shipped pubkey have diverged — see docs/releasing.md (Rotating the signing key)."
+            exit 1
+          fi
+          echo "verified: ${asset} is signed by the key this build trusts"
+          rm -f verify.pub verify.sig
+
+      # The runtime refuses any download URL that is not an asset of this
+      # repository's releases (`updater::is_permitted_download_url`). The
+      # manifest is composed by the step above, so a bad edit there would ship a
+      # release the app declines to download — with a correct signature and a
+      # correct version. Assert the two agree here, where it is cheap.
+      - name: Manifest download URL is one the app will accept
+        run: |
+          set -euo pipefail
+          url="$(jq -r '.platforms["darwin-aarch64"].url' dist-release/latest.json)"
+          echo "manifest download url: ${url}"
+          expected_prefix="https://github.com/${GITHUB_REPOSITORY}/releases/download/"
+          case "${url}" in
+            "${expected_prefix}"*) ;;
+            *)
+              echo "::error::the manifest points the download at '${url}', which the app refuses; it must start with '${expected_prefix}'"
+              exit 1
+              ;;
+          esac
+          # Mirror of the Rust constant. If the repository is ever renamed, both
+          # this and `updater::RELEASE_DOWNLOAD_PREFIX` have to move together.
+          case "${url}" in
+            https://github.com/hayaitoko/lost-harness/releases/download/*) ;;
+            *)
+              echo "::error::'${url}' does not match updater::RELEASE_DOWNLOAD_PREFIX in src-tauri/src/updater/mod.rs"
+              exit 1
+              ;;
+          esac
+          echo "the shipped app will accept this download URL"
+
+      # Created as a DRAFT. Publishing is a human step — the moment a release
+      # goes live, every installed copy of the app starts offering it.
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          gh release create "v${version}" \
+            --draft \
+            --title "Lost Harness v${version}" \
+            --notes "Signed arm64 macOS build. Attached: the updater payload, its minisign signature, and the latest.json the app fetches." \
+            "dist-release/Lost-Harness_${version}_aarch64.app.tar.gz" \
+            "dist-release/Lost-Harness_${version}_aarch64.app.tar.gz.sig" \
+            "dist-release/latest.json"
+          echo "Draft release v${version} created. Review it, then publish — the app only sees PUBLISHED releases."

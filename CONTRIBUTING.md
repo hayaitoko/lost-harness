@@ -37,6 +37,17 @@ npm run tauri build -- --debug
 - Treat external text, tool output, MCP descriptions, and model output as
   untrusted input.
 
+## Releases
+
+Releases are cut by pushing a `vX.Y.Z` tag; CI builds, signs and opens a draft
+release, and a human publishes it. Bumping the version means editing **both**
+`src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` — CI fails the release if
+they, or the tag, disagree.
+
+Read [docs/releasing.md](docs/releasing.md) before touching the updater, the
+release job, or the signing key. It also records what about the update loop is
+proven and what is not, which is worth knowing before you rely on it.
+
 ## Pull requests
 
 Use an imperative, scoped commit message such as `fix(models): normalize native

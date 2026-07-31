@@ -59,6 +59,7 @@ user message
 | [storage.md](storage.md) | Two-DB SQLite (global + per-profile), schema/migrations, sqlite-vec + FTS5, `trm_logs` audit, plus `embedder.rs` (the on-device text embedder feeding memory's sqlite-vec meaning lane) |
 | [ipc-and-app-wiring.md](ipc-and-app-wiring.md) | Tauri command surface + `AppState` (70 commands as of 2026-07-24, 9 `AppState` fields — incl. the Gmail surface + `EmailRuntime`), the approval IPC round-trip, `lib.rs::run` wiring, plus `ipc/ask_human.rs` (the ask-human IPC round-trip) and `packs/mod.rs` (Capability Packs, installed via the `install_pack` command) |
 | [frontend-svelte.md](frontend-svelte.md) | The Svelte 5 shell, `tauri.ts` (the only IPC bridge), stores, components — the ported `src/lib/design/` design system (components/screens reskinned from the React source at lost-harness-ui), now mostly wired to real backend stores (see that doc for exactly which screens/tabs still aren't) |
+| [../releasing.md](../releasing.md) | `updater/mod.rs` — the app's self-update: the launch gate (dev build + Settings toggle, the only update egress path), signature verification, the download-host constraint, and the pending-update slot. Also the release runbook (tag → CI → signed draft), where the signing key lives + how to rotate it, and an explicit **proven vs not proven** section — the end-to-end install/relaunch loop has never been executed. Read it before touching `.github/workflows/build.yml`'s `release` job |
 
 ## Load-bearing invariants (do NOT break these)
 

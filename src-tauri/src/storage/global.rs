@@ -1605,6 +1605,59 @@ impl GlobalDb {
         self.set_app_setting(Self::SKILL_REFLECT_KEY, if enabled { "1" } else { "0" })
     }
 
+    /// The app_settings key for the launch-time update check (round-2 item 3).
+    /// Global (the app updates as a whole, not per profile), and stored HERE
+    /// rather than in the frontend's localStorage `settings` store because the
+    /// reader is Rust: the launch check runs in `lib.rs::run`'s setup, long
+    /// before — and independently of — any webview.
+    const UPDATE_CHECK_KEY: &'static str = "update_check_enabled";
+
+    /// Should the app check GitHub for a newer version when it launches?
+    ///
+    /// Three cases, and the third is the load-bearing one:
+    ///
+    /// * **A row that reads exactly `"0"`** — off. Anything else stored counts
+    ///   as on, so a garbled value can never silently disable the check while
+    ///   the Settings toggle still shows it as on.
+    /// * **No row at all** — on. This is the fresh-install default, and it is
+    ///   the inverse of `skill_reflect_enabled`'s opt-in default because Lukas
+    ///   asked for the check to be on: the egress it makes is a single
+    ///   anonymous version request, not user data.
+    /// * **The read FAILED** (a locked database, a missing table, a corrupt
+    ///   file) — **off**. This is the only correct answer. The alternative,
+    ///   swallowing the error into the absent-row default, makes a failed read
+    ///   indistinguishable from "the user never chose", and this method runs
+    ///   during startup, which is exactly when a transient `SQLITE_BUSY` under
+    ///   lock contention is plausible. Answering "on" there would send a
+    ///   request on behalf of a user who had turned it off. For a privacy
+    ///   toggle, failing safe means NOT sending: an unreadable setting is not
+    ///   consent, so no error path here can authorize egress.
+    ///
+    /// The launch check and the About pane call this same function, so the two
+    /// can never disagree — including in the error case, where the toggle
+    /// renders off because that is genuinely what the app will do.
+    pub fn update_check_enabled(&self) -> bool {
+        match self.get_app_setting(Self::UPDATE_CHECK_KEY) {
+            Ok(Some(v)) => v != "0",
+            Ok(None) => true,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "couldn't read the update-check setting; treating it as OFF (no request \
+                     will be made) — an unreadable setting is not consent"
+                );
+                false
+            }
+        }
+    }
+
+    /// Turn the launch-time update check on/off. When off, the app performs no
+    /// update-related network request at launch at all — see
+    /// `updater::run_launch_check`, which is where that is enforced and tested.
+    pub fn set_update_check_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_app_setting(Self::UPDATE_CHECK_KEY, if enabled { "1" } else { "0" })
+    }
+
     /// The app_settings key for the active-profile choice — the profile the UI
     /// was last switched to. Global (app-wide selection state, not per-profile),
     /// read on boot so the choice survives a restart.

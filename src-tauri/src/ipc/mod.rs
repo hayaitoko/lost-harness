@@ -2410,6 +2410,104 @@ pub fn set_skill_reflect_enabled(
         .map_err(|e| e.to_string())
 }
 
+// ── App self-update (round-2 item 3) ────────────────────────────────────────
+//
+// Four commands, and between them they are the app's whole update surface.
+// The webview is NOT granted the `updater:default` ACL permission, so
+// `plugin:updater|check` cannot be invoked from Svelte — every path to the
+// network goes through `updater::check_now`, which logs the egress. See the
+// module docs in `updater/mod.rs` for why it is wired this way.
+
+/// Is the launch-time update check on? Global; default **true**.
+#[tauri::command]
+pub fn get_update_check_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.storage.global().update_check_enabled())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateCheckArgs {
+    pub enabled: bool,
+}
+
+/// Turn the launch-time update check on/off. When off, launching the app makes
+/// no update-related network request at all — not a cached one, not a
+/// conditional one, none. The manual "Check for updates" button is unaffected:
+/// clicking it is its own explicit consent.
+#[tauri::command]
+pub fn set_update_check_enabled(
+    state: State<'_, AppState>,
+    args: UpdateCheckArgs,
+) -> Result<(), String> {
+    state
+        .storage
+        .global()
+        .set_update_check_enabled(args.enabled)
+        .map_err(|e| e.to_string())
+}
+
+/// The Settings → About "Check for updates" button. Always allowed — the click
+/// IS the consent — and deliberately not gated on the launch toggle.
+#[tauri::command]
+pub async fn check_for_update(app: AppHandle) -> Result<crate::updater::ManualCheckResult, String> {
+    let current_version = tauri::Manager::package_info(&app).version.to_string();
+    match crate::updater::check_now(&app).await? {
+        Some(info) => Ok(crate::updater::ManualCheckResult::Available(info)),
+        None => Ok(crate::updater::ManualCheckResult::UpToDate { current_version }),
+    }
+}
+
+/// Download and stage the update the last check found, then tell the caller it
+/// is ready. **Never called on the app's own initiative** — the frontend calls
+/// this only from the banner's explicit button. Signature verification happens
+/// inside `Update::download`: a payload whose bytes do not match the manifest's
+/// minisign signature under the compiled-in public key is refused there, and
+/// this returns the error rather than installing anything.
+///
+/// Signature verification answers "are these the right bytes?"; it does not
+/// answer "where did they come from?". The download host is therefore checked
+/// again here, immediately before the fetch, against
+/// `updater::is_permitted_download_url`. `check_now` already refused anything
+/// off-host before it staged the offer, so this is the belt to that pair of
+/// braces — the last statement before bytes move, so no future path that stages
+/// an `Update` some other way can skip it.
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    let state = tauri::Manager::try_state::<crate::updater::PendingUpdate>(&app)
+        .ok_or_else(|| "Update state is not initialised.".to_string())?;
+
+    // One install at a time; two would unpack over the same .app bundle.
+    let _guard = state.install_guard().await;
+
+    let pending = state
+        .peek()
+        .ok_or_else(|| "No update is staged — check for updates first.".to_string())?;
+
+    crate::updater::ensure_permitted_download_url(pending.download_url.as_str())?;
+
+    tracing::info!(version = %pending.version, "egress: downloading the signed update bundle");
+    pending
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| {
+            // The offer stays staged on failure — a refused signature should
+            // leave "Try again" meaningful rather than turning into "nothing
+            // is staged".
+            tracing::error!(error = %e, "update install refused or failed");
+            e.to_string()
+        })?;
+
+    state.clear();
+    tracing::info!("update installed; awaiting the user's relaunch");
+    Ok(())
+}
+
+// Relaunching after an install is NOT one of these commands: it is
+// `tauri-plugin-process`'s `restart`, invoked from the frontend and gated by
+// the `process:allow-restart` entry in `capabilities/default.json`. Restarting
+// is not egress and has no state to guard, so the standard plugin path is the
+// right one — and unlike the updater's commands, that ACL grant is real: the
+// relaunch button is the thing that uses it.
+
 /// Roll up a profile's model-call cost ledger for the Settings "Usage" view.
 #[tauri::command]
 pub fn get_usage_summary(

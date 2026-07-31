@@ -83,9 +83,14 @@
     removeMcpServer,
     type McpServer,
     getAppVersion,
+    getUpdateCheckEnabled,
+    setUpdateCheckEnabled,
+    checkForUpdate,
+    describeUpdateCheckError,
   } from "$lib/api/tauri";
+  import { setAvailableUpdate, clearAvailableUpdate } from "$lib/stores/update";
 
-  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "agents" | "mcp" | "usage" | "appearance";
+  type Section = "routing" | "privacy" | "permissions" | "models" | "memory" | "skills" | "agents" | "mcp" | "usage" | "appearance" | "about";
   const SECTIONS: [Section, string][] = [
     ["routing", "Routing"],
     ["privacy", "Privacy guard"],
@@ -97,6 +102,7 @@
     ["mcp", "MCP servers"],
     ["usage", "Usage"],
     ["appearance", "Appearance"],
+    ["about", "About"],
   ];
 
 
@@ -1180,6 +1186,62 @@
       skillReflectEnabled = prev; // revert on failure
     } finally {
       skillReflectSaving = false;
+    }
+  }
+
+  // ── About / self-update (round-2 item 3) ─────────────────────────────────
+  //
+  // The pane owns the toggle and the manual check. It deliberately does NOT
+  // own an install button: a found update is handed to the app-level
+  // `UpdateBanner` via the store, so there is exactly one place in the whole
+  // UI that can start a download.
+  let updateCheckEnabled = $state(true);
+  let updateCheckSaving = $state(false);
+  let checkingForUpdate = $state(false);
+  let updateCheckNote = $state<string | null>(null);
+
+  $effect(() => {
+    if (section !== "about") return;
+    getUpdateCheckEnabled()
+      .then((v) => {
+        updateCheckEnabled = v;
+      })
+      .catch(() => {});
+  });
+
+  async function toggleUpdateCheck(next: boolean) {
+    updateCheckSaving = true;
+    const prev = updateCheckEnabled;
+    updateCheckEnabled = next;
+    try {
+      await setUpdateCheckEnabled(next);
+    } catch {
+      updateCheckEnabled = prev; // revert on failure
+    } finally {
+      updateCheckSaving = false;
+    }
+  }
+
+  async function runManualUpdateCheck() {
+    checkingForUpdate = true;
+    updateCheckNote = null;
+    try {
+      const result = await checkForUpdate();
+      if (result.status === "available") {
+        setAvailableUpdate(result);
+        updateCheckNote = `Version ${result.version} is available.`;
+      } else {
+        clearAvailableUpdate();
+        updateCheckNote = "You're on the latest version.";
+      }
+    } catch (err) {
+      // Not every failure here is a network failure — `check_now` also refuses
+      // a manifest whose download URL isn't this project's release asset, and
+      // that must not render as "GitHub was flaky, try again". See
+      // `describeUpdateCheckError`.
+      updateCheckNote = describeUpdateCheckError(err);
+    } finally {
+      checkingForUpdate = false;
     }
   }
 
@@ -2475,6 +2537,58 @@
                 <Toggle checked={motion} onchange={(v) => (motion = v)} />
               {/snippet}
             </SettingRow>
+          {:else if section === "about"}
+            <SettingRow title="Version" desc="The build you're running right now">
+              {#snippet control()}
+                <span class="font-mono text-[12px] tabular-nums text-text-2" data-testid="about-version">
+                  {appVersion || "…"}
+                </span>
+              {/snippet}
+            </SettingRow>
+
+            <SettingRow
+              title="Check for updates when the app opens"
+              desc="Asks github.com which version is newest. GitHub serves that answer by redirecting to its own file host, so it's two requests — github.com, then objects.githubusercontent.com. Neither carries conversations, files or an account, just the question. Nothing downloads or installs until you say so."
+            >
+              {#snippet control()}
+                <Toggle
+                  checked={updateCheckEnabled}
+                  locked={updateCheckSaving}
+                  onchange={toggleUpdateCheck}
+                  label="Check for updates when the app opens"
+                />
+              {/snippet}
+            </SettingRow>
+
+            <SettingRow
+              title="Check now"
+              desc="Asks the same question once, right now, whether or not the setting above is on."
+            >
+              {#snippet control()}
+                <Button
+                  variant="default"
+                  disabled={checkingForUpdate}
+                  onclick={runManualUpdateCheck}
+                >
+                  {checkingForUpdate ? "Checking…" : "Check for updates"}
+                </Button>
+              {/snippet}
+            </SettingRow>
+
+            {#if updateCheckNote}
+              <div class="px-3 py-2 text-[11.5px] text-text-3" data-testid="about-update-note">
+                {updateCheckNote}
+              </div>
+            {/if}
+
+            <div class="mt-3 px-3 text-[11px] leading-[1.6] text-text-3">
+              Updates are signed. The app checks the signature against a key built into
+              this build before it installs anything — a download that doesn't match is
+              discarded, not run. The download itself is refused unless it comes from
+              this project's own GitHub releases, so an update can't send you somewhere
+              else even if the version list is tampered with. Turning the setting off
+              means no update request is made at launch at all.
+            </div>
           {/if}
         </div>
       </div>
