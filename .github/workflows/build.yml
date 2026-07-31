@@ -364,6 +364,90 @@ jobs:
           echo "manifest:"
           jq '.platforms["darwin-aarch64"].signature = "<redacted>"' dist-release/latest.json
 
+      # ── The gate that decides whether this release is installable at all ──
+      #
+      # Everything above proves a signature was PRODUCED. It does not prove the
+      # signature verifies against the public key compiled into the app, and
+      # those are different facts: `TAURI_SIGNING_PRIVATE_KEY` is a repository
+      # secret, `plugins.updater.pubkey` is a string in tauri.conf.json, and
+      # nothing keeps them in step. Rotate the key, paste it into the wrong
+      # secret, or update the config without re-signing, and every step above
+      # still passes — while every installed copy of the app REFUSES the
+      # release, silently, forever. That is the worst failure mode this feature
+      # has, because it looks like success from here.
+      #
+      # So verify it, with the same minisign the updater implements, against
+      # the pubkey the app actually ships rather than against the secret that
+      # signed it.
+      #
+      # Formats (both are base64 wrappers, which is why the decode step exists):
+      #   * `plugins.updater.pubkey` is base64 of a minisign `.pub` FILE
+      #     (comment line + key line), not of the raw key bytes.
+      #   * the emitted `.sig` is base64 of a minisign `.sig` FILE
+      #     (untrusted comment, signature, trusted comment, global signature).
+      - name: Signature verifies against the pubkey this build ships
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          asset="Lost-Harness_${version}_aarch64.app.tar.gz"
+
+          brew list minisign >/dev/null 2>&1 || brew install minisign
+          minisign -v
+
+          node -e '
+            const fs = require("fs");
+            const conf = require("./src-tauri/tauri.conf.json");
+            const pubkey = conf.plugins?.updater?.pubkey;
+            if (!pubkey) throw new Error("plugins.updater.pubkey is missing from tauri.conf.json");
+            fs.writeFileSync("verify.pub", Buffer.from(pubkey, "base64"));
+            const sig = fs.readFileSync(process.argv[1], "utf8").trim();
+            fs.writeFileSync("verify.sig", Buffer.from(sig, "base64"));
+          ' "dist-release/${asset}.sig"
+
+          # The key id, not the key material — both halves are public anyway,
+          # and having it in the log is what makes a rotation mismatch legible.
+          echo "shipped pubkey: $(head -1 verify.pub)"
+
+          if ! minisign -V -m "dist-release/${asset}" -p verify.pub -x verify.sig; then
+            echo "::error::the signed artifact does NOT verify against plugins.updater.pubkey in src-tauri/tauri.conf.json"
+            echo "::error::every installed copy of the app would refuse this release. The signing key and the shipped pubkey have diverged — see docs/releasing.md (Rotating the signing key)."
+            exit 1
+          fi
+          echo "verified: ${asset} is signed by the key this build trusts"
+          rm -f verify.pub verify.sig
+
+      # The runtime refuses any download URL that is not an asset of this
+      # repository's releases (`updater::is_permitted_download_url`). The
+      # manifest is composed by the step above, so a bad edit there would ship a
+      # release the app declines to download — with a correct signature and a
+      # correct version. Assert the two agree here, where it is cheap.
+      - name: Manifest download URL is one the app will accept
+        run: |
+          set -euo pipefail
+          url="$(jq -r '.platforms["darwin-aarch64"].url' dist-release/latest.json)"
+          echo "manifest download url: ${url}"
+          expected_prefix="https://github.com/${GITHUB_REPOSITORY}/releases/download/"
+          case "${url}" in
+            "${expected_prefix}"*) ;;
+            *)
+              echo "::error::the manifest points the download at '${url}', which the app refuses; it must start with '${expected_prefix}'"
+              exit 1
+              ;;
+          esac
+          # Mirror of the Rust constant. If the repository is ever renamed, both
+          # this and `updater::RELEASE_DOWNLOAD_PREFIX` have to move together.
+          case "${url}" in
+            https://github.com/hayaitoko/lost-harness/releases/download/*) ;;
+            *)
+              echo "::error::'${url}' does not match updater::RELEASE_DOWNLOAD_PREFIX in src-tauri/src/updater/mod.rs"
+              exit 1
+              ;;
+          esac
+          echo "the shipped app will accept this download URL"
+
       # Created as a DRAFT. Publishing is a human step — the moment a release
       # goes live, every installed copy of the app starts offering it.
       - name: Publish the draft release
