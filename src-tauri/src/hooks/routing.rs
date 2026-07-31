@@ -16,12 +16,16 @@
 //! see the invariant on `enforce_local_routing`.
 //!
 //! "Local" here means `Provider::is_local() && Provider::is_private()`, and
-//! `AgentLoop::find_local_provider` / `LocalModelExtractor::local_provider` no
-//! longer re-implement that test — they call `enforce_local_routing`, so there
-//! is exactly one definition in the tree and it cannot quietly diverge from
-//! what the loop actually calls. `enforce_local_routing`'s own docs name every
-//! call site and the (deliberately arbitrary, deliberately trust-zone-safe)
-//! rule it uses to choose among several local endpoints.
+//! nothing outside this module re-implements that test — `find_local_provider`,
+//! `run_cron`, `LocalModelExtractor::local_provider` and
+//! `LocalModelDrafter::local_provider` all call `enforce_local_routing`, so
+//! there is exactly one definition in the tree and it cannot quietly diverge
+//! from what the loop actually calls. `enforce_local_routing`'s own docs name
+//! every call site and the (deliberately arbitrary, deliberately
+//! trust-zone-safe) rule it uses to choose among several local endpoints. That
+//! list is a claim about the code: `grep -rn 'is_local() && is_private()'` must
+//! only ever find this module, the belt-and-suspenders re-checks in
+//! `memory_flush` / `skill_reflect`, and doc comments.
 
 use crate::hooks::RoutingRequirement;
 use crate::models::Provider;
@@ -93,17 +97,32 @@ impl std::error::Error for LocalRoutingViolation {}
 ///   - `agent::loop_mod::resolve_reroute` / `lazy_start_then_retry` — a tool
 ///     result forced the rest of the turn local, including the retry after the
 ///     bundled sidecar is lazily started.
+///   - `agent::loop_mod::AgentLoop::run_cron` — an unattended SCHEDULED job.
+///     Nobody is watching it, so it is pinned to a local endpoint and a
+///     `Private` binding by construction.
 ///   - `agent::memory_flush::LocalModelExtractor::local_provider` — not a
 ///     user turn at all, but it does send trimmed (possibly private) history to
 ///     a model, so it is held to the same rule.
+///   - `agent::skill_reflect::LocalModelDrafter::local_provider` — likewise:
+///     it hands a WHOLE prior conversation to a model to draft a skill from.
 ///
-/// The first and last of those used to be hand-rolled
+/// All but the second of those used to be hand-rolled
 /// `find(|p| p.is_local() && p.is_private())` loops over `list_providers()`.
-/// Same predicate, same order, same answer — but a third and fourth copy of
-/// "what counts as local", which is how two definitions drift apart and one of
+/// Same predicate, same order, same answer — but one more copy of "what counts
+/// as local" each time, which is how two definitions drift apart and one of
 /// them stops matching what the enforcer would allow. They now call this
 /// function, so the list above is exhaustive by construction rather than by
 /// good intentions.
+///
+/// Keeping that claim true is a maintenance obligation, and the last two
+/// entries are here because it had already gone false: `run_cron` (a live
+/// feature — the scheduler) and the skill drafter both hand-rolled the
+/// predicate and appeared in no list. `models::runner::ensure_running` is
+/// deliberately NOT an entry: it does not *select* among configured providers,
+/// it CREATES the bundled sidecar's own `http://127.0.0.1:<port>` provider —
+/// and every caller either routes the result back through this function
+/// (`lazy_start_then_retry`) or re-derives the zone from the base URL rather
+/// than assuming it (`process_message_inner`'s `local_is_cloud`).
 ///
 /// Handing `Unconstrained` to an enforcer is a caller bug, so it is reported as
 /// one rather than silently satisfied.

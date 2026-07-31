@@ -866,12 +866,22 @@ impl AgentLoop {
         profile: &str,
         target_conv: Option<String>,
     ) -> Result<String> {
-        let local = self
-            .model_manager
-            .list_providers()
-            .into_iter()
-            .find(|p| p.is_local() && p.is_private())
-            .ok_or_else(|| anyhow!("no local model available for an unattended cron job"))?;
+        // Routed through `enforce_local_routing`, not a hand-rolled
+        // `find(|p| p.is_local() && p.is_private())`. Same predicate and same
+        // answer today — but this is a LIVE feature that picks an endpoint the
+        // user never named for a turn they are not watching, which is exactly
+        // what `hooks::routing` is the single definition of. A second copy is
+        // how "what counts as local" drifts, and here that would mean an
+        // unattended job quietly running somewhere the enforcer would refuse.
+        let candidates = self.model_manager.list_providers();
+        let local = enforce_local_routing(
+            &RoutingRequirement::LocalRequired {
+                reason: "unattended cron job: a scheduled run must never egress".to_string(),
+            },
+            &candidates,
+        )
+        .map_err(|_| anyhow!("no local model available for an unattended cron job"))?
+        .clone();
         let client = self
             .model_manager
             .get_client(&local.id)

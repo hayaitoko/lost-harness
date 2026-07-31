@@ -2162,3 +2162,76 @@ fn a_helper_run_with_nothing_to_go_on_reports_no_zone_rather_than_local() {
     assert_eq!(zone_of_run(&[zone_row(None)]), None);
     assert_eq!(zone_of_run(&[zone_row(Some("somewhere-else"))]), None);
 }
+
+// ── Every "pick a local endpoint" path goes through the ONE enforcer ────────
+
+#[tokio::test]
+async fn an_unattended_cron_job_refuses_a_local_tagged_provider_at_a_public_url() {
+    // `run_cron` is a LIVE feature that chooses an endpoint the user never named
+    // for a turn nobody is watching — one of the two places that hand-rolled
+    // `find(|p| p.is_local() && p.is_private())` while appearing in no list on
+    // `enforce_local_routing`. It now calls the enforcer, and this pins the
+    // property that makes the enforcer the right home for it: `kind` is a
+    // user-typed label with no enforcement power, so a row tagged "Local" whose
+    // base URL is public can never satisfy a local-only requirement. A
+    // scheduled job that egressed to `api.openai.com` because someone typed
+    // "Local" in a form is exactly the failure this forbids.
+    let mislabelled = Provider::new(
+        "mislabelled",
+        "Definitely My Laptop",
+        "https://api.openai.com/v1",
+        Some("sk-test".to_string()),
+        ProviderKind::Local,
+    );
+    let fake = Arc::new(FakeStreamer::new(
+        mislabelled.clone(),
+        sse_chunks_for("should never be reached"),
+    ));
+    let (agent, _storage, dir) = b7_loop_with(Arc::clone(&fake), &[]);
+
+    let err = agent
+        .run_cron("summarize my day", "personal", None)
+        .await
+        .expect_err("a scheduled job must refuse to run rather than egress");
+    assert!(
+        err.to_string().contains("no local model"),
+        "the refusal must name the missing local endpoint, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_skill_drafter_refuses_a_local_tagged_provider_at_a_public_url() {
+    // The other formerly-hand-rolled site. A reflection hands a WHOLE prior
+    // conversation to a model, so it is held to the same rule: available()
+    // must be false when the only "Local" row points off-box.
+    use crate::agent::skill_reflect::{LocalModelDrafter, SkillDrafter};
+    use crate::models::ModelManager;
+
+    let dir = tempdir();
+    let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+    let mm = Arc::new(ModelManager::new());
+    mm.add_provider(Provider::new(
+        "mislabelled",
+        "Definitely My Laptop",
+        "https://api.openai.com/v1",
+        Some("sk-test".to_string()),
+        ProviderKind::Local,
+    ));
+    let drafter = LocalModelDrafter::new(Arc::clone(&mm), Arc::clone(&storage));
+    assert!(
+        !drafter.available(),
+        "a public base URL tagged Local is not a local endpoint"
+    );
+
+    // …and a genuinely private one is accepted, so this isn't just "always no".
+    mm.add_provider(Provider::new(
+        "box",
+        "My box",
+        "http://10.0.0.5:8000/v1",
+        None,
+        ProviderKind::Local,
+    ));
+    assert!(drafter.available());
+    let _ = std::fs::remove_dir_all(dir);
+}
