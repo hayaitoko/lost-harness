@@ -146,6 +146,31 @@ pub(crate) fn observe_google_call<T>(
     }
 }
 
+/// A step that never reaches Google — building the client, assembling the HTTP
+/// stack. Only its FAILURE is evidence.
+///
+/// [`EmailToolDeps::client`] is a pure constructor: `GmailClient::new` sends
+/// nothing. Handing it to [`observe_google_call`] therefore recorded a
+/// SUCCESSFUL Gmail call with zero proof that anything succeeded — so merely
+/// dispatching `email_search` wiped a real "Gmail is switched off" state and
+/// darkened its banner before a single request left the machine, and the state
+/// only came back when the call that followed actually failed. Only a
+/// completed API call may count as proof.
+///
+/// The failing half still records: a dead grant hit while minting the token
+/// provider is a real verdict, and reaches `observe_failure` the same typed
+/// way. (This is what `productivity.rs`'s client-build path already does.)
+pub(crate) fn observe_local_step<T>(
+    deps: &EmailToolDeps,
+    profile: &str,
+    outcome: anyhow::Result<T>,
+) -> Result<T, String> {
+    outcome.map_err(|err| {
+        deps.google.observe_failure(profile, &err);
+        err.to_string()
+    })
+}
+
 /// Fetch header/snippet previews for `ids`, at most [`SEARCH_CONCURRENCY`] in
 /// flight.
 ///
@@ -247,12 +272,7 @@ impl Tool for EmailSearchTool {
                 .unwrap_or(5);
 
             let client: Arc<dyn GmailApi> = Arc::new(
-                match observe_google_call(
-                    &self.deps,
-                    &ctx.profile,
-                    GoogleApi::Gmail,
-                    self.deps.client(&ctx.profile),
-                ) {
+                match observe_local_step(&self.deps, &ctx.profile, self.deps.client(&ctx.profile)) {
                     Ok(c) => c,
                     Err(msg) => return ToolResult::Err(msg),
                 },
@@ -349,10 +369,9 @@ impl Tool for EmailReadTool {
             let Some(id) = input.args.get("id").and_then(|v| v.as_str()) else {
                 return ToolResult::Err("email_read needs an id (from email_search)".into());
             };
-            let client = match observe_google_call(
+            let client = match observe_local_step(
                 &self.deps,
                 &ctx.profile,
-                GoogleApi::Gmail,
                 self.deps.client(&ctx.profile),
             ) {
                 Ok(c) => c,
@@ -476,10 +495,9 @@ impl Tool for EmailSendTool {
                 Ok(r) => r,
                 Err(e) => return ToolResult::Err(e.to_string()),
             };
-            let client = match observe_google_call(
+            let client = match observe_local_step(
                 &self.deps,
                 &ctx.profile,
-                GoogleApi::Gmail,
                 self.deps.client(&ctx.profile),
             ) {
                 Ok(c) => c,
@@ -878,8 +896,11 @@ mod tests {
         assert_eq!(
             shared.disabled_apis("work"),
             Some(crate::email::connection_state::GoogleApiDisabled {
-                console_url: Some(CONSOLE.to_string()),
-                apis: vec!["Google Calendar".to_string()],
+                apis: vec![crate::email::connection_state::DisabledApi {
+                    id: "calendar",
+                    label: "Google Calendar",
+                    console_url: Some(CONSOLE.to_string()),
+                }],
             })
         );
 
@@ -887,5 +908,67 @@ mod tests {
         // the agent path exactly as on the screen path.
         let _ = observe_google_call(&deps, "work", GoogleApi::Calendar, Ok(()));
         assert_eq!(shared.disabled_apis("work"), None);
+    }
+
+    /// The finding this pins: all three tools handed the CLIENT BUILD to
+    /// `observe_google_call`, and `EmailToolDeps::client` is a pure
+    /// constructor — `GmailClient::new` sends nothing. Its `Ok` was therefore
+    /// recorded as a successful Gmail call, so merely dispatching a tool wiped
+    /// a real "Gmail is switched off" state (and darkened its banner) with no
+    /// evidence whatsoever. Only a completed API call may count as proof.
+    ///
+    /// Driven through the real `run` of each tool: the profile is
+    /// unconfigured, so the client builds fine and the first call that
+    /// actually reaches for a token fails with an UNCLASSIFIED error — which
+    /// records nothing. Anything that changed the state here can only have
+    /// come from the build.
+    #[tokio::test]
+    async fn merely_building_the_client_is_not_proof_that_gmail_is_switched_on() {
+        use crate::email::api_error::google_api_error;
+        const DISABLED: &str = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}"#;
+
+        let ctx = ExecCtx {
+            profile: "personal".into(),
+            ..Default::default()
+        };
+        for (name, args) in [
+            ("email_search", serde_json::json!({})),
+            ("email_read", serde_json::json!({ "id": "m1" })),
+            (
+                "email_send",
+                serde_json::json!({ "to": "a@b.co", "subject": "s", "body": "b" }),
+            ),
+        ] {
+            let shared = fresh_connection_state();
+            shared.observe_failure(
+                "personal",
+                &google_api_error(GoogleApi::Gmail, 403, DISABLED, "snip"),
+            );
+            assert!(
+                shared.disabled_apis("personal").is_some(),
+                "{name}: precondition — Gmail starts out recorded as switched off"
+            );
+
+            let deps = EmailToolDeps::new(
+                Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
+                Arc::new(NoopEndpoint),
+                Arc::clone(&shared),
+            );
+            let input = ToolInput::new(args);
+            let out = match name {
+                "email_search" => EmailSearchTool::new(deps).run(input, &ctx).await,
+                "email_read" => EmailReadTool::new(deps).run(input, &ctx).await,
+                _ => EmailSendTool::new(deps).run(input, &ctx).await,
+            };
+            assert!(
+                matches!(out, ToolResult::Err(_)),
+                "{name}: nothing could reach Gmail, so the tool must report a failure — got {out:?}"
+            );
+            assert!(
+                shared.disabled_apis("personal").is_some(),
+                "{name}: a dispatch that never reached Google cleared the disabled-API state"
+            );
+        }
     }
 }

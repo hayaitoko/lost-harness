@@ -3235,10 +3235,12 @@ pub struct GmailSetupStatus {
     /// The stored authorization died (expired/revoked) — show "Reconnect".
     pub needs_reconnect: bool,
     /// A Google API this profile needs is switched off in the user's own
-    /// Cloud project. `None` means "not in that state"; `Some` names the APIs
-    /// and carries the console link when Google gave one. A SEPARATE field
-    /// from `needs_reconnect`, and it must drive a separate banner with NO
-    /// Reconnect button — see `email::connection_state`.
+    /// Cloud project. `None` means "not in that state"; `Some` lists them one
+    /// by one, each with its own wire id and the console link Google gave for
+    /// it — the screen rendering the banner can only re-test some of them, so
+    /// it needs to tell them apart. A SEPARATE field from `needs_reconnect`,
+    /// and it must drive a separate banner with NO Reconnect button — see
+    /// `email::connection_state`.
     pub api_not_enabled: Option<crate::email::connection_state::GoogleApiDisabled>,
 }
 
@@ -4627,8 +4629,11 @@ mod tests {
         assert_eq!(
             state.email.google.disabled_apis("personal"),
             Some(crate::email::connection_state::GoogleApiDisabled {
-                console_url: Some(CONSOLE.to_string()),
-                apis: vec!["Google Tasks".to_string()],
+                apis: vec![crate::email::connection_state::DisabledApi {
+                    id: "tasks",
+                    label: "Google Tasks",
+                    console_url: Some(CONSOLE.to_string()),
+                }],
             })
         );
         // Per-profile, like every other part of the connection state.
@@ -4695,9 +4700,14 @@ mod tests {
             .email
             .google
             .clear_disabled("personal", &[GoogleApi::Gmail]);
+        let still_off = state
+            .email
+            .google
+            .disabled_apis("personal")
+            .map(|d| d.apis.iter().map(|api| api.label).collect::<Vec<_>>());
         assert_eq!(
-            state.email.google.disabled_apis("personal").map(|d| d.apis),
-            Some(vec!["Google Tasks".to_string()]),
+            still_off,
+            Some(vec!["Google Tasks"]),
             "Email's re-check must not blank a Tasks banner it will never retry"
         );
 

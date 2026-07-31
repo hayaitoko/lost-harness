@@ -1032,8 +1032,13 @@ fn google_clear_api_not_enabled_round_trips_through_real_ipc() {
     .expect("valid JSON");
     assert_eq!(
         status["api_not_enabled"]["apis"],
-        json!(["Gmail", "Google Tasks"]),
-        "the wire contract names the APIs the banner reports"
+        json!([
+            { "id": "gmail", "label": "Gmail", "console_url": null },
+            { "id": "tasks", "label": "Google Tasks", "console_url": null },
+        ]),
+        "the wire contract names the APIs the banner reports, ONE BY ONE: the \
+         screen rendering it can only re-test some of them, and matches on the \
+         wire id"
     );
     assert_eq!(
         status["needs_reconnect"], false,
@@ -1057,7 +1062,10 @@ fn google_clear_api_not_enabled_round_trips_through_real_ipc() {
     .expect("gmail_setup_status must dispatch")
     .deserialize()
     .expect("valid JSON");
-    assert_eq!(status["api_not_enabled"]["apis"], json!(["Google Tasks"]));
+    assert_eq!(
+        status["api_not_enabled"]["apis"],
+        json!([{ "id": "tasks", "label": "Google Tasks", "console_url": null }])
+    );
 
     // An unknown API name is a DOMAIN error naming what it expected — not a
     // silent no-op that reports success while the banner stays lit.
@@ -1079,7 +1087,7 @@ fn google_clear_api_not_enabled_round_trips_through_real_ipc() {
     .expect("valid JSON");
     assert_eq!(
         status["api_not_enabled"]["apis"],
-        json!(["Google Tasks"]),
+        json!([{ "id": "tasks", "label": "Google Tasks", "console_url": null }]),
         "a refused clear must not have cleared anything"
     );
 

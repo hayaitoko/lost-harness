@@ -29,7 +29,7 @@
     type GoogleApiId,
     type GoogleTaskInfo,
   } from "$lib/api/tauri";
-  import { GoogleConnection } from "$lib/design/googleConnection.svelte";
+  import { GoogleConnection, disabledFor } from "$lib/design/googleConnection.svelte";
 
   let events = $state<CalendarEventInfo[]>([]);
   let tasks = $state<GoogleTaskInfo[]>([]);
@@ -49,8 +49,10 @@
   const recheckingApi = $derived(conn.checking);
   let statusTick = $state(0);
 
-  /// The APIs this screen can actually re-test. Its re-check must not clear a
-  /// Gmail state that only the Email screen will ever retry.
+  /// The APIs this screen can actually re-test — which is also exactly what it
+  /// may put in a banner. Its re-check must not clear a Gmail state that only
+  /// the Email screen will ever retry, and its banner must not name one either:
+  /// the button under it would clear and retry Calendar and Tasks.
   const PLANNER_APIS: GoogleApiId[] = ["calendar", "tasks"];
 
   $effect(() => {
@@ -65,8 +67,13 @@
   const showReconnectBanner = $derived(
     status != null && status.connected && status.needs_reconnect,
   );
+  // Scoped to PLANNER_APIS: the state is per-profile, so it can also hold a
+  // Gmail entry the Email screen (or an agent tool) recorded. Rendering that
+  // here produced a banner this screen's own button could not act on — it
+  // announced "Gmail isn't switched on" above a re-check that clears and
+  // retries Calendar and Tasks.
   const apiDisabled = $derived(
-    status != null && status.connected ? status.api_not_enabled : null,
+    status != null && status.connected ? disabledFor(status, PLANNER_APIS) : null,
   );
 
   /// Forget the disabled-API state for THIS screen's APIs, then reload. If one

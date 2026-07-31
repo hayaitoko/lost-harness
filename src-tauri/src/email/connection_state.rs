@@ -36,6 +36,18 @@
 //! can only re-test the APIs it uses — so it clears just those
 //! ([`GoogleConnectionState::clear_disabled`]) and lets the retry re-record
 //! anything still off. Nothing is ever assumed fixed.
+//!
+//! ## …and it reaches the UI per-API too
+//!
+//! [`disabled_apis`](GoogleConnectionState::disabled_apis) hands back one
+//! [`DisabledApi`] per API, each carrying its OWN wire id, label and console
+//! link. It used to flatten them into a single label list plus "the first
+//! console link in API order", which broke the same per-screen truthfulness at
+//! the last step: the state is profile-wide, but the banner's button is not —
+//! Email can only re-test Gmail, Planner only Calendar and Tasks. A screen
+//! rendering the flattened value could name an API its own button would never
+//! clear, and, with two APIs off, offer the link Google gave for the OTHER
+//! one. Per-API entries let each screen render exactly the ones it can fix.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -44,20 +56,32 @@ use parking_lot::Mutex;
 use super::api_error::{google_api_error_of, GoogleApi, GoogleApiFailure};
 use super::token_provider::NeedsReconnect;
 
+/// One API known to be switched off, as the UI renders it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DisabledApi {
+    /// The stable wire id ([`GoogleApi::wire`]). A screen names the APIs it is
+    /// able to re-test, and matches on THIS rather than on the human label —
+    /// so the label stays free to be copy.
+    pub id: &'static str,
+    /// What a human calls it ([`GoogleApi::label`]). The banner names it: "a
+    /// Google API" when the app knows exactly which one is a worse answer than
+    /// the one it knows.
+    pub label: &'static str,
+    /// Google's own console activation link FOR THIS API, validated (https +
+    /// one of Google's API-activation console hosts) at classification time
+    /// and carried as data ever since. `None` when this API's response carried
+    /// no usable link — the UI then points at the console in prose rather than
+    /// inventing a URL, or at another API's link, which would be worse.
+    pub console_url: Option<String>,
+}
+
 /// Per-profile summary of "a Google API this profile needs is switched off in
-/// the user's Cloud project", as the UI renders it.
+/// the user's Cloud project", as the UI renders it. Never empty: no API off is
+/// `None`, not a `GoogleApiDisabled` with an empty list.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GoogleApiDisabled {
-    /// Google's own console activation link, validated (https + one of
-    /// Google's API-activation console hosts) at classification time and
-    /// carried as data ever since. `None` when no response carried a usable
-    /// link — the UI then points at the console in prose rather than
-    /// inventing a URL.
-    pub console_url: Option<String>,
-    /// Which APIs are known to be off, by label ("Gmail", "Google Calendar",
-    /// "Google Tasks"). The banner names them: "a Google API" when the app
-    /// knows exactly which one is a worse answer than the one it knows.
-    pub apis: Vec<String>,
+    /// The APIs known to be off, in a stable order.
+    pub apis: Vec<DisabledApi>,
 }
 
 /// The shared connection state. One instance per app, held behind an `Arc` by
@@ -140,6 +164,10 @@ impl GoogleConnectionState {
 
     /// What the UI should render for this profile, or `None` when no API is
     /// known to be off.
+    ///
+    /// One entry per API, each with its own link: the caller is a screen that
+    /// can only re-test some of them, and flattening the entries would hand it
+    /// a banner it cannot honour.
     pub fn disabled_apis(&self, profile: &str) -> Option<GoogleApiDisabled> {
         let disabled = self.disabled.lock();
         let apis = disabled.get(profile)?;
@@ -147,11 +175,14 @@ impl GoogleConnectionState {
             return None;
         }
         Some(GoogleApiDisabled {
-            // The first link Google gave, in API order. One button can only
-            // point at one page; the copy points at the API library when
-            // nothing carried a link.
-            console_url: apis.values().flatten().next().cloned(),
-            apis: apis.keys().map(|api| api.label().to_string()).collect(),
+            apis: apis
+                .iter()
+                .map(|(api, console_url)| DisabledApi {
+                    id: api.wire(),
+                    label: api.label(),
+                    console_url: console_url.clone(),
+                })
+                .collect(),
         })
     }
 
@@ -210,6 +241,22 @@ mod tests {
     const SCOPE_BODY: &str = r#"{"error":{"errors":[{"reason":"insufficientPermissions"}],
         "code":403}}"#;
 
+    /// The entry the UI should get for one switched-off API.
+    fn off(api: GoogleApi, console_url: Option<&str>) -> DisabledApi {
+        DisabledApi {
+            id: api.wire(),
+            label: api.label(),
+            console_url: console_url.map(String::from),
+        }
+    }
+
+    /// Just the labels a banner would name, in order.
+    fn labels(state: &GoogleConnectionState, profile: &str) -> Option<Vec<&'static str>> {
+        state
+            .disabled_apis(profile)
+            .map(|d| d.apis.iter().map(|api| api.label).collect())
+    }
+
     /// The banner-flip contract: two 403s, two states, and neither may stand
     /// in for the other. If a disabled-API 403 flipped `needs_reconnect`, the
     /// user would be offered Reconnect, complete the whole OAuth dance, fail
@@ -241,12 +288,45 @@ mod tests {
         assert_eq!(
             state.disabled_apis("personal"),
             Some(GoogleApiDisabled {
-                console_url: Some(CONSOLE.to_string()),
-                apis: vec!["Google Tasks".to_string()],
+                apis: vec![off(GoogleApi::Tasks, Some(CONSOLE))],
             })
         );
         // Per-profile, like every other part of the connection state.
         assert_eq!(state.disabled_apis("work"), None);
+    }
+
+    /// Each API keeps its OWN console link and its own wire id.
+    ///
+    /// The finding this pins: the state used to flatten into one label list
+    /// plus "the first link in API order". The banner is rendered by a screen
+    /// that can only re-test SOME of these — Email just Gmail, Planner just
+    /// Calendar and Tasks — so a flattened value let Email name Gmail while
+    /// linking to the page Google gave for Calendar, and left either screen
+    /// naming an API its own "check again" button would never clear.
+    #[test]
+    fn every_disabled_api_carries_its_own_id_and_its_own_link() {
+        const CAL: &str =
+            "https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=42";
+        let state = GoogleConnectionState::new();
+        state.observe_failure(
+            "personal",
+            &google_api_error(GoogleApi::Calendar, 403, &disabled_body(Some(CAL)), "snip"),
+        );
+        state.observe_failure(
+            "personal",
+            &google_api_error(GoogleApi::Gmail, 403, &disabled_body(None), "snip"),
+        );
+
+        assert_eq!(
+            state.disabled_apis("personal"),
+            Some(GoogleApiDisabled {
+                apis: vec![
+                    off(GoogleApi::Gmail, None),
+                    off(GoogleApi::Calendar, Some(CAL)),
+                ],
+            }),
+            "Gmail carried no link of its own, and must not borrow Calendar's"
+        );
     }
 
     /// An unclassified failure lights nothing. The alternative — promoting an
@@ -302,30 +382,21 @@ mod tests {
             );
         }
         assert_eq!(
-            state.disabled_apis("personal").map(|d| d.apis),
-            Some(vec![
-                "Google Calendar".to_string(),
-                "Google Tasks".to_string()
-            ])
+            labels(&state, "personal"),
+            Some(vec!["Google Calendar", "Google Tasks"])
         );
 
         // Gmail was never off; a Gmail success must not clear anything.
         state.observe_success("personal", GoogleApi::Gmail);
         assert_eq!(
-            state.disabled_apis("personal").map(|d| d.apis),
-            Some(vec![
-                "Google Calendar".to_string(),
-                "Google Tasks".to_string()
-            ])
+            labels(&state, "personal"),
+            Some(vec!["Google Calendar", "Google Tasks"])
         );
 
         // The user switches Calendar on; the next Calendar call works. The
         // banner must stop claiming Calendar — and must keep claiming Tasks.
         state.observe_success("personal", GoogleApi::Calendar);
-        assert_eq!(
-            state.disabled_apis("personal").map(|d| d.apis),
-            Some(vec!["Google Tasks".to_string()])
-        );
+        assert_eq!(labels(&state, "personal"), Some(vec!["Google Tasks"]));
 
         // …and once Tasks works too, the banner goes out on its own, with no
         // manual re-check needed.
@@ -337,10 +408,7 @@ mod tests {
             &google_api_error(GoogleApi::Tasks, 403, &disabled_body(None), "snip"),
         );
         state.observe_success("work", GoogleApi::Tasks);
-        assert_eq!(
-            state.disabled_apis("personal").map(|d| d.apis),
-            Some(vec!["Google Tasks".to_string()])
-        );
+        assert_eq!(labels(&state, "personal"), Some(vec!["Google Tasks"]));
     }
 
     /// The explicit re-check clears only what the asking screen can re-test,
@@ -355,10 +423,7 @@ mod tests {
             );
         }
         state.clear_disabled("personal", &[GoogleApi::Gmail]);
-        assert_eq!(
-            state.disabled_apis("personal").map(|d| d.apis),
-            Some(vec!["Google Tasks".to_string()])
-        );
+        assert_eq!(labels(&state, "personal"), Some(vec!["Google Tasks"]));
         // No API named = the whole profile (the bare "forget it all" call).
         state.clear_disabled("personal", &[]);
         assert_eq!(state.disabled_apis("personal"), None);
@@ -393,8 +458,7 @@ mod tests {
         assert_eq!(
             state.disabled_apis("personal"),
             Some(GoogleApiDisabled {
-                console_url: None,
-                apis: vec!["Google Calendar".to_string()],
+                apis: vec![off(GoogleApi::Calendar, None)],
             })
         );
     }

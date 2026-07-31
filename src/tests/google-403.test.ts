@@ -26,9 +26,10 @@ import Email from "$lib/design/screens/Email.svelte";
 import Planner from "$lib/design/screens/Planner.svelte";
 import {
   connectionStateChanged,
+  disabledFor,
   shouldAdopt,
 } from "$lib/design/googleConnection.svelte";
-import type { GmailSetupStatus } from "$lib/api/tauri";
+import type { GmailSetupStatus, GoogleApiDisabled, GoogleApiId } from "$lib/api/tauri";
 
 const CONSOLE_URL =
   "https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=42";
@@ -41,10 +42,19 @@ async function settle(): Promise<void> {
   await tick();
 }
 
-/** The disabled-API state as the backend sends it: the link plus the APIs it
- *  actually recorded as off. */
-function disabledState(apis: string[] = ["Google Tasks"], console_url: string | null = CONSOLE_URL) {
-  return { console_url, apis };
+const LABEL: Record<GoogleApiId, string> = {
+  gmail: "Gmail",
+  calendar: "Google Calendar",
+  tasks: "Google Tasks",
+};
+
+/** The disabled-API state as the backend sends it: ONE ENTRY PER API, each
+ *  with its own wire id, its own label and its own console link. */
+function disabledState(
+  apis: GoogleApiId[] = ["tasks"],
+  console_url: string | null = CONSOLE_URL,
+): GoogleApiDisabled {
+  return { apis: apis.map((id) => ({ id, label: LABEL[id], console_url })) };
 }
 
 // ── the banner component on its own ─────────────────────────────────────────
@@ -177,12 +187,23 @@ describe("Email + Planner — the two connection banners", () => {
     (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
   });
 
-  for (const [name, Screen] of [
-    ["Email", Email],
-    ["Planner", Planner],
-  ] as const) {
+  /// Each screen with the API it OWNS — the one its "check again" button
+  /// actually clears and re-tests — and the one that belongs to the other
+  /// screen entirely.
+  const SCREENS = [
+    { name: "Email", Screen: Email, own: "gmail", label: "Gmail", theirs: "calendar" },
+    {
+      name: "Planner",
+      Screen: Planner,
+      own: "tasks",
+      label: "Google Tasks",
+      theirs: "gmail",
+    },
+  ] as const;
+
+  for (const { name, Screen, own, theirs } of SCREENS) {
     it(`${name}: a disabled API shows the console banner and NO reconnect`, async () => {
-      routeInvoke(status({ api_not_enabled: disabledState() }));
+      routeInvoke(status({ api_not_enabled: disabledState([own]) }));
       const { getByTestId, queryByText } = render(Screen);
 
       const banner = await waitFor(() => getByTestId("google-api-disabled-banner"));
@@ -204,6 +225,25 @@ describe("Email + Planner — the two connection banners", () => {
           getByText(name === "Email" ? "Reconnect" : "Reconnect in Email"),
         ).toBeInTheDocument(),
       );
+      expect(queryByTestId("google-api-disabled-banner")).toBeNull();
+    });
+
+    /// The banner is drawn from a PROFILE-wide state, but the button under it
+    /// is screen-scoped: it clears and re-tests only this screen's APIs. A
+    /// banner naming an API this screen never calls is a button that cannot
+    /// fix what it names — Email announcing "Google Calendar isn't switched
+    /// on" above a re-check that clears and retries Gmail.
+    it(`${name}: renders no banner for an API only the other screen can re-test`, async () => {
+      routeInvoke(status({ api_not_enabled: disabledState([theirs]) }));
+      const { queryByTestId } = render(Screen);
+
+      await waitFor(() =>
+        expect(tauri.invoke).toHaveBeenCalledWith(
+          "gmail_setup_status",
+          expect.anything(),
+        ),
+      );
+      await settle();
       expect(queryByTestId("google-api-disabled-banner")).toBeNull();
     });
 
@@ -327,10 +367,10 @@ describe("Email + Planner — the two connection banners", () => {
   /// Tasks would blank a banner nothing on that screen will ever retry, and
   /// the user would be told the problem was gone.
   it.each([
-    ["Email", Email, ["gmail"]],
-    ["Planner", Planner, ["calendar", "tasks"]],
-  ] as const)("%s: the re-check clears only the APIs it can re-test", async (_name, Screen, apis) => {
-    routeInvoke(status({ api_not_enabled: disabledState() }));
+    ["Email", Email, ["gmail"], "gmail"],
+    ["Planner", Planner, ["calendar", "tasks"], "tasks"],
+  ] as const)("%s: the re-check clears only the APIs it can re-test", async (_name, Screen, apis, own) => {
+    routeInvoke(status({ api_not_enabled: disabledState([own]) }));
     const { getByText } = render(Screen);
     await waitFor(() => getByText(/I've enabled it/));
 
@@ -339,6 +379,43 @@ describe("Email + Planner — the two connection banners", () => {
       expect(tauri.invoke).toHaveBeenCalledWith("google_clear_api_not_enabled", {
         args: { profile: expect.any(String), apis },
       }),
+    );
+  });
+
+  /// Two APIs off at once, one per screen. Each screen must name ITS OWN and
+  /// link where Google pointed FOR THAT ONE. The flattened state this replaces
+  /// carried a single label list plus "the first link in API order", so Email
+  /// would name Gmail while linking to the page Google gave for Calendar.
+  it("with two APIs off, each screen names its own and links to its own page", async () => {
+    const GMAIL_URL =
+      "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=42";
+    const both: GoogleApiDisabled = {
+      apis: [
+        { id: "gmail", label: "Gmail", console_url: GMAIL_URL },
+        { id: "calendar", label: "Google Calendar", console_url: CONSOLE_URL },
+      ],
+    };
+    routeInvoke(status({ api_not_enabled: both }));
+
+    const email = render(Email);
+    const emailBanner = await waitFor(() =>
+      email.getByTestId("google-api-disabled-banner"),
+    );
+    expect(emailBanner.textContent).toMatch(/Gmail isn't switched on/);
+    expect(emailBanner.textContent).not.toMatch(/Calendar/);
+    expect(email.getByTestId("google-api-console-link").getAttribute("href")).toBe(
+      GMAIL_URL,
+    );
+    cleanup();
+
+    const planner = render(Planner);
+    const plannerBanner = await waitFor(() =>
+      planner.getByTestId("google-api-disabled-banner"),
+    );
+    expect(plannerBanner.textContent).toMatch(/Google Calendar isn't switched on/);
+    expect(plannerBanner.textContent).not.toMatch(/Gmail/);
+    expect(planner.getByTestId("google-api-console-link").getAttribute("href")).toBe(
+      CONSOLE_URL,
     );
   });
 
@@ -383,6 +460,35 @@ describe("the shared connection-state decision", () => {
     );
   });
 
+  /// A screen may only render what its own "check again" button can act on.
+  it("hands a screen only the entries it can re-test, with THAT API's link", () => {
+    const twoOff: GmailSetupStatus = {
+      ...base,
+      api_not_enabled: {
+        apis: [
+          { id: "gmail", label: "Gmail", console_url: null },
+          { id: "calendar", label: "Google Calendar", console_url: CONSOLE_URL },
+        ],
+      },
+    };
+
+    // Gmail carried no link of its own, and must not borrow Calendar's — the
+    // banner then points at the API library in prose instead.
+    expect(disabledFor(twoOff, ["gmail"])).toEqual({
+      console_url: null,
+      apis: ["Gmail"],
+    });
+    expect(disabledFor(twoOff, ["calendar", "tasks"])).toEqual({
+      console_url: CONSOLE_URL,
+      apis: ["Google Calendar"],
+    });
+    // Nothing of this screen's is off → no banner at all, rather than one
+    // whose button cannot fix what it names.
+    expect(disabledFor(twoOff, ["tasks"])).toBeNull();
+    expect(disabledFor(base, ["gmail"])).toBeNull();
+    expect(disabledFor(null, ["gmail"])).toBeNull();
+  });
+
   it("notices each state a banner depends on", () => {
     expect(connectionStateChanged({ ...base, needs_reconnect: true }, base)).toBe(true);
     expect(
@@ -392,14 +498,14 @@ describe("the shared connection-state decision", () => {
     // rendered.
     expect(
       connectionStateChanged(
-        { ...base, api_not_enabled: disabledState(["Gmail"]) },
-        { ...base, api_not_enabled: disabledState(["Google Tasks"]) },
+        { ...base, api_not_enabled: disabledState(["gmail"]) },
+        { ...base, api_not_enabled: disabledState(["tasks"]) },
       ),
     ).toBe(true);
     expect(
       connectionStateChanged(
-        { ...base, api_not_enabled: disabledState(["Gmail"], null) },
-        { ...base, api_not_enabled: disabledState(["Gmail"]) },
+        { ...base, api_not_enabled: disabledState(["gmail"], null) },
+        { ...base, api_not_enabled: disabledState(["gmail"]) },
       ),
     ).toBe(true);
   });

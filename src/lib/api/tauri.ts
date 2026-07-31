@@ -1491,6 +1491,24 @@ export async function setMemorySettings(
  *  only the Planner will ever retry. Mirrors `GoogleApi::wire`. */
 export type GoogleApiId = "gmail" | "calendar" | "tasks";
 
+/** One Google API known to be switched off. Mirrors `DisabledApi` in
+ *  `email/connection_state.rs`. */
+export interface DisabledApi {
+  /** The backend wire id. A screen matches on THIS to decide whether the entry
+   *  is one it can re-test, so the label stays free to be copy. */
+  id: GoogleApiId;
+  /** What a human calls it ("Gmail", "Google Calendar", "Google Tasks"). The
+   *  backend knows exactly which API answered SERVICE_DISABLED, so the banner
+   *  names it instead of saying "a Google API". */
+  label: string;
+  /** Google's own console activation link FOR THIS API, validated backend-side
+   *  (https + one of Google's API-activation console hosts) before it is ever
+   *  surfaced. `null` when this API's response carried no usable link — the UI
+   *  then points at the console in prose rather than inventing a URL, or
+   *  handing out another API's link. */
+  console_url: string | null;
+}
+
 /** A Google API this profile needs is switched OFF in the user's own Google
  *  Cloud project. Mirrors `GoogleApiDisabled` in `email/connection_state.rs`.
  *
@@ -1500,16 +1518,13 @@ export type GoogleApiId = "gmail" | "calendar" | "tasks";
  *  offer the same button again. This state gets its own banner, with a link
  *  to the console instead of a Reconnect button. */
 export interface GoogleApiDisabled {
-  /** Google's own console activation link, validated backend-side (https +
-   *  one of Google's API-activation console hosts) before it is ever
-   *  surfaced. `null` when no response carried a usable link — the UI then
-   *  points at the console in prose rather than inventing a URL. */
-  console_url: string | null;
-  /** Which APIs are known to be off, by label ("Gmail", "Google Calendar",
-   *  "Google Tasks"). The backend knows exactly which ones answered with
-   *  SERVICE_DISABLED, so the banner names them instead of saying "a Google
-   *  API". Cleared per API as calls to them start working. */
-  apis: string[];
+  /** The APIs known to be off, one entry each. Per-API rather than flattened
+   *  because the state is profile-wide but the banner's "check again" button
+   *  is not: Email can only re-test Gmail, Planner only Calendar and Tasks.
+   *  Each screen renders the entries it can actually fix — see `disabledFor`
+   *  in `$lib/design/googleConnection.svelte`. Never empty (no API off is
+   *  `api_not_enabled: null`). Cleared per API as calls start working. */
+  apis: DisabledApi[];
 }
 
 /** The Gmail setup/connection state for one profile. Mirrors `GmailSetupStatus`
