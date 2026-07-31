@@ -170,6 +170,7 @@ fn test_app() -> App<MockRuntime> {
             ipc::gmail_begin_connect,
             ipc::gmail_finish_connect,
             ipc::gmail_disconnect,
+            ipc::google_clear_api_not_enabled,
             ipc::list_email,
             ipc::read_email,
             ipc::send_email,
@@ -993,6 +994,126 @@ fn gmail_flows_fail_closed_with_setup_pointing_errors() {
     .expect("disconnect must be idempotent");
 }
 
+/// `google_clear_api_not_enabled` — the banner's "I've enabled it — check
+/// again" — end to end through real IPC.
+///
+/// It had NO coverage at all: not a dispatch test, not a behaviour test, and
+/// it was missing from the contract-test command list, so nothing would have
+/// noticed if it stopped being registered. It is also the only way out of a
+/// state the app cannot observe being fixed (the user switches the API on in
+/// the Google console), which makes "it dispatches and does the right thing"
+/// load-bearing rather than incidental.
+#[test]
+fn google_clear_api_not_enabled_round_trips_through_real_ipc() {
+    use crate::email::api_error::{google_api_error, GoogleApi};
+
+    let app = test_app();
+    let webview = test_webview(&app);
+    let state = app.state::<AppState>();
+
+    // Two APIs off for this profile, recorded the way a real failure records
+    // them: from the classifier's TYPED verdict.
+    let disabled_body = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+        {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}"#;
+    for api in [GoogleApi::Gmail, GoogleApi::Tasks] {
+        state
+            .email
+            .google
+            .observe_failure("personal", &google_api_error(api, 403, disabled_body, "s"));
+    }
+
+    let status: Value = call(
+        &webview,
+        "gmail_setup_status",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("gmail_setup_status must dispatch")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(
+        status["api_not_enabled"]["apis"],
+        json!(["Gmail", "Google Tasks"]),
+        "the wire contract names the APIs the banner reports"
+    );
+    assert_eq!(
+        status["needs_reconnect"], false,
+        "a disabled API is not a dead grant"
+    );
+
+    // A clear scoped to what the asking screen can re-test leaves the rest
+    // standing — Email's re-check must not blank a Tasks banner that nothing
+    // is about to retry.
+    call(
+        &webview,
+        "google_clear_api_not_enabled",
+        json!({ "args": { "profile": "personal", "apis": ["gmail"] } }),
+    )
+    .expect("a scoped clear must dispatch");
+    let status: Value = call(
+        &webview,
+        "gmail_setup_status",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("gmail_setup_status must dispatch")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(status["api_not_enabled"]["apis"], json!(["Google Tasks"]));
+
+    // An unknown API name is a DOMAIN error naming what it expected — not a
+    // silent no-op that reports success while the banner stays lit.
+    let err = call(
+        &webview,
+        "google_clear_api_not_enabled",
+        json!({ "args": { "profile": "personal", "apis": ["drive"] } }),
+    )
+    .expect_err("an unknown API name must be refused");
+    let msg = err.as_str().unwrap_or_default();
+    assert!(msg.contains("drive") && msg.contains("gmail"), "got: {msg}");
+    let status: Value = call(
+        &webview,
+        "gmail_setup_status",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("gmail_setup_status must dispatch")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(
+        status["api_not_enabled"]["apis"],
+        json!(["Google Tasks"]),
+        "a refused clear must not have cleared anything"
+    );
+
+    // No `apis` at all = the whole profile, and the field is optional on the
+    // wire (an older caller sending just a profile still works).
+    call(
+        &webview,
+        "google_clear_api_not_enabled",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("a bare clear must dispatch");
+    let status: Value = call(
+        &webview,
+        "gmail_setup_status",
+        json!({ "args": { "profile": "personal" } }),
+    )
+    .expect("gmail_setup_status must dispatch")
+    .deserialize()
+    .expect("valid JSON");
+    assert_eq!(status["api_not_enabled"], Value::Null);
+
+    // A bad profile name is refused here like everywhere else.
+    let err = call(
+        &webview,
+        "google_clear_api_not_enabled",
+        json!({ "args": { "profile": "../escape" } }),
+    )
+    .expect_err("an invalid profile must be refused");
+    assert!(
+        !err.as_str().unwrap_or_default().is_empty(),
+        "the refusal must say something"
+    );
+}
+
 // ── classifier settings (PLAN §11) ─────────────────────────────────────
 
 #[test]
@@ -1369,6 +1490,7 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "gmail_begin_connect",
         "gmail_finish_connect",
         "gmail_disconnect",
+        "google_clear_api_not_enabled",
         "list_email",
         "read_email",
         "send_email",
