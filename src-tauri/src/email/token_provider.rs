@@ -10,8 +10,9 @@
 //! Failure honesty: [`RefreshError::NeedsReconnect`] must reach callers
 //! UNMANGLED — the IPC layer maps it to the calm "reconnect your Gmail"
 //! state, and the agent tools convert it into a clear "ask the user to
-//! reconnect in Settings" tool error. Both match on
-//! [`NEEDS_RECONNECT_MARKER`] rather than parsing prose.
+//! reconnect in Settings" tool error. It travels as the typed
+//! [`NeedsReconnect`] error, which is what
+//! [`crate::email::connection_state`] downcasts to; the prose is for humans.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,46 +24,51 @@ use super::oauth::{self, GcpClient, RefreshError, TokenEndpoint};
 use super::BoxFuture;
 use crate::secrets::ProviderSecretStore;
 
-/// Stable substring carried by every NeedsReconnect-derived error message.
-/// The IPC layer and tools match on this instead of prose so the mapping
-/// survives copy edits.
-pub const NEEDS_RECONNECT_MARKER: &str = "[gmail:needs_reconnect]";
-
-/// Stable substring carried by every "this Google API is switched off in your
-/// own Cloud project" error (see [`crate::email::api_error`]).
+/// The stored authorization for a profile is dead (expired or revoked) and
+/// only a reconnect can fix it.
 ///
-/// DELIBERATELY DISTINCT from [`NEEDS_RECONNECT_MARKER`]: a reconnect
-/// re-consents scopes, and no amount of re-consenting can enable an API that
-/// the user's Google Cloud project has turned off. Driving the reconnect
-/// banner from this state would walk the user through the whole OAuth dance,
-/// fail identically, and offer the same button again — an infinite loop with
-/// no exit. The two states get two banners.
-pub const API_NOT_ENABLED_MARKER: &str = "[google:api_not_enabled]";
-
-/// Opening delimiter of the optional console-activation URL that rides beside
-/// [`API_NOT_ENABLED_MARKER`]: `[google:enable_url=https://…]`. The URL is
-/// validated before it is embedded (see
-/// [`crate::email::api_error::sanitize_console_url`]) — in particular it can
-/// never contain the `]` that terminates it here, so extraction is exact.
-const ENABLE_URL_OPEN: &str = "[google:enable_url=";
-const ENABLE_URL_CLOSE: char = ']';
-
-/// Wrap a (already validated) console URL for embedding in an error string.
-pub fn embed_enable_url(url: &str) -> String {
-    format!("{ENABLE_URL_OPEN}{url}{ENABLE_URL_CLOSE}")
+/// A TYPE, not a marker in prose. This used to be a `[gmail:needs_reconnect]`
+/// substring that state-changing code matched on, which meant any text that
+/// reached an error message — including an excerpt of an untrusted HTTP
+/// response body — could assert the state. Callers that add context with
+/// `.context(…)` keep the payload downcastable; callers that rebuild an error
+/// from `format!("{e}")` do not, so they must not (see `gmail::execute`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeedsReconnect {
+    pub profile: String,
 }
 
-/// The console-activation URL an error string carries, if any. Pure; the
-/// inverse of [`embed_enable_url`].
-pub fn extract_enable_url(err: &str) -> Option<String> {
-    let start = err.find(ENABLE_URL_OPEN)? + ENABLE_URL_OPEN.len();
-    let rest = &err[start..];
-    let end = rest.find(ENABLE_URL_CLOSE)?;
-    let url = &rest[..end];
-    if url.is_empty() {
-        return None;
+impl std::fmt::Display for NeedsReconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Gmail needs to be reconnected for the {} profile (the stored authorization expired \
+             or was revoked — this is routine for a Testing-status Google client). Reconnect in \
+             Settings → Email.",
+            self.profile
+        )
     }
-    Some(url.to_string())
+}
+
+impl std::error::Error for NeedsReconnect {}
+
+/// Text shapes that used to BE state decisions. Nothing parses them any more,
+/// but untrusted text (an HTTP body excerpt) is still echoed into error
+/// messages, so it is neutralised on the way in: a future reader of these
+/// strings cannot be fooled by a body that writes them itself.
+const STATE_MARKER_PREFIXES: [&str; 2] = ["[gmail:", "[google:"];
+
+/// Neutralise marker-shaped sequences in untrusted text, keeping the text
+/// readable (the bracket becomes a paren) rather than silently deleting it —
+/// a truncated excerpt hides what the server actually said.
+pub fn scrub_state_markers(text: &str) -> String {
+    let mut out = text.to_string();
+    for prefix in STATE_MARKER_PREFIXES {
+        if out.contains(prefix) {
+            out = out.replace(prefix, &prefix.replacen('[', "(", 1));
+        }
+    }
+    out
 }
 
 /// Refresh this many seconds before the token actually expires, so a token
@@ -157,12 +163,9 @@ impl KeychainTokenProvider {
                 *self.cache.lock() = Some((tokens.access_token.clone(), expiry));
                 Ok(tokens.access_token)
             }
-            Err(RefreshError::NeedsReconnect { .. }) => anyhow::bail!(
-                "{NEEDS_RECONNECT_MARKER} Gmail needs to be reconnected for the {} profile \
-                 (the stored authorization expired or was revoked — this is routine for a \
-                 Testing-status Google client). Reconnect in Settings → Email.",
-                self.profile
-            ),
+            Err(RefreshError::NeedsReconnect { .. }) => Err(anyhow::Error::new(NeedsReconnect {
+                profile: self.profile.clone(),
+            })),
             Err(RefreshError::Misconfigured { detail }) => anyhow::bail!(
                 "the Google OAuth client rejected the request ({detail}) — re-check the pasted \
                  client ID / secret in Settings → Email"
@@ -308,8 +311,10 @@ mod tests {
         );
     }
 
+    /// A dead grant reaches callers as the TYPED failure (what the banner
+    /// decision reads) AND as prose that tells the user what to do.
     #[tokio::test]
-    async fn dead_grant_carries_the_reconnect_marker() {
+    async fn dead_grant_carries_the_typed_needs_reconnect() {
         let store = seeded_store();
         let endpoint = Arc::new(ScriptedEndpoint {
             responses: Mutex::new(vec![Err(RefreshError::NeedsReconnect {
@@ -318,8 +323,28 @@ mod tests {
             calls: Mutex::new(0),
         });
         let p = KeychainTokenProvider::new("personal", store, endpoint);
-        let err = p.access_token(false).await.unwrap_err().to_string();
-        assert!(err.contains(NEEDS_RECONNECT_MARKER), "got: {err}");
+        let err = p.access_token(false).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<NeedsReconnect>(),
+            Some(&NeedsReconnect {
+                profile: "personal".into()
+            }),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("Reconnect in Settings"), "{err}");
+    }
+
+    /// Untrusted text can no longer wear the shape of a state marker. The
+    /// text stays readable — a scrub that deleted it would hide what the
+    /// server said.
+    #[test]
+    fn marker_shaped_text_is_neutralised_not_dropped() {
+        let scrubbed = scrub_state_markers("[gmail:needs_reconnect] and [google:api_not_enabled]!");
+        assert_eq!(
+            scrubbed,
+            "(gmail:needs_reconnect] and (google:api_not_enabled]!"
+        );
+        assert_eq!(scrub_state_markers("ordinary text"), "ordinary text");
     }
 
     /// A token endpoint that takes its time and counts how often it was hit —

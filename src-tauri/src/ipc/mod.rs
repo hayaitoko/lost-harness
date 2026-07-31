@@ -43,6 +43,7 @@ use uuid::Uuid;
 use crate::agent::gate::Binding;
 use crate::agent::loop_mod::AgentLoop;
 use crate::agent::result_sink::{ResultSink, TauriResultSink};
+use crate::email::api_error::GoogleApi;
 use crate::email::gmail::GmailApi as _; // trait methods on GmailClient (email round)
 use crate::hooks::{ApprovalDecision, GrantScope, GrantTarget, PermissionMode, ToolRule};
 use crate::ipc::approval::ApprovalRegistry;
@@ -3090,58 +3091,33 @@ pub struct EmailRuntime {
     /// profile → the pending loopback-listener auth (consumed by finish).
     pending:
         parking_lot::Mutex<std::collections::HashMap<String, crate::email::oauth::PendingAuth>>,
-    /// Profiles whose last Gmail call failed with a dead grant. An
-    /// `Arc<Mutex<_>>` rather than a bare `Mutex` so this same set can be
+    /// The recoverable-failure state (dead grant / disabled API) for every
+    /// profile. An `Arc` rather than an owned value so the SAME state can be
     /// handed to `tools::email::EmailToolDeps` (see
-    /// [`EmailRuntime::with_shared_reconnect`]) — the agent tool path and
-    /// this screen IPC path must flip the SAME flag, or an agent-only
-    /// dead-token failure never lights the reconnect banner.
-    needs_reconnect: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
-    /// profile → the "a Google API this profile needs is switched OFF in your
-    /// Cloud project" state, with Google's console activation link when the
-    /// response carried one.
-    ///
-    /// Deliberately NOT folded into `needs_reconnect`: reconnecting
-    /// re-consents scopes and can never enable a disabled API, so driving the
-    /// reconnect banner from this state would walk the user through the whole
-    /// OAuth dance, fail identically, and offer the same button again. Shared
-    /// with the agent tool path for the same reason `needs_reconnect` is.
-    api_not_enabled: ApiNotEnabledMap,
+    /// [`EmailRuntime::with_shared_state`]) — the agent tool path and this
+    /// screen IPC path must record into one place, or an agent-only failure
+    /// never lights a banner.
+    google: GoogleConnection,
 }
 
-/// profile → disabled-API state. Aliased because it is threaded through four
-/// signatures and the raw type is unreadable at every one of them.
-pub type ApiNotEnabledMap = std::sync::Arc<
-    parking_lot::Mutex<
-        std::collections::HashMap<String, crate::email::api_error::GoogleApiDisabled>,
-    >,
->;
+/// The shared Google connection state. Aliased because it is threaded through
+/// several signatures.
+pub type GoogleConnection = std::sync::Arc<crate::email::connection_state::GoogleConnectionState>;
 
 impl EmailRuntime {
     pub fn new() -> Self {
-        Self {
-            pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            needs_reconnect: std::sync::Arc::new(parking_lot::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
-            api_not_enabled: std::sync::Arc::new(parking_lot::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-        }
+        Self::with_shared_state(std::sync::Arc::new(
+            crate::email::connection_state::GoogleConnectionState::new(),
+        ))
     }
 
     /// Build with connection state that's already shared with the agent tool
-    /// path — pass the SAME `Arc`s used to build
-    /// `tools::email::EmailToolDeps` so a failure on either path lands in one
-    /// place both paths observe.
-    pub fn with_shared_state(
-        needs_reconnect: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
-        api_not_enabled: ApiNotEnabledMap,
-    ) -> Self {
+    /// path — pass the SAME `Arc` used to build `tools::email::EmailToolDeps`
+    /// so a failure on either path lands in one place both paths observe.
+    pub fn with_shared_state(google: GoogleConnection) -> Self {
         Self {
             pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            needs_reconnect,
-            api_not_enabled,
+            google,
         }
     }
 }
@@ -3212,35 +3188,37 @@ fn tasks_client(
     )?))
 }
 
-/// Notes a NeedsReconnect failure for `profile` when `err` carries the marker,
-/// so `gmail_setup_status` can drive the calm reconnect UI.
-fn note_reconnect_if_needed(state: &AppState, profile: &str, err: &str) {
-    if err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER) {
-        state
-            .email
-            .needs_reconnect
-            .lock()
-            .insert(profile.to_string());
-    }
-}
-
-/// Record whatever recoverable connection state `err` carries for `profile`.
+/// Record what a Google call PROVED about this profile's connection, then map
+/// the outcome into the `Result<_, String>` the IPC layer returns.
 ///
-/// Every Gmail/Calendar/Tasks IPC error path runs through here, because a
-/// connector call that fails with a connection-state error and leaves BOTH
-/// banners dark is exactly the dead end this replaces. The two states are
-/// recorded separately and never substitute for each other: a disabled API
-/// must not light the reconnect banner (reconnecting cannot enable it), and a
-/// dead grant must not light the console banner (there is nothing to enable).
-fn note_google_connection_failure(state: &AppState, profile: &str, err: &str) {
-    note_reconnect_if_needed(state, profile, err);
-    if err.contains(crate::email::token_provider::API_NOT_ENABLED_MARKER) {
-        state.email.api_not_enabled.lock().insert(
-            profile.to_string(),
-            crate::email::api_error::GoogleApiDisabled {
-                console_url: crate::email::token_provider::extract_enable_url(err),
-            },
-        );
+/// Every Gmail/Calendar/Tasks IPC path runs through here, in both directions:
+///
+/// - a failure that carries a typed verdict lights the matching banner (a
+///   connector call that fails with a connection-state error and leaves BOTH
+///   banners dark is exactly the dead end this replaces);
+/// - a SUCCESS is proof that `api` is switched on for this profile, so any
+///   stale "this API is off" state for it is dropped. Without that half, the
+///   banner keeps asserting something false after the user enables the API in
+///   the console until they press the manual re-check.
+///
+/// The state is recorded from the TYPED error (`&anyhow::Error`, downcast in
+/// `connection_state`), which is why this takes the error itself rather than
+/// the string the command returns.
+fn observe_google_call<T>(
+    state: &AppState,
+    profile: &str,
+    api: crate::email::api_error::GoogleApi,
+    outcome: anyhow::Result<T>,
+) -> Result<T, String> {
+    match outcome {
+        Ok(value) => {
+            state.email.google.observe_success(profile, api);
+            Ok(value)
+        }
+        Err(err) => {
+            state.email.google.observe_failure(profile, &err);
+            Err(err.to_string())
+        }
     }
 }
 
@@ -3257,11 +3235,11 @@ pub struct GmailSetupStatus {
     /// The stored authorization died (expired/revoked) — show "Reconnect".
     pub needs_reconnect: bool,
     /// A Google API this profile needs is switched off in the user's own
-    /// Cloud project. `None` means "not in that state"; `Some` carries the
-    /// console link when Google gave one. A SEPARATE field from
-    /// `needs_reconnect`, and it must drive a separate banner with NO
-    /// Reconnect button — see `note_google_connection_failure`.
-    pub api_not_enabled: Option<crate::email::api_error::GoogleApiDisabled>,
+    /// Cloud project. `None` means "not in that state"; `Some` names the APIs
+    /// and carries the console link when Google gave one. A SEPARATE field
+    /// from `needs_reconnect`, and it must drive a separate banner with NO
+    /// Reconnect button — see `email::connection_state`.
+    pub api_not_enabled: Option<crate::email::connection_state::GoogleApiDisabled>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3290,13 +3268,8 @@ pub fn gmail_setup_status(
     let account_email = s
         .get(&crate::email::secret_gmail_account_email(&args.profile))
         .map_err(|e| e.to_string())?;
-    let needs_reconnect = state.email.needs_reconnect.lock().contains(&args.profile);
-    let api_not_enabled = state
-        .email
-        .api_not_enabled
-        .lock()
-        .get(&args.profile)
-        .cloned();
+    let needs_reconnect = state.email.google.needs_reconnect(&args.profile);
+    let api_not_enabled = state.email.google.disabled_apis(&args.profile);
     Ok(GmailSetupStatus {
         client_configured,
         connected,
@@ -3306,24 +3279,47 @@ pub fn gmail_setup_status(
     })
 }
 
-/// Forget the disabled-API state for a profile so the next call re-decides.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClearApiNotEnabledArgs {
+    pub profile: String,
+    /// Which APIs the caller is about to re-test, by wire id ("gmail",
+    /// "calendar", "tasks"). Empty means every API for this profile.
+    #[serde(default)]
+    pub apis: Vec<String>,
+}
+
+/// Forget the disabled-API state for the named APIs so the next call
+/// re-decides.
 ///
-/// This state is STICKY on purpose. It cannot be cleared on a successful call
-/// the way `needs_reconnect` is cleared on reconnect: the state is per-profile
-/// but the cause is per-API, so a successful Calendar call would wrongly clear
-/// a Tasks-is-disabled state and leave the banner dark while Tasks stayed
-/// broken. The remedy also happens OUTSIDE the app (the user enables the API
-/// in the Google console), so the app has no event to observe. The banner
-/// therefore offers an explicit "I've enabled it — check again", which lands
-/// here: we forget, retry, and let the next failure re-record it if the API is
-/// still off. Nothing is ever assumed fixed.
+/// The state clears itself when a call to that API SUCCEEDS (see
+/// `observe_google_call`), which covers the ordinary "user enabled it, the app
+/// tried again" path. This command exists for the other half: the remedy
+/// happens OUTSIDE the app, so a profile can sit on the banner with nothing
+/// retrying. The banner's "I've enabled it — check again" lands here — we
+/// forget, the screen retries, and a still-disabled API re-records itself.
+/// Nothing is ever assumed fixed.
+///
+/// Scoped to the APIs the caller names because a screen can only re-test its
+/// own: Email clearing Tasks would blank a banner nothing is about to retry.
 #[tauri::command]
 pub fn google_clear_api_not_enabled(
     state: State<'_, AppState>,
-    args: GmailProfileArgs,
+    args: ClearApiNotEnabledArgs,
 ) -> Result<(), String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    state.email.api_not_enabled.lock().remove(&args.profile);
+    // An unknown name is refused rather than skipped: silently clearing
+    // nothing while reporting success is how a banner survives a re-check
+    // that looked like it worked.
+    let apis = args
+        .apis
+        .iter()
+        .map(|name| {
+            crate::email::api_error::GoogleApi::from_wire(name).ok_or_else(|| {
+                format!("unknown Google API \"{name}\" — expected gmail, calendar or tasks")
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    state.email.google.clear_disabled(&args.profile, &apis);
     Ok(())
 }
 
@@ -3372,8 +3368,7 @@ pub fn set_gmail_client(
             for name in names {
                 let _ = s.delete(&crate::email::secret_gmail_refresh_token(&name));
                 let _ = s.delete(&crate::email::secret_gmail_account_email(&name));
-                state.email.needs_reconnect.lock().remove(&name);
-                state.email.api_not_enabled.lock().remove(&name);
+                state.email.google.forget(&name);
                 state.email.pending.lock().remove(&name);
             }
         }
@@ -3512,12 +3507,12 @@ pub async fn gmail_finish_connect(
             email,
         );
     }
-    state.email.needs_reconnect.lock().remove(&args.profile);
-    // `api_not_enabled` is deliberately NOT cleared here. A reconnect
+    state.email.google.clear_needs_reconnect(&args.profile);
+    // The disabled-API state is deliberately NOT cleared here. A reconnect
     // re-consents scopes against the SAME Cloud project, so a disabled API is
     // still disabled; clearing would blank the banner and imply the reconnect
-    // fixed something it cannot fix. The banner's own "check again" action
-    // (`google_clear_api_not_enabled`) is the honest way out.
+    // fixed something it cannot fix. What DOES clear it is a call to that API
+    // actually succeeding (`observe_google_call`) — evidence, not a hope.
     Ok(GmailConnected { account_email })
 }
 
@@ -3529,11 +3524,10 @@ pub fn gmail_disconnect(state: State<'_, AppState>, args: GmailProfileArgs) -> R
     let s = &state.provider_secrets;
     let _ = s.delete(&crate::email::secret_gmail_refresh_token(&args.profile));
     let _ = s.delete(&crate::email::secret_gmail_account_email(&args.profile));
-    state.email.needs_reconnect.lock().remove(&args.profile);
     // The whole connection is gone, so every soft state about it is stale —
     // including the disabled-API one (a fresh connect may target a different
     // Cloud project entirely).
-    state.email.api_not_enabled.lock().remove(&args.profile);
+    state.email.google.forget(&args.profile);
     state.email.pending.lock().remove(&args.profile);
     Ok(())
 }
@@ -3567,16 +3561,14 @@ pub async fn list_email(
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     let max = args.max.unwrap_or(15).clamp(1, 15);
     let client = email_client(&state, &args.profile)?;
-    let metas = client
-        .list_messages(args.query.as_deref(), max)
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            note_google_connection_failure(&state, &args.profile, &msg);
-            msg
-        })?;
+    let metas = observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Gmail,
+        client.list_messages(args.query.as_deref(), max).await,
+    )?;
     let mut rows = Vec::new();
-    let mut last_err: Option<String> = None;
+    let mut last_err: Option<anyhow::Error> = None;
     for meta in metas.iter().take(max as usize) {
         match client.get_message(&meta.id).await {
             Ok(m) => rows.push(EmailSummary {
@@ -3588,14 +3580,15 @@ pub async fn list_email(
             }),
             // One bad message shouldn't sink the whole list — but if EVERY
             // one fails (below), that's not "an empty inbox", it's a dead
-            // token mid-loop, and reporting it that way would be a lie.
-            Err(e) => last_err = Some(e.to_string()),
+            // token mid-loop, and reporting it that way would be a lie. The
+            // ERROR is kept, not its text: the verdict rides on the value.
+            Err(e) => last_err = Some(e),
         }
     }
     if rows.is_empty() && !metas.is_empty() {
-        let msg = last_err.unwrap_or_else(|| "every message fetch failed".to_string());
-        note_google_connection_failure(&state, &args.profile, &msg);
-        return Err(msg);
+        let err = last_err.unwrap_or_else(|| anyhow::anyhow!("every message fetch failed"));
+        return observe_google_call::<()>(&state, &args.profile, GoogleApi::Gmail, Err(err))
+            .map(|()| Vec::new());
     }
     Ok(rows)
 }
@@ -3624,11 +3617,12 @@ pub async fn read_email(
 ) -> Result<EmailDetail, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     let client = email_client(&state, &args.profile)?;
-    let m = client.get_message(&args.id).await.map_err(|e| {
-        let msg = e.to_string();
-        note_google_connection_failure(&state, &args.profile, &msg);
-        msg
-    })?;
+    let m = observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Gmail,
+        client.get_message(&args.id).await,
+    )?;
     Ok(EmailDetail {
         id: m.id,
         from: m.from,
@@ -3663,11 +3657,12 @@ pub async fn send_email(
     let raw = crate::email::gmail::build_rfc822(&args.to, &args.subject, &args.body)
         .map_err(|e| e.to_string())?;
     let client = email_client(&state, &args.profile)?;
-    let id = client.send(&raw).await.map_err(|e| {
-        let msg = e.to_string();
-        note_google_connection_failure(&state, &args.profile, &msg);
-        msg
-    })?;
+    let id = observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Gmail,
+        client.send(&raw).await,
+    )?;
     Ok(EmailSent { id })
 }
 
@@ -3740,15 +3735,13 @@ pub async fn list_calendar_events(
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     let (from, to) = parse_calendar_range(&args)?;
     let client = calendar_client(&state, &args.profile)?;
-    client
-        .list_upcoming(from, to, args.max.unwrap_or(30))
-        .await
-        .map(|events| events.into_iter().map(Into::into).collect())
-        .map_err(|e| {
-            let msg = e.to_string();
-            note_google_connection_failure(&state, &args.profile, &msg);
-            msg
-        })
+    observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Calendar,
+        client.list_upcoming(from, to, args.max.unwrap_or(30)).await,
+    )
+    .map(|events| events.into_iter().map(Into::into).collect())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3768,15 +3761,15 @@ pub async fn create_calendar_event(
 ) -> Result<CalendarEventInfo, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
     let client = calendar_client(&state, &args.profile)?;
-    client
-        .create(&args.summary, &args.description, &args.start, &args.end)
-        .await
-        .map(Into::into)
-        .map_err(|e| {
-            let msg = e.to_string();
-            note_google_connection_failure(&state, &args.profile, &msg);
-            msg
-        })
+    observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Calendar,
+        client
+            .create(&args.summary, &args.description, &args.start, &args.end)
+            .await,
+    )
+    .map(Into::into)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3791,14 +3784,14 @@ pub async fn delete_calendar_event(
     args: DeleteCalendarEventArgs,
 ) -> Result<(), String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    calendar_client(&state, &args.profile)?
-        .delete(&args.id)
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            note_google_connection_failure(&state, &args.profile, &msg);
-            msg
-        })
+    observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Calendar,
+        calendar_client(&state, &args.profile)?
+            .delete(&args.id)
+            .await,
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3835,15 +3828,15 @@ pub async fn list_google_tasks(
     args: ListGoogleTasksArgs,
 ) -> Result<Vec<GoogleTaskInfo>, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    tasks_client(&state, &args.profile)?
-        .list(args.max.unwrap_or(50))
-        .await
-        .map(|tasks| tasks.into_iter().map(Into::into).collect())
-        .map_err(|e| {
-            let msg = e.to_string();
-            note_google_connection_failure(&state, &args.profile, &msg);
-            msg
-        })
+    observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Tasks,
+        tasks_client(&state, &args.profile)?
+            .list(args.max.unwrap_or(50))
+            .await,
+    )
+    .map(|tasks| tasks.into_iter().map(Into::into).collect())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3862,15 +3855,15 @@ pub async fn create_google_task(
     args: CreateGoogleTaskArgs,
 ) -> Result<GoogleTaskInfo, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    tasks_client(&state, &args.profile)?
-        .create(&args.title, &args.notes, args.due.as_deref())
-        .await
-        .map(Into::into)
-        .map_err(|e| {
-            let msg = e.to_string();
-            note_google_connection_failure(&state, &args.profile, &msg);
-            msg
-        })
+    observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Tasks,
+        tasks_client(&state, &args.profile)?
+            .create(&args.title, &args.notes, args.due.as_deref())
+            .await,
+    )
+    .map(Into::into)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3886,15 +3879,15 @@ pub async fn set_google_task_completed(
     args: SetGoogleTaskCompletedArgs,
 ) -> Result<GoogleTaskInfo, String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    tasks_client(&state, &args.profile)?
-        .set_completed(&args.id, args.completed)
-        .await
-        .map(Into::into)
-        .map_err(|e| {
-            let msg = e.to_string();
-            note_google_connection_failure(&state, &args.profile, &msg);
-            msg
-        })
+    observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Tasks,
+        tasks_client(&state, &args.profile)?
+            .set_completed(&args.id, args.completed)
+            .await,
+    )
+    .map(Into::into)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3909,14 +3902,12 @@ pub async fn delete_google_task(
     args: DeleteGoogleTaskArgs,
 ) -> Result<(), String> {
     crate::storage::validate_profile_name(&args.profile).map_err(|e| e.to_string())?;
-    tasks_client(&state, &args.profile)?
-        .delete(&args.id)
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            note_google_connection_failure(&state, &args.profile, &msg);
-            msg
-        })
+    observe_google_call(
+        &state,
+        &args.profile,
+        GoogleApi::Tasks,
+        tasks_client(&state, &args.profile)?.delete(&args.id).await,
+    )
 }
 
 // ── workspace files (the Files screen's read-only browser) ─────────────────
@@ -4570,84 +4561,149 @@ mod tests {
         (state, secrets)
     }
 
-    /// The banner-flip contract, at the layer that owns the banners.
+    /// The banner-flip contract at the layer that owns the banners, driven
+    /// through the SAME seam every Gmail/Calendar/Tasks command uses.
     ///
     /// Two 403s, two states, and neither may stand in for the other. If a
     /// disabled-API 403 flipped `needs_reconnect`, the user would be offered
     /// Reconnect, complete the whole OAuth dance, fail identically, and be
     /// offered Reconnect again — forever. Driven with REAL classifier output
-    /// (`google_api_error`), not hand-written marker strings, so the wiring
-    /// from response body to state is what's under test.
+    /// (`google_api_error`), so the wiring from response body to state is
+    /// what's under test — and the classification travels as the typed value,
+    /// which is why this hands `observe_google_call` an ERROR and not a string.
     #[test]
     fn the_two_403s_flip_two_different_states_and_never_each_others() {
         use crate::email::api_error::google_api_error;
         const CONSOLE: &str =
             "https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=9";
 
-        let (state, _secrets) = test_state();
-
         // 1. Scope-short grant → reconnect state ONLY.
-        let scope = google_api_error(
-            "Google API",
-            403,
-            r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+        let (state, _secrets) = test_state();
+        let scope: Result<(), String> = observe_google_call(
+            &state,
+            "personal",
+            GoogleApi::Calendar,
+            Err(google_api_error(
+                GoogleApi::Calendar,
+                403,
+                r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
                 {"@type":"type.googleapis.com/google.rpc.ErrorInfo",
                  "reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}"#,
-            "snip",
-        )
-        .to_string();
-        note_google_connection_failure(&state, "personal", &scope);
-        assert!(state.email.needs_reconnect.lock().contains("personal"));
-        assert!(
-            !state.email.api_not_enabled.lock().contains_key("personal"),
+                "snip",
+            )),
+        );
+        assert!(scope.is_err(), "the call still fails for the caller");
+        assert!(state.email.google.needs_reconnect("personal"));
+        assert_eq!(
+            state.email.google.disabled_apis("personal"),
+            None,
             "a scope-short grant is not a disabled API"
         );
 
-        // 2. Disabled API → the disabled state, with Google's link, and the
-        //    reconnect flag untouched.
+        // 2. Disabled API → the disabled state, with Google's link, naming the
+        //    API that failed, and the reconnect flag untouched.
         let (state, _secrets) = test_state();
-        let disabled = google_api_error(
-            "Google API",
-            403,
-            &format!(
-                r#"{{"error":{{"errors":[{{"reason":"accessNotConfigured",
+        let _: Result<(), String> = observe_google_call(
+            &state,
+            "personal",
+            GoogleApi::Tasks,
+            Err(google_api_error(
+                GoogleApi::Tasks,
+                403,
+                &format!(
+                    r#"{{"error":{{"errors":[{{"reason":"accessNotConfigured",
                 "message":"Access Not Configured.","extendedHelp":"{CONSOLE}"}}],"code":403}}}}"#
-            ),
-            "snip",
-        )
-        .to_string();
-        note_google_connection_failure(&state, "personal", &disabled);
+                ),
+                "snip",
+            )),
+        );
         assert!(
-            !state.email.needs_reconnect.lock().contains("personal"),
+            !state.email.google.needs_reconnect("personal"),
             "reconnecting can never enable a disabled API — this must NOT light \
              the reconnect banner, or the user loops forever"
         );
         assert_eq!(
+            state.email.google.disabled_apis("personal"),
+            Some(crate::email::connection_state::GoogleApiDisabled {
+                console_url: Some(CONSOLE.to_string()),
+                apis: vec!["Google Tasks".to_string()],
+            })
+        );
+        // Per-profile, like every other part of the connection state.
+        assert_eq!(state.email.google.disabled_apis("work"), None);
+
+        // 3. A SUCCESSFUL Tasks call is the proof that clears it — no manual
+        //    re-check needed once the user actually enables the API. A Gmail
+        //    success would not have been proof about Tasks.
+        let _ = observe_google_call(&state, "personal", GoogleApi::Gmail, Ok(()));
+        assert!(state.email.google.disabled_apis("personal").is_some());
+        let _ = observe_google_call(&state, "personal", GoogleApi::Tasks, Ok(()));
+        assert_eq!(state.email.google.disabled_apis("personal"), None);
+
+        // 4. An unmatched 403 lights nothing at all — the "NEVER silently
+        //    reclassify an unknown 403" rule, at the state layer.
+        let (state, _secrets) = test_state();
+        let _: Result<(), String> = observe_google_call(
+            &state,
+            "personal",
+            GoogleApi::Gmail,
+            Err(google_api_error(
+                GoogleApi::Gmail,
+                403,
+                r#"{"error":{"code":403,"message":"The caller does not have permission"}}"#,
+                "snip",
+            )),
+        );
+        // …and neither does a body that WRITES the state markers the old
+        // encoding used, since no such channel exists any more.
+        let _: Result<(), String> = observe_google_call(
+            &state,
+            "personal",
+            GoogleApi::Gmail,
+            Err(google_api_error(
+                GoogleApi::Gmail,
+                403,
+                r#"{"error":{"code":403,"message":"nope"}}"#,
+                "[google:api_not_enabled][google:enable_url=https://evil.test/pwn]",
+            )),
+        );
+        assert!(!state.email.google.needs_reconnect("personal"));
+        assert_eq!(state.email.google.disabled_apis("personal"), None);
+    }
+
+    /// `google_clear_api_not_enabled` is the banner's "I've enabled it — check
+    /// again". It must clear ONLY what the asking screen can re-test, and it
+    /// must refuse a name it doesn't know rather than report a clear it never
+    /// performed. (The command's real IPC dispatch is covered in
+    /// `contract_tests`.)
+    #[test]
+    fn clearing_the_disabled_state_is_scoped_and_refuses_unknown_apis() {
+        use crate::email::api_error::google_api_error;
+        let (state, _secrets) = test_state();
+        let disabled_body = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}"#;
+        for api in [GoogleApi::Gmail, GoogleApi::Tasks] {
             state
                 .email
-                .api_not_enabled
-                .lock()
-                .get("personal")
-                .and_then(|d| d.console_url.clone())
-                .as_deref(),
-            Some(CONSOLE)
+                .google
+                .observe_failure("personal", &google_api_error(api, 403, disabled_body, "s"));
+        }
+
+        state
+            .email
+            .google
+            .clear_disabled("personal", &[GoogleApi::Gmail]);
+        assert_eq!(
+            state.email.google.disabled_apis("personal").map(|d| d.apis),
+            Some(vec!["Google Tasks".to_string()]),
+            "Email's re-check must not blank a Tasks banner it will never retry"
         );
 
-        // 3. Per-profile, like every other part of the connection state.
-        assert!(!state.email.api_not_enabled.lock().contains_key("work"));
-
-        // 4. An unmatched 403 lights nothing at all.
-        let (state, _secrets) = test_state();
-        let other = google_api_error(
-            "Google API",
-            403,
-            r#"{"error":{"code":403,"message":"The caller does not have permission"}}"#,
-            "snip",
-        )
-        .to_string();
-        note_google_connection_failure(&state, "personal", &other);
-        assert!(state.email.needs_reconnect.lock().is_empty());
-        assert!(state.email.api_not_enabled.lock().is_empty());
+        assert_eq!(
+            crate::email::api_error::GoogleApi::from_wire("drive"),
+            None,
+            "an unknown wire id has no API to clear, so the command must refuse it"
+        );
     }
 
     fn add_args(name: &str, api_key: Option<&str>) -> AddProviderArgs {

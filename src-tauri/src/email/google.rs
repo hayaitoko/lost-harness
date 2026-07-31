@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use super::api_error::GoogleApi;
 use super::gmail::{read_body_capped, TokenProvider, MAX_RESPONSE_BYTES};
 
 #[derive(Debug, Clone, Copy)]
@@ -77,8 +78,14 @@ impl GoogleClient {
 
     /// Perform one authorized request, refresh and retry exactly once on 401,
     /// then parse JSON. `204 No Content` maps to JSON null for DELETE calls.
+    ///
+    /// `api` names the caller's surface. It is a parameter rather than a
+    /// property of this client because the recovery state is per-API: this one
+    /// client serves both Calendar and Tasks, and "Tasks is switched off" must
+    /// not be recorded (or cleared) as if it were about Calendar.
     pub async fn json(
         &self,
+        api: GoogleApi,
         method: Method,
         url: &str,
         body: Option<&serde_json::Value>,
@@ -92,16 +99,13 @@ impl GoogleClient {
         if !(200..300).contains(&status) {
             let compact = text.chars().take(700).collect::<String>();
             // The structural gap this closes: EVERY non-2xx used to bail with
-            // a marker-free plain string, so a real Google 403 could never
-            // trip the connection-state markers no matter how many callers
-            // checked for them. Classification happens HERE, once, for both
-            // recoverable 403s; an unmatched status still produces exactly the
-            // string it did before.
+            // an unclassified plain string, so a real Google 403 could never
+            // reach the connection state no matter how many callers looked.
+            // Classification happens HERE, once, for both recoverable 403s,
+            // and travels on the error as a typed value; an unmatched status
+            // still produces exactly the string it did before.
             return Err(crate::email::api_error::google_api_error(
-                "Google API",
-                status,
-                &text,
-                &compact,
+                api, status, &text, &compact,
             ));
         }
         if text.trim().is_empty() {
@@ -184,7 +188,7 @@ mod tests {
         let client = GoogleClient::with_response_cap(Box::new(FixedToken), 1024).unwrap();
         let url = serve_once(with_content_length(&vec![b'a'; 4096])).await;
         let err = client
-            .json(Method::Get, &url, None)
+            .json(GoogleApi::Calendar, Method::Get, &url, None)
             .await
             .expect_err("a 4 KiB body must not pass a 1 KiB cap");
         assert!(
@@ -196,7 +200,7 @@ mod tests {
         // 2. Chunked (no declared length) over the cap → refused mid-stream.
         let url = serve_once(chunked(4096, 512)).await;
         let err = client
-            .json(Method::Get, &url, None)
+            .json(GoogleApi::Calendar, Method::Get, &url, None)
             .await
             .expect_err("a chunked 4 KiB body must not pass a 1 KiB cap");
         assert!(
@@ -206,26 +210,31 @@ mod tests {
 
         // 3. Control: a body under the cap still parses into JSON.
         let url = serve_once(with_content_length(br#"{"id":"evt-1"}"#)).await;
-        let value = client.json(Method::Get, &url, None).await.unwrap();
+        let value = client
+            .json(GoogleApi::Calendar, Method::Get, &url, None)
+            .await
+            .unwrap();
         assert_eq!(value["id"], serde_json::json!("evt-1"));
     }
 
     const CONSOLE: &str =
         "https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=42";
 
-    /// The finding this pins: `json` bailed with a marker-free plain string
+    /// The finding this pins: `json` bailed with an unclassified plain string
     /// for ANY non-2xx, so a real Google 403 could never light a banner — the
     /// Planner just failed forever with raw `Google API HTTP 403` text.
     ///
     /// Driven through the REAL transport (loopback socket → reqwest → `json`),
     /// not the pure classifier, so this covers the wiring and not just the
-    /// parse.
+    /// parse. Asserted on the TYPED verdict the error carries, because that
+    /// value — not its text — is what the connection state is recorded from.
     #[tokio::test]
-    async fn a_403_reaches_callers_with_the_right_marker_for_its_flavour() {
+    async fn a_403_reaches_callers_with_the_typed_verdict_for_its_flavour() {
+        use crate::email::api_error::{google_api_error_of, GoogleApiFailure};
         let client = GoogleClient::new(Box::new(FixedToken)).unwrap();
 
-        // Scope-short grant → the reconnect marker. Reconnecting re-consents
-        // all four scopes, so the reconnect banner is the honest remedy.
+        // Scope-short grant → ScopeInsufficient. Reconnecting re-consents all
+        // four scopes, so the reconnect banner is the honest remedy.
         let scope_body = br#"{"error":{"code":403,
             "message":"Request had insufficient authentication scopes.",
             "status":"PERMISSION_DENIED","details":[
@@ -233,46 +242,37 @@ mod tests {
              "reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT","domain":"googleapis.com"}]}}"#;
         let url = serve_once(with_status(403, "Forbidden", scope_body)).await;
         let err = client
-            .json(Method::Get, &url, None)
+            .json(GoogleApi::Calendar, Method::Get, &url, None)
             .await
-            .expect_err("a 403 is still a failure")
-            .to_string();
-        assert!(
-            err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER),
-            "got: {err}"
-        );
-        assert!(
-            !err.contains(crate::email::token_provider::API_NOT_ENABLED_MARKER),
-            "got: {err}"
-        );
+            .expect_err("a 403 is still a failure");
+        let classified = google_api_error_of(&err).expect("a typed classification");
+        assert_eq!(classified.failure, GoogleApiFailure::ScopeInsufficient);
+        assert_eq!(classified.api, GoogleApi::Calendar);
 
-        // Disabled API → the DISTINCT marker plus Google's console link, and
-        // NOT the reconnect marker (that would loop the user forever).
+        // Disabled API → the DISTINCT verdict plus Google's console link, and
+        // NOT the reconnect one (that would loop the user forever). The API on
+        // the error is the one the CALLER named, so Tasks-is-off is recorded
+        // against Tasks even though Calendar shares this client type.
         let disabled_body = format!(
             r#"{{"error":{{"errors":[{{"domain":"usageLimits","reason":"accessNotConfigured",
             "message":"Access Not Configured.","extendedHelp":"{CONSOLE}"}}],"code":403}}}}"#
         );
         let url = serve_once(with_status(403, "Forbidden", disabled_body.as_bytes())).await;
         let err = client
-            .json(Method::Get, &url, None)
+            .json(GoogleApi::Tasks, Method::Get, &url, None)
             .await
-            .expect_err("a 403 is still a failure")
-            .to_string();
-        assert!(
-            err.contains(crate::email::token_provider::API_NOT_ENABLED_MARKER),
-            "got: {err}"
-        );
-        assert!(
-            !err.contains(crate::email::token_provider::NEEDS_RECONNECT_MARKER),
-            "reconnecting can never enable a disabled API: {err}"
-        );
+            .expect_err("a 403 is still a failure");
+        let classified = google_api_error_of(&err).expect("a typed classification");
         assert_eq!(
-            crate::email::token_provider::extract_enable_url(&err).as_deref(),
-            Some(CONSOLE)
+            classified.failure,
+            GoogleApiFailure::ApiNotEnabled {
+                console_url: Some(CONSOLE.to_string())
+            }
         );
+        assert_eq!(classified.api, GoogleApi::Tasks);
 
         // An unmatched 403 keeps the pre-existing plain-string behaviour —
-        // no marker, no guess about which recovery applies.
+        // the `Other` verdict, and no guess about which recovery applies.
         let url = serve_once(with_status(
             403,
             "Forbidden",
@@ -280,14 +280,21 @@ mod tests {
         ))
         .await;
         let err = client
-            .json(Method::Get, &url, None)
+            .json(GoogleApi::Tasks, Method::Get, &url, None)
             .await
-            .expect_err("a 403 is still a failure")
-            .to_string();
-        assert!(err.starts_with("Google API HTTP 403: "), "got: {err}");
+            .expect_err("a 403 is still a failure");
+        assert_eq!(
+            google_api_error_of(&err).map(|e| e.failure.clone()),
+            Some(GoogleApiFailure::Other)
+        );
+        let text = err.to_string();
         assert!(
-            !err.contains("[google:") && !err.contains("[gmail:"),
-            "an unmatched 403 must carry no marker: {err}"
+            text.starts_with("Google Tasks API HTTP 403: "),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("[google:") && !text.contains("[gmail:"),
+            "no marker channel exists any more: {text}"
         );
     }
 }

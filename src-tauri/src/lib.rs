@@ -307,21 +307,15 @@ pub fn run() {
                     std::time::Duration::from_secs(600),
                 ));
 
-            // The email round's needs-reconnect set, created ONCE here and
-            // shared between the agent tool path (threaded into
+            // The email round's recoverable-failure state (dead grant, and
+            // the APIs a Cloud project has switched off), created ONCE here
+            // and shared between the agent tool path (threaded into
             // `build_tool_dispatcher` → `EmailToolDeps`, below) and the
             // screen IPC path (`ipc::EmailRuntime`, at `AppState`
-            // construction) — a dead Gmail grant hit from EITHER path must
-            // flip the SAME flag, or the reconnect banner only ever lights
-            // from the screen.
-            let email_needs_reconnect =
-                Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
-            // Same story for the OTHER recoverable Google failure: an API the
-            // user's own Cloud project has switched off. Kept apart from the
-            // set above because reconnecting can never enable a disabled API,
-            // so the two must drive two different banners.
-            let email_api_not_enabled: crate::ipc::ApiNotEnabledMap =
-                Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+            // construction) — a failure hit from EITHER path must land where
+            // BOTH look, or a banner only ever lights from the screen.
+            let google_connection: crate::ipc::GoogleConnection =
+                Arc::new(crate::email::connection_state::GoogleConnectionState::new());
 
             // §3 tool spine: workspace-confined read-only tools behind the
             // unified pretooluse hook chain, filtered by this body's caps.
@@ -346,8 +340,7 @@ pub fn run() {
                 Some(Arc::clone(&human_prompter)),
                 Arc::clone(&model_manager),
                 Arc::clone(&provider_secrets),
-                Arc::clone(&email_needs_reconnect),
-                Arc::clone(&email_api_not_enabled),
+                Arc::clone(&google_connection),
             ));
 
             // C4: register every ALREADY-APPROVED skill as a callable Tool at
@@ -489,10 +482,9 @@ pub fn run() {
             let hardware = Arc::new(crate::models::hardware::probe());
             let state = AppState {
                 agent_loop,
-                email: Arc::new(crate::ipc::EmailRuntime::with_shared_state(
-                    Arc::clone(&email_needs_reconnect),
-                    Arc::clone(&email_api_not_enabled),
-                )),
+                email: Arc::new(crate::ipc::EmailRuntime::with_shared_state(Arc::clone(
+                    &google_connection,
+                ))),
                 model_manager,
                 storage,
                 provider_secrets,
@@ -929,8 +921,7 @@ fn build_tool_dispatcher(
     model_manager: Arc<ModelManager>,
     provider_secrets: Arc<dyn crate::secrets::ProviderSecretStore>,
     // Shared with `ipc::EmailRuntime` — see the call site's comment in `run()`.
-    email_needs_reconnect: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
-    email_api_not_enabled: crate::ipc::ApiNotEnabledMap,
+    google_connection: crate::ipc::GoogleConnection,
 ) -> ToolDispatcher {
     use crate::hooks::{
         build_pretooluse_chain_full, AuditObserverHook, AuditWriter, InMemoryPolicySource,
@@ -1035,8 +1026,7 @@ fn build_tool_dispatcher(
             let deps = crate::tools::email::EmailToolDeps::new(
                 provider_secrets,
                 Arc::new(endpoint),
-                email_needs_reconnect,
-                email_api_not_enabled,
+                google_connection,
             );
             registry.register(Box::new(crate::tools::email::EmailSearchTool::new(
                 deps.clone(),
@@ -1265,8 +1255,7 @@ mod tool_path_degraded_tests {
             None,
             Arc::new(crate::models::ModelManager::new()),
             Arc::new(crate::secrets::MemoryProviderSecretStore::default()),
-            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
-            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            Arc::new(crate::email::connection_state::GoogleConnectionState::new()),
         );
         (d, dir)
     }

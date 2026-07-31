@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::api_error::GoogleApi;
 use super::google::{GoogleClient, Method};
 
 const TASKS_API: &str = "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks";
@@ -30,7 +31,10 @@ impl TasksClient {
             .append_pair("maxResults", &max.clamp(1, 100).to_string())
             .append_pair("showCompleted", "true")
             .append_pair("showHidden", "false");
-        let value = self.google.json(Method::Get, url.as_str(), None).await?;
+        let value = self
+            .google
+            .json(GoogleApi::Tasks, Method::Get, url.as_str(), None)
+            .await?;
         let items = value
             .get("items")
             .and_then(|v| v.as_array())
@@ -57,7 +61,7 @@ impl TasksClient {
         let body = serde_json::json!({ "title": title, "notes": notes.trim(), "due": due });
         let value = self
             .google
-            .json(Method::Post, TASKS_API, Some(&body))
+            .json(GoogleApi::Tasks, Method::Post, TASKS_API, Some(&body))
             .await?;
         parse_task(value)
             .ok_or_else(|| anyhow::anyhow!("Google Tasks returned a task without an id"))
@@ -69,7 +73,7 @@ impl TasksClient {
             serde_json::json!({ "status": if completed { "completed" } else { "needsAction" } });
         let value = self
             .google
-            .json(Method::Patch, url.as_str(), Some(&body))
+            .json(GoogleApi::Tasks, Method::Patch, url.as_str(), Some(&body))
             .await?;
         parse_task(value)
             .ok_or_else(|| anyhow::anyhow!("Google Tasks returned a task without an id"))
@@ -77,7 +81,9 @@ impl TasksClient {
 
     pub async fn delete(&self, id: &str) -> anyhow::Result<()> {
         let url = task_url(id)?;
-        self.google.json(Method::Delete, url.as_str(), None).await?;
+        self.google
+            .json(GoogleApi::Tasks, Method::Delete, url.as_str(), None)
+            .await?;
         Ok(())
     }
 }

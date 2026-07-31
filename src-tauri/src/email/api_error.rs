@@ -4,13 +4,11 @@
 //! ## Why this exists
 //!
 //! Before this module, EVERY non-2xx from a Google REST call bailed with a
-//! plain `"… API HTTP {status}: {body}"` string. The reconnect banner is
-//! driven by a substring match on
-//! [`NEEDS_RECONNECT_MARKER`](super::token_provider::NEEDS_RECONNECT_MARKER),
-//! and that marker is only ever embedded by the OAuth *token-refresh*
-//! classifier — so a real Google `403` could never light any banner no matter
-//! how many callers checked for it. The Planner just failed forever with raw
-//! `Google API HTTP 403` text and no route out.
+//! plain `"… API HTTP {status}: {body}"` string, and the only recovery signal
+//! in the app was a substring match on a marker embedded by the OAuth
+//! *token-refresh* classifier — so a real Google `403` could never light any
+//! banner no matter how many callers checked for it. The Planner just failed
+//! forever with raw `Google API HTTP 403` text and no route out.
 //!
 //! ## The two recoverable 403s (and why they must stay separate)
 //!
@@ -18,7 +16,7 @@
 //!   `ACCESS_TOKEN_SCOPE_INSUFFICIENT`) — the stored grant predates a scope
 //!   the app now needs (e.g. a Gmail-only grant hitting Calendar). A
 //!   reconnect genuinely fixes this: `begin_auth` re-consents with all four
-//!   scopes and `prompt=consent`. → flip the EXISTING `needs_reconnect`.
+//!   scopes and `prompt=consent`. → the EXISTING `needs_reconnect` state.
 //! - **API not enabled** (`accessNotConfigured` / `SERVICE_DISABLED`) — the
 //!   user's own Google Cloud project has the API switched off. Reconnecting
 //!   can NEVER fix this; offering the reconnect button here would loop the
@@ -28,6 +26,25 @@
 //! Anything else — including an unmatched 403 — falls through to exactly the
 //! plain-string behaviour that shipped before. Silently reclassifying an
 //! unknown 403 as either specific case would be a guess dressed as a fact.
+//!
+//! ## The classification is DATA, not text
+//!
+//! [`google_api_error`] returns an `anyhow::Error` whose payload is a typed
+//! [`GoogleApiError`] carrying the [`GoogleApiFailure`] and the
+//! [`GoogleApi`] it happened on. Everything downstream that CHANGES STATE
+//! (see [`crate::email::connection_state`]) downcasts to that value; nothing
+//! re-derives a decision by scanning the message.
+//!
+//! That is not a style preference. The error message necessarily contains an
+//! excerpt of the response body — untrusted bytes from the network. An
+//! earlier revision of this file encoded the verdict as markers
+//! (`[google:api_not_enabled]`, `[google:enable_url=…]`) inside that same
+//! string and re-parsed them downstream, which meant a body excerpt could
+//! *state its own verdict*: it bypassed the URL gate below end-to-end and
+//! could promote an unknown 403 into the API-disabled state, which the rules
+//! above explicitly forbid. Those markers are gone. Body excerpts are also
+//! run through [`scrub_state_markers`] on the way into the message, so no
+//! marker-shaped text can survive in a place a future parser might look.
 //!
 //! ## Structure, not substrings
 //!
@@ -42,7 +59,60 @@
 //! bare `body.contains("SERVICE_DISABLED")` would also fire on the word
 //! appearing inside a mail subject echoed back in an error message.
 
-use super::token_provider::{embed_enable_url, API_NOT_ENABLED_MARKER, NEEDS_RECONNECT_MARKER};
+use super::token_provider::scrub_state_markers;
+
+/// Which Google API a call was for. Carried on the failure so the recovery
+/// state is per-API rather than a single per-profile flag: the user enables
+/// APIs one at a time in the console, and "Tasks is off" must not be cleared
+/// by a Gmail call that worked (nor keep claiming Tasks is off after a Tasks
+/// call succeeds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GoogleApi {
+    Gmail,
+    Calendar,
+    Tasks,
+}
+
+impl GoogleApi {
+    /// Every API this app talks to — the "all of them" set for a clear.
+    pub const ALL: [GoogleApi; 3] = [GoogleApi::Gmail, GoogleApi::Calendar, GoogleApi::Tasks];
+
+    /// Stable id on the IPC wire (the UI names the APIs it is able to
+    /// re-test, so a re-check on one screen can't wipe another screen's
+    /// state).
+    pub const fn wire(self) -> &'static str {
+        match self {
+            GoogleApi::Gmail => "gmail",
+            GoogleApi::Calendar => "calendar",
+            GoogleApi::Tasks => "tasks",
+        }
+    }
+
+    /// What a human calls it (banner copy).
+    pub const fn label(self) -> &'static str {
+        match self {
+            GoogleApi::Gmail => "Gmail",
+            GoogleApi::Calendar => "Google Calendar",
+            GoogleApi::Tasks => "Google Tasks",
+        }
+    }
+
+    /// How the API names itself at the head of an error message.
+    pub const fn error_label(self) -> &'static str {
+        match self {
+            GoogleApi::Gmail => "Gmail API",
+            GoogleApi::Calendar => "Google Calendar API",
+            GoogleApi::Tasks => "Google Tasks API",
+        }
+    }
+
+    /// Parse a wire id. `None` for anything unknown — an unrecognised name is
+    /// refused at the IPC edge rather than silently ignored (which would look
+    /// like a successful clear that cleared nothing).
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|api| api.wire() == value)
+    }
+}
 
 /// What a non-2xx Google API response means for RECOVERY. The variant is the
 /// product behaviour, exactly like `oauth::RefreshError`.
@@ -60,17 +130,31 @@ pub enum GoogleApiFailure {
     Other,
 }
 
-/// Per-profile record that a Google API this profile needs is switched off in
-/// the user's Cloud project. Lives here (not in `ipc`) so the agent-tool path
-/// and the screen IPC path can share ONE type and one shared map.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct GoogleApiDisabled {
-    /// Google's own console activation link, validated (https + a
-    /// `google.com` host) before it is ever stored or rendered. `None` when
-    /// the response carried no usable link — the UI then points at the
-    /// console in prose rather than inventing a URL.
-    pub console_url: Option<String>,
+/// The error a Google REST caller bails with.
+///
+/// `failure` is the verdict as DATA — the single source of truth for every
+/// state decision downstream. `message` is for humans and logs only; it
+/// contains a bounded excerpt of an untrusted response body and must never be
+/// parsed to recover the verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleApiError {
+    /// The API the failing call was for.
+    pub api: GoogleApi,
+    /// The HTTP status Google returned.
+    pub status: u16,
+    /// The classification. Read this, never the text.
+    pub failure: GoogleApiFailure,
+    /// Display text (body excerpt included, markers scrubbed).
+    message: String,
 }
+
+impl std::fmt::Display for GoogleApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GoogleApiError {}
 
 // ---------------------------------------------------------------------------
 // Wire shapes. Every field is optional/defaulted: these bodies come off the
@@ -235,7 +319,7 @@ fn console_url(error: &ErrorBody) -> Option<String> {
         .map(String::as_str)
         .chain(error.errors.iter().filter_map(|e| e.message.as_deref()))
     {
-        if let Some(url) = first_google_url_in(message) {
+        if let Some(url) = first_console_url_in(message) {
             return Some(url);
         }
     }
@@ -247,17 +331,28 @@ fn console_url(error: &ErrorBody) -> Option<String> {
 /// error string.
 const MAX_CONSOLE_URL_LEN: usize = 400;
 
+/// The ONLY hosts an API-activation link is allowed to live on.
+///
+/// Deliberately exact hosts, not "some google.com domain": Google's real
+/// activation links are `console.developers.google.com` (legacy
+/// `extendedHelp`) and `console.cloud.google.com` (the modern console), and
+/// those two are all this feature needs. A `*.google.com` rule would have let
+/// an error body point the button at any Google-hosted surface that can
+/// redirect, host user content, or take a `continue=` parameter — a much
+/// wider target than "the page that switches this API on".
+const CONSOLE_HOSTS: [&str; 2] = ["console.developers.google.com", "console.cloud.google.com"];
+
 /// Accept a URL only if it is one we are willing to render as a clickable
-/// link: `https`, a `google.com` host, bounded, and free of the `]` that
-/// delimits it inside an error string.
+/// link: `https`, one of [`CONSOLE_HOSTS`], and bounded in length.
 ///
 /// This body is UNTRUSTED input (it is whatever the endpoint we contacted
 /// sent back). Handing an unvalidated URL to the UI would turn a Google 403
 /// into an arbitrary-link surface, so the check is a real gate, not a
-/// formality.
+/// formality — and the value it returns is the only path a console URL has to
+/// the UI, so the gate cannot be walked around.
 pub fn sanitize_console_url(candidate: &str) -> Option<String> {
     let candidate = candidate.trim();
-    if candidate.len() > MAX_CONSOLE_URL_LEN || candidate.contains(']') {
+    if candidate.len() > MAX_CONSOLE_URL_LEN {
         return None;
     }
     let parsed = url::Url::parse(candidate).ok()?;
@@ -265,14 +360,14 @@ pub fn sanitize_console_url(candidate: &str) -> Option<String> {
         return None;
     }
     let host = parsed.host_str()?.to_ascii_lowercase();
-    if host != "google.com" && !host.ends_with(".google.com") {
+    if !CONSOLE_HOSTS.contains(&host.as_str()) {
         return None;
     }
     Some(parsed.to_string())
 }
 
-/// The first `https://…google.com/…` URL embedded in prose, if any.
-fn first_google_url_in(text: &str) -> Option<String> {
+/// The first console activation URL embedded in prose, if any.
+fn first_console_url_in(text: &str) -> Option<String> {
     let mut from = 0usize;
     while let Some(offset) = text[from..].find("https://") {
         let start = from + offset;
@@ -290,38 +385,65 @@ fn first_google_url_in(text: &str) -> Option<String> {
     None
 }
 
-/// Build the error a Google REST caller bails with, carrying the marker the
-/// IPC/tool layers match on.
+/// Build the error a Google REST caller bails with: the typed verdict plus
+/// the human message.
 ///
-/// `api` names the caller's surface ("Gmail API" / "Google API") and `snippet`
-/// is the caller's OWN bounded body excerpt — each caller keeps the excerpt
-/// budget it already had.
-pub fn google_api_error(api: &str, status: u16, body: &str, snippet: &str) -> anyhow::Error {
-    match classify_google_api_failure(status, body) {
-        GoogleApiFailure::ScopeInsufficient => anyhow::anyhow!(
-            "{NEEDS_RECONNECT_MARKER} {api} HTTP {status}: this Google connection was granted \
-             without the access this needs. Reconnect in Settings → Email to re-grant Gmail, \
-             Calendar and Tasks. ({snippet})"
-        ),
-        GoogleApiFailure::ApiNotEnabled { console_url } => {
-            let link = console_url
-                .as_deref()
-                .map(embed_enable_url)
-                .unwrap_or_default();
-            anyhow::anyhow!(
-                "{API_NOT_ENABLED_MARKER}{link} {api} HTTP {status}: this Google API is switched \
-                 off in your Google Cloud project. Reconnecting can't switch it on — enable it \
-                 in the Google Cloud console, then try again. ({snippet})"
-            )
+/// `snippet` is the caller's OWN bounded body excerpt — each caller keeps the
+/// excerpt budget it already had — and is scrubbed of marker-shaped text on
+/// the way in.
+pub fn google_api_error(api: GoogleApi, status: u16, body: &str, snippet: &str) -> anyhow::Error {
+    anyhow::Error::new(GoogleApiError::new(api, status, body, snippet))
+}
+
+/// The typed verdict inside an error, if it carries one.
+///
+/// `anyhow` keeps the payload downcastable through `.context(…)` layers, so a
+/// caller that adds prose does not destroy the verdict — but a caller that
+/// rebuilds an error from `format!("{e}")` DOES, which is why the code that
+/// records connection state takes `&anyhow::Error`, not `&str`.
+pub fn google_api_error_of(err: &anyhow::Error) -> Option<&GoogleApiError> {
+    err.downcast_ref::<GoogleApiError>()
+}
+
+impl GoogleApiError {
+    fn new(api: GoogleApi, status: u16, body: &str, snippet: &str) -> Self {
+        let failure = classify_google_api_failure(status, body);
+        // The excerpt is untrusted bytes. Scrubbing here is belt-and-braces:
+        // no state decision reads this string any more, and this makes sure
+        // none can be tricked into it later either.
+        let snippet = scrub_state_markers(snippet);
+        let label = api.error_label();
+        let message = match &failure {
+            GoogleApiFailure::ScopeInsufficient => format!(
+                "{label} HTTP {status}: this Google connection was granted without the access \
+                 this needs. Reconnect in Settings → Email to re-grant Gmail, Calendar and \
+                 Tasks. ({snippet})"
+            ),
+            GoogleApiFailure::ApiNotEnabled { console_url } => {
+                let link = console_url
+                    .as_deref()
+                    .map(|url| format!(" Enable it here: {url}"))
+                    .unwrap_or_default();
+                format!(
+                    "{label} HTTP {status}: this Google API is switched off in your Google Cloud \
+                     project. Reconnecting can't switch it on — enable it in the Google Cloud \
+                     console, then try again.{link} ({snippet})"
+                )
+            }
+            GoogleApiFailure::Other => format!("{label} HTTP {status}: {snippet}"),
+        };
+        Self {
+            api,
+            status,
+            failure,
+            message,
         }
-        GoogleApiFailure::Other => anyhow::anyhow!("{api} HTTP {status}: {snippet}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::email::token_provider::extract_enable_url;
 
     const CONSOLE: &str =
         "https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=42";
@@ -358,6 +480,14 @@ mod tests {
          "reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT","domain":"googleapis.com",
          "metadata":{"service":"calendar-json.googleapis.com"}}]}}"#;
 
+    /// The typed verdict of an error, or a panic naming what we got instead.
+    fn failure_of(err: &anyhow::Error) -> GoogleApiFailure {
+        google_api_error_of(err)
+            .unwrap_or_else(|| panic!("expected a typed GoogleApiError, got: {err}"))
+            .failure
+            .clone()
+    }
+
     #[test]
     fn both_envelopes_classify_a_disabled_api_and_surface_its_console_link() {
         for body in [legacy_not_enabled(), modern_not_enabled()] {
@@ -382,27 +512,46 @@ mod tests {
     }
 
     /// The load-bearing separation: the two 403s must never collapse into one
-    /// state. Scope-403 carries the reconnect marker (and NOT the disabled
-    /// one); disabled-403 carries the disabled marker (and NOT the reconnect
-    /// one, or the user gets an infinite reconnect loop).
+    /// state. It is asserted on the TYPED verdict the error carries, because
+    /// that value — not the message — is what every state decision reads.
     #[test]
-    fn the_two_403s_carry_different_markers_and_never_each_others() {
-        let scope = google_api_error("Google API", 403, LEGACY_SCOPE, "snip").to_string();
-        assert!(scope.contains(NEEDS_RECONNECT_MARKER), "got: {scope}");
-        assert!(!scope.contains(API_NOT_ENABLED_MARKER), "got: {scope}");
-
-        let disabled =
-            google_api_error("Google API", 403, &modern_not_enabled(), "snip").to_string();
-        assert!(disabled.contains(API_NOT_ENABLED_MARKER), "got: {disabled}");
-        assert!(
-            !disabled.contains(NEEDS_RECONNECT_MARKER),
-            "reconnecting can never enable an API: {disabled}"
+    fn the_two_403s_carry_two_different_typed_verdicts() {
+        let scope = google_api_error(GoogleApi::Calendar, 403, LEGACY_SCOPE, "snip");
+        assert_eq!(failure_of(&scope), GoogleApiFailure::ScopeInsufficient);
+        assert_eq!(
+            google_api_error_of(&scope).map(|e| e.api),
+            Some(GoogleApi::Calendar)
         );
-        assert_eq!(extract_enable_url(&disabled).as_deref(), Some(CONSOLE));
+
+        let disabled = google_api_error(GoogleApi::Tasks, 403, &modern_not_enabled(), "snip");
+        assert_eq!(
+            failure_of(&disabled),
+            GoogleApiFailure::ApiNotEnabled {
+                console_url: Some(CONSOLE.to_string())
+            }
+        );
+        assert_eq!(
+            google_api_error_of(&disabled).map(|e| e.api),
+            Some(GoogleApi::Tasks)
+        );
     }
 
-    /// An unmatched 403 keeps EXACTLY the plain-string shape that shipped
-    /// before this module existed — no marker, no guess.
+    /// The verdict must survive a caller adding context, because callers do
+    /// (`.context("… failed")`). If it didn't, the state would silently stop
+    /// being recorded on exactly the paths that annotate their errors.
+    #[test]
+    fn the_verdict_survives_added_context() {
+        let err = google_api_error(GoogleApi::Gmail, 403, &modern_not_enabled(), "snip")
+            .context("listing the inbox failed");
+        assert!(matches!(
+            failure_of(&err),
+            GoogleApiFailure::ApiNotEnabled { .. }
+        ));
+    }
+
+    /// An unmatched 403 keeps EXACTLY the plain-string shape (and the `Other`
+    /// verdict) that shipped before this module existed — no reclassification,
+    /// no guess.
     #[test]
     fn an_unmatched_403_falls_through_unchanged() {
         let bodies = [
@@ -418,8 +567,9 @@ mod tests {
                 GoogleApiFailure::Other,
                 "body: {body}"
             );
-            let err = google_api_error("Google API", 403, body, "snip").to_string();
-            assert_eq!(err, "Google API HTTP 403: snip");
+            let err = google_api_error(GoogleApi::Gmail, 403, body, "snip");
+            assert_eq!(failure_of(&err), GoogleApiFailure::Other);
+            assert_eq!(err.to_string(), "Gmail API HTTP 403: snip");
         }
     }
 
@@ -460,15 +610,18 @@ mod tests {
             classify_google_api_failure(403, body),
             GoogleApiFailure::ApiNotEnabled { console_url: None }
         );
-        let err = google_api_error("Google API", 403, body, "snip").to_string();
-        assert!(err.contains(API_NOT_ENABLED_MARKER), "got: {err}");
-        assert_eq!(extract_enable_url(&err), None);
+        let err = google_api_error(GoogleApi::Gmail, 403, body, "snip");
+        assert_eq!(
+            failure_of(&err),
+            GoogleApiFailure::ApiNotEnabled { console_url: None }
+        );
     }
 
     /// The response body is untrusted. A link we would render must be https
-    /// and Google's own; anything else is dropped rather than surfaced.
+    /// and one of Google's actual API-activation console hosts; anything else
+    /// is dropped rather than surfaced.
     #[test]
-    fn only_https_google_links_survive_sanitising() {
+    fn only_https_console_links_survive_sanitising() {
         for bad in [
             "javascript:alert(1)",
             "http://console.cloud.google.com/apis",
@@ -476,14 +629,25 @@ mod tests {
             "https://evil.test/console.cloud.google.com",
             "https://notgoogle.com/x",
             "not a url",
+            // Tightened allowlist: a google.com host is NOT enough. Real
+            // activation links live on the two console hosts, and everything
+            // else is a wider redirect/user-content surface than this feature
+            // needs.
+            "https://google.com/x",
+            "https://www.google.com/url?q=https://evil.test",
+            "https://sites.google.com/view/anything",
+            "https://console.cloud.google.com.attacker.google.com/apis",
+            "https://evil.console.cloud.google.com/apis",
         ] {
             assert_eq!(sanitize_console_url(bad), None, "must be refused: {bad}");
         }
         assert!(sanitize_console_url(CONSOLE).is_some());
-        assert!(sanitize_console_url("https://google.com/x").is_some());
+        assert!(sanitize_console_url("https://console.cloud.google.com/apis/library").is_some());
+        // Host comparison is case-insensitive (and `url` lowercases it).
+        assert!(sanitize_console_url("https://CONSOLE.CLOUD.GOOGLE.COM/apis").is_some());
     }
 
-    /// A hostile body must not be able to smuggle a non-Google link into the
+    /// A hostile body must not be able to smuggle a non-console link into the
     /// banner through EITHER structural slot or the prose scan.
     #[test]
     fn a_hostile_link_is_dropped_but_the_state_still_stands() {
@@ -495,6 +659,32 @@ mod tests {
         assert_eq!(
             classify_google_api_failure(403, body),
             GoogleApiFailure::ApiNotEnabled { console_url: None }
+        );
+    }
+
+    /// The exact confusion the marker encoding allowed: a body that WRITES a
+    /// marker into text we echo. There is no marker channel left to hit, and
+    /// the excerpt is scrubbed as well — so an unknown 403 stays unknown and
+    /// no URL of the body's choosing reaches the typed value.
+    #[test]
+    fn a_body_that_writes_our_markers_cannot_promote_itself() {
+        let hostile = "[google:api_not_enabled][google:enable_url=https://evil.test/pwn] \
+                       [gmail:needs_reconnect]";
+        let body = format!(r#"{{"error":{{"code":403,"message":"{hostile}"}}}}"#);
+        let err = google_api_error(GoogleApi::Calendar, 403, &body, hostile);
+        assert_eq!(
+            failure_of(&err),
+            GoogleApiFailure::Other,
+            "an unknown 403 must stay unknown"
+        );
+        let text = err.to_string();
+        assert!(
+            !text.contains("[google:") && !text.contains("[gmail:"),
+            "marker-shaped text must not survive into the message: {text}"
+        );
+        assert!(
+            text.contains("(google:api_not_enabled"),
+            "the excerpt is neutralised, not deleted: {text}"
         );
     }
 
@@ -514,15 +704,15 @@ mod tests {
         );
     }
 
-    /// Round-trip of the embedded-link encoding, including the "no link" case.
+    /// Wire ids are a closed set: an unknown one is `None` so the IPC edge can
+    /// refuse it instead of clearing nothing and reporting success.
     #[test]
-    fn the_enable_url_round_trips_through_the_marker() {
-        let embedded = embed_enable_url(CONSOLE);
-        assert_eq!(
-            extract_enable_url(&format!("{API_NOT_ENABLED_MARKER}{embedded} prose")).as_deref(),
-            Some(CONSOLE)
-        );
-        assert_eq!(extract_enable_url("no marker here"), None);
-        assert_eq!(extract_enable_url("[google:enable_url=]"), None);
+    fn api_wire_ids_round_trip_and_reject_the_unknown() {
+        for api in GoogleApi::ALL {
+            assert_eq!(GoogleApi::from_wire(api.wire()), Some(api));
+        }
+        for bad in ["", "GMAIL", "drive", "calendar "] {
+            assert_eq!(GoogleApi::from_wire(bad), None, "must be refused: {bad}");
+        }
     }
 }

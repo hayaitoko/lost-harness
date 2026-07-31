@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::api_error::GoogleApi;
 use super::google::{GoogleClient, Method};
 
 const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
@@ -40,7 +41,10 @@ impl CalendarClient {
             .append_pair("singleEvents", "true")
             .append_pair("orderBy", "startTime")
             .append_pair("maxResults", &max.clamp(1, 100).to_string());
-        let value = self.google.json(Method::Get, url.as_str(), None).await?;
+        let value = self
+            .google
+            .json(GoogleApi::Calendar, Method::Get, url.as_str(), None)
+            .await?;
         let rows = value
             .get("items")
             .and_then(|v| v.as_array())
@@ -77,7 +81,7 @@ impl CalendarClient {
         });
         let value = self
             .google
-            .json(Method::Post, CALENDAR_API, Some(&body))
+            .json(GoogleApi::Calendar, Method::Post, CALENDAR_API, Some(&body))
             .await?;
         parse_event(value).ok_or_else(|| {
             anyhow::anyhow!("Google Calendar returned an event without an id or schedule")
@@ -86,7 +90,9 @@ impl CalendarClient {
 
     pub async fn delete(&self, id: &str) -> anyhow::Result<()> {
         let url = event_url(id)?;
-        self.google.json(Method::Delete, url.as_str(), None).await?;
+        self.google
+            .json(GoogleApi::Calendar, Method::Delete, url.as_str(), None)
+            .await?;
         Ok(())
     }
 }
