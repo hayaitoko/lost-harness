@@ -110,10 +110,16 @@
     loading = true;
     error = null;
     Promise.all([listCalendarEvents(profile), listGoogleTasks(profile)])
-      .then(([nextEvents, nextTasks]) => {
+      .then(async ([nextEvents, nextTasks]) => {
         if (token !== sequence) return;
         events = nextEvents;
         tasks = nextTasks;
+        // BOTH outcomes are re-checked, because the backend records on both:
+        // loads that WORKED are proof Calendar and Tasks are switched on, and
+        // drop the disabled state for them. Without this the banner kept
+        // rendering a state the backend had already thrown away, until the
+        // user pressed "check again" by hand.
+        await conn.refreshAfterSuccess(profile);
       })
       .catch(async (err) => {
         if (token !== sequence) return;
@@ -147,6 +153,7 @@
       eventTitle = "";
       eventStart = "";
       eventEnd = "";
+      void conn.refreshAfterSuccess($activeProfileId);
     } catch (err) {
       error = String(err);
       void conn.refresh($activeProfileId);
@@ -167,6 +174,7 @@
       tasks = [...tasks, task];
       taskTitle = "";
       taskNotes = "";
+      void conn.refreshAfterSuccess($activeProfileId);
     } catch (err) {
       error = String(err);
       void conn.refresh($activeProfileId);
@@ -180,6 +188,7 @@
     try {
       const updated = await setGoogleTaskCompleted($activeProfileId, task.id, !task.completed);
       tasks = tasks.map((row) => (row.id === updated.id ? updated : row));
+      void conn.refreshAfterSuccess($activeProfileId);
     } catch (err) {
       error = String(err);
       void conn.refresh($activeProfileId);
@@ -205,6 +214,7 @@
         await deleteGoogleTask($activeProfileId, id);
         tasks = tasks.filter((task) => task.id !== id);
       }
+      void conn.refreshAfterSuccess($activeProfileId);
     } catch (err) {
       error = String(err);
       void conn.refresh($activeProfileId);

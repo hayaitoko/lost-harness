@@ -15,6 +15,14 @@
 // refresh that would light the banner was thrown away because the effect's
 // read had claimed a newer token — leaving the banner dark while the API was
 // still switched off. Newest read wins, whichever resolves first.
+//
+// Why BOTH outcomes are observed: the backend records a verdict on failure AND
+// clears one on success (a call that works proves that API is switched on).
+// The screens only ever re-read after a failure, so the clearing half never
+// reached the UI: once the user enabled the API in the console and the next
+// call went through, the backend dropped the state and the banner went on
+// rendering the stale one until a manual re-check. `refreshAfterSuccess` is
+// the missing half.
 
 import {
   gmailSetupStatus,
@@ -134,7 +142,30 @@ export class GoogleConnection {
     } catch {
       // Keep whatever error the caller already surfaced — a failed re-read is
       // not a new fact about the connection.
+      // (`refreshAfterSuccess` funnels through here, so this holds for it too:
+      // a status read that fails is not evidence the call that succeeded
+      // didn't.)
     }
+  }
+
+  /** Re-read after a call SUCCEEDED.
+   *
+   *  A completed call is proof the API it reached is switched on, and the
+   *  backend drops that API's disabled state on the spot. The screen has to
+   *  re-read or it never learns: this is the half that was missing, so after
+   *  the user enabled the API in the console and the very next call went
+   *  through, the banner kept rendering a state the backend had already
+   *  thrown away, until they pressed "check again" by hand.
+   *
+   *  Skipped when the screen holds no disabled-API claim, because that is the
+   *  only state a success can change — `observe_success` deliberately does not
+   *  touch `needs_reconnect` (a call on a cached access token is no evidence
+   *  the stored grant came back). With nothing claimed there is nothing a
+   *  re-read could clear, so it would be a round trip that can only re-confirm
+   *  what we hold. */
+  async refreshAfterSuccess(profile: string): Promise<void> {
+    if (this.status?.api_not_enabled == null) return;
+    await this.refresh(profile);
   }
 
   /** "I've enabled it — check again": forget the disabled state for the APIs

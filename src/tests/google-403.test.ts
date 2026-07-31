@@ -228,6 +228,52 @@ describe("Email + Planner — the two connection banners", () => {
       expect(queryByTestId("google-api-disabled-banner")).toBeNull();
     });
 
+    /// The half that was missing. The backend records on BOTH outcomes: a
+    /// call that completes is proof its API is switched on, and clears the
+    /// disabled state on the spot. The screens only ever re-read after a
+    /// FAILURE, so the clearing half never reached the UI — the user enabled
+    /// the API in the console, the very next call went through, and the banner
+    /// went on rendering a state the backend had already thrown away until
+    /// they pressed "check again" by hand.
+    it(`${name}: a call that succeeds takes the banner down, with no manual re-check`, async () => {
+      let apiOn = false; // the switch in the user's Google Cloud console
+      let recorded = true; // what the backend currently holds
+      tauri.invoke.mockImplementation(async (cmd: string) => {
+        switch (cmd) {
+          case "gmail_setup_status":
+            return status(recorded ? { api_not_enabled: disabledState([own]) } : {});
+          case "list_email":
+          case "list_calendar_events":
+          case "list_google_tasks":
+            if (!apiOn) {
+              recorded = true; // observe_failure
+              throw new Error("Google API HTTP 403: switched off");
+            }
+            recorded = false; // observe_success — the call proves the API is on
+            return [];
+          default:
+            return null;
+        }
+      });
+
+      const { getByRole, queryByTestId } = render(Screen);
+      await waitFor(() =>
+        expect(queryByTestId("google-api-disabled-banner")).not.toBeNull(),
+      );
+
+      // The user switches it on in the console and just uses the app again.
+      // No "I've enabled it — check again" press anywhere in this test.
+      apiOn = true;
+      await fireEvent.click(getByRole("button", { name: "Refresh" }));
+      await settle();
+
+      expect(queryByTestId("google-api-disabled-banner")).toBeNull();
+      expect(tauri.invoke).not.toHaveBeenCalledWith(
+        "google_clear_api_not_enabled",
+        expect.anything(),
+      );
+    });
+
     /// The banner is drawn from a PROFILE-wide state, but the button under it
     /// is screen-scoped: it clears and re-tests only this screen's APIs. A
     /// banner naming an API this screen never calls is a button that cannot

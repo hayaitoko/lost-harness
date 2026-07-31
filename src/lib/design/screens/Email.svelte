@@ -112,8 +112,14 @@
     listLoading = true;
     listError = null;
     listEmail(profile)
-      .then((rows) => {
-        if (token === listSeq) emails = rows;
+      .then(async (rows) => {
+        if (token !== listSeq) return;
+        emails = rows;
+        // BOTH outcomes are re-checked, because the backend records on both:
+        // a listing that WORKED is proof Gmail is switched on, and drops the
+        // disabled state for it. Without this the banner kept rendering a
+        // state the backend had already thrown away.
+        await conn.refreshAfterSuccess(profile);
       })
       .catch(async (err) => {
         if (token !== listSeq) return;
@@ -135,7 +141,10 @@
     detail = null;
     try {
       const d = await readEmail($activeProfileId, id);
-      if (token === detailSeq) detail = d;
+      if (token === detailSeq) {
+        detail = d;
+        void conn.refreshAfterSuccess($activeProfileId);
+      }
     } catch (err) {
       if (token === detailSeq) {
         detailError = String(err);
@@ -194,6 +203,7 @@
     try {
       await sendEmail($activeProfileId, composeTo.trim(), composeSubject.trim(), composeBody);
       sentTo = composeTo.trim();
+      void conn.refreshAfterSuccess($activeProfileId);
     } catch (err) {
       sendError = String(err);
       void conn.refresh($activeProfileId);
