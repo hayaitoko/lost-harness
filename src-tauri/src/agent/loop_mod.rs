@@ -727,11 +727,6 @@ impl AgentLoop {
         }
     }
 
-    /// This loop's provider registry.
-    pub(crate) fn model_manager(&self) -> &ModelManager {
-        &self.model_manager
-    }
-
     /// Wave 4.3c — run one bounded, one-shot "helper" sub-agent. This is the
     /// `delegate` tool's actual EXECUTION, performed here by the background
     /// `WorkQueueRunner` (`agent::work_runner`), never by `delegate` itself:

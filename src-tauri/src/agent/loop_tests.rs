@@ -2152,7 +2152,6 @@ fn a_helper_run_that_stayed_local_is_reported_as_local() {
 #[test]
 fn a_helper_run_with_nothing_to_go_on_reports_no_zone_rather_than_local() {
     use crate::agent::loop_mod::zone_of_run;
-    use crate::models::TrustZone;
 
     // No rows at all (a gate block before anything was persisted), and rows
     // whose zone is missing or unrecognised. Every one of these is UNKNOWN.
