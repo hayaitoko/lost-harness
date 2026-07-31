@@ -91,6 +91,24 @@ Install LM Studio independently, load a model, start its local server, then add
 the OpenAI-compatible provider in Lost Harness. The standard endpoint is
 `http://127.0.0.1:1234/v1`.
 
+## Releases and updating
+
+The app can update itself from this repository's public GitHub releases. On
+launch it makes at most one anonymous request — for a version manifest,
+carrying no conversations, files or account — and only if the **Settings →
+About** toggle is on. Nothing downloads or installs without a click, and a
+payload is refused unless it is signed by the project's key and comes from this
+repository's own release assets.
+
+Cutting a release is a `vX.Y.Z` tag: CI builds, signs, verifies the signature
+against the public key the app ships, and opens a **draft** release for a human
+to publish.
+
+See [docs/releasing.md](docs/releasing.md) for the full release runbook, the
+signing-key location and rotation procedure, the updater's egress behaviour, and
+an explicit account of which parts of the update loop have been verified and
+which have not.
+
 ## Contributing
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
