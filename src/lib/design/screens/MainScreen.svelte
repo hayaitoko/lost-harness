@@ -6,7 +6,10 @@
   // `.lh-ghost-btn` prototype helpers for hover.
   import ChatMessage from "../components/ChatMessage.svelte";
   import IconButton from "../components/IconButton.svelte";
-  import ModelPicker from "../components/ModelPicker.svelte";
+  import ModelPicker, {
+    type ModelGroup,
+    type ArmedSelection,
+  } from "../components/ModelPicker.svelte";
   import PrivacyEventBar from "../components/PrivacyEventBar.svelte";
   import RoutingBadge from "../components/RoutingBadge.svelte";
   import Sidebar from "../components/Sidebar.svelte";
@@ -26,8 +29,8 @@
   import {
     providersStore,
     setActiveModel,
-    getProvider,
     fetchModels,
+    type Provider,
   } from "$lib/stores/providers.svelte";
   import { sendOnEnter } from "$lib/stores/settings";
   import { activeProfileId } from "$lib/stores/profiles";
@@ -44,7 +47,12 @@
   // Nav honesty: only tabs with real backing data. The mock tasks/agents/
   // terminal tabs were removed with the other fiction surfaces (2026-07-24).
   type PanelTab = "routing" | "files";
-  type ModelOption = { name: string; kind: "local" | "cloud"; group: string; key: string };
+
+  /** Shown when the composer has no endpoint armed. Mirrors the backend's
+   *  `NO_ENDPOINT_SELECTED` (agent/loop_mod.rs) so the user reads one
+   *  sentence no matter which layer catches it. */
+  const NO_ENDPOINT_SELECTED =
+    "no model endpoint is selected — pick a model in the composer";
 
   const BINDING_LABEL: Record<Binding, string> = {
     auto: "Auto",
@@ -273,9 +281,11 @@
     public: "Nothing sensitive detected",
   };
 
-  // ── Model picker: build the design's flat ModelOption[] from the real
-  // provider list, fetching each provider's models (cached by the store).
-  let modelOptions = $state<ModelOption[]>([]);
+  // ── Model picker: one group per configured provider, built from the real
+  // provider list. A provider whose listing FAILED still gets a group, carrying
+  // the reason — never dropped, because a provider missing from the popover is
+  // what leaves a different one armed and serving every turn.
+  let modelGroups = $state<ModelGroup[]>([]);
   // Keyed by the composite `providerId::name` so two providers that expose an
   // identically-named model don't collide (the old name-keyed map let the
   // last-registered provider silently shadow the others).
@@ -283,76 +293,233 @@
 
   const modelKey = (providerId: string, name: string) => `${providerId}::${name}`;
 
-  $effect(() => {
-    const provs = providersStore.providers;
-    let cancelled = false;
-    (async () => {
-      const perProvider = await Promise.all(
-        provs.map(async (p) => ({ provider: p, models: await fetchModels(p.id) })),
-      );
-      if (cancelled) return;
-      const opts: ModelOption[] = [];
-      const owner = new Map<string, { providerId: string; name: string }>();
-      for (const { provider, models } of perProvider) {
-        for (const name of models) {
-          const key = modelKey(provider.id, name);
-          opts.push({
-            name,
-            kind: provider.kind === "cloud" ? "cloud" : "local",
-            group: provider.name,
-            key,
-          });
-          owner.set(key, { providerId: provider.id, name });
-        }
+  // `modelSeq` drops a slow listing that lands after a newer one, so the
+  // groups can never be rebuilt from a stale round.
+  let modelSeq = 0;
+  async function loadModelGroups(providers: Provider[], refresh: boolean) {
+    const token = ++modelSeq;
+    const perProvider = await Promise.all(
+      providers.map(async (p) => ({
+        provider: p,
+        result: await fetchModels(p.id, { refresh }),
+      })),
+    );
+    if (token !== modelSeq) return;
+    const groups: ModelGroup[] = [];
+    const owner = new Map<string, { providerId: string; name: string }>();
+    for (const { provider, result } of perProvider) {
+      // `key` is `providerId::name`, so an endpoint that returns the same model
+      // name twice would produce two identical keys and throw
+      // `each_key_duplicate` in the (always-mounted) popover — the same crash
+      // class as a duplicate group key, one level down. There is deliberately
+      // no `new Set(...)` here any more: `fetchModels` guarantees distinct
+      // names for EVERY consumer, so Settings → Models is safe too. De-duping
+      // per call site is how Settings kept crashing after the composer was
+      // "fixed".
+      const models = result.ok ? result.models : [];
+      for (const name of models) {
+        owner.set(modelKey(provider.id, name), { providerId: provider.id, name });
       }
-      modelOptions = opts;
-      modelOwner = owner;
-    })();
-    return () => {
-      cancelled = true;
-    };
+      groups.push({
+        // Identity is the provider ID. Two providers may share a display
+        // name (nothing enforces uniqueness — see ModelGroup.id), and a
+        // name-keyed list would crash the whole composer when they do.
+        id: provider.id,
+        group: provider.name,
+        // Same predicate the backend stamps turns with: `isPrivate` (the
+        // base URL), NOT `kind` (a user-typed label with no enforcement
+        // power). `kind === "cloud" ? cloud : local` painted a Custom
+        // provider at https://api.example.com green and labelled it "on
+        // device" — a trust-zone claim about an endpoint that egresses, made
+        // at exactly the moment the user is choosing where to send.
+        kind: provider.isPrivate ? "local" : "cloud",
+        items: models.map((name) => ({ name, key: modelKey(provider.id, name) })),
+        // Every empty group says why it is empty — a failed listing and an
+        // endpoint with no models are different problems with different fixes.
+        //
+        // The "listed nothing" wording is deliberately blunt about the dead
+        // end. Removing the Anthropic quick-add preset only helps NEW installs;
+        // an existing `global.db` still has that row, and its user sees an
+        // endpoint that is configured, answers, and can never be selected —
+        // because this app speaks only the OpenAI-compatible surface and
+        // Anthropic's native API rejects a Bearer key. We do not touch their
+        // data, so the notice has to be enough to act on.
+        notice: result.ok
+          ? models.length === 0
+            ? "This endpoint answered but listed no models, so nothing here can be selected. Lost Harness talks to OpenAI-compatible endpoints only — GET /models and POST /chat/completions with an Authorization: Bearer key. Check the base URL (it usually ends in /v1); if the service doesn't offer that API, remove it in Settings → Models."
+            : null
+          : `Couldn't list models — check the endpoint or key. (${result.error})`,
+      });
+    }
+    modelGroups = groups;
+    modelOwner = owner;
+  }
+
+  // Listing on provider-list changes only — a cache miss (new provider, edited
+  // base URL) is the one thing that legitimately needs a live `GET /models`
+  // without the user asking. Opening the picker no longer triggers anything.
+  $effect(() => {
+    void loadModelGroups(providersStore.providers, false);
   });
+
+  /**
+   * The picker's explicit "Refresh" affordance.
+   *
+   * This is now the ONLY interaction in the composer that contacts configured
+   * endpoints on demand. Opening the picker used to run this on every click —
+   * on open AND on close — bypassing the cache and issuing an authenticated
+   * `GET {base_url}/models` to every provider, cloud ones included. In a
+   * privacy-first app that is egress the user never asked for, so it is now
+   * behind a button that says what it does.
+   */
+  let modelsRefreshing = $state(false);
+  async function refreshModelGroups(): Promise<void> {
+    if (modelsRefreshing) return;
+    modelsRefreshing = true;
+    try {
+      await loadModelGroups(providersStore.providers, true);
+    } finally {
+      modelsRefreshing = false;
+    }
+  }
 
   function handleModelChange(key: string) {
     const owner = modelOwner.get(key);
-    if (owner) setActiveModel(owner.providerId, owner.name);
+    if (!owner) {
+      composerError = "That model is no longer listed — pick another.";
+      return;
+    }
+    // setActiveModel reports whether the selection actually took. Believing a
+    // silent no-op would leave the PREVIOUS endpoint armed while the picker
+    // appeared to have moved.
+    if (!setActiveModel(owner.providerId, owner.name)) {
+      composerError = "That endpoint is no longer configured — pick another model.";
+      return;
+    }
+    composerError = null;
   }
 
-  // The picker's selection identity: the active provider+model as a composite
-  // key, or "" when nothing is selected (the picker then shows its placeholder).
-  const activeModelKey = $derived(
-    providersStore.activeProviderId && providersStore.activeModel
-      ? modelKey(providersStore.activeProviderId, providersStore.activeModel)
-      : "",
-  );
-
-  // The send color reflects the actual route commitment we can make before a
-  // turn starts: explicit local/cloud models get their own colors, while Auto
-  // (or an unset model) stays amber because the privacy filter decides.
-  type SendRoute = "local" | "public" | "filter";
   const activeProvider = $derived(
     providersStore.providers.find((provider) => provider.id === providersStore.activeProviderId),
   );
+
+  /**
+   * THE armed endpoint — the single expression EVERY "is the composer armed?"
+   * question in this screen answers from. Not just the display ones: the picker
+   * chip, the Send button's enabled state and colour, the knot, AND
+   * {@link handleSend} / {@link confirmAndResend} themselves.
+   *
+   * It is `providersStore.active` plus the provider row that pair names, and
+   * requiring the row is the load-bearing part. `active` is a provider ID; the
+   * row is what turns it into an endpoint the user can be shown — a name, a
+   * base URL, a trust zone. Without it there is nothing to display and nothing
+   * to warn about, so a send would be going somewhere the UI could not describe.
+   *
+   * The send path used to read `providersStore.active` on its own, on the
+   * grounds that it is the authority. That left a gap in one direction: with
+   * `active` set but its row missing, every display went unarmed while Send
+   * still had a selection and still sent. Both halves now read this, so they
+   * cannot disagree in EITHER direction.
+   *
+   * The store deliberately does NOT close this particular gap at its own end.
+   * `loadFromStorage` KEEPS a selection whose provider isn't in the loaded list
+   * (see its comment): that list is only a cache, `hydrateProviders()` is about
+   * to replace it with the backend's answer, and discarding the pair at load
+   * would cost the user a perfectly good endpoint every time that one blob was
+   * unreadable. So the contradiction is real, transient, and closed HERE, at
+   * the consumer — uniformly unarmed while the row is missing, re-armed by
+   * itself once hydration restores it. What the store does guarantee is the
+   * other two directions: `setActiveModel` refuses to arm a provider that isn't
+   * in the list, and `hydrateProviders` clears a selection the backend no
+   * longer lists (with a sentence naming the endpoint).
+   *
+   * `AppStatusBar` is shared by every screen and so cannot import this, but it
+   * derives its own copy of the same pair under the same rule — the bar never
+   * names a model whose provider row is absent either.
+   */
+  const armed = $derived.by(() => {
+    const selection = providersStore.active;
+    if (!selection || !activeProvider) return null;
+    return { selection, provider: activeProvider };
+  });
+
+  /**
+   * What the picker chip shows. Built from {@link armed} — the ARMED pair —
+   * and never from `modelGroups`.
+   *
+   * The old chip searched the fetched listings for the selected key, so a
+   * provider whose `GET /models` failed (`items: []`) rendered the amber "No
+   * model selected" placeholder while `canSend` stayed true and Send still went
+   * to that provider. `unconfirmed` is the honest version of that state: the
+   * selection is shown as armed, with a distinct warning that we could not
+   * confirm the model against the endpoint.
+   *
+   * A provider with no group yet (the first listing round hasn't landed) is NOT
+   * flagged — "we haven't asked yet" is not "we asked and it wasn't there", and
+   * flashing a warning on every launch would train the user to ignore it.
+   */
+  const armedSelection = $derived.by((): ArmedSelection | null => {
+    if (!armed) return null;
+    const { selection, provider } = armed;
+    const key = modelKey(selection.providerId, selection.model);
+    const group = modelGroups.find((g) => g.id === provider.id);
+    const listed = group?.items.some((m) => m.key === key) ?? true;
+    return {
+      key,
+      model: selection.model,
+      provider: provider.name,
+      // `isPrivate` (the base URL), not `kind` (a user-typed label) — the same
+      // predicate the backend stamps the turn's trust zone with.
+      kind: provider.isPrivate ? "local" : "cloud",
+      unconfirmed: listed
+        ? null
+        : (group?.notice ??
+          "this endpoint's model list doesn't currently include it"),
+    };
+  });
+
+  // The send color reflects the actual route commitment we can make before a
+  // turn starts: explicit local/cloud models get their own colors, Auto stays
+  // amber because the privacy filter decides — and "nothing selected" is its
+  // OWN state, never folded into the amber filter state. An unarmed composer
+  // is not a routing decision waiting to happen; it is a turn that cannot go
+  // anywhere, and it must look different from one that can.
+  type SendRoute = "local" | "public" | "filter" | "unset";
   const sendRoute = $derived.by((): SendRoute => {
-    if (binding === "auto" || !activeProvider) return "filter";
-    if (binding === "private" || activeProvider.kind !== "cloud") return "local";
+    // Same `armed` the chip renders from. A failed model listing does not
+    // disarm anything, and must not be able to make these two disagree.
+    if (!armed) return "unset";
+    if (binding === "auto") return "filter";
+    // `isPrivate`, not `kind` — same reason as the picker groups above. A
+    // Custom-kind provider pointed at a public API would otherwise turn the
+    // Send button green and read "Send via local model".
+    if (binding === "private" || armed.provider.isPrivate) return "local";
     return "public";
   });
+  const canSend = $derived(sendRoute !== "unset");
   const SEND_ROUTE_LABEL: Record<SendRoute, string> = {
     local: "local model",
     public: "public model",
     filter: "privacy filter",
+    unset: "no model selected",
   };
   const SEND_ROUTE_CLASS: Record<SendRoute, string> = {
     local: "bg-local text-white hover:brightness-110",
     public: "bg-cloud text-white hover:brightness-110",
     filter: "bg-warn text-[#231f16] hover:brightness-110",
+    unset: "bg-surface-2 text-text-3 cursor-not-allowed",
   };
   const knotState = $derived.by((): KnotState => {
     if (sendRoute === "local") return "local";
     if (sendRoute === "public") return "cloud";
+    if (sendRoute === "unset") return "idle";
     return "filter";
   });
+
+  // A refusal or a lost selection, shown right under the composer. Cleared as
+  // soon as the user makes a valid choice.
+  let composerError = $state<string | null>(null);
+  const composerNotice = $derived(composerError ?? providersStore.activeSelectionLost);
 
   // The backend does not expose full token accounting yet. The context panel
   // therefore reports only a clearly-labelled estimate for text already in the
@@ -445,10 +612,18 @@
     }
   }
 
-  // ── Routing: map a real message's gate outcome to the design's Route.
-  // "allow" means the gate let the request go to whichever endpoint was
-  // targeted — local or cloud depends on that provider's kind, so allow
-  // alone doesn't tell us the route; cross-reference providersStore.
+  // ── Routing: report a real message's trust zone.
+  //
+  // Every branch below reads a PERSISTED backend fact about that turn. Nothing
+  // here consults the live provider registry, and nothing falls through to a
+  // reassuring default.
+  //
+  // The bug this replaces did both: it looked the served provider up in
+  // `providersStore` and returned `"local"` whenever it couldn't find one. So
+  // a turn genuinely served by a public cloud endpoint rendered as a green
+  // "Local" badge the moment that endpoint was deleted — the privacy signal
+  // inverted. The trust zone of a past turn is a fact about the past, and it
+  // now arrives from the backend stamped on the turn (`served_by.zone`).
   function messageRoute(m: Message): Route {
     // H-12: `gate_confirm` also means nothing left the machine (pending the
     // user's one-send confirmation), so it reads as "held" too.
@@ -458,21 +633,138 @@
       m.routing_decision === "block"
     )
       return "blocked";
-    if (m.routing_decision === "route_local") return "local";
-    // redact_send: the safe remainder went to the cloud (sensitive spans stayed
-    // local) — surface it as a cloud route; the event bar explains the redaction.
+
+    // The authoritative answer: the zone the backend stamped on this turn when
+    // it ran, from the same `is_cloud` the privacy gate itself was given.
+    const zone = m.served_by?.zone;
+    if (zone === "cloud") return "cloud";
+    if (zone === "local") return "local";
+
+    // No stamped zone — a row older than profile schema v12. The only other
+    // evidence is the persisted routing decision, and the rule for using it is:
+    //
+    //   **a decision may only ever support the LESS reassuring claim.**
+    //
+    // `redact_send` therefore still yields "cloud". The backend only reaches
+    // that branch under `if is_cloud`, so the turn provably egressed (the
+    // sensitive spans were blacked out first — the event bar says so). Being
+    // wrong here can only over-warn.
     if (m.routing_decision === "redact_send") return "cloud";
-    if (m.routing_decision === "allow") {
-      const provider = getProvider(m.provider_id ?? null);
-      if (provider) return provider.kind === "cloud" ? "cloud" : "local";
-    }
-    return "local";
+
+    // `route_local` / `tool_reroute_local` deliberately do NOT yield "local".
+    // They used to, on the grounds that `enforce_local_routing` structurally
+    // proves the target was `is_local() && is_private()`. That argument does
+    // not survive contact with the code:
+    //
+    //   1. The backend itself does not make it. On the `RouteLocal` branch,
+    //      `process_message_inner` picks the endpoint and then computes
+    //      `local_is_cloud = !is_private_endpoint(&local.base_url)` and stamps
+    //      the row from THAT — because `find_or_start_local_provider` has a
+    //      second path (`models::runner::ensure_running`) that mints the
+    //      bundled sidecar's provider without going through the enforcer at
+    //      all. "We took the local route" and "that endpoint was private" are
+    //      two separate facts there. A reader cannot infer what the writer
+    //      declined to assume.
+    //   2. A zone-null row was written by a build OLDER than the stamp. The
+    //      proof would be a claim about today's routing code applied to a row
+    //      produced by code that is no longer in the tree — including builds
+    //      before `enforce_local_routing` refused `Unconstrained` (its old arm
+    //      returned `candidates.first()`, cloud included) and before the
+    //      pre-send indicators stopped keying off `kind`.
+    //
+    // So: unknown. Which is also the whole point — `messageRoute` already
+    // refuses to answer "local" for a zone-null row whose provider still
+    // resolves to a local endpoint. Answering "local" from a persisted string
+    // instead is the same inference walking in a different door, and it is the
+    // reassuring direction, which is the one that must never be guessed.
+    //
+    // "allow" with no stamped zone tells us the gate permitted the turn, not
+    // where it went. Same answer.
+    return "unknown";
   }
 
+  /**
+   * How to REFER to the endpoint that served a turn: provider name + host.
+   *
+   * Honest scope, because the two halves of `served_by` are not the same kind
+   * of fact. `provider_id` and `zone` are HISTORY — stamped on the row when the
+   * turn ran, true forever. `provider_name` and `base_url` are resolved from
+   * the LIVE registry at read time (`ipc::resolve_served_by`), so they describe
+   * that provider's configuration NOW: rename it or repoint its base URL and
+   * this label follows, for a turn that ran against the old address.
+   *
+   * That split is deliberate and it stays. The privacy-bearing part — the trust
+   * zone — is persisted; these two exist so the user can RECOGNISE which of
+   * their rows it was. Snapshotting them onto every message would duplicate
+   * mutable display data across the whole transcript (a schema change) to
+   * harden a recognition aid, while the claim that actually matters is already
+   * hard. What was not acceptable was presenting current config as a record of
+   * the past, so {@link routeTitle} now says which is which.
+   *
+   * Falls back to the persisted provider id when the provider has since been
+   * removed — an id the user can still recognise beats inventing a name.
+   */
+  function servedByLabel(m: Message): string | null {
+    const served = m.served_by;
+    if (!served) return null;
+    const host = served.base_url ? hostOf(served.base_url) : null;
+    if (served.provider_name && host) return `${served.provider_name} (${host})`;
+    return served.provider_name ?? served.provider_id;
+  }
+
+  function hostOf(baseUrl: string): string {
+    try {
+      return new URL(baseUrl).host;
+    } catch {
+      return baseUrl;
+    }
+  }
+
+  // Spec: "the UI must show, per turn, which provider+endpoint actually served
+  // it". The model string alone never says WHERE it ran — and on a reroute or
+  // a redacted send the serving endpoint is a different one than the composer
+  // shows, which is exactly the case worth surfacing.
+  // An exhaustive map, not a chained ternary: the ternary this replaces had an
+  // `else` arm, so adding a fourth Route silently labelled it "Held" — an
+  // unknown route would have claimed the turn was blocked.
+  const ROUTE_PREFIX: Record<Route, string> = {
+    local: "Local",
+    cloud: "Cloud",
+    blocked: "Held",
+    unknown: "Unknown route",
+  };
+
   function routeLabel(m: Message): string {
-    const route = messageRoute(m);
-    const prefix = route === "local" ? "Local" : route === "cloud" ? "Cloud" : "Held";
-    return m.model ? `${prefix} · ${m.model}` : prefix;
+    const parts = [ROUTE_PREFIX[messageRoute(m)]];
+    const served = servedByLabel(m);
+    if (served) parts.push(served);
+    if (m.model) parts.push(m.model);
+    return parts.join(" · ");
+  }
+
+  /** The badge tooltip — the detail that doesn't fit in a calm chip.
+   *
+   *  The URL is labelled "now" on purpose: it is the provider's CURRENT
+   *  configuration, not the address this turn was sent to (see
+   *  {@link servedByLabel}). It used to be shown as a bare URL next to a route
+   *  claim about the past, which invites reading it as part of that claim. The
+   *  zone in the badge is the recorded fact; this line is context. */
+  function routeTitle(m: Message): string | undefined {
+    const configuredNow = m.served_by?.base_url;
+    if (messageRoute(m) === "unknown") {
+      // Say what we don't know and why, rather than leaving a bare chip. This
+      // is the honest end of the old silent "Local" default.
+      return (
+        "This turn was recorded before Lost Harness stamped the trust zone on " +
+        "each turn, so whether it stayed on this machine can't be confirmed." +
+        (configuredNow ? ` Endpoint as configured now: ${configuredNow}` : "")
+      );
+    }
+    if (!configuredNow) return undefined;
+    return (
+      `Endpoint as configured now: ${configuredNow}. ` +
+      "The route shown is what was recorded when this turn ran."
+    );
   }
 
   // Only show a routing badge once a real decision exists — never on a
@@ -504,17 +796,36 @@
   async function handleSend() {
     const content = draft.trim();
     if (!content || isSending) return;
+    // Fail closed, from the SAME expression the chip and the Send button read.
+    // The composer used to read the store and send whatever was there,
+    // including `provider_id: ""` / `model: ""`. A turn goes to the endpoint
+    // the user picked — the one the UI is showing them — or it does not go.
+    const armedNow = armed;
+    if (!armedNow) {
+      composerError = NO_ENDPOINT_SELECTED;
+      return; // draft is deliberately kept — nothing was sent
+    }
+    const selection = armedNow.selection;
+    composerError = null;
     isSending = true;
     draft = "";
     autoresize();
     try {
       await sendChatMessage(
         content,
-        providersStore.activeProviderId,
-        providersStore.activeModel,
+        selection.providerId,
+        selection.model,
         $activeConversation ? undefined : binding,
         mode,
       );
+    } catch (err) {
+      // sendMessage surfaces model/gate failures inline on the assistant row
+      // and does not throw; reaching here means nothing was sent at all (the
+      // store's own endpoint precondition, or a failed conversation create).
+      // Give the user their text back rather than swallowing it.
+      composerError = err instanceof Error ? err.message : String(err);
+      draft = content;
+      autoresize();
     } finally {
       isSending = false;
       textareaEl?.focus();
@@ -530,16 +841,28 @@
   let confirming = $state(false);
   async function confirmAndResend(heldContent: string) {
     if (confirming || isSending) return;
+    // Same fail-closed rule as handleSend, from the same `armed`. A confirmed
+    // send is still a send, and the endpoint it goes to is exactly what the
+    // user is confirming — so it must be the one they can see.
+    const armedNow = armed;
+    if (!armedNow) {
+      composerError = NO_ENDPOINT_SELECTED;
+      return;
+    }
+    const selection = armedNow.selection;
+    composerError = null;
     confirming = true;
     try {
       await confirmPublicSend(heldContent);
       await sendChatMessage(
         heldContent,
-        providersStore.activeProviderId,
-        providersStore.activeModel,
+        selection.providerId,
+        selection.model,
         $activeConversation ? undefined : binding,
         mode,
       );
+    } catch (err) {
+      composerError = err instanceof Error ? err.message : String(err);
     } finally {
       confirming = false;
     }
@@ -666,10 +989,24 @@
               <span class="whitespace-pre-wrap">{m.content}</span>
             </ChatMessage>
           {:else}
-            {#if m.routing_decision === "route_local"}
+            <!-- The reassuring bar is gated on the STAMPED zone, not on the
+                 routing decision. `route_local` says the gate rerouted the
+                 turn; only `served_by.zone` says where it landed. See
+                 `messageRoute` for why the decision cannot stand in for the
+                 zone on a pre-stamp row — this is the same conclusion applied
+                 to the louder of the two surfaces. -->
+            {#if m.routing_decision === "route_local" && m.served_by?.zone === "local"}
               <PrivacyEventBar kind="kept" title="Kept on your machine">
                 This turn was routed to a local model — the content looked
                 sensitive, or a cloud endpoint wasn't reachable.
+              </PrivacyEventBar>
+            {:else if m.routing_decision === "route_local"}
+              <PrivacyEventBar kind="unknown" title="Rerouted — not confirmed local">
+                The privacy gate sent this turn to a different endpoint than the
+                one you picked.
+                {m.served_by?.zone === "cloud"
+                  ? "That endpoint was reachable off this machine, so the content still left it."
+                  : "This turn was recorded before Lost Harness stamped the trust zone on each turn, so whether it stayed on this machine can't be confirmed."}
               </PrivacyEventBar>
             {:else if m.routing_decision === "redact_send"}
               <PrivacyEventBar kind="kept" title="Sent the safe parts only">
@@ -718,6 +1055,7 @@
               <RoutingBadge
                 route={messageRoute(m)}
                 label={routeLabel(m)}
+                title={routeTitle(m)}
                 onclick={toggleWhy}
               />
             {/snippet}
@@ -752,6 +1090,23 @@
     {/if}
 
     <div class="flex-shrink-0 px-5 pb-4 pt-2">
+      {#if composerNotice}
+        <!-- A refused send, or an endpoint that went away under the user.
+             Never silent: the alternative to saying this out loud is a
+             message going somewhere they didn't choose. -->
+        <div class="mx-auto mb-1.5 max-w-[700px]">
+          <p
+            role="status"
+            class="flex items-start gap-1.5 rounded-[var(--r)] bg-warn-soft px-2.5 py-1.5 text-[11.5px] leading-[1.35] text-warn"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" class="mt-[1px] shrink-0">
+              <path d="M12 8v5M12 16.5v.1" stroke-linecap="round" />
+              <circle cx="12" cy="12" r="9" />
+            </svg>
+            {composerNotice}
+          </p>
+        </div>
+      {/if}
       <div
         class="mx-auto flex max-w-[700px] flex-col rounded-[24px] border border-border-strong bg-surface px-[15px] py-1.5 shadow-[var(--shadow)] transition-colors duration-100 focus-within:border-[color-mix(in_srgb,var(--accent)_55%,var(--border-strong))]"
       >
@@ -897,13 +1252,21 @@
             </div>
 
             <ModelPicker
-              models={modelOptions}
-              value={activeModelKey}
+              groups={modelGroups}
+              selection={armedSelection}
               onchange={handleModelChange}
               onopen={() => {
+                // OPENING only, and NO network. This used to fire on open AND
+                // close and kick off a cache-bypassing `GET {base_url}/models`
+                // — bearer key attached — to every configured provider,
+                // including cloud ones, on every picker click. Listing is now
+                // either cached, driven by the provider list changing, or
+                // explicitly requested via the Refresh button below.
                 composerPopover = null;
                 permissionOpen = false;
               }}
+              refreshing={modelsRefreshing}
+              onrefresh={() => void refreshModelGroups()}
             />
 
             <div class="relative flex items-center">
@@ -946,10 +1309,15 @@
             {:else}
               <button
                 type="button"
-                aria-label={`Send via ${SEND_ROUTE_LABEL[sendRoute]}`}
-                title={`Send via ${SEND_ROUTE_LABEL[sendRoute]}`}
+                disabled={!canSend}
+                aria-label={canSend
+                  ? `Send via ${SEND_ROUTE_LABEL[sendRoute]}`
+                  : "Can't send — pick a model first"}
+                title={canSend
+                  ? `Send via ${SEND_ROUTE_LABEL[sendRoute]}`
+                  : "Pick a model in the picker before sending"}
                 onclick={handleSend}
-                class="grid h-[36px] w-[36px] place-items-center rounded-full transition-[transform,filter] hover:scale-[1.03] {SEND_ROUTE_CLASS[sendRoute]}"
+                class="grid h-[36px] w-[36px] place-items-center rounded-full transition-[transform,filter] enabled:hover:scale-[1.03] {SEND_ROUTE_CLASS[sendRoute]}"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M12 19V5M5 12l7-7 7 7" stroke-linecap="round" stroke-linejoin="round" />

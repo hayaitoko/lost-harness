@@ -137,7 +137,8 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
             let mut stmt = tx
                 .prepare(
                     "SELECT id, conversation_id, role, content, model, provider_id,
-                            routing_decision, thinking_content, error, aborted, created_at
+                            routing_decision, endpoint_zone, thinking_content, error,
+                            aborted, created_at
                      FROM messages WHERE conversation_id = ?1
                      ORDER BY created_at ASC, rowid ASC",
                 )
@@ -152,10 +153,11 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
                         model: r.get(4)?,
                         provider_id: r.get(5)?,
                         routing_decision: r.get(6)?,
-                        thinking_content: r.get(7)?,
-                        error: r.get(8)?,
-                        aborted: r.get::<_, i64>(9)? != 0,
-                        created_at: r.get(10)?,
+                        endpoint_zone: r.get(7)?,
+                        thinking_content: r.get(8)?,
+                        error: r.get(9)?,
+                        aborted: r.get::<_, i64>(10)? != 0,
+                        created_at: r.get(11)?,
                     })
                 })
                 .context("crash-recovery: loading messages")?
@@ -186,6 +188,9 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
             model: None,
             provider_id: None,
             routing_decision: Some(REPAIR_ROUTING_DECISION.to_string()),
+            // A locally-synthesised repair marker — no endpoint served it, so
+            // there is no trust zone to claim.
+            endpoint_zone: None,
             thinking_content: None,
             error: Some(INTERRUPTED_ERROR_TAG.to_string()),
             aborted: true,
@@ -195,8 +200,9 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
         tx.execute(
             "INSERT INTO messages
              (id, conversation_id, role, content, model, provider_id,
-              routing_decision, thinking_content, error, aborted, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              routing_decision, endpoint_zone, thinking_content, error, aborted,
+              created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 repair.id,
                 repair.conversation_id,
@@ -205,6 +211,7 @@ pub(crate) fn reconcile_profile_db(db: &ProfileDb) -> Result<Vec<String>> {
                 repair.model,
                 repair.provider_id,
                 repair.routing_decision,
+                repair.endpoint_zone,
                 repair.thinking_content,
                 repair.error,
                 repair.aborted as i64,

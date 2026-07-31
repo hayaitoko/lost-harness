@@ -18,7 +18,7 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 9;
 /// `classifier_settings` in the classifier settings round,
 /// `memory_settings` in Wave 1 memory) bumps `PROFILE_SCHEMA_VERSION`
 /// without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 11;
+pub const PROFILE_SCHEMA_VERSION: i32 = 12;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)

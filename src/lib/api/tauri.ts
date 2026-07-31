@@ -45,6 +45,36 @@ import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 
 // ── Shared types (mirror the Rust serde structs) ────────────────────────────
 
+/**
+ * Mirrors `ServedBy` in ipc/mod.rs — the endpoint that ACTUALLY served one
+ * turn, read back off the persisted assistant row.
+ *
+ * `provider_id` is persisted history, so it is true forever. `provider_name`
+ * and `base_url` are joined from the live provider registry at read time and
+ * are `null` once that provider is removed; the UI must show them as unknown
+ * rather than invent a name.
+ */
+export interface ServedBy {
+  provider_id: string;
+  provider_name: string | null;
+  base_url: string | null;
+  /**
+   * The trust zone this turn ACTUALLY ran in, stamped by the backend when the
+   * turn ran. The ONLY thing the route badge may colour itself from.
+   *
+   * Do not re-derive this from the provider store. `provider_name`/`base_url`
+   * describe the registry as it is NOW; this describes what happened THEN. The
+   * frontend used to compute the zone from the live provider's `kind` and fall
+   * through to "local" when the provider was gone, so deleting a cloud
+   * endpoint retroactively repainted every turn it had served as a reassuring
+   * green "Local".
+   *
+   * `null` means genuinely unknown (a row persisted before the backend stamped
+   * zones). Render that as an explicit UNKNOWN — never as "local".
+   */
+  zone: "local" | "cloud" | null;
+}
+
 /** Mirrors `SendMessageResponse` in ipc/mod.rs. */
 export interface SendMessageResponse {
   message_id: string;
@@ -54,6 +84,16 @@ export interface SendMessageResponse {
   profile: string;
   /** "allow" | "route_local" — which branch of the gate served this message. */
   routing_decision: string;
+  /**
+   * Which endpoint served this turn. `null` when no assistant row was
+   * persisted (the same cases that leave `message_id` unusable).
+   *
+   * Authoritative, and NOT the same as the provider the composer sent: a
+   * `route_local` or `redact_send` turn is served by a different provider
+   * than the picker shows. Per docs/TECH-DEBT.md §1 this final state wins
+   * over the pre-send prediction.
+   */
+  served_by: ServedBy | null;
   /** Epoch ms the response was finalized. */
   completed_at: number;
 }
@@ -99,6 +139,10 @@ export interface MessageInfo {
   error: string | null;
   aborted: boolean;
   created_at: number;
+  /** The endpoint this turn was served by, resolved the same way as
+   *  `SendMessageResponse.served_by`, so a reloaded transcript renders the
+   *  per-turn route indicator identically to a live send. */
+  served_by: ServedBy | null;
 }
 
 /** Payload of the `stream:token` event. Mirrors `StreamTokenPayload` in loop_mod.rs. */
@@ -725,8 +769,13 @@ export async function probeHardware(): Promise<HardwareProfile | null> {
 
 // ── M8 S2′/S3′ — HF model search + interactive calculator ──────────────────
 
-/** How much we vouch for a model's bytes (the compensating trust-root control). */
-export type Provenance = "trusted" | "community";
+/** How much we vouch for a model's bytes (the compensating trust-root control).
+ *  Wire values come from the backend's `#[serde(rename_all = "snake_case")]`
+ *  `Provenance` enum (src-tauri/src/models/hf_search.rs) — "curated" (verified
+ *  against a signed manifest) or "community" (everything else). Pinned on both
+ *  sides: see `manifest_state_wire_shape_is_stable_for_the_ui` in hf_search.rs
+ *  and src/tests/provenance.test.ts here. */
+export type Provenance = "curated" | "community";
 export type SearchSort = "downloads" | "likes" | "trending" | "last_modified";
 export type KvCacheQuant = "f16" | "q8_0" | "q4_0";
 export type Fit = "fits" | "tight" | "too_large";
@@ -1925,6 +1974,9 @@ async function browserSendMessage(
     conversation_id: conversationId,
     profile: "personal",
     routing_decision: "allow",
+    // The browser stub never contacted an endpoint, so it names none. A
+    // fabricated one here would be a lie about where text went.
+    served_by: null,
     completed_at: Date.now(),
   };
 }

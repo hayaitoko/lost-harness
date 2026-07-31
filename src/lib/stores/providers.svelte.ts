@@ -16,6 +16,22 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type ProviderKind = "local" | "cloud" | "custom";
 
+/**
+ * The user's endpoint selection: a provider AND the model on it, together.
+ *
+ * Indivisible by construction. There is no way to represent "a provider with
+ * no model" or "a model with no provider", in memory or on disk, because a
+ * half-pair is what let the app send `model: ""` — or worse, send to a
+ * provider the user never chose. A wrong provider is a wrong TRUST ZONE, so
+ * this pair may ONLY ever be written by an explicit user choice
+ * ({@link setActiveModel}); nothing in this module may infer, default, or
+ * slide it to another provider.
+ */
+export interface ActiveSelection {
+  providerId: string;
+  model: string;
+}
+
 export interface Provider {
   id: string;
   name: string;
@@ -24,7 +40,18 @@ export interface Provider {
    *  in the OS keychain and NEVER enters the renderer process. */
   hasApiKey: boolean;
   kind: ProviderKind;
-  /** Whether the backend classified the endpoint as private/LAN. */
+  /**
+   * Whether the backend classified the endpoint as private/LAN
+   * (`Provider::is_private()` — it parses `baseUrl`).
+   *
+   * This is the RIGHT notion of trust zone — it is the same bit the privacy
+   * gate consumes, whereas `kind` is a user-typed label with no enforcement
+   * power. But it describes the endpoint's configuration RIGHT NOW, so it must
+   * not be used to label a PAST turn: the turn's zone is stamped by the
+   * backend and arrives on `ServedBy.zone`. Use this only for statements about
+   * the current configuration (e.g. warning about an endpoint the user is
+   * about to select), never for the per-turn route badge.
+   */
   isPrivate: boolean;
   /** Q1: whether the endpoint supports OpenAI-style native structured tool calls. */
   supportsNativeTools: boolean;
@@ -49,7 +76,11 @@ export interface ProviderInput {
 }
 
 const STORAGE_KEY = "lh.providers.v1";
-const ACTIVE_KEY = "lh.providers.active.v1";
+/** v2 persists the pair as ONE value (`{providerId, model}` or `null`), so a
+ *  half-pair is unrepresentable on disk. v1 stored two independent fields and
+ *  could therefore persist a provider with no model. */
+const ACTIVE_KEY = "lh.providers.active.v2";
+const LEGACY_ACTIVE_KEY = "lh.providers.active.v1";
 
 /** Migrate old stored data: strip `apiKey` from any stored Provider objects
  *  (replaced with a `hasApiKey` boolean). Also strips apiKey from any
@@ -64,33 +95,73 @@ function migrateProviders(raw: unknown): Provider[] {
   });
 }
 
+/** Accept a persisted selection ONLY when both halves are real, non-blank
+ *  strings. Anything else — a half-pair written by a pre-fix build, a
+ *  hand-edited blob, a `null` — is discarded rather than repaired, because
+ *  guessing the missing half is exactly the substitution this fix forbids. */
+function parseActiveSelection(raw: unknown): ActiveSelection | null {
+  if (!raw || typeof raw !== "object") return null;
+  const { providerId, model } = raw as Record<string, unknown>;
+  if (typeof providerId !== "string" || providerId.trim() === "") return null;
+  if (typeof model !== "string" || model.trim() === "") return null;
+  return { providerId, model };
+}
+
+/** Read the persisted selection, migrating the v1 two-field shape. A v1 blob
+ *  that only ever had a provider (the half-pair) is dropped, not adopted. */
+function loadActiveSelection(): ActiveSelection | null {
+  const rawV2 = localStorage.getItem(ACTIVE_KEY);
+  if (rawV2 !== null) return parseActiveSelection(JSON.parse(rawV2));
+
+  const rawV1 = localStorage.getItem(LEGACY_ACTIVE_KEY);
+  if (rawV1 === null) return null;
+  return parseActiveSelection(JSON.parse(rawV1));
+}
+
 function loadFromStorage(): {
   providers: Provider[];
-  activeProviderId: string | null;
-  activeModel: string | null;
+  active: ActiveSelection | null;
 } {
-  const empty = { providers: [], activeProviderId: null, activeModel: null };
-  if (typeof localStorage === "undefined") return empty;
+  if (typeof localStorage === "undefined") return { providers: [], active: null };
+  // Two INDEPENDENT blobs, so two independent try blocks. Sharing one meant a
+  // corrupt selection blob threw past the provider parse and discarded the
+  // whole provider list — the user's configured endpoints vanishing because a
+  // single unrelated key was malformed. Each failure now costs only its own
+  // value: unreadable providers → no providers, unreadable selection →
+  // disarmed composer (which then refuses to send, the correct fail-closed
+  // outcome), never one taking the other with it.
+  let providers: Provider[] = [];
   try {
     const rawProv = localStorage.getItem(STORAGE_KEY);
-    const rawActive = localStorage.getItem(ACTIVE_KEY);
-    const providers: Provider[] = rawProv
-      ? migrateProviders(JSON.parse(rawProv))
-      : [];
-    let activeProviderId: string | null = null;
-    let activeModel: string | null = null;
-    if (rawActive) {
-      const parsed = JSON.parse(rawActive) as {
-        providerId?: string | null;
-        model?: string | null;
-      };
-      activeProviderId = parsed.providerId ?? null;
-      activeModel = parsed.model ?? null;
-    }
-    return { providers, activeProviderId, activeModel };
+    if (rawProv) providers = migrateProviders(JSON.parse(rawProv));
   } catch {
-    return empty;
+    providers = [];
   }
+  let active: ActiveSelection | null = null;
+  try {
+    active = loadActiveSelection();
+  } catch {
+    active = null;
+  }
+  // The two blobs are independent on disk, so nothing on disk stops them from
+  // CONTRADICTING each other: a selection naming a provider the loaded list
+  // doesn't contain (`providers: []` with a live `active` is the everyday shape
+  // — the provider blob was corrupt, or hand-edited).
+  //
+  // That contradiction is deliberately NOT resolved by discarding the selection
+  // here. The provider list loaded from localStorage is a CACHE; `hydrate-
+  // Providers()` is about to replace it with the backend's answer, and it
+  // already disarms a selection the backend doesn't corroborate — with a
+  // sentence naming the endpoint. Dropping the pair at load would throw away a
+  // perfectly good selection whenever the cache blob alone was unreadable.
+  //
+  // What must NOT happen in the meantime is the send path acting on a selection
+  // the UI can't show. That is closed at the consumer: `MainScreen`'s `armed`
+  // requires BOTH halves, and the chip, the Send button AND `handleSend` all
+  // read it — so while the list is missing the composer is uniformly unarmed
+  // and refuses to send, and it re-arms by itself once hydration restores the
+  // row. Fail closed, without destroying anything.
+  return { providers, active };
 }
 
 const initial = loadFromStorage();
@@ -100,14 +171,39 @@ const initial = loadFromStorage();
 // state lives on the module record, so a single import is enough.
 export const providersStore = $state({
   providers: initial.providers as Provider[],
-  activeProviderId: initial.activeProviderId as string | null,
-  activeModel: initial.activeModel as string | null,
+  /**
+   * The one and only endpoint selection. Write it through
+   * {@link setActiveModel} / {@link clearActiveSelection} — never by hand, so
+   * every change is traceable to a user action.
+   */
+  active: initial.active as ActiveSelection | null,
+  /**
+   * Set when a selection was taken away by something other than the user
+   * (the provider vanished from the backend, or was removed), carrying a
+   * sentence the UI shows. The old code silently slid the selection to
+   * another provider here; the user must instead be TOLD their endpoint is
+   * gone, because the alternative is their next message going somewhere they
+   * never chose.
+   */
+  activeSelectionLost: null as string | null,
   /** True while hydrateProviders() is in flight. */
   loading: false as boolean,
+
+  // Read-only views of the pair, for call sites that only need one half.
+  // Deliberately getters: assigning either half independently is how the
+  // half-pair used to be created, and now simply is not possible.
+  get activeProviderId(): string | null {
+    return this.active?.providerId ?? null;
+  },
+  get activeModel(): string | null {
+    return this.active?.model ?? null;
+  },
 });
 
-// Cache of fetched models per provider id — avoids re-fetching on every
-// picker open. The installed app never substitutes a baked-in model list.
+// Cache of fetched models per provider id — so the provider-list effect that
+// drives listing can re-run without re-contacting every endpoint. The installed
+// app never substitutes a baked-in model list. Only DISTINCT names are stored
+// (see `fetchModels`).
 const modelCache = new Map<string, string[]>();
 
 function persistProviders(): void {
@@ -133,13 +229,11 @@ function persistProviders(): void {
 function persistActive(): void {
   if (typeof localStorage === "undefined") return;
   try {
-    localStorage.setItem(
-      ACTIVE_KEY,
-      JSON.stringify({
-        providerId: providersStore.activeProviderId,
-        model: providersStore.activeModel,
-      }),
-    );
+    // One value, written whole: either a complete pair or `null`.
+    localStorage.setItem(ACTIVE_KEY, JSON.stringify(providersStore.active));
+    // Drop the v1 two-field blob once v2 exists, so a downgrade-then-upgrade
+    // cycle can't resurrect a half-pair.
+    localStorage.removeItem(LEGACY_ACTIVE_KEY);
   } catch {
     // non-fatal
   }
@@ -155,6 +249,16 @@ if (
   localStorage.getItem(STORAGE_KEY) !== null
 ) {
   persistProviders();
+}
+
+// Same idea for the selection: rewrite any v1 two-field blob into the v2
+// single-value shape at load, so the half-pair representation stops existing
+// on disk the first time a fixed build runs.
+if (
+  typeof localStorage !== "undefined" &&
+  localStorage.getItem(LEGACY_ACTIVE_KEY) !== null
+) {
+  persistActive();
 }
 
 // ── One-shot key injection IPC ────────────────────────────────────────────
@@ -234,17 +338,32 @@ export async function hydrateProviders(): Promise<void> {
     }
 
     providersStore.providers = merged;
-    // Ensure active selection still valid.
-    if (
-      providersStore.activeProviderId &&
-      !merged.some((p) => p.id === providersStore.activeProviderId)
-    ) {
-      providersStore.activeProviderId = merged[0]?.id ?? null;
-      providersStore.activeModel = null;
+
+    // The selection survives hydration ONLY if the provider it names is still
+    // configured. If it vanished, the pair is cleared and the loss is
+    // surfaced — it is NOT slid onto `merged[0]`.
+    //
+    // Why that mattered: the backend lists providers `ORDER BY name`, so
+    // `merged[0]` is the alphabetically-first provider. Among the quick-add
+    // presets that was "Anthropic", which is precisely how a turn the user
+    // aimed at their OpenAI endpoint ended up addressed at Anthropic's.
+    //
+    // And there is deliberately NO "nothing selected → arm the first
+    // provider" branch here. Auto-arming is the same substitution wearing a
+    // friendlier hat, and it arms a provider with no model.
+    const prior = providersStore.active;
+    if (prior && !merged.some((p) => p.id === prior.providerId)) {
+      const priorName = localById.get(prior.providerId)?.name ?? prior.providerId;
+      // Through `clearActiveSelection`, not by hand: this module's own rule is
+      // that the pair is only ever written by `setActiveModel` /
+      // `clearActiveSelection`, and a hand-written `active = null` here both
+      // broke that rule and skipped the `persistActive()` the clear does — the
+      // disarm lived only in memory until some later call happened to persist.
+      clearActiveSelection(
+        `The endpoint you had selected (${priorName}) is no longer configured. Pick a model before sending.`,
+      );
     }
-    if (!providersStore.activeProviderId && merged.length > 0) {
-      providersStore.activeProviderId = merged[0].id;
-    }
+
     persistProviders();
     persistActive();
   } catch (err) {
@@ -255,20 +374,63 @@ export async function hydrateProviders(): Promise<void> {
 }
 
 /**
- * Fetches the model list for a provider via the backend IPC and caches the
- * result. Returns the cached list if available. In browser fallback, returns
- * a minimal list.
+ * The outcome of listing one provider's models. A discriminated result, not a
+ * bare array: the old `catch → return []` made "this endpoint refused us" and
+ * "this endpoint has no models" indistinguishable, and the picker then dropped
+ * the provider from the popover entirely — leaving a DIFFERENT provider armed
+ * and serving every turn, invisibly.
  */
-export async function fetchModels(providerId: string): Promise<string[]> {
-  const cached = modelCache.get(providerId);
-  if (cached) return cached;
+export type ModelListResult =
+  | { ok: true; models: string[] }
+  | { ok: false; error: string };
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  return String(err);
+}
+
+/**
+ * Fetches the model list for a provider via the backend IPC.
+ *
+ * Only successes are cached. Pass `{ refresh: true }` to go past the cache.
+ * That refresh is NOT a side effect of opening the model picker — opening the
+ * picker contacts nothing (see `MainScreen.refreshModelGroups`); it is wired to
+ * the picker's explicit "Refresh" button, so a model added on a live endpoint
+ * shows up without restarting the app and without silent egress.
+ *
+ * A failure is REPORTED, never swallowed, and never cached: the caller must be
+ * able to tell the user "couldn't list models" instead of quietly hiding the
+ * endpoint they picked.
+ *
+ * **The returned names are DISTINCT.** Every consumer keys a list by model
+ * name — the composer's picker (`providerId::name`) and the Settings → Models
+ * `<Select>` (`item.value`) — and Svelte throws `each_key_duplicate` on a
+ * repeated key, which blanks the whole screen. An endpoint listing the same id
+ * twice is perfectly legal on the wire (a proxy fanning out to two upstreams
+ * does it routinely), so the guarantee belongs here, where the list is
+ * produced, not at each call site: the composer was patched once and Settings
+ * still crashed. The backend dedupes too (`models::client::distinct_model_ids`)
+ * — this covers the browser-fallback bridge and any endpoint reached by a
+ * client that isn't ours.
+ */
+export async function fetchModels(
+  providerId: string,
+  opts?: { refresh?: boolean },
+): Promise<ModelListResult> {
+  if (!opts?.refresh) {
+    const cached = modelCache.get(providerId);
+    if (cached) return { ok: true, models: cached };
+  }
   try {
-    const models = await api.listModels(providerId);
+    // First-seen order kept: the endpoint's own ordering is meaningful, so
+    // this only ever drops later repeats.
+    const models = [...new Set(await api.listModels(providerId))];
     modelCache.set(providerId, models);
-    return models;
+    return { ok: true, models };
   } catch (err) {
     console.error("fetchModels failed", err);
-    return [];
+    return { ok: false, error: describeError(err) };
   }
 }
 
@@ -322,6 +484,18 @@ export async function addProvider(input: ProviderInput): Promise<Provider> {
     };
     // Base URL or kind may have changed — drop the cached model list.
     modelCache.delete(id);
+    // Repointing the armed provider at a different endpoint moves the turn to
+    // a different host — possibly a different trust zone — while the composer
+    // still shows the model the user picked from the OLD endpoint. Disarm and
+    // say so rather than let the next message follow the URL silently.
+    if (
+      info.base_url !== existing.baseUrl &&
+      providersStore.active?.providerId === id
+    ) {
+      clearActiveSelection(
+        `${info.name}'s endpoint changed to ${info.base_url}, so no model is selected. Pick one before sending.`,
+      );
+    }
     persistProviders();
 
     if (gotNewKey) {
@@ -389,12 +563,12 @@ export async function addProvider(input: ProviderInput): Promise<Provider> {
     trustedByName: info.trusted_by_name,
   };
   providersStore.providers.push(provider);
-  // First provider added → make it active by default.
-  if (providersStore.activeProviderId === null) {
-    providersStore.activeProviderId = provider.id;
-  }
+  // NO auto-arm, not even for the very first provider. Arming a provider
+  // here could only ever arm it WITHOUT a model — which is what sent
+  // `model: ""` — and the models on a brand-new endpoint have not been
+  // listed yet, so there is nothing honest to arm it with. The user picks in
+  // the composer; the composer refuses to send until they do.
   persistProviders();
-  persistActive();
   return provider;
 }
 
@@ -408,33 +582,63 @@ export async function removeProvider(id: string): Promise<void> {
   }
   const idx = providersStore.providers.findIndex((p) => p.id === id);
   if (idx < 0) return;
+  const removed = providersStore.providers[idx];
   providersStore.providers.splice(idx, 1);
   modelCache.delete(id);
-  if (providersStore.activeProviderId === id) {
-    providersStore.activeProviderId = providersStore.providers[0]?.id ?? null;
-    providersStore.activeModel = null;
-    persistActive();
+  if (providersStore.active?.providerId === id) {
+    // Removing the armed endpoint disarms the composer. It does NOT slide the
+    // selection to `providers[0]` — silently re-pointing the composer at a
+    // surviving provider is a trust-zone change the user never asked for.
+    clearActiveSelection(
+      `${removed.name} was removed, so no endpoint is selected. Pick a model before sending.`,
+    );
   }
   persistProviders();
 }
 
-/** Switch the active selection. No-op if the provider doesn't exist. */
-export function setActiveModel(providerId: string, model: string): void {
+/**
+ * Record the user's explicit endpoint choice — the ONLY way the active pair
+ * is ever set.
+ *
+ * Returns `false` (and changes nothing) when the provider isn't configured or
+ * the model is blank. Deliberately not a silent no-op: a caller that believed
+ * a selection took, when it didn't, would leave a stale provider armed and
+ * send the next turn there.
+ */
+export function setActiveModel(providerId: string, model: string): boolean {
   const exists = providersStore.providers.some((p) => p.id === providerId);
-  if (!exists) return;
-  providersStore.activeProviderId = providerId;
-  providersStore.activeModel = model;
+  if (!exists) {
+    console.error(`setActiveModel: no such provider ${providerId}`);
+    return false;
+  }
+  if (model.trim() === "") {
+    console.error(`setActiveModel: refusing to arm ${providerId} with no model`);
+    return false;
+  }
+  providersStore.active = { providerId, model };
+  providersStore.activeSelectionLost = null;
+  persistActive();
+  return true;
+}
+
+/** Disarm the composer. `reason` is shown to the user when the clearing was
+ *  not their direct doing (a provider vanishing); pass nothing for a plain
+ *  user-initiated clear. */
+export function clearActiveSelection(reason: string | null = null): void {
+  providersStore.active = null;
+  providersStore.activeSelectionLost = reason;
   persistActive();
 }
 
 /** Reset everything — used in tests / future "clear all" UI. */
 export function resetProviders(): void {
   providersStore.providers = [];
-  providersStore.activeProviderId = null;
-  providersStore.activeModel = null;
   modelCache.clear();
   persistProviders();
-  persistActive();
+  // Same rule as everywhere else in this module: the pair is written through
+  // `clearActiveSelection`, never by hand. (No reason — this clear IS the
+  // caller's own doing.)
+  clearActiveSelection();
 }
 
 // Quick lookup for the UI; pure derived data off the runes state.

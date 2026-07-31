@@ -29,6 +29,7 @@ import {
   resetProviders,
   fetchModels,
   setActiveModel,
+  clearActiveSelection,
   getProvider,
 } from "$lib/stores/providers.svelte";
 
@@ -113,7 +114,8 @@ describe("providers store — addProvider", () => {
     expect(p.kind).toBe("local");
     expect(p.isPrivate).toBe(true);
     expect(providersStore.providers).toHaveLength(1);
-    expect(providersStore.activeProviderId).toBe(p.id);
+    // Adding a provider does NOT arm it — see the auto-arm test below.
+    expect(providersStore.active).toBeNull();
   });
 
   it("adds a cloud provider with isPrivate=false", async () => {
@@ -149,16 +151,21 @@ describe("providers store — addProvider", () => {
     expect(dumpLocalStorage()).not.toContain("sk-dev-mode-secret");
   });
 
-  it("automatically sets active on first provider", async () => {
-    expect(providersStore.activeProviderId).toBeNull();
-    const p = await addProvider({
+  it("does NOT auto-arm the first provider — an armed provider with no model is what sent model:''", async () => {
+    expect(providersStore.active).toBeNull();
+    await addProvider({
       name: "Test",
       baseUrl: "http://localhost:8080",
       apiKey: "",
       kind: "local",
       supportsNativeTools: false,
     });
-    expect(providersStore.activeProviderId).toBe(p.id);
+    // The old code armed this provider here, with no model — so the composer
+    // looked ready and sent `model: ""`. The endpoint is chosen by the user
+    // in the picker, or not at all.
+    expect(providersStore.active).toBeNull();
+    expect(providersStore.activeProviderId).toBeNull();
+    expect(providersStore.activeModel).toBeNull();
   });
 
   it("persists to localStorage", async () => {
@@ -197,13 +204,33 @@ describe("providers store — removeProvider", () => {
     expect(parsed).toHaveLength(1);
   });
 
-  it("switches active when the active provider is removed", async () => {
+  it("CLEARS the selection when the active provider is removed — it must not slide to another provider", async () => {
+    // This test previously asserted the opposite ("switches active"), blessing
+    // the exact bug: removing the armed endpoint silently re-pointed the
+    // composer at providers[0]. Sliding a selection is a trust-zone change the
+    // user never made — the next message would go to a different vendor.
     const ids = providersStore.providers.map((p) => p.id);
-    providersStore.activeProviderId = ids[0];
+    setActiveModel(ids[0], "llama3");
 
     await removeProvider(ids[0]);
-    // Active should fall back to the remaining provider (or null)
-    expect(providersStore.activeProviderId).toBe(ids[1]);
+
+    expect(providersStore.active).toBeNull();
+    expect(providersStore.activeProviderId).toBeNull();
+    expect(providersStore.activeModel).toBeNull();
+    // The surviving provider is still there — it just isn't armed.
+    expect(providersStore.providers.map((p) => p.id)).toEqual([ids[1]]);
+    // ...and the user is told, rather than left to discover it by sending.
+    expect(providersStore.activeSelectionLost).toMatch(/removed/i);
+  });
+
+  it("leaves an unrelated selection alone when a different provider is removed", async () => {
+    const ids = providersStore.providers.map((p) => p.id);
+    setActiveModel(ids[1], "mistral");
+
+    await removeProvider(ids[0]);
+
+    expect(providersStore.active).toEqual({ providerId: ids[1], model: "mistral" });
+    expect(providersStore.activeSelectionLost).toBeNull();
   });
 
   it("sets active to null when the last provider is removed", async () => {
@@ -240,7 +267,7 @@ describe("providers store — apiKey security (blank = keep stored)", () => {
       supportsNativeTools: false,
       trustedByName: false,
     }];
-    providersStore.activeProviderId = "test-id";
+    setActiveModel("test-id", "some-model");
   });
 
   it("updateProvider with apiKey='' keeps the stored key (hasApiKey stays true)", async () => {
@@ -301,51 +328,75 @@ describe("providers store — setActiveModel", () => {
     await addProvider({ name: "P1", baseUrl: "http://localhost:1", apiKey: "", kind: "local", supportsNativeTools: false });
   });
 
-  it("sets the active provider and model", () => {
+  it("sets the active provider and model together, and reports success", () => {
     const id = providersStore.providers[0].id;
-    setActiveModel(id, "gpt-4");
+    expect(setActiveModel(id, "gpt-4")).toBe(true);
 
+    expect(providersStore.active).toEqual({ providerId: id, model: "gpt-4" });
     expect(providersStore.activeProviderId).toBe(id);
     expect(providersStore.activeModel).toBe("gpt-4");
   });
 
-  it("is a no-op for an unknown provider id", () => {
-    providersStore.activeProviderId = providersStore.providers[0].id;
-    providersStore.activeModel = "original";
+  it("REPORTS FALSE for an unknown provider id instead of silently no-opping", () => {
+    // The silent no-op was its own bug: the caller believed the selection had
+    // moved while the PREVIOUS endpoint stayed armed and served the next turn.
+    const known = providersStore.providers[0].id;
+    setActiveModel(known, "original");
 
-    setActiveModel("unknown-id", "gpt-4");
+    expect(setActiveModel("unknown-id", "gpt-4")).toBe(false);
 
-    expect(providersStore.activeProviderId).toBe(providersStore.providers[0].id);
-    expect(providersStore.activeModel).toBe("original");
+    expect(providersStore.active).toEqual({ providerId: known, model: "original" });
   });
 
-  it("persists the active selection to localStorage", () => {
+  it("refuses to arm a provider with a blank model", () => {
+    const id = providersStore.providers[0].id;
+
+    expect(setActiveModel(id, "")).toBe(false);
+    expect(setActiveModel(id, "   ")).toBe(false);
+
+    // No half-pair was created — this is the state that sent `model: ""`.
+    expect(providersStore.active).toBeNull();
+  });
+
+  it("clears the 'your endpoint went away' notice once the user picks again", () => {
+    const id = providersStore.providers[0].id;
+    clearActiveSelection("the endpoint vanished");
+    expect(providersStore.activeSelectionLost).toBe("the endpoint vanished");
+
+    setActiveModel(id, "gpt-4");
+
+    expect(providersStore.activeSelectionLost).toBeNull();
+  });
+
+  it("persists the selection as ONE value, so a half-pair is unrepresentable", () => {
     const id = providersStore.providers[0].id;
     setActiveModel(id, "claude-3");
 
-    const raw = localStorage.getItem("lh.providers.active.v1");
+    const raw = localStorage.getItem("lh.providers.active.v2");
     expect(raw).toBeTruthy();
-    const parsed = JSON.parse(raw!);
-    expect(parsed.providerId).toBe(id);
-    expect(parsed.model).toBe("claude-3");
+    expect(JSON.parse(raw!)).toEqual({ providerId: id, model: "claude-3" });
+
+    // Cleared state persists as a single null, not as two independent fields
+    // one of which could survive alone.
+    clearActiveSelection();
+    expect(localStorage.getItem("lh.providers.active.v2")).toBe("null");
   });
 });
 
 describe("providers store — resetProviders", () => {
   it("clears everything including localStorage and modelCache", async () => {
-    await addProvider({ name: "P1", baseUrl: "http://localhost:1", apiKey: "", kind: "local", supportsNativeTools: false });
-    providersStore.activeModel = "some-model";
+    const p = await addProvider({ name: "P1", baseUrl: "http://localhost:1", apiKey: "", kind: "local", supportsNativeTools: false });
+    setActiveModel(p.id, "some-model");
 
     resetProviders();
 
     expect(providersStore.providers).toEqual([]);
+    expect(providersStore.active).toBeNull();
     expect(providersStore.activeProviderId).toBeNull();
     expect(providersStore.activeModel).toBeNull();
     // localStorage should be cleared (persisted as empty array / null entry)
     expect(localStorage.getItem("lh.providers.v1")).toBe("[]");
-    expect(localStorage.getItem("lh.providers.active.v1")).toBe(
-      JSON.stringify({ providerId: null, model: null }),
-    );
+    expect(localStorage.getItem("lh.providers.active.v2")).toBe("null");
   });
 });
 
@@ -379,7 +430,82 @@ describe("providers store — fetchModels", () => {
   it("returns cached models on second call", async () => {
     // First call: browser fallback returns ["default"]
     const first = await fetchModels("any-id");
-    expect(first).toEqual(["default"]);
+    expect(first).toEqual({ ok: true, models: ["default"] });
+
+    const second = await fetchModels("any-id");
+    expect(second).toEqual({ ok: true, models: ["default"] });
+  });
+
+});
+
+describe("providers store — fetchModels failures and refresh (Tauri runtime, mocked)", () => {
+  const invokeMock = vi.mocked(invoke);
+  /** What the fake `list_models` IPC should do on its next call. */
+  let listModelsImpl: () => Promise<string[]>;
+  let listModelsCalls = 0;
+
+  beforeEach(() => {
+    listModelsCalls = 0;
+    listModelsImpl = async () => ["default"];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_models") {
+        listModelsCalls += 1;
+        return listModelsImpl();
+      }
+      if (cmd === "list_providers") return [];
+      throw new Error(`unexpected IPC command: ${cmd}`);
+    });
+    resetProviders();
+  });
+
+  afterEach(() => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
+    invokeMock.mockReset();
+  });
+
+  it("reports a listing failure instead of swallowing it into an empty list", async () => {
+    // The swallowed `catch → return []` is why a provider whose /models call
+    // failed vanished from the picker entirely, leaving a DIFFERENT provider
+    // armed and serving every turn. "The endpoint refused us" and "the
+    // endpoint has no models" are different facts with different fixes, and
+    // must stay distinguishable.
+    listModelsImpl = async () => {
+      throw new Error("401 Unauthorized");
+    };
+
+    const result = await fetchModels("broken-provider");
+
+    expect(result).toEqual({ ok: false, error: "401 Unauthorized" });
+  });
+
+  it("never caches a failure, and can refresh past a cached success", async () => {
+    listModelsImpl = async () => {
+      throw new Error("connection refused");
+    };
+    expect(await fetchModels("p")).toEqual({ ok: false, error: "connection refused" });
+
+    // The failure was NOT cached — the next attempt really re-asks and wins.
+    listModelsImpl = async () => ["a"];
+    expect(await fetchModels("p")).toEqual({ ok: true, models: ["a"] });
+    expect(listModelsCalls).toBe(2);
+
+    // A success IS cached: no third call to the endpoint.
+    expect(await fetchModels("p")).toEqual({ ok: true, models: ["a"] });
+    expect(listModelsCalls).toBe(2);
+
+    // ...until an explicit refresh. That refresh is the picker's "Refresh"
+    // BUTTON, not a side effect of the picker opening — opening it contacts
+    // nothing (see picker-egress.test.ts). The point of having it at all is
+    // that a model added on a live endpoint isn't invisible until the app
+    // restarts.
+    listModelsImpl = async () => ["a", "b-just-added"];
+    expect(await fetchModels("p", { refresh: true })).toEqual({
+      ok: true,
+      models: ["a", "b-just-added"],
+    });
+    expect(listModelsCalls).toBe(3);
   });
 });
 
@@ -439,15 +565,237 @@ describe("providers store — hydrateProviders merge logic", () => {
     expect(providersStore.loading).toBe(false);
   });
 
-  it("selects first provider as active when none was selected", async () => {
+  it("does NOT auto-arm a provider when nothing was selected", async () => {
+    // The auto-arm branch is the precise mechanism of the reported bug. The
+    // backend lists providers `ORDER BY name`, so "the first provider" is the
+    // ALPHABETICALLY first one — which among the quick-add presets was
+    // "Anthropic". That is how turns aimed at an OpenAI endpoint ended up
+    // addressed at Anthropic's.
     seedLocalStorage([
-      { id: "a1", name: "Alpha", base_url: "http://localhost:1", kind: "local", is_private: true, trusted_by_name: false, supports_native_tools: false },
+      { id: "anthropic", name: "Anthropic", base_url: "https://api.anthropic.com/v1", kind: "cloud", is_private: false, trusted_by_name: false, supports_native_tools: false },
+      { id: "openai", name: "OpenAI", base_url: "https://api.openai.com/v1", kind: "cloud", is_private: false, trusted_by_name: false, supports_native_tools: false },
     ]);
-    providersStore.activeProviderId = null;
+    clearActiveSelection();
 
     await hydrateProviders();
 
-    expect(providersStore.activeProviderId).toBeTruthy();
+    expect(providersStore.providers).toHaveLength(2);
+    expect(providersStore.active).toBeNull();
+    expect(providersStore.activeProviderId).toBeNull();
+  });
+
+  it("keeps a still-valid selection across hydration", async () => {
+    providersStore.providers = [{
+      id: "b1",
+      name: "Browser",
+      baseUrl: "http://localhost:1234",
+      hasApiKey: false,
+      kind: "local",
+      isPrivate: true,
+      supportsNativeTools: false,
+      trustedByName: false,
+    }];
+    setActiveModel("b1", "llama3");
+    seedLocalStorage([
+      { id: "b1", name: "Browser", base_url: "http://localhost:1234", kind: "local", is_private: true, trusted_by_name: false, supports_native_tools: false },
+    ]);
+
+    await hydrateProviders();
+
+    expect(providersStore.active).toEqual({ providerId: "b1", model: "llama3" });
+    expect(providersStore.activeSelectionLost).toBeNull();
+  });
+
+});
+
+describe("providers store — hydrateProviders in the installed app (Tauri runtime, mocked)", () => {
+  // The installed app drops local cache entries the backend doesn't know
+  // about, so this is the only runtime where a persisted provider can truly
+  // VANISH under the user — the case that produced the reported bug.
+  const invokeMock = vi.mocked(invoke);
+  let remoteProviders: ProviderInfo[] = [];
+
+  beforeEach(() => {
+    remoteProviders = [];
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    invokeMock.mockReset();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_providers") return remoteProviders;
+      if (cmd === "list_models") return ["default"];
+      throw new Error(`unexpected IPC command: ${cmd}`);
+    });
+    resetProviders();
+  });
+
+  afterEach(() => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = undefined;
+    invokeMock.mockReset();
+  });
+
+  /** Put a provider in the store as though a previous session had it. */
+  function seedStoreProvider(id: string, name: string) {
+    providersStore.providers = [
+      ...providersStore.providers,
+      {
+        id,
+        name,
+        baseUrl: `http://${id}.example/v1`,
+        hasApiKey: false,
+        kind: "custom",
+        isPrivate: false,
+        supportsNativeTools: false,
+        trustedByName: false,
+      },
+    ];
+  }
+
+  it("CLEARS the selection when the persisted provider is gone — it must not slide to providers[0]", async () => {
+    seedStoreProvider("my-openai", "My OpenAI box");
+    setActiveModel("my-openai", "qwen3-32b");
+    // The backend no longer has it, and returns the alphabetically-first
+    // provider that the old code would have silently slid onto. The backend
+    // orders `ORDER BY name`, which is why "Anthropic" was always first.
+    remoteProviders = [
+      { id: "anthropic", name: "Anthropic", base_url: "https://api.anthropic.com/v1", kind: "cloud", is_private: false, trusted_by_name: false, supports_native_tools: false },
+    ];
+
+    await hydrateProviders();
+
+    expect(providersStore.active).toBeNull();
+    // Emphatically NOT "anthropic".
+    expect(providersStore.activeProviderId).not.toBe("anthropic");
+    // ...and the user is TOLD their endpoint went away, instead of silently
+    // getting a different vendor — a different TRUST ZONE — on the next turn.
+    expect(providersStore.activeSelectionLost).toContain("My OpenAI box");
+  });
+
+  it("does not auto-arm the alphabetically-first provider when nothing is selected", async () => {
+    remoteProviders = [
+      { id: "anthropic", name: "Anthropic", base_url: "https://api.anthropic.com/v1", kind: "cloud", is_private: false, trusted_by_name: false, supports_native_tools: false },
+      { id: "openai", name: "OpenAI", base_url: "https://api.openai.com/v1", kind: "cloud", is_private: false, trusted_by_name: false, supports_native_tools: false },
+    ];
+
+    await hydrateProviders();
+
+    expect(providersStore.providers).toHaveLength(2);
+    expect(providersStore.active).toBeNull();
+  });
+
+  it("can never leave activeProviderId and activeModel owned by different providers", async () => {
+    // The invariant, stated directly: whatever hydration does to the
+    // selection, the two halves always describe ONE configured provider, or
+    // both are null. There is no reachable state in between.
+    const decoy: ProviderInfo = { id: "anthropic", name: "Anthropic", base_url: "https://api.anthropic.com/v1", kind: "cloud", is_private: false, trusted_by_name: false, supports_native_tools: false };
+    const kept: ProviderInfo = { id: "kept", name: "Kept", base_url: "http://kept.example/v1", kind: "custom", is_private: false, trusted_by_name: false, supports_native_tools: false };
+
+    const scenarios: ProviderInfo[][] = [
+      [], // everything vanished
+      [decoy], // the armed one vanished, a different one remains
+      [decoy, kept], // the armed one survives alongside another
+      [kept], // only the armed one remains
+    ];
+
+    for (const remote of scenarios) {
+      resetProviders();
+      seedStoreProvider("kept", "Kept");
+      setActiveModel("kept", "the-model");
+      remoteProviders = remote;
+
+      await hydrateProviders();
+
+      const { activeProviderId, activeModel } = providersStore;
+      // Both set, or both null. Never one without the other.
+      expect(activeProviderId === null).toBe(activeModel === null);
+      if (activeProviderId !== null) {
+        // ...and the provider it names is really configured, and it is the
+        // one the model was actually chosen from — never a substitute.
+        expect(providersStore.providers.some((p) => p.id === activeProviderId)).toBe(true);
+        expect(activeProviderId).toBe("kept");
+        expect(activeModel).toBe("the-model");
+      }
+    }
+  });
+});
+
+describe("providers store — persisted selection shape", () => {
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  it("migrates a complete v1 pair into the v2 single value", async () => {
+    localStorage.setItem(
+      "lh.providers.active.v1",
+      JSON.stringify({ providerId: "p1", model: "gpt-4" }),
+    );
+
+    vi.resetModules();
+    const fresh = await import("$lib/stores/providers.svelte");
+
+    expect(fresh.providersStore.active).toEqual({ providerId: "p1", model: "gpt-4" });
+    // The v1 key is gone, so the two-field representation stops existing on
+    // disk the first time a fixed build runs.
+    expect(localStorage.getItem("lh.providers.active.v1")).toBeNull();
+    expect(JSON.parse(localStorage.getItem("lh.providers.active.v2")!)).toEqual({
+      providerId: "p1",
+      model: "gpt-4",
+    });
+  });
+
+  it("DISCARDS a persisted v1 half-pair rather than repairing it", async () => {
+    // A provider armed with no model is exactly what a pre-fix build could
+    // write, and exactly what sent `model: ""`. Guessing the missing half
+    // would be the substitution this whole fix forbids.
+    localStorage.setItem(
+      "lh.providers.active.v1",
+      JSON.stringify({ providerId: "p1", model: null }),
+    );
+
+    vi.resetModules();
+    const fresh = await import("$lib/stores/providers.svelte");
+
+    expect(fresh.providersStore.active).toBeNull();
+    expect(localStorage.getItem("lh.providers.active.v2")).toBe("null");
+  });
+
+  it("ignores a corrupt persisted selection instead of half-adopting it", async () => {
+    localStorage.setItem("lh.providers.active.v2", "{not json");
+
+    vi.resetModules();
+    const fresh = await import("$lib/stores/providers.svelte");
+
+    expect(fresh.providersStore.active).toBeNull();
+  });
+
+  it("a corrupt selection blob does not take the PROVIDER LIST down with it", async () => {
+    // The two blobs are independent values under independent keys, and used to
+    // be parsed inside one shared try: a throw from the selection parse escaped
+    // past the already-parsed providers and returned the `empty` fallback, so
+    // one malformed key made every configured endpoint vanish. Each failure
+    // must cost only its own value.
+    localStorage.setItem(
+      "lh.providers.v1",
+      JSON.stringify([
+        {
+          id: "keep-me",
+          name: "My box",
+          baseUrl: "http://10.0.0.5:8000/v1",
+          hasApiKey: false,
+          kind: "custom",
+          isPrivate: true,
+          supportsNativeTools: true,
+          trustedByName: false,
+        },
+      ]),
+    );
+    localStorage.setItem("lh.providers.active.v2", "{not json");
+
+    vi.resetModules();
+    const fresh = await import("$lib/stores/providers.svelte");
+
+    expect(fresh.providersStore.providers.map((p) => p.id)).toEqual(["keep-me"]);
+    // The selection alone was lost — the composer is disarmed (fail closed),
+    // not repointed at the surviving provider.
+    expect(fresh.providersStore.active).toBeNull();
   });
 });
 
@@ -597,7 +945,7 @@ describe("providers store — provider key IPC (Tauri runtime, mocked)", () => {
         trustedByName: false,
       },
     ];
-    providersStore.activeProviderId = "srv-9";
+    setActiveModel("srv-9", "some-model");
   }
 
   it("add: reports hasApiKey only after the key IPC resolves, and leaks no plaintext", async () => {

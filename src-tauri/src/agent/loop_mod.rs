@@ -43,9 +43,71 @@ use crate::agent::egress::is_private_endpoint;
 use crate::agent::gate::{Binding, GateDecision, PrivacyGate};
 use crate::agent::result_sink::ResultSink;
 use crate::hooks::{enforce_local_routing, RoutingRequirement};
-use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider};
+use crate::models::{ChatMessage, ModelClient, ModelManager, OwnOutput, Provider, TrustZone};
 use crate::storage::{MemoryBucket, MemoryFact, Message, ProfileDb, Storage, TrmLog};
 use crate::tools::{ExecCtx, ToolDispatcher, TurnOutcome};
+
+// ── Endpoint-selection errors ─────────────────────────────────────────────
+//
+// A turn carries the endpoint the user picked. When that selection arrives
+// empty the cause is upstream state (the composer's picker lost its pair),
+// not a bad provider id — so it gets its own user-actionable wording instead
+// of the internal-sounding `unknown provider id: `. These live here, next to
+// the invariant they describe, and the IPC boundary reuses them so the user
+// sees one sentence no matter which layer catches it.
+
+/// No provider id at all was supplied for the turn.
+pub(crate) const NO_ENDPOINT_SELECTED: &str =
+    "no model endpoint is selected — pick a model in the composer";
+
+/// A provider was supplied but no model name with it.
+pub(crate) const NO_MODEL_SELECTED: &str =
+    "no model is selected for this endpoint — pick a model in the composer";
+
+// ── Delegated helper runs ─────────────────────────────────────────────────
+
+/// What one `run_subagent` produced: the helper's answer, plus the trust zone
+/// it ACTUALLY ran in.
+///
+/// The zone travels with the result on purpose. The work runner posts a note
+/// about this run into the PARENT conversation, and that note needs a zone —
+/// but it is written after the run has finished, so anything it looks up then
+/// is the registry as it is *now*, not as it was when the turn was served. That
+/// is the exact defect `messages.endpoint_zone` (profile schema v12) exists to
+/// remove: edit or delete the provider mid-run and the note would claim
+/// whatever the replacement row says, up to and including a reassuring "local"
+/// for a turn that egressed. So the zone is carried, never re-derived.
+#[derive(Debug, Clone)]
+pub struct SubagentRun {
+    /// The helper's final text (or, on a gate block, its explanation).
+    pub text: String,
+    /// The zone the helper's own turns were stamped with, or `None` when the
+    /// run persisted no turn at all (a gate block before any row was written).
+    /// `None` must render as UNKNOWN — never as "local".
+    pub zone: Option<TrustZone>,
+}
+
+/// Fold a helper run's persisted rows into one zone for the note posted back
+/// into the parent conversation.
+///
+/// **Any cloud round makes the whole run cloud.** The note carries the helper's
+/// output, and the privacy-relevant question about it is "did this work touch
+/// an endpoint off my machine?" — one round that did is enough for the answer
+/// to be yes, even if a mid-run privacy reroute finished the job locally.
+///
+/// `None` when no row carries a zone: an empty run, or rows from before v12.
+/// Deliberately not defaulted to `Local`.
+pub(crate) fn zone_of_run(rows: &[Message]) -> Option<TrustZone> {
+    let mut seen_local = false;
+    for row in rows {
+        match row.endpoint_zone.as_deref().and_then(TrustZone::parse) {
+            Some(TrustZone::Cloud) => return Some(TrustZone::Cloud),
+            Some(TrustZone::Local) => seen_local = true,
+            None => {}
+        }
+    }
+    seen_local.then_some(TrustZone::Local)
+}
 
 // ── Event payloads ────────────────────────────────────────────────────────
 
@@ -475,10 +537,24 @@ impl AgentLoop {
         }
 
         // ── 1. Resolve provider + classify endpoint ──────────────────────
+        //
+        // Two distinct failures, deliberately worded differently. A blank id
+        // means the caller never had a selection to send (the composer's
+        // provider/model pair came apart upstream) — a state the USER can
+        // fix, and one that used to render as the dangling, internal-looking
+        // `unknown provider id: `. A non-blank id that isn't registered stays
+        // loud and unchanged: it is never a cue to substitute some other
+        // provider (see `hooks::routing::enforce_local_routing`).
         let provider = self
             .model_manager
             .get_provider(&provider_id)
-            .ok_or_else(|| anyhow!("unknown provider id: {provider_id}"))?;
+            .ok_or_else(|| {
+                if provider_id.trim().is_empty() {
+                    anyhow!("{NO_ENDPOINT_SELECTED}")
+                } else {
+                    anyhow!("unknown provider id: {provider_id}")
+                }
+            })?;
         let is_cloud = !is_private_endpoint(&provider.base_url);
 
         // ── 2. Privacy gate ──────────────────────────────────────────────
@@ -651,6 +727,11 @@ impl AgentLoop {
         }
     }
 
+    /// This loop's provider registry.
+    pub(crate) fn model_manager(&self) -> &ModelManager {
+        &self.model_manager
+    }
+
     /// Wave 4.3c — run one bounded, one-shot "helper" sub-agent. This is the
     /// `delegate` tool's actual EXECUTION, performed here by the background
     /// `WorkQueueRunner` (`agent::work_runner`), never by `delegate` itself:
@@ -692,7 +773,7 @@ impl AgentLoop {
         profile: &str,
         binding: Binding,
         task: &str,
-    ) -> Result<String> {
+    ) -> Result<SubagentRun> {
         let belt: std::collections::HashSet<String> = tools_allowlist.iter().cloned().collect();
         let restricted = Arc::new(self.tools.restricted(&belt));
         let mut sub = AgentLoop::new(
@@ -754,13 +835,22 @@ impl AgentLoop {
             )
             .await;
 
+        // The zone the helper ACTUALLY ran in, read off its own persisted rows
+        // BEFORE they are deleted below — see `SubagentRun::zone`. This is the
+        // only moment those rows exist, which is precisely why the zone has to
+        // be captured here rather than looked up afterwards.
+        let zone = db
+            .list_messages_by_conversation(&sub_conv_id)
+            .map(|rows| zone_of_run(&rows))
+            .unwrap_or(None);
+
         // Wave 4.3c review fix: the sub-conversation is scratch space, not a
         // first-class chat — delete it (its messages cascade via the FK) so
         // delegated helper runs don't pile up junk conversations in the sidebar
         // or grow storage unboundedly. Best-effort (the result is already
         // captured), and runs whether the helper succeeded or errored.
         let _ = db.delete_conversation(&sub_conv_id);
-        result
+        result.map(|text| SubagentRun { text, zone })
     }
 
     /// Run one cron job's prompt as an unattended, HEADLESS, LOCAL-only turn
@@ -776,12 +866,22 @@ impl AgentLoop {
         profile: &str,
         target_conv: Option<String>,
     ) -> Result<String> {
-        let local = self
-            .model_manager
-            .list_providers()
-            .into_iter()
-            .find(|p| p.is_local() && p.is_private())
-            .ok_or_else(|| anyhow!("no local model available for an unattended cron job"))?;
+        // Routed through `enforce_local_routing`, not a hand-rolled
+        // `find(|p| p.is_local() && p.is_private())`. Same predicate and same
+        // answer today — but this is a LIVE feature that picks an endpoint the
+        // user never named for a turn they are not watching, which is exactly
+        // what `hooks::routing` is the single definition of. A second copy is
+        // how "what counts as local" drifts, and here that would mean an
+        // unattended job quietly running somewhere the enforcer would refuse.
+        let candidates = self.model_manager.list_providers();
+        let local = enforce_local_routing(
+            &RoutingRequirement::LocalRequired {
+                reason: "unattended cron job: a scheduled run must never egress".to_string(),
+            },
+            &candidates,
+        )
+        .map_err(|_| anyhow!("no local model available for an unattended cron job"))?
+        .clone();
         let client = self
             .model_manager
             .get_client(&local.id)
@@ -1324,13 +1424,42 @@ impl AgentLoop {
 
     // ── helpers ─────────────────────────────────────────────────────────
 
-    /// Find the first registered provider that is both `Local` *and*
-    /// private by base URL. Returns `None` if no local model is set up.
+    /// The endpoint a privacy reroute lands on: a provider that is both
+    /// `ProviderKind::Local` *and* private by base URL. `None` if no local
+    /// model is set up (the caller then fails loudly — never onto cloud).
+    ///
+    /// # Selection rule, stated
+    ///
+    /// **The first `is_local() && is_private()` provider in
+    /// `ModelManager::list_providers()` order — which the storage layer emits
+    /// `ORDER BY name` (`storage/global.rs`). That is: alphabetically first
+    /// among the local private endpoints.**
+    ///
+    /// Say it out loud because it *is* arbitrary. With two local endpoints
+    /// registered, which one serves a rerouted turn is decided by their names,
+    /// not by anything the user asked for. What it is NOT arbitrary about is
+    /// the trust zone: every candidate the predicate admits is private by base
+    /// URL, so a reroute can only ever move a turn *toward* the private zone.
+    /// That is why this is a legitimate endpoint source and the user's
+    /// explicit picker choice being silently replaced by
+    /// `providers.first()` was not.
+    ///
+    /// Routed through [`enforce_local_routing`] rather than repeating the
+    /// predicate here. It was a hand-rolled `find(..)` over the same list —
+    /// same rule, but a second copy of it, which is how two "local" definitions
+    /// quietly drift apart. `hooks::routing` is the one place allowed to turn a
+    /// local-only requirement into an endpoint, and this is now genuinely that
+    /// one place; see the invariant on `enforce_local_routing`.
     fn find_local_provider(&self) -> Option<Provider> {
-        self.model_manager
-            .list_providers()
-            .into_iter()
-            .find(|p| p.is_local() && p.is_private())
+        let candidates = self.model_manager.list_providers();
+        enforce_local_routing(
+            &RoutingRequirement::LocalRequired {
+                reason: "privacy reroute: this turn must stay on a local endpoint".to_string(),
+            },
+            &candidates,
+        )
+        .ok()
+        .cloned()
     }
 
     /// The borrowed lazy-runner reference for the free-fn reroute path.
@@ -1439,6 +1568,9 @@ impl AgentLoop {
             model: Some(model.clone()),
             provider_id: Some(provider.id.clone()),
             routing_decision: Some(routing_decision.to_string()),
+            // Stamp the zone this turn ran in, from the SAME `is_cloud` the
+            // gate was given — never recomputed later from the live registry.
+            endpoint_zone: Some(TrustZone::from_is_cloud(is_cloud).as_str().to_string()),
             thinking_content: None,
             error: None,
             aborted: false,
@@ -1786,6 +1918,13 @@ impl AgentLoop {
                 model: Some(model.clone()),
                 provider_id: Some(provider.id.clone()),
                 routing_decision: Some(routing_decision.to_string()),
+                // The trust zone THIS round ran in, taken from the live
+                // `is_cloud` that governed it — so a mid-turn reroute to a
+                // local endpoint is recorded as local, and a cloud turn stays
+                // cloud forever regardless of what happens to the provider
+                // afterwards. This is the value the route badge renders; it is
+                // never re-derived frontend-side.
+                endpoint_zone: Some(TrustZone::from_is_cloud(is_cloud).as_str().to_string()),
                 thinking_content: None,
                 error: None,
                 // C7: a cancelled turn is ALSO marked aborted (distinguishable
@@ -1910,6 +2049,11 @@ impl AgentLoop {
                         model: Some(model.clone()),
                         provider_id: Some(provider.id.clone()),
                         routing_decision: Some(routing_decision.to_string()),
+                        // Post-reroute `is_cloud`, matching the provider on
+                        // this same row.
+                        endpoint_zone: Some(
+                            TrustZone::from_is_cloud(is_cloud).as_str().to_string(),
+                        ),
                         thinking_content: None,
                         error: None,
                         aborted: false,

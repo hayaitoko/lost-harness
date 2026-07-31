@@ -52,12 +52,14 @@
     local: "Local",
     cloud: "Cloud",
     blocked: "Held",
+    unknown: "Unknown",
   };
   // Route dot fill — grayscale default, meaning-color per disposition.
   const ROUTE_DOT: Record<Route, string> = {
     local: "bg-local",
     cloud: "bg-cloud",
     blocked: "bg-blocked",
+    unknown: "bg-warn",
   };
 
   const st = "inline-flex items-center gap-[5px] whitespace-nowrap";

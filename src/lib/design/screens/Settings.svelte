@@ -4,6 +4,9 @@
   // accent/theme/appearance controls. Closing returns to the main screen.
   // Ported from the React Settings screen (templates/settings/Settings.dc.html).
   import { nav } from "../nav.svelte";
+  // Presets live in their own module so the "no endpoint this app cannot talk
+  // to" rule is testable — see src/tests/provider-presets.test.ts.
+  import { QUICK_PROVIDER_PRESETS } from "../provider-presets";
   import Button from "../components/Button.svelte";
   import IconButton from "../components/IconButton.svelte";
   import SegmentedControl from "../components/SegmentedControl.svelte";
@@ -118,18 +121,6 @@
     kind: "cloud",
     supportsNativeTools: false,
   };
-  const QUICK_PROVIDER_PRESETS: Array<{
-    id: string;
-    name: string;
-    baseUrl: string;
-    kind: ProviderKind;
-  }> = [
-    { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", kind: "cloud" },
-    { id: "anthropic", name: "Anthropic", baseUrl: "https://api.anthropic.com/v1", kind: "cloud" },
-    { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", kind: "cloud" },
-    { id: "lmstudio", name: "LM Studio", baseUrl: "http://localhost:1234/v1", kind: "local" },
-    { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434/v1", kind: "local" },
-  ];
   const PROVIDER_KIND_OPTIONS = [
     { value: "cloud", label: "Cloud (public endpoint)" },
     { value: "local", label: "Local (loopback / LAN / tailnet)" },
@@ -155,6 +146,8 @@
   let providerError = $state<string | null>(null);
   // Fetched model lists per provider id (populated lazily below).
   let modelsByProvider = $state<Record<string, string[]>>({});
+  // Why a provider's list is empty, when the listing itself failed.
+  let modelListErrors = $state<Record<string, string | null>>({});
   // memory — real facts for the active profile (PLAN §9)
   let memoryMode = $state("walled");
   let semanticSearchEnabled = $state(true);
@@ -349,8 +342,18 @@
   $effect(() => {
     for (const p of providersStore.providers) {
       if (p.id in modelsByProvider) continue;
-      fetchModels(p.id).then((models) => {
-        modelsByProvider = { ...modelsByProvider, [p.id]: models };
+      fetchModels(p.id).then((result) => {
+        modelsByProvider = {
+          ...modelsByProvider,
+          [p.id]: result.ok ? result.models : [],
+        };
+        // A failed listing is reported, not silently shown as "no models" —
+        // an unreachable endpoint and an endpoint with nothing on it need
+        // different fixes.
+        modelListErrors = {
+          ...modelListErrors,
+          [p.id]: result.ok ? null : result.error,
+        };
       });
     }
   });
@@ -817,10 +820,60 @@
     return modelsByProvider[p.id] ?? [];
   }
 
-  function providerDotColor(kind: ProviderKind): string {
-    if (kind === "local") return "var(--local)";
-    if (kind === "cloud") return "var(--cloud)";
-    return "var(--text-3)";
+  /**
+   * Arm an endpoint from the Settings list, honouring the store's answer.
+   *
+   * `setActiveModel` returns `false` when the provider is no longer configured
+   * or the model is blank, and it is documented as "deliberately not a silent
+   * no-op" for a reason: a caller that discards the result leaves the PREVIOUS
+   * endpoint armed while this row's Select visibly moves to the new model. The
+   * user then reads one endpoint off the screen and sends to another — the
+   * same UI-says-one-thing / send-does-another shape this whole fix exists to
+   * close. So: say so, and leave the row honest.
+   */
+  function armProviderModel(providerId: string, model: string): void {
+    if (model.trim() === "") return; // the Select's own empty placeholder
+    if (!setActiveModel(providerId, model)) {
+      providerError =
+        "Couldn't select that model — the endpoint is no longer configured. Reload settings and try again.";
+      return;
+    }
+    providerError = null;
+  }
+
+  /**
+   * The trust-zone dot beside an endpoint in Settings → Models.
+   *
+   * Keyed on `isPrivate` (the BASE URL, as the backend classifies it), not on
+   * `kind` — which is a user-typed label with no enforcement power. A provider
+   * someone tagged "Local" while pointing it at `https://api.openai.com/v1`
+   * used to get the green on-device dot here, in the one screen whose whole job
+   * is telling the user what their endpoints are. The composer's picker, the
+   * Send button and the per-turn badge were all moved onto `isPrivate` in this
+   * workstream; this was the last holdout, and the inconsistency was itself the
+   * bug — two screens disagreeing about the same endpoint.
+   *
+   * Same predicate the backend stamps turns with, so the dot before you send
+   * and the badge after you send can't contradict each other.
+   */
+  function providerDotColor(p: Provider): string {
+    return p.isPrivate ? "var(--local)" : "var(--cloud)";
+  }
+
+  /**
+   * The endpoint's zone in words, for the row's description line. Again
+   * `isPrivate`, not `kind`.
+   *
+   * `kind` is still shown — the user typed it and it drives nothing else
+   * visible — but as what it is: a label they chose, not a claim the app is
+   * making. When the two disagree the ZONE leads and the label follows in
+   * parentheses, so a mislabelled row reads "Cloud · tagged Local" instead of
+   * silently presenting the lie as fact.
+   */
+  function providerZoneLabel(p: Provider): string {
+    const zone = p.isPrivate ? "Local" : "Cloud";
+    const typed = p.kind === "local" ? "Local" : p.kind === "cloud" ? "Cloud" : "Custom";
+    return typed === zone ? zone : `${zone} · tagged ${typed}`;
   }
 
   function startAddProvider() {
@@ -1380,15 +1433,16 @@
             {:else if providersStore.providers.length > 0}
               {#each providersStore.providers as p (p.id)}
                 {@const models = modelsFor(p)}
+                {@const listError = modelListErrors[p.id] ?? null}
                 {@const isActive = p.id === providersStore.activeProviderId}
                 <SettingRow
                   title={p.name}
-                  desc={`${p.kind === "local" ? "Local" : p.kind === "cloud" ? "Cloud" : "Custom"} · ${p.baseUrl}${
+                  desc={`${providerZoneLabel(p)} · ${p.baseUrl}${
                     p.trustedByName
                       ? " · trusted by name — only use on a network you control"
                       : ""
-                  }`}
-                  dotColor={providerDotColor(p.kind)}
+                  }${listError ? ` · couldn't list models — check the endpoint or key (${listError})` : ""}`}
+                  dotColor={providerDotColor(p)}
                   tag={isActive
                     ? { label: "active", bg: "var(--accent-soft)", color: "var(--accent)" }
                     : p.trustedByName
@@ -1400,8 +1454,12 @@
                       <Select
                         items={models.map((m) => ({ value: m, label: m }))}
                         value={isActive ? (providersStore.activeModel ?? "") : ""}
-                        onchange={(v) => setActiveModel(p.id, v)}
-                        placeholder={models.length > 0 ? "Select model" : "No models"}
+                        onchange={(v) => armProviderModel(p.id, v)}
+                        placeholder={models.length > 0
+                          ? "Select model"
+                          : listError
+                            ? "Can't list models"
+                            : "No models"}
                         disabled={models.length === 0}
                       />
                       <Button variant="ghost" onclick={() => startEditProvider(p)}>
@@ -1606,8 +1664,8 @@
                           {r.publisher}{r.downloads != null ? ` · ${r.downloads.toLocaleString()} downloads` : ""}{r.likes != null ? ` · ${r.likes.toLocaleString()} likes` : ""}
                         </span>
                       </span>
-                      {#if r.provenance === "trusted"}
-                        <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">trusted</span>
+                      {#if r.provenance === "curated"}
+                        <span class="flex-shrink-0 rounded-[8px] bg-local-soft px-[7px] py-px text-[10px] text-local">curated</span>
                       {:else}
                         <span class="flex-shrink-0 rounded-[8px] bg-warn-soft px-[7px] py-px text-[10px] text-warn">community</span>
                       {/if}
