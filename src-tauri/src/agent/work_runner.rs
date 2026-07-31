@@ -1199,9 +1199,8 @@ mod tests {
                     None,
                     ProviderKind::Local,
                 ));
-                let delta =
-                    serde_json::json!({ "choices": [{ "delta": { "content": "done" } }] })
-                        .to_string();
+                let delta = serde_json::json!({ "choices": [{ "delta": { "content": "done" } }] })
+                    .to_string();
                 let chunks: Vec<Vec<u8>> = vec![
                     format!("data: {delta}\n").into_bytes(),
                     b"data: [DONE]\n".to_vec(),

@@ -174,7 +174,9 @@ struct ModelEntry {
 /// model this endpoint leads with"), so this only ever REMOVES later repeats.
 pub(super) fn distinct_model_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
-    ids.into_iter().filter(|id| seen.insert(id.clone())).collect()
+    ids.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
