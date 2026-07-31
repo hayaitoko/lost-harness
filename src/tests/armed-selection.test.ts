@@ -285,6 +285,98 @@ describe("composer chip — one source of truth with canSend", () => {
     await waitFor(() => expect(armedSend()).toBeNull());
     expect(chip().textContent).toContain("No model selected");
   });
+
+  it("a store that says unarmed cannot still SEND — the other direction", async () => {
+    // The gap the display-only fix left open. `armed` requires the provider ROW
+    // as well as the pair, so removing the row disarms every display — but
+    // `handleSend` used to read `providersStore.active` on its own and still
+    // had a selection. Chip: "No model selected". Send: goes anyway.
+    //
+    // Pressing Enter is the path that reaches `handleSend` without the disabled
+    // Send button in the way, which is exactly how a user would hit this.
+    render(MainScreen);
+    await settle();
+    expect(setActiveModel("openai", "gpt-4o")).toBe(true);
+    await waitFor(() => expect(armedSend()).not.toBeNull());
+
+    providersStore.providers = providersStore.providers.filter(
+      (p) => p.id !== "openai",
+    );
+    await waitFor(() => expect(armedSend()).toBeNull());
+
+    // The pair itself is deliberately still set — the store does not destroy a
+    // selection just because a row went missing (hydration is what adjudicates
+    // that, with a message). What must not happen is a SEND.
+    expect(providersStore.active).toEqual({
+      providerId: "openai",
+      model: "gpt-4o",
+    });
+
+    const textarea = screen.getByPlaceholderText("Message Lost Harness…");
+    await fireEvent.input(textarea, { target: { value: "hello" } });
+    await fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/pick a model in the composer/i),
+      ).toBeInTheDocument(),
+    );
+    expect(sendCalls).toHaveLength(0);
+    // …and the user's text is kept, because nothing was sent.
+    expect((textarea as HTMLTextAreaElement).value).toBe("hello");
+  });
+});
+
+describe("composer — a CORRUPT provider list with a live selection", () => {
+  // `providers: []` while `active` is still set. Nothing on disk prevents it:
+  // the two localStorage blobs are independent, so an unreadable provider blob
+  // leaves exactly this shape. It is the mirror of the corrupt-SELECTION case
+  // (pinned in providers.test.ts) and had no test.
+  //
+  // The rule is the same in both directions: the composer's display and its
+  // send read ONE expression, so they cannot disagree — and here that means
+  // uniformly unarmed until the provider list comes back.
+
+  beforeEach(() => {
+    resetProviders();
+    providersStore.providers = [];
+    // Reach past setActiveModel deliberately: it refuses to arm an
+    // unconfigured provider, which is the point — this state can only arrive
+    // from disk, so it has to be constructed the way disk would produce it.
+    providersStore.active = { providerId: "openai", model: "gpt-4o" };
+  });
+
+  it("shows nothing armed and refuses to send", async () => {
+    render(MainScreen);
+
+    await waitFor(() => expect(chip().textContent).toContain("No model selected"));
+    expect(armedSend()).toBeNull();
+
+    const textarea = screen.getByPlaceholderText("Message Lost Harness…");
+    await fireEvent.input(textarea, { target: { value: "hello" } });
+    await fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/pick a model in the composer/i),
+      ).toBeInTheDocument(),
+    );
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("re-arms by itself once the provider list is restored", async () => {
+    // The reason the store does NOT discard the pair at load: the list is a
+    // cache, and hydration is about to replace it. Throwing the selection away
+    // would cost the user a perfectly good endpoint every time that one blob
+    // was unreadable. Being unarmed in the meantime is free.
+    render(MainScreen);
+    await waitFor(() => expect(chip().textContent).toContain("No model selected"));
+
+    await hydrateProviders();
+
+    await waitFor(() => expect(chip().textContent).toContain("gpt-4o"));
+    expect(armedSend()).not.toBeNull();
+  });
 });
 
 describe("composer chip — a listing that fails AFTER the user picked", () => {

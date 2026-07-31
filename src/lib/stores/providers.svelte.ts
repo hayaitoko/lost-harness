@@ -143,6 +143,24 @@ function loadFromStorage(): {
   } catch {
     active = null;
   }
+  // The two blobs are independent on disk, so nothing on disk stops them from
+  // CONTRADICTING each other: a selection naming a provider the loaded list
+  // doesn't contain (`providers: []` with a live `active` is the everyday shape
+  // — the provider blob was corrupt, or hand-edited).
+  //
+  // That contradiction is deliberately NOT resolved by discarding the selection
+  // here. The provider list loaded from localStorage is a CACHE; `hydrate-
+  // Providers()` is about to replace it with the backend's answer, and it
+  // already disarms a selection the backend doesn't corroborate — with a
+  // sentence naming the endpoint. Dropping the pair at load would throw away a
+  // perfectly good selection whenever the cache blob alone was unreadable.
+  //
+  // What must NOT happen in the meantime is the send path acting on a selection
+  // the UI can't show. That is closed at the consumer: `MainScreen`'s `armed`
+  // requires BOTH halves, and the chip, the Send button AND `handleSend` all
+  // read it — so while the list is missing the composer is uniformly unarmed
+  // and refuses to send, and it re-arms by itself once hydration restores the
+  // row. Fail closed, without destroying anything.
   return { providers, active };
 }
 

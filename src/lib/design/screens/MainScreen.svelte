@@ -404,14 +404,25 @@
   );
 
   /**
-   * THE armed endpoint — the single expression every "is the composer armed?"
-   * question in this screen answers from: the picker chip, the Send button's
-   * enabled state and colour, and the knot.
+   * THE armed endpoint — the single expression EVERY "is the composer armed?"
+   * question in this screen answers from. Not just the display ones: the picker
+   * chip, the Send button's enabled state and colour, the knot, AND
+   * {@link handleSend} / {@link confirmAndResend} themselves.
    *
-   * `handleSend` reads `providersStore.active` directly (it must — it is the
-   * authority), and this is that same pair plus the provider row it names.
-   * Anything that wants to *display* armed-ness derives from here, so the
-   * composer and the send can no longer disagree.
+   * It is `providersStore.active` plus the provider row that pair names, and
+   * requiring the row is the load-bearing part. `active` is a provider ID; the
+   * row is what turns it into an endpoint the user can be shown — a name, a
+   * base URL, a trust zone. Without it there is nothing to display and nothing
+   * to warn about, so a send would be going somewhere the UI could not describe.
+   *
+   * The send path used to read `providersStore.active` on its own, on the
+   * grounds that it is the authority. That left a gap in one direction: with
+   * `active` set but its row missing, every display went unarmed while Send
+   * still had a selection and still sent. Both halves now read this, so they
+   * cannot disagree in EITHER direction — and the store closes the same gap at
+   * its own end (`loadFromStorage` drops a selection whose provider isn't in
+   * the loaded list, `setActiveModel` refuses to create one, `hydrateProviders`
+   * clears one that vanishes).
    */
   const armed = $derived.by(() => {
     const selection = providersStore.active;
@@ -744,14 +755,16 @@
   async function handleSend() {
     const content = draft.trim();
     if (!content || isSending) return;
-    // Fail closed. The composer used to read the store and send whatever was
-    // there, including `provider_id: ""` / `model: ""`. A turn goes to the
-    // endpoint the user picked, or it does not go — it is never guessed.
-    const selection = providersStore.active;
-    if (!selection) {
+    // Fail closed, from the SAME expression the chip and the Send button read.
+    // The composer used to read the store and send whatever was there,
+    // including `provider_id: ""` / `model: ""`. A turn goes to the endpoint
+    // the user picked — the one the UI is showing them — or it does not go.
+    const armedNow = armed;
+    if (!armedNow) {
       composerError = NO_ENDPOINT_SELECTED;
       return; // draft is deliberately kept — nothing was sent
     }
+    const selection = armedNow.selection;
     composerError = null;
     isSending = true;
     draft = "";
@@ -787,13 +800,15 @@
   let confirming = $state(false);
   async function confirmAndResend(heldContent: string) {
     if (confirming || isSending) return;
-    // Same fail-closed rule as handleSend. A confirmed send is still a send,
-    // and the endpoint it goes to is exactly what the user is confirming.
-    const selection = providersStore.active;
-    if (!selection) {
+    // Same fail-closed rule as handleSend, from the same `armed`. A confirmed
+    // send is still a send, and the endpoint it goes to is exactly what the
+    // user is confirming — so it must be the one they can see.
+    const armedNow = armed;
+    if (!armedNow) {
       composerError = NO_ENDPOINT_SELECTED;
       return;
     }
+    const selection = armedNow.selection;
     composerError = null;
     confirming = true;
     try {
