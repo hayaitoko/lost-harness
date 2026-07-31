@@ -419,10 +419,23 @@
    * grounds that it is the authority. That left a gap in one direction: with
    * `active` set but its row missing, every display went unarmed while Send
    * still had a selection and still sent. Both halves now read this, so they
-   * cannot disagree in EITHER direction — and the store closes the same gap at
-   * its own end (`loadFromStorage` drops a selection whose provider isn't in
-   * the loaded list, `setActiveModel` refuses to create one, `hydrateProviders`
-   * clears one that vanishes).
+   * cannot disagree in EITHER direction.
+   *
+   * The store deliberately does NOT close this particular gap at its own end.
+   * `loadFromStorage` KEEPS a selection whose provider isn't in the loaded list
+   * (see its comment): that list is only a cache, `hydrateProviders()` is about
+   * to replace it with the backend's answer, and discarding the pair at load
+   * would cost the user a perfectly good endpoint every time that one blob was
+   * unreadable. So the contradiction is real, transient, and closed HERE, at
+   * the consumer — uniformly unarmed while the row is missing, re-armed by
+   * itself once hydration restores it. What the store does guarantee is the
+   * other two directions: `setActiveModel` refuses to arm a provider that isn't
+   * in the list, and `hydrateProviders` clears a selection the backend no
+   * longer lists (with a sentence naming the endpoint).
+   *
+   * `AppStatusBar` is shared by every screen and so cannot import this, but it
+   * derives its own copy of the same pair under the same rule — the bar never
+   * names a model whose provider row is absent either.
    */
   const armed = $derived.by(() => {
     const selection = providersStore.active;

@@ -94,9 +94,9 @@ impl std::error::Error for LocalRoutingViolation {}
 ///   - `agent::loop_mod::AgentLoop::find_local_provider` — the §7 gate returned
 ///     `RouteLocal`, or a cloud send was refused because the conversation's
 ///     history isn't cloud-safe.
-///   - `agent::loop_mod::resolve_reroute` / `lazy_start_then_retry` — a tool
-///     result forced the rest of the turn local, including the retry after the
-///     bundled sidecar is lazily started.
+///   - `agent::loop_mod::resolve_turn_outcome` / `agent::loop_mod::lazy_start_then_retry`
+///     — a tool result forced the rest of the turn local, including the retry
+///     after the bundled sidecar is lazily started.
 ///   - `agent::loop_mod::AgentLoop::run_cron` — an unattended SCHEDULED job.
 ///     Nobody is watching it, so it is pinned to a local endpoint and a
 ///     `Private` binding by construction.
@@ -112,12 +112,16 @@ impl std::error::Error for LocalRoutingViolation {}
 /// as local" each time, which is how two definitions drift apart and one of
 /// them stops matching what the enforcer would allow. They now call this
 /// function, so the list above is exhaustive by construction rather than by
-/// good intentions.
+/// good intentions — and it is checkable in one command:
+/// `grep -rn 'enforce_local_routing(' src-tauri/src` finds exactly six call
+/// expressions outside the `hooks` module itself, one in each of the six
+/// functions named above (five entries; the second names two).
 ///
-/// Keeping that claim true is a maintenance obligation, and the last two
-/// entries are here because it had already gone false: `run_cron` (a live
-/// feature — the scheduler) and the skill drafter both hand-rolled the
-/// predicate and appeared in no list. `models::runner::ensure_running` is
+/// Keeping that claim true is a maintenance obligation, and two of the entries
+/// above — the third (`run_cron`) and the last (the skill drafter) — are here
+/// because it had already gone false: the scheduler (a live feature, running
+/// unattended turns) and `LocalModelDrafter::local_provider` both hand-rolled
+/// the predicate and appeared in no list. `models::runner::ensure_running` is
 /// deliberately NOT an entry: it does not *select* among configured providers,
 /// it CREATES the bundled sidecar's own `http://127.0.0.1:<port>` provider —
 /// and every caller either routes the result back through this function

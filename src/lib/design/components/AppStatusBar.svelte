@@ -14,13 +14,20 @@
 
   let props: Partial<ComponentProps<typeof StatusBar>> = $props();
 
-  // Active model + the provider it runs on, straight from the provider store;
-  // undefined (segment hidden) until the user has actually picked one.
-  let engine = $derived(providersStore.activeModel ?? undefined);
-  let host = $derived(
-    providersStore.providers.find((p) => p.id === providersStore.activeProviderId)
-      ?.name,
+  // Active model + the provider it runs on — the SAME pair `MainScreen`'s
+  // `armed` requires (selection AND its provider row), for the same reason.
+  // Both segments hang off the row: no row, no segment.
+  //
+  // `engine` used to read `activeModel` on its own. That let this bar name a
+  // model whose provider row was absent — the everyday shape while the cached
+  // provider blob is unreadable and `hydrateProviders()` hasn't landed yet —
+  // so the status bar claimed an endpoint every other display was calling
+  // unarmed, and named it without being able to say what it runs on.
+  let activeProvider = $derived(
+    providersStore.providers.find((p) => p.id === providersStore.activeProviderId),
   );
+  let engine = $derived(activeProvider ? (providersStore.activeModel ?? undefined) : undefined);
+  let host = $derived(activeProvider?.name);
 
   // Real build version, resolved once on mount; hidden until it arrives (and
   // stays hidden if the IPC call fails — no fallback string).

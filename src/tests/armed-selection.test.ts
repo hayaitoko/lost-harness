@@ -377,6 +377,26 @@ describe("composer — a CORRUPT provider list with a live selection", () => {
     await waitFor(() => expect(chip().textContent).toContain("gpt-4o"));
     expect(armedSend()).not.toBeNull();
   });
+
+  it("keeps the STATUS BAR off it too, and puts it back on re-arm", async () => {
+    // The status bar is a separate component every screen mounts, so it derives
+    // its own copy of the armed pair rather than importing MainScreen's. It used
+    // to read `activeModel` straight off the store with no provider-row
+    // requirement, so it printed "gpt-4o" while the chip, Send and the knot all
+    // said unarmed — screen furniture naming an endpoint the rest of the UI
+    // could not describe, and naming no host to go with it.
+    const { container } = render(MainScreen);
+    const statusbar = () => container.querySelector("footer")!;
+
+    await waitFor(() => expect(chip().textContent).toContain("No model selected"));
+    expect(statusbar()).not.toBeNull();
+    expect(statusbar().textContent).not.toContain("gpt-4o");
+
+    // Not a vacuous assertion: once the row is back, the bar names both halves.
+    await hydrateProviders();
+    await waitFor(() => expect(statusbar().textContent).toContain("gpt-4o"));
+    expect(statusbar().textContent).toContain("OpenAI");
+  });
 });
 
 describe("composer chip — a listing that fails AFTER the user picked", () => {
