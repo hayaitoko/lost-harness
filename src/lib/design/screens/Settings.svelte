@@ -841,10 +841,39 @@
     providerError = null;
   }
 
-  function providerDotColor(kind: ProviderKind): string {
-    if (kind === "local") return "var(--local)";
-    if (kind === "cloud") return "var(--cloud)";
-    return "var(--text-3)";
+  /**
+   * The trust-zone dot beside an endpoint in Settings → Models.
+   *
+   * Keyed on `isPrivate` (the BASE URL, as the backend classifies it), not on
+   * `kind` — which is a user-typed label with no enforcement power. A provider
+   * someone tagged "Local" while pointing it at `https://api.openai.com/v1`
+   * used to get the green on-device dot here, in the one screen whose whole job
+   * is telling the user what their endpoints are. The composer's picker, the
+   * Send button and the per-turn badge were all moved onto `isPrivate` in this
+   * workstream; this was the last holdout, and the inconsistency was itself the
+   * bug — two screens disagreeing about the same endpoint.
+   *
+   * Same predicate the backend stamps turns with, so the dot before you send
+   * and the badge after you send can't contradict each other.
+   */
+  function providerDotColor(p: Provider): string {
+    return p.isPrivate ? "var(--local)" : "var(--cloud)";
+  }
+
+  /**
+   * The endpoint's zone in words, for the row's description line. Again
+   * `isPrivate`, not `kind`.
+   *
+   * `kind` is still shown — the user typed it and it drives nothing else
+   * visible — but as what it is: a label they chose, not a claim the app is
+   * making. When the two disagree the ZONE leads and the label follows in
+   * parentheses, so a mislabelled row reads "Cloud · tagged Local" instead of
+   * silently presenting the lie as fact.
+   */
+  function providerZoneLabel(p: Provider): string {
+    const zone = p.isPrivate ? "Local" : "Cloud";
+    const typed = p.kind === "local" ? "Local" : p.kind === "cloud" ? "Cloud" : "Custom";
+    return typed === zone ? zone : `${zone} · tagged ${typed}`;
   }
 
   function startAddProvider() {
@@ -1408,12 +1437,12 @@
                 {@const isActive = p.id === providersStore.activeProviderId}
                 <SettingRow
                   title={p.name}
-                  desc={`${p.kind === "local" ? "Local" : p.kind === "cloud" ? "Cloud" : "Custom"} · ${p.baseUrl}${
+                  desc={`${providerZoneLabel(p)} · ${p.baseUrl}${
                     p.trustedByName
                       ? " · trusted by name — only use on a network you control"
                       : ""
                   }${listError ? ` · couldn't list models — check the endpoint or key (${listError})` : ""}`}
-                  dotColor={providerDotColor(p.kind)}
+                  dotColor={providerDotColor(p)}
                   tag={isActive
                     ? { label: "active", bg: "var(--accent-soft)", color: "var(--accent)" }
                     : p.trustedByName

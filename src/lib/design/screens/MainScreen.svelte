@@ -670,9 +670,27 @@
     return "unknown";
   }
 
-  /** The endpoint that actually served a turn: provider name + host.
-   *  Falls back to the persisted provider id when the provider has since been
-   *  removed — an id the user can still recognise beats inventing a name. */
+  /**
+   * How to REFER to the endpoint that served a turn: provider name + host.
+   *
+   * Honest scope, because the two halves of `served_by` are not the same kind
+   * of fact. `provider_id` and `zone` are HISTORY — stamped on the row when the
+   * turn ran, true forever. `provider_name` and `base_url` are resolved from
+   * the LIVE registry at read time (`ipc::resolve_served_by`), so they describe
+   * that provider's configuration NOW: rename it or repoint its base URL and
+   * this label follows, for a turn that ran against the old address.
+   *
+   * That split is deliberate and it stays. The privacy-bearing part — the trust
+   * zone — is persisted; these two exist so the user can RECOGNISE which of
+   * their rows it was. Snapshotting them onto every message would duplicate
+   * mutable display data across the whole transcript (a schema change) to
+   * harden a recognition aid, while the claim that actually matters is already
+   * hard. What was not acceptable was presenting current config as a record of
+   * the past, so {@link routeTitle} now says which is which.
+   *
+   * Falls back to the persisted provider id when the provider has since been
+   * removed — an id the user can still recognise beats inventing a name.
+   */
   function servedByLabel(m: Message): string | null {
     const served = m.served_by;
     if (!served) return null;
@@ -711,19 +729,29 @@
     return parts.join(" · ");
   }
 
-  /** Full endpoint URL for the badge tooltip — the detail that doesn't fit in
-   *  a calm chip but settles "where did this go?" outright. */
+  /** The badge tooltip — the detail that doesn't fit in a calm chip.
+   *
+   *  The URL is labelled "now" on purpose: it is the provider's CURRENT
+   *  configuration, not the address this turn was sent to (see
+   *  {@link servedByLabel}). It used to be shown as a bare URL next to a route
+   *  claim about the past, which invites reading it as part of that claim. The
+   *  zone in the badge is the recorded fact; this line is context. */
   function routeTitle(m: Message): string | undefined {
+    const configuredNow = m.served_by?.base_url;
     if (messageRoute(m) === "unknown") {
       // Say what we don't know and why, rather than leaving a bare chip. This
       // is the honest end of the old silent "Local" default.
       return (
         "This turn was recorded before Lost Harness stamped the trust zone on " +
         "each turn, so whether it stayed on this machine can't be confirmed." +
-        (m.served_by?.base_url ? ` Endpoint now: ${m.served_by.base_url}` : "")
+        (configuredNow ? ` Endpoint as configured now: ${configuredNow}` : "")
       );
     }
-    return m.served_by?.base_url ?? undefined;
+    if (!configuredNow) return undefined;
+    return (
+      `Endpoint as configured now: ${configuredNow}. ` +
+      "The route shown is what was recorded when this turn ran."
+    );
   }
 
   // Only show a routing badge once a real decision exists — never on a

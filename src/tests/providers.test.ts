@@ -495,8 +495,11 @@ describe("providers store — fetchModels failures and refresh (Tauri runtime, m
     expect(await fetchModels("p")).toEqual({ ok: true, models: ["a"] });
     expect(listModelsCalls).toBe(2);
 
-    // ...until an explicit refresh, which the picker fires on open so a model
-    // added on a live endpoint isn't invisible until the app restarts.
+    // ...until an explicit refresh. That refresh is the picker's "Refresh"
+    // BUTTON, not a side effect of the picker opening — opening it contacts
+    // nothing (see picker-egress.test.ts). The point of having it at all is
+    // that a model added on a live endpoint isn't invisible until the app
+    // restarts.
     listModelsImpl = async () => ["a", "b-just-added"];
     expect(await fetchModels("p", { refresh: true })).toEqual({
       ok: true,

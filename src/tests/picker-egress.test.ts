@@ -164,6 +164,56 @@ describe("model picker — endpoint egress per interaction", () => {
     expect([...listed].sort()).toEqual(["my-box", "openai", "openrouter"]);
   });
 
+  it("typing in the search box contacts NO endpoint", async () => {
+    // The zero-egress claim names four interactions: open, close, search, pick.
+    // Only the first two were pinned. Search is the one that LOOKS like it
+    // should hit the network — every other search box in every other app does —
+    // so an "improvement" wiring it to a live re-list is a plausible future
+    // regression, and it would fan an authenticated `GET /models` out to every
+    // configured endpoint on each keystroke.
+    render(MainScreen);
+    await waitFor(() => expect(listed).toHaveLength(3));
+    listed = [];
+
+    await fireEvent.click(picker());
+    const search = screen.getByPlaceholderText("Search models…");
+    for (const value of ["m", "mo", "mod", "model-a"]) {
+      await fireEvent.input(search, { target: { value } });
+    }
+    await quiesce();
+
+    expect(listed).toEqual([]);
+    // …and it really did filter, so this isn't passing because nothing happened.
+    expect(await screen.findAllByRole("option")).toHaveLength(3);
+    await fireEvent.input(search, { target: { value: "no-such-model" } });
+    await waitFor(() => expect(screen.queryAllByRole("option")).toHaveLength(0));
+    expect(listed).toEqual([]);
+  });
+
+  it("picking a model contacts NO endpoint", async () => {
+    // Choosing an endpoint is a local state write. It must not "confirm" the
+    // choice by asking the endpoint anything — least of all the OTHER
+    // endpoints, which have nothing to do with the pick.
+    render(MainScreen);
+    await waitFor(() => expect(listed).toHaveLength(3));
+    listed = [];
+
+    await fireEvent.click(picker());
+    const options = await screen.findAllByRole("option");
+    await fireEvent.click(options[1]!);
+    await quiesce();
+
+    expect(listed).toEqual([]);
+    // The pick took, and on exactly what was clicked. Each provider exposes one
+    // model here, so the options are in provider order and [1] is OpenAI's —
+    // asserting the id (not just "something is armed") keeps this honest if the
+    // popover ever reorders.
+    expect(providersStore.active).toEqual({
+      providerId: "openai",
+      model: "model-a",
+    });
+  });
+
   it("a refresh goes past the cache — a newly-added model shows up", async () => {
     render(MainScreen);
     await waitFor(() => expect(listed).toHaveLength(3));

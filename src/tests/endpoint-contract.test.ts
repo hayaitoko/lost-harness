@@ -353,8 +353,13 @@ describe("per-turn route indicator", () => {
     const badge = await screen.findByRole("button", { name: /Local llama/ });
     expect(badge.textContent).toContain("Local llama");
     expect(badge.textContent).toContain("127.0.0.1:11434");
-    // The full endpoint is available on hover for the exact answer.
-    expect(badge).toHaveAttribute("title", "http://127.0.0.1:11434/v1");
+    // The full endpoint is available on hover for the exact answer — labelled
+    // as the provider's CURRENT configuration, which is what it is: the backend
+    // resolves `served_by.provider_name`/`base_url` from the live registry at
+    // read time, while only `provider_id` and `zone` are stamped on the row. A
+    // bare URL beside a claim about the past reads as part of that claim.
+    expect(badge.getAttribute("title")).toContain("http://127.0.0.1:11434/v1");
+    expect(badge.getAttribute("title")).toContain("as configured now");
     // The composer's predicted model is NOT shown beside the rerouted
     // provider — it was the model on the other endpoint, and pairing them
     // would be a small, confident lie.

@@ -21,6 +21,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/svelte";
 import RoutingBadge from "$lib/design/components/RoutingBadge.svelte";
 import MainScreen from "$lib/design/screens/MainScreen.svelte";
+import Settings from "$lib/design/screens/Settings.svelte";
 import {
   resetProviders,
   hydrateProviders,
@@ -375,6 +376,46 @@ describe("pre-send indicators use the same trust-zone predicate", () => {
       expect(group?.textContent).toContain("cloud");
       expect(group?.textContent).not.toContain("on device");
     });
+  });
+
+  it("labels a MISLABELLED endpoint by its URL in Settings, not by its tag", async () => {
+    // Settings → Models was the last surface still keyed on the user-typed
+    // `kind`: a row tagged "Local" pointing at a public host got the green
+    // on-device dot and the word "Local", in the one screen whose whole job is
+    // telling the user what their endpoints are. The tag is still shown — the
+    // user typed it — but as a tag, with the real zone leading.
+    resetProviders();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_providers":
+          return [
+            {
+              id: "mislabelled",
+              name: "Definitely My Laptop",
+              base_url: "https://api.openai.com/v1",
+              kind: "local", // the lie
+              is_private: false, // the truth
+              trusted_by_name: false,
+              supports_native_tools: false,
+            },
+          ];
+        case "get_active_profile":
+          return "personal";
+        default:
+          return cmd.startsWith("list_") ? [] : null;
+      }
+    });
+    await hydrateProviders();
+
+    render(Settings);
+    await fireEvent.click(screen.getByRole("button", { name: "Models" }));
+
+    const desc = await screen.findByText(/api\.openai\.com/);
+    expect(desc.textContent).toContain("Cloud");
+    expect(desc.textContent).toContain("tagged Local");
+    // Not the reassuring green dot.
+    const row = desc.closest("div")?.parentElement;
+    expect(row?.innerHTML ?? "").not.toContain("var(--local)");
   });
 
   it("does not offer to 'Send via local model' to a public custom endpoint", async () => {
