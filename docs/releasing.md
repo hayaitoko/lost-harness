@@ -248,7 +248,11 @@ accept, so the installed base has to be replaced regardless.
 Stated plainly, because the spec's headline acceptance criterion has **not**
 been executed.
 
-### Proven — observed, by tests that run in CI
+### Proven — observed, by tests that pass locally
+
+> These tests have **never run in CI**. Round 2 is unpushed: `origin/main` is `f6535d4`, and
+> `src-tauri/src/updater/` does not exist there at all, so no GitHub runner has ever executed them.
+> They pass locally, on every run of `cargo test --lib`. "Proven" below means *observed locally*.
 
 | Property | Where |
 |---|---|
