@@ -139,9 +139,9 @@ fn an_unparseable_version_is_never_newer() {
 // ── The download host ───────────────────────────────────────────────────────
 //
 // The manifest endpoint is pinned in tauri.conf.json, but `platforms.*.url` is
-// remote input. Without these, "one request to github.com" is a claim about the
-// manifest only, and a swapped manifest could send the (still signature-checked)
-// download anywhere.
+// remote input. Without these, "updates come from github.com" is a claim about
+// the manifest only, and a swapped manifest could send the (still
+// signature-checked) download anywhere.
 
 #[test]
 fn the_real_release_asset_url_shape_is_permitted() {
@@ -205,15 +205,99 @@ fn the_right_host_but_the_wrong_repository_is_refused() {
 
 #[test]
 fn a_path_that_climbs_out_of_the_release_assets_is_refused() {
-    // `Url::parse` normalises literal `..` away, so the first of these leaves
-    // the prefix by itself; the percent-encoded spelling survives parsing and
-    // is rejected explicitly.
+    // Both of these are refused by the PREFIX check, because `Url::parse`
+    // collapses the climb before this function ever sees the path — and it does
+    // that for the percent-encoded spelling too, which an earlier comment here
+    // got backwards. `percent_encoded_dot_segments_are_collapsed_by_the_parser`
+    // below pins the parser behaviour so the claim can't rot again.
     assert!(!is_permitted_download_url(
         "https://github.com/hayaitoko/lost-harness/releases/download/../../../../other/x.app.tar.gz"
     ));
     assert!(!is_permitted_download_url(
         "https://github.com/hayaitoko/lost-harness/releases/download/%2e%2e/%2e%2e/x.app.tar.gz"
     ));
+}
+
+#[test]
+fn percent_encoded_dot_segments_are_collapsed_by_the_parser() {
+    // The exact case from the security review. `url` decodes and collapses
+    // `%2E%2E` at parse time — it is a "double-dot path segment" in the URL
+    // standard, ASCII-case-insensitively, alongside `..`, `.%2e` and `%2e.`.
+    // The path that reaches the prefix check has already lost `download/`.
+    let parsed =
+        url::Url::parse("https://github.com/hayaitoko/lost-harness/releases/download/%2E%2E/x")
+            .expect("parses");
+    assert_eq!(
+        parsed.path(),
+        "/hayaitoko/lost-harness/releases/x",
+        "if this ever changes, the prefix check stops being what refuses a climb"
+    );
+    assert!(!is_permitted_download_url(parsed.as_str()));
+    assert!(!is_permitted_download_url(
+        "https://github.com/hayaitoko/lost-harness/releases/download/%2E%2E/x"
+    ));
+}
+
+#[test]
+fn an_escape_that_survives_parsing_cannot_smuggle_a_climb_past_the_prefix() {
+    // These are the ones that matter: each still starts with
+    // RELEASE_DOWNLOAD_PREFIX *after* parsing, so the prefix check passes them,
+    // and the first four contain no `%2e` at all — the old
+    // `path.contains("%2e")` guard let every one of them through.
+    for raw in [
+        // Encoded SLASH, literal dots. Decodes to `/../../../other/x.tar.gz`.
+        "https://github.com/hayaitoko/lost-harness/releases/download/%2f..%2f..%2f..%2fother/x.tar.gz",
+        // The same trick hidden behind a plausible-looking tag segment.
+        "https://github.com/hayaitoko/lost-harness/releases/download/v1%2f..%2f..%2f..%2fother/x.tar.gz",
+        // Encoded backslash.
+        "https://github.com/hayaitoko/lost-harness/releases/download/v1/%5c..%5cevil.tar.gz",
+        // Double-encoded dots: one decode pass yields `%2e%2e`. Refuse rather
+        // than decode again and guess how many passes a fetcher makes.
+        "https://github.com/hayaitoko/lost-harness/releases/download/%252e%252e/x.tar.gz",
+        // Encoded slash AND encoded dots.
+        "https://github.com/hayaitoko/lost-harness/releases/download/%2e%2e%2f%2e%2e/x.tar.gz",
+        // A malformed escape can't be read the way a fetcher would read it.
+        "https://github.com/hayaitoko/lost-harness/releases/download/v1/%zz.tar.gz",
+        "https://github.com/hayaitoko/lost-harness/releases/download/v1/%2",
+        // The release-asset directory itself is not a payload.
+        "https://github.com/hayaitoko/lost-harness/releases/download/",
+        // An empty segment is not an asset name.
+        "https://github.com/hayaitoko/lost-harness/releases/download/v1//x.tar.gz",
+    ] {
+        let parsed = url::Url::parse(raw).expect("parses");
+        assert!(
+            parsed.path().starts_with(RELEASE_DOWNLOAD_PREFIX),
+            "this case is only interesting while it still passes the prefix check: {raw}"
+        );
+        assert!(!is_permitted_download_url(raw), "must refuse: {raw}");
+    }
+}
+
+#[test]
+fn an_ordinary_asset_name_is_not_caught_by_the_segment_check() {
+    // The hardening must not turn away real releases. Dots, dashes and
+    // underscores are exactly what CI writes into `latest.json`.
+    for raw in [
+        "https://github.com/hayaitoko/lost-harness/releases/download/v0.1.1/Lost-Harness_0.1.1_aarch64.app.tar.gz",
+        "https://github.com/hayaitoko/lost-harness/releases/download/v0.1.1/Lost-Harness_0.1.1_aarch64.app.tar.gz.sig",
+        "https://github.com/hayaitoko/lost-harness/releases/download/v1.0.0-rc.1/x.app.tar.gz",
+    ] {
+        assert!(is_permitted_download_url(raw), "must permit: {raw}");
+    }
+}
+
+#[test]
+fn a_refusal_is_identifiable_to_the_frontend() {
+    // `check_for_update` hands Svelte a bare String, so this refusal and "GitHub
+    // is unreachable" arrive looking identical. `Settings.svelte` tells them
+    // apart on this prefix (mirrored there as `UPDATE_DOWNLOAD_REFUSED`); if the
+    // wording drifts, a security refusal starts rendering as a network blip.
+    let err = ensure_permitted_download_url("https://evil.example/x.app.tar.gz")
+        .expect_err("an off-host download must be refused");
+    assert!(
+        err.starts_with(DOWNLOAD_REFUSED_PREFIX),
+        "the refusal must stay recognisable to the UI, got: {err}"
+    );
 }
 
 #[test]

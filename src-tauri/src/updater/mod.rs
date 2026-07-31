@@ -3,7 +3,11 @@
 //! ## What this is
 //!
 //! On launch the app asks `github.com/hayaitoko/lost-harness`'s **public**
-//! releases for a `latest.json` manifest. If that manifest names a version
+//! releases for a `latest.json` manifest. Because that manifest is a release
+//! asset, GitHub answers with a redirect to its object CDN, so the check is two
+//! requests to two GitHub-owned hosts rather than one — see [`check_now`] for
+//! the full account, and say it that way anywhere it is described to the user.
+//! If that manifest names a version
 //! newer than the running one, a calm banner appears. Nothing is downloaded
 //! and nothing is installed until the user clicks. There is no silent install
 //! path in this module, by construction: `check` and `install` are separate
@@ -196,9 +200,9 @@ pub const RELEASE_DOWNLOAD_PREFIX: &str = "/hayaitoko/lost-harness/releases/down
 /// * The host is compared for **exact** equality, so `raw.github.com` and
 ///   `github.com.evil.example` are both refused.
 /// * Default port only — `github.com:8443` is a different service.
-/// * The path must be under this project's release assets, and must not try to
-///   climb out of them (`url` normalises real `..` segments away at parse time;
-///   the percent-encoded spelling is rejected here).
+/// * The path must be under this project's release assets, and every segment
+///   below the prefix must be a plain asset name once decoded — see
+///   [`is_plain_asset_segment`] for why the prefix check alone is not enough.
 pub fn is_permitted_download_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
@@ -215,17 +219,99 @@ pub fn is_permitted_download_url(raw: &str) -> bool {
     if url.port_or_known_default() != Some(443) {
         return false;
     }
-    let path = url.path();
-    if !path.starts_with(RELEASE_DOWNLOAD_PREFIX) {
+    // `url.path()` is the NORMALISED path, which is also the path the plugin
+    // will fetch — `Update::download_url` is a parsed `Url` and this is its
+    // serialisation round-tripped.
+    let Some(asset_path) = url.path().strip_prefix(RELEASE_DOWNLOAD_PREFIX) else {
         return false;
-    }
-    // `Url::parse` already collapsed literal `..` segments; this catches the
-    // encoded spelling, which it leaves alone.
-    if path.contains("%2e") || path.contains("%2E") {
-        return false;
-    }
-    true
+    };
+    // An empty `asset_path` means the URL is the release-asset directory
+    // itself, which is not a payload; `split` yields one empty segment for it
+    // and `is_plain_asset_segment` refuses that.
+    asset_path.split('/').all(is_plain_asset_segment)
 }
+
+/// Is `segment` an ordinary asset-path segment — one that cannot become a
+/// directory climb or a path separator no matter who decodes it?
+///
+/// This exists because the prefix check on its own is weaker than it looks, in
+/// a way that is easy to get backwards:
+///
+/// * `Url::parse` **does** collapse dot segments, and it does so for every
+///   spelling the URL standard recognises — `..`, `%2e%2e`, `.%2e`, `%2E%2E`.
+///   `…/releases/download/%2E%2E/x` parses to `/hayaitoko/lost-harness/releases/x`,
+///   which no longer starts with [`RELEASE_DOWNLOAD_PREFIX`], so it is refused
+///   by the prefix check itself. (An earlier comment here claimed the parser
+///   left the encoded spelling alone and that a `path.contains("%2e")` test was
+///   what caught it. That was false in both halves.)
+/// * What parsing leaves untouched is an escape that is not a *whole* segment.
+///   `%2f..%2f..%2fother` survives verbatim, so the parsed path still starts
+///   with the prefix and sails through a prefix check — while anything that
+///   percent-decodes it reads `/../../other`. That is the case the old check
+///   missed completely: it contains no `%2e` at all.
+///
+/// So the decision is made on the decoded segment: not empty, not a dot
+/// segment, no embedded separator, and no escape left over after one decode
+/// pass (`%252e%252e` decodes to `%2e%2e`, and how many passes something
+/// downstream makes is not a thing to guess at).
+///
+/// A genuine GitHub release asset never needs any of this — asset filenames are
+/// plain ASCII names — so nothing legitimate is turned away.
+fn is_plain_asset_segment(segment: &str) -> bool {
+    let Some(decoded) = decode_percent_escapes(segment) else {
+        return false;
+    };
+    match decoded.as_slice() {
+        b"" | b"." | b".." => return false,
+        _ => {}
+    }
+    !decoded.iter().any(|b| matches!(b, b'/' | b'\\' | b'%'))
+}
+
+/// One pass of `%XX` decoding, on bytes so that a non-UTF-8 escape is decoded
+/// rather than rejected for the wrong reason.
+///
+/// `None` when an escape is malformed (`%zz`, a truncated `%2`): a URL this app
+/// cannot read the same way a fetcher would is a URL it refuses.
+fn decode_percent_escapes(segment: &str) -> Option<Vec<u8>> {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = hex(*bytes.get(i + 1)?)?;
+            let lo = hex(*bytes.get(i + 2)?)?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// The opening phrase of the refusal from [`ensure_permitted_download_url`].
+///
+/// It is a constant because the frontend has to be able to tell this refusal
+/// apart from a network failure: `check_for_update` returns `Result<_, String>`,
+/// so a refused download URL and an unreachable GitHub arrive at Svelte as the
+/// same shape, and rendering a security refusal as "Couldn't reach GitHub" would
+/// disguise the one message a user must actually read.
+///
+/// Mirrored in `src/lib/api/tauri.ts` as `UPDATE_DOWNLOAD_REFUSED`, and pinned
+/// on both sides — `updater::tests::a_refusal_is_identifiable_to_the_frontend`
+/// here, `updater.test.ts` there. Change the wording and both fail.
+pub const DOWNLOAD_REFUSED_PREFIX: &str = "This update's download link points somewhere unexpected";
 
 /// [`is_permitted_download_url`] as a refusal with a message.
 ///
@@ -242,7 +328,7 @@ pub fn ensure_permitted_download_url(raw: &str) -> Result<(), String> {
         "refusing an update whose download URL is not this project's GitHub release asset"
     );
     Err(format!(
-        "This update's download link points somewhere unexpected, so it was refused. \
+        "{DOWNLOAD_REFUSED_PREFIX}, so it was refused. \
          Updates may only be downloaded from https://{RELEASE_HOST}{RELEASE_DOWNLOAD_PREFIX}…"
     ))
 }
@@ -333,13 +419,29 @@ impl PendingUpdate {
 /// Sends: a plain GET for `latest.json`, anonymous, no headers of ours, no app
 /// data. Receives: a version string, a download URL and a signature.
 ///
-/// The manifest endpoint is pinned in `tauri.conf.json`; the download URL it
-/// names is remote input, so it is checked here against
-/// [`is_permitted_download_url`] before an update is ever offered. Between the
-/// two, every update-related connection this app opens is to
-/// `https://github.com/…` — which is what Settings → About tells the user.
-/// (GitHub itself answers an asset download with a redirect to its own object
-/// CDN; that hop is GitHub's, not a host this manifest chose.)
+/// ## How many requests this actually is
+///
+/// **Two, to two hosts** — not one, which is what this comment and the About
+/// pane used to say. The pinned endpoint
+/// (`github.com/…/releases/latest/download/latest.json`) is a *release asset*,
+/// and GitHub answers release-asset requests with a `302` to its own object
+/// CDN (`objects.githubusercontent.com` / `release-assets.githubusercontent.com`);
+/// the HTTP client follows it. So a check is a request to `github.com` and then
+/// a request to a `githubusercontent.com` host, and a download is the same
+/// again.
+///
+/// The endpoint is left as it is rather than moved somewhere redirect-free:
+/// GitHub's API returns its own JSON shape, not a Tauri manifest, and hosting
+/// the manifest elsewhere would add a second place a release can be tampered
+/// with. Naming the redirect is the honest fix; hiding it behind a different
+/// host would not be.
+///
+/// What is still true, and is the point of the check below: the manifest
+/// endpoint is pinned in `tauri.conf.json`, and the download URL it names is
+/// remote input, so it is checked against [`is_permitted_download_url`] before
+/// an update is ever offered. Every update-related connection this app *chooses*
+/// is to `https://github.com/…`; the CDN hop is GitHub's own redirect, not a
+/// host a manifest talked the app into.
 pub async fn check_now<R: Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<Option<UpdateInfo>, String> {
