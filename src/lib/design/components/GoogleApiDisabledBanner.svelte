@@ -21,13 +21,27 @@
      *  response carried none — we then point at the console generally rather
      *  than inventing a per-API URL. */
     consoleUrl: string | null;
+    /** Which APIs answered "switched off", by label. The backend records the
+     *  state per API, so the banner names them rather than making the user
+     *  guess which of the three it means. */
+    apis?: string[];
     /** "I've enabled it — check again": forget the state and retry. */
     oncheckagain: () => void;
     /** A retry is in flight. */
     checking?: boolean;
   }
 
-  let { consoleUrl, oncheckagain, checking = false }: Props = $props();
+  let { consoleUrl, apis = [], oncheckagain, checking = false }: Props = $props();
+
+  /** "Google Tasks", "Gmail and Google Tasks", "…, … and …". Falls back to the
+   *  vaguer phrasing only when we genuinely weren't told which. */
+  const named = $derived(
+    apis.length === 0
+      ? null
+      : apis.length === 1
+        ? apis[0]
+        : `${apis.slice(0, -1).join(", ")} and ${apis[apis.length - 1]}`,
+  );
 
   // The same static pointer the setup wizard hands out at its "enable the
   // APIs" step. Used ONLY when Google gave no link of its own — a known-good
@@ -60,11 +74,14 @@
   </svg>
   <div class="min-w-0 flex-1">
     <div class="text-[12.5px] font-semibold text-text">
-      A Google API isn't switched on
+      {named == null ? "A Google API isn't switched on" : `${named} isn't switched on`}
     </div>
     <p class="mt-0.5 text-[12px] leading-[1.5] text-text-2">
-      Google turned this request down because one of the APIs this profile uses
-      — Gmail, Calendar or Tasks — is switched off in your Google Cloud project.
+      Google turned this request down because
+      {named == null
+        ? "one of the APIs this profile uses — Gmail, Calendar or Tasks — is"
+        : `${named} ${apis.length > 1 ? "are" : "is"}`}
+      switched off in your Google Cloud project.
       Reconnecting won't help: the switch lives in the console, not in the
       permission you granted. Turn it on there, then check again.
       {#if consoleUrl == null}

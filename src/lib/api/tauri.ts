@@ -1486,8 +1486,13 @@ export async function setMemorySettings(
 // (Testing-status Google clients expire refresh tokens after ~7 days) —
 // the UI renders a calm Reconnect, not an error.
 
+/** The Google APIs this app talks to, by their backend wire id. A screen names
+ *  the ones it is able to re-test, so a re-check on Email can't clear a state
+ *  only the Planner will ever retry. Mirrors `GoogleApi::wire`. */
+export type GoogleApiId = "gmail" | "calendar" | "tasks";
+
 /** A Google API this profile needs is switched OFF in the user's own Google
- *  Cloud project. Mirrors `GoogleApiDisabled` in `email/api_error.rs`.
+ *  Cloud project. Mirrors `GoogleApiDisabled` in `email/connection_state.rs`.
  *
  *  Kept apart from `needs_reconnect` on purpose: reconnecting re-consents
  *  scopes and can never enable a disabled API, so offering Reconnect here
@@ -1496,10 +1501,15 @@ export async function setMemorySettings(
  *  to the console instead of a Reconnect button. */
 export interface GoogleApiDisabled {
   /** Google's own console activation link, validated backend-side (https +
-   *  a google.com host) before it is ever surfaced. `null` when the response
-   *  carried no usable link — the UI then points at the console in prose
-   *  rather than inventing a URL. */
+   *  one of Google's API-activation console hosts) before it is ever
+   *  surfaced. `null` when no response carried a usable link — the UI then
+   *  points at the console in prose rather than inventing a URL. */
   console_url: string | null;
+  /** Which APIs are known to be off, by label ("Gmail", "Google Calendar",
+   *  "Google Tasks"). The backend knows exactly which ones answered with
+   *  SERVICE_DISABLED, so the banner names them instead of saying "a Google
+   *  API". Cleared per API as calls to them start working. */
+  apis: string[];
 }
 
 /** The Gmail setup/connection state for one profile. Mirrors `GmailSetupStatus`
@@ -1572,14 +1582,21 @@ export async function gmailSetupStatus(profile: string): Promise<GmailSetupStatu
   };
 }
 
-/** Forget this profile's "a Google API is disabled" state so the next call
- *  re-decides. Backs the banner's "I've enabled it — check again": the remedy
- *  happens outside the app (in the Google console), so nothing the app can
- *  observe would otherwise clear it. Nothing is assumed fixed — if the API is
- *  still off, the next call re-records the state and the banner returns. */
-export async function googleClearApiNotEnabled(profile: string): Promise<void> {
+/** Forget this profile's "a Google API is disabled" state for `apis` so the
+ *  next call re-decides. Backs the banner's "I've enabled it — check again".
+ *
+ *  A call that SUCCEEDS already clears the API it proves, backend-side, so
+ *  this is for the other half: the remedy happens outside the app (in the
+ *  Google console) and nothing may be retrying. Pass only the APIs the caller
+ *  is about to re-test — clearing one a screen will never retry would blank a
+ *  banner while the API stays off. Nothing is assumed fixed: if it's still
+ *  off, the retry re-records the state and the banner returns. */
+export async function googleClearApiNotEnabled(
+  profile: string,
+  apis: GoogleApiId[],
+): Promise<void> {
   if (isTauri()) {
-    await tauriInvoke("google_clear_api_not_enabled", { args: { profile } });
+    await tauriInvoke("google_clear_api_not_enabled", { args: { profile, apis } });
     return;
   }
   // Browser mode has no backend state to clear; the caller's reload is the

@@ -20,13 +20,32 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, fireEvent, cleanup, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import GoogleApiDisabledBanner from "$lib/design/components/GoogleApiDisabledBanner.svelte";
 import Email from "$lib/design/screens/Email.svelte";
 import Planner from "$lib/design/screens/Planner.svelte";
+import {
+  connectionStateChanged,
+  shouldAdopt,
+} from "$lib/design/googleConnection.svelte";
 import type { GmailSetupStatus } from "$lib/api/tauri";
 
 const CONSOLE_URL =
   "https://console.developers.google.com/apis/api/tasks.googleapis.com/overview?project=42";
+
+/** Let every pending promise chain and the resulting render finish. Used where
+ *  the point of the test is the state AFTER a late write lands — `waitFor`
+ *  would happily pass on the state before it. */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  await tick();
+}
+
+/** The disabled-API state as the backend sends it: the link plus the APIs it
+ *  actually recorded as off. */
+function disabledState(apis: string[] = ["Google Tasks"], console_url: string | null = CONSOLE_URL) {
+  return { console_url, apis };
+}
 
 // ── the banner component on its own ─────────────────────────────────────────
 
@@ -36,6 +55,7 @@ describe("GoogleApiDisabledBanner", () => {
   it("links to the page Google pointed to, and never offers a reconnect", () => {
     const { getByTestId, container } = render(GoogleApiDisabledBanner, {
       consoleUrl: CONSOLE_URL,
+      apis: ["Google Tasks"],
       oncheckagain: () => {},
     });
 
@@ -56,9 +76,29 @@ describe("GoogleApiDisabledBanner", () => {
     expect(container.textContent).toMatch(/Reconnecting won't help/i);
   });
 
+  it("names the APIs the backend recorded, and stays vague only when it must", async () => {
+    const oncheckagain = () => {};
+    const { container, rerender } = render(GoogleApiDisabledBanner, {
+      consoleUrl: null,
+      apis: ["Google Tasks"],
+      oncheckagain,
+    });
+    // The backend knows exactly which API answered SERVICE_DISABLED, so making
+    // the user guess between three would be throwing information away.
+    expect(container.textContent).toMatch(/Google Tasks isn't switched on/i);
+
+    await rerender({ consoleUrl: null, apis: ["Gmail", "Google Tasks"], oncheckagain });
+    expect(container.textContent).toMatch(/Gmail and Google Tasks/);
+
+    // …and only when nothing was recorded does it fall back to the vaguer copy.
+    await rerender({ consoleUrl: null, apis: [], oncheckagain });
+    expect(container.textContent).toMatch(/A Google API isn't switched on/i);
+  });
+
   it("falls back to the API library, and says so, when Google gave no link", () => {
     const { getByTestId, container } = render(GoogleApiDisabledBanner, {
       consoleUrl: null,
+      apis: ["Google Tasks"],
       oncheckagain: () => {},
     });
 
@@ -73,15 +113,17 @@ describe("GoogleApiDisabledBanner", () => {
     const oncheckagain = vi.fn();
     const { getByText, rerender } = render(GoogleApiDisabledBanner, {
       consoleUrl: CONSOLE_URL,
+      apis: ["Google Tasks"],
       oncheckagain,
     });
 
     await fireEvent.click(getByText(/I've enabled it/));
     expect(oncheckagain).toHaveBeenCalledTimes(1);
 
-    // The remedy happens outside the app, so this button is the ONLY thing
-    // that clears the sticky state — it must not be double-fireable.
-    await rerender({ consoleUrl: CONSOLE_URL, oncheckagain, checking: true });
+    // The remedy happens outside the app, so this button is one of the two
+    // ways out (a successful call is the other) — it must not be
+    // double-fireable.
+    await rerender({ consoleUrl: CONSOLE_URL, apis: ["Google Tasks"], oncheckagain, checking: true });
     expect(getByText("Checking…")).toBeDisabled();
   });
 });
@@ -140,7 +182,7 @@ describe("Email + Planner — the two connection banners", () => {
     ["Planner", Planner],
   ] as const) {
     it(`${name}: a disabled API shows the console banner and NO reconnect`, async () => {
-      routeInvoke(status({ api_not_enabled: { console_url: CONSOLE_URL } }));
+      routeInvoke(status({ api_not_enabled: disabledState() }));
       const { getByTestId, queryByText } = render(Screen);
 
       const banner = await waitFor(() => getByTestId("google-api-disabled-banner"));
@@ -192,7 +234,7 @@ describe("Email + Planner — the two connection banners", () => {
       switch (cmd) {
         case "gmail_setup_status":
           return status(
-            disabled ? { api_not_enabled: { console_url: CONSOLE_URL } } : {},
+            disabled ? { api_not_enabled: disabledState() } : {},
           );
         case "list_calendar_events":
         case "list_google_tasks":
@@ -200,7 +242,10 @@ describe("Email + Planner — the two connection banners", () => {
         case "create_google_task":
           // The failing call is what records the state backend-side.
           disabled = true;
-          throw new Error("[google:api_not_enabled] Google API HTTP 403");
+          throw new Error(
+            "Google Tasks API HTTP 403: this Google API is switched off in your " +
+              "Google Cloud project.",
+          );
         default:
           return null;
       }
@@ -217,16 +262,145 @@ describe("Email + Planner — the two connection banners", () => {
     await waitFor(() => expect(queryByTestId("google-api-disabled-banner")).not.toBeNull());
   });
 
+  /// The re-check race. Pressing "I've enabled it — check again" starts TWO
+  /// things: a status read (the state was just cleared, so it reads clean) and
+  /// a retry (which fails, re-records the state, and re-reads). If the stale
+  /// clean read is allowed to land last, the banner goes dark while the API is
+  /// still switched off — the app asserting something false about Google,
+  /// which is the one thing this whole feature exists to stop.
+  ///
+  /// Driven in the WORST order on purpose: both reads are held, then released
+  /// stale-LAST, and the assertion happens after they have both settled (a
+  /// `waitFor` here would pass on the state as it is before the stale write).
+  it("Planner: a failed re-check leaves the banner lit, whatever order the reads land in", async () => {
+    let disabled = true;
+    let holdReads = false;
+    const held: Array<{ sawDisabled: boolean; release: () => void }> = [];
+
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "gmail_setup_status": {
+          // Captured NOW, resolved later — that is what makes a read stale.
+          const sawDisabled = disabled;
+          const snapshot = status(
+            sawDisabled ? { api_not_enabled: disabledState() } : {},
+          );
+          if (!holdReads) return snapshot;
+          return new Promise((resolve) =>
+            held.push({ sawDisabled, release: () => resolve(snapshot) }),
+          );
+        }
+        case "google_clear_api_not_enabled":
+          disabled = false;
+          return null;
+        case "list_google_tasks":
+          // The retry: Tasks is STILL off, so the call re-records the state.
+          disabled = true;
+          throw new Error("Google Tasks API HTTP 403: switched off");
+        case "list_calendar_events":
+          return [];
+        default:
+          return null;
+      }
+    });
+
+    const { getByText, queryByTestId } = render(Planner);
+    await waitFor(() => expect(queryByTestId("google-api-disabled-banner")).not.toBeNull());
+
+    holdReads = true;
+    await fireEvent.click(getByText(/I've enabled it/));
+    // Both reads are now in flight: the post-clear one (clean) and the
+    // post-failure one (disabled again).
+    await waitFor(() => expect(held.length).toBe(2));
+    const stale = held.find((read) => !read.sawDisabled);
+    const fresh = held.find((read) => read.sawDisabled);
+    expect(stale && fresh).toBeTruthy();
+
+    fresh!.release();
+    stale!.release();
+    await settle();
+
+    expect(queryByTestId("google-api-disabled-banner")).not.toBeNull();
+  });
+
+  /// A screen may only clear what it can re-test. Email clearing Calendar or
+  /// Tasks would blank a banner nothing on that screen will ever retry, and
+  /// the user would be told the problem was gone.
+  it.each([
+    ["Email", Email, ["gmail"]],
+    ["Planner", Planner, ["calendar", "tasks"]],
+  ] as const)("%s: the re-check clears only the APIs it can re-test", async (_name, Screen, apis) => {
+    routeInvoke(status({ api_not_enabled: disabledState() }));
+    const { getByText } = render(Screen);
+    await waitFor(() => getByText(/I've enabled it/));
+
+    await fireEvent.click(getByText(/I've enabled it/));
+    await waitFor(() =>
+      expect(tauri.invoke).toHaveBeenCalledWith("google_clear_api_not_enabled", {
+        args: { profile: expect.any(String), apis },
+      }),
+    );
+  });
+
   /// Planner's specific gap: it read no connection state, so it printed the
   /// raw backend error under fixed prose that told the user to reconnect —
   /// advice that is simply wrong for a disabled API.
   it("Planner: stops advising a reconnect once a banner names the real problem", async () => {
-    routeInvoke(status({ api_not_enabled: { console_url: CONSOLE_URL } }));
+    routeInvoke(status({ api_not_enabled: disabledState() }));
     const { getByTestId, queryByText } = render(Planner);
 
     await waitFor(() => getByTestId("google-api-disabled-banner"));
     expect(
       queryByText(/connect or reconnect Google from Email/i),
     ).toBeNull();
+  });
+});
+
+// ── the shared connection-state rules ───────────────────────────────────────
+
+describe("the shared connection-state decision", () => {
+  const base: GmailSetupStatus = {
+    client_configured: true,
+    connected: true,
+    account_email: "ada@example.com",
+    needs_reconnect: false,
+    api_not_enabled: null,
+  };
+
+  /// The divergence this replaces: Planner adopted a fresh status when it held
+  /// none, Email discarded it. Email's copy was the wrong one — a screen that
+  /// holds no status shows NO banner, so refusing the only answer available
+  /// keeps both banners dark for exactly the failure that just happened.
+  it("adopts a fresh status when nothing has been read yet", () => {
+    expect(shouldAdopt(base, null)).toBe(true);
+  });
+
+  /// …but not when nothing about the CONNECTION changed, or every re-read
+  /// would re-trigger the effects that watch it.
+  it("keeps what it has when the connection state is unchanged", () => {
+    expect(shouldAdopt({ ...base, account_email: "someone-else@example.com" }, base)).toBe(
+      false,
+    );
+  });
+
+  it("notices each state a banner depends on", () => {
+    expect(connectionStateChanged({ ...base, needs_reconnect: true }, base)).toBe(true);
+    expect(
+      connectionStateChanged({ ...base, api_not_enabled: disabledState() }, base),
+    ).toBe(true);
+    // …including WHICH apis are off and WHERE the link points, since both are
+    // rendered.
+    expect(
+      connectionStateChanged(
+        { ...base, api_not_enabled: disabledState(["Gmail"]) },
+        { ...base, api_not_enabled: disabledState(["Google Tasks"]) },
+      ),
+    ).toBe(true);
+    expect(
+      connectionStateChanged(
+        { ...base, api_not_enabled: disabledState(["Gmail"], null) },
+        { ...base, api_not_enabled: disabledState(["Gmail"]) },
+      ),
+    ).toBe(true);
   });
 });

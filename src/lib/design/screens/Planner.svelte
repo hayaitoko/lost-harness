@@ -18,8 +18,6 @@
   import GoogleApiDisabledBanner from "../components/GoogleApiDisabledBanner.svelte";
   import { activeProfileId } from "$lib/stores/profiles";
   import {
-    gmailSetupStatus,
-    googleClearApiNotEnabled,
     listCalendarEvents,
     createCalendarEvent,
     deleteCalendarEvent,
@@ -28,9 +26,10 @@
     setGoogleTaskCompleted,
     deleteGoogleTask,
     type CalendarEventInfo,
-    type GmailSetupStatus,
+    type GoogleApiId,
     type GoogleTaskInfo,
   } from "$lib/api/tauri";
+  import { GoogleConnection } from "$lib/design/googleConnection.svelte";
 
   let events = $state<CalendarEventInfo[]>([]);
   let tasks = $state<GoogleTaskInfo[]>([]);
@@ -39,53 +38,29 @@
   let refreshTick = $state(0);
   let sequence = 0;
 
-  // ── connection state (per profile), the same shape Email reads ────────────
-  let status = $state<GmailSetupStatus | null>(null);
+  // ── connection state (per profile) — the SAME implementation Email uses ───
+  //
+  // Reading it, dropping stale reads, and deciding whether a re-read replaces
+  // what we hold are all one shared thing now. Two private copies had already
+  // drifted: this screen adopted a fresh status when it held none and Email
+  // discarded it, and nothing said which was right.
+  const conn = new GoogleConnection();
+  const status = $derived(conn.status);
+  const recheckingApi = $derived(conn.checking);
   let statusTick = $state(0);
-  let statusSeq = 0;
-  let recheckingApi = $state(false);
 
-  function connectionStateChanged(a: GmailSetupStatus, b: GmailSetupStatus): boolean {
-    return (
-      a.needs_reconnect !== b.needs_reconnect ||
-      (a.api_not_enabled == null) !== (b.api_not_enabled == null) ||
-      (a.api_not_enabled?.console_url ?? null) !== (b.api_not_enabled?.console_url ?? null)
-    );
-  }
+  /// The APIs this screen can actually re-test. Its re-check must not clear a
+  /// Gmail state that only the Email screen will ever retry.
+  const PLANNER_APIS: GoogleApiId[] = ["calendar", "tasks"];
 
   $effect(() => {
     const profile = $activeProfileId;
     void statusTick;
-    const token = ++statusSeq;
     // A failed status read is not worth an error of its own here — the loads
-    // below carry their own errors. Leave the banners dark rather than
-    // claiming a connection state we could not read.
-    gmailSetupStatus(profile)
-      .then((s) => {
-        if (token === statusSeq) status = s;
-      })
-      .catch(() => {
-        if (token === statusSeq) status = null;
-      });
+    // below carry their own errors, and `conn` leaves the banners dark rather
+    // than claiming a connection state it could not read.
+    void conn.read(profile);
   });
-
-  /// Re-read the connection state after a call failed.
-  ///
-  /// The failing call is what records the state backend-side, so without this
-  /// EVERY non-list failure — creating an event, ticking a task, a delete —
-  /// would leave both banners dark and show only raw `Google API HTTP 403`
-  /// text. Only swaps when something actually changed, so it can't churn.
-  async function refreshConnectionState() {
-    const token = statusSeq;
-    try {
-      const fresh = await gmailSetupStatus($activeProfileId);
-      if (token === statusSeq && (status == null || connectionStateChanged(fresh, status))) {
-        status = fresh;
-      }
-    } catch {
-      // Keep whatever error the caller already surfaced.
-    }
-  }
 
   const showReconnectBanner = $derived(
     status != null && status.connected && status.needs_reconnect,
@@ -94,23 +69,22 @@
     status != null && status.connected ? status.api_not_enabled : null,
   );
 
-  /// Forget the sticky disabled-API state, then reload. If the API is still
-  /// off, the reload re-records it and the banner returns — nothing is assumed
-  /// fixed.
+  /// Forget the disabled-API state for THIS screen's APIs, then reload. If one
+  /// is still off, the reload re-records it and the banner returns — nothing
+  /// is assumed fixed.
   async function recheckApi() {
-    if (recheckingApi) return;
-    recheckingApi = true;
-    try {
-      await googleClearApiNotEnabled($activeProfileId);
-    } catch (err) {
+    const failed = await conn.clearDisabled($activeProfileId, PLANNER_APIS);
+    if (failed !== null) {
       // A failed CLEAR is a local IPC problem, not a Google verdict — nothing
-      // to re-read about the connection.
-      error = String(err);
-    } finally {
-      recheckingApi = false;
+      // changed backend-side, so there is nothing new to reload or re-read.
+      error = failed;
+      return;
     }
-    statusTick++;
+    // Order doesn't matter — every read claims a token and the newest wins —
+    // but the reload is what re-records a still-disabled API, and the status
+    // read is what renders whatever it recorded.
     refreshTick++;
+    statusTick++;
   }
 
   let eventTitle = $state("");
@@ -139,7 +113,7 @@
         error = String(err);
         // A dead grant or a disabled API is recorded backend-side by the very
         // call that just failed — re-check so the matching banner lights.
-        await refreshConnectionState();
+        await conn.refresh(profile);
       })
       .finally(() => {
         if (token === sequence) loading = false;
@@ -168,7 +142,7 @@
       eventEnd = "";
     } catch (err) {
       error = String(err);
-      void refreshConnectionState();
+      void conn.refresh($activeProfileId);
     } finally {
       creatingEvent = false;
     }
@@ -188,7 +162,7 @@
       taskNotes = "";
     } catch (err) {
       error = String(err);
-      void refreshConnectionState();
+      void conn.refresh($activeProfileId);
     } finally {
       creatingTask = false;
     }
@@ -201,7 +175,7 @@
       tasks = tasks.map((row) => (row.id === updated.id ? updated : row));
     } catch (err) {
       error = String(err);
-      void refreshConnectionState();
+      void conn.refresh($activeProfileId);
     }
   }
 
@@ -226,7 +200,7 @@
       }
     } catch (err) {
       error = String(err);
-      void refreshConnectionState();
+      void conn.refresh($activeProfileId);
     }
   }
 
@@ -277,6 +251,7 @@
     {#if apiDisabled}
       <GoogleApiDisabledBanner
         consoleUrl={apiDisabled.console_url}
+        apis={apiDisabled.apis}
         checking={recheckingApi}
         oncheckagain={() => void recheckApi()}
       />

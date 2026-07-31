@@ -22,22 +22,31 @@
   import GoogleApiDisabledBanner from "../components/GoogleApiDisabledBanner.svelte";
   import { activeProfileId } from "$lib/stores/profiles";
   import {
-    gmailSetupStatus,
     gmailDisconnect,
-    googleClearApiNotEnabled,
     listEmail,
     readEmail,
     sendEmail,
-    type GmailSetupStatus,
+    type GoogleApiId,
     type EmailSummary,
     type EmailDetail,
   } from "$lib/api/tauri";
+  import { GoogleConnection } from "$lib/design/googleConnection.svelte";
 
   // ── connection status (per profile) ────────────────────────────────────────
-  let status = $state<GmailSetupStatus | null>(null);
-  let statusError: string | null = $state(null);
+  //
+  // The reading, the token discipline that keeps the newest read authoritative,
+  // and the "adopt this fresh status?" rule all live in ONE shared place —
+  // Planner holds the same thing. The two screens used to keep private copies
+  // that had already drifted apart on the never-read-anything case.
+  const conn = new GoogleConnection();
+  const status = $derived(conn.status);
+  const statusError = $derived(conn.error);
+  const recheckingApi = $derived(conn.checking);
   let statusTick = $state(0);
-  let statusSeq = 0;
+
+  /// The APIs this screen can actually re-test. A re-check here must not clear
+  /// a Calendar/Tasks state that only the Planner will ever retry.
+  const EMAIL_APIS: GoogleApiId[] = ["gmail"];
 
   // ── inbox list ─────────────────────────────────────────────────────────────
   let emails = $state<EmailSummary[]>([]);
@@ -57,44 +66,18 @@
   let confirmDisconnect = $state(false);
   let actionError: string | null = $state(null);
   let reconnecting = $state(false);
-  let recheckingApi = $state(false);
-
-  // Has the CONNECTION state (as opposed to the mail) changed? Both recoverable
-  // Google failures count, because both drive a banner.
-  function connectionStateChanged(a: GmailSetupStatus, b: GmailSetupStatus): boolean {
-    return (
-      a.needs_reconnect !== b.needs_reconnect ||
-      (a.api_not_enabled == null) !== (b.api_not_enabled == null) ||
-      (a.api_not_enabled?.console_url ?? null) !== (b.api_not_enabled?.console_url ?? null)
-    );
-  }
-
-  // Re-read the connection state after a call failed. The failing call is what
-  // records it backend-side, so without this a failed read or send would leave
-  // both banners dark and show only the raw error. Only swaps on a real change,
-  // so the list effect settles instead of looping.
-  async function refreshConnectionState() {
-    const token = statusSeq;
-    try {
-      const fresh = await gmailSetupStatus($activeProfileId);
-      if (token === statusSeq && status && connectionStateChanged(fresh, status)) {
-        status = fresh;
-      }
-    } catch {
-      // Keep whatever error the caller already surfaced.
-    }
-  }
 
   // One effect owns the status check + the profile-switch reset (the
   // connection is per-profile, so switching drops the old profile's mail
-  // state). `seq` tokens drop stale responses, like Files.svelte.
+  // state). Stale responses are dropped inside `conn`, by the same token rule
+  // every other read there follows.
   let lastProfile: string | null = null;
   $effect(() => {
     const profile = $activeProfileId;
     void statusTick; // manual re-check hook (connect / disconnect / reconnect)
     if (profile !== lastProfile) {
       lastProfile = profile;
-      status = null; // gate the UI on a fresh check for the new profile
+      conn.reset(); // gate the UI on a fresh check for the new profile
       emails = [];
       selectedId = null;
       detail = null;
@@ -103,23 +86,11 @@
       listLoading = false; // clear loading flag on profile switch
       actionError = null;
       reconnecting = false;
-      recheckingApi = false;
       confirmDisconnect = false;
       listSeq++;
       detailSeq++; // invalidate anything in flight for the old profile
     }
-    const token = ++statusSeq;
-    statusError = null;
-    gmailSetupStatus(profile)
-      .then((s) => {
-        if (token === statusSeq) status = s;
-      })
-      .catch((err) => {
-        if (token === statusSeq) {
-          statusError = String(err);
-          status = null;
-        }
-      });
+    void conn.read(profile);
   });
 
   // Inbox listing — only when connected and the grant isn't known-dead
@@ -147,7 +118,7 @@
         listError = String(err);
         // A dead grant or a disabled API is recorded backend-side — re-check
         // so the matching calm banner appears.
-        await refreshConnectionState();
+        await conn.refresh(profile);
       })
       .finally(() => {
         if (token === listSeq) listLoading = false;
@@ -166,7 +137,7 @@
     } catch (err) {
       if (token === detailSeq) {
         detailError = String(err);
-        void refreshConnectionState();
+        void conn.refresh($activeProfileId);
       }
     } finally {
       if (token === detailSeq) detailLoading = false;
@@ -223,7 +194,7 @@
       sentTo = composeTo.trim();
     } catch (err) {
       sendError = String(err);
-      void refreshConnectionState();
+      void conn.refresh($activeProfileId);
     } finally {
       sending = false;
     }
@@ -244,22 +215,23 @@
     status != null && status.connected && !reconnecting ? status.api_not_enabled : null,
   );
 
-  // "I've enabled it — check again": forget the sticky state, then retry. If
-  // the API is still off the next call re-records it and the banner returns —
-  // nothing is assumed fixed.
+  // "I've enabled it — check again": forget the state for THIS screen's API,
+  // then retry. If it is still off the retry re-records it and the banner
+  // returns — nothing is assumed fixed.
   async function recheckApi() {
-    if (recheckingApi) return;
-    recheckingApi = true;
     actionError = null;
-    try {
-      await googleClearApiNotEnabled($activeProfileId);
-    } catch (err) {
-      actionError = String(err);
-    } finally {
-      recheckingApi = false;
+    const failed = await conn.clearDisabled($activeProfileId, EMAIL_APIS);
+    if (failed !== null) {
+      // A failed CLEAR is a local IPC problem, not a Google verdict: nothing
+      // changed backend-side, so there is nothing new to retry or re-read.
+      actionError = failed;
+      return;
     }
-    statusTick++;
+    // Order doesn't matter — every read claims a token and the newest wins —
+    // but the retry is what re-records a still-disabled API, and the status
+    // read is what renders whatever it recorded.
     listTick++;
+    statusTick++;
   }
 
   function fmtDate(raw: string): string {
@@ -336,6 +308,7 @@
     {#if apiDisabled}
       <GoogleApiDisabledBanner
         consoleUrl={apiDisabled.console_url}
+        apis={apiDisabled.apis}
         checking={recheckingApi}
         oncheckagain={() => void recheckApi()}
       />
