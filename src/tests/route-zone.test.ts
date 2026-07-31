@@ -210,14 +210,38 @@ describe("route badge — trust zone comes from the backend", () => {
     expect(await badgeZone()).toBe("Local");
   });
 
-  it("keeps a privacy reroute readable on a pre-stamp row", async () => {
-    // `route_local` is itself a persisted backend fact (enforce_local_routing
-    // structurally proves the target was local+private), so an old row that
-    // carries it is still answerable without consulting live state.
+  it("will NOT call a pre-stamp privacy reroute 'Local'", async () => {
+    // This test used to assert "Local" here, on the argument that `route_local`
+    // is itself a persisted backend fact and `enforce_local_routing`
+    // structurally proves its target was local+private. That argument does not
+    // hold, and the test was blessing the behaviour rather than checking it:
+    //
+    //   - The backend does not make the inference either. On the `RouteLocal`
+    //     branch, `process_message_inner` picks the endpoint and THEN computes
+    //     `local_is_cloud = !is_private_endpoint(&local.base_url)` to stamp the
+    //     row, because `find_or_start_local_provider` also reaches
+    //     `models::runner::ensure_running`, which mints the bundled sidecar's
+    //     provider without passing through the enforcer.
+    //   - A zone-null row was written by a build older than the stamp. Proving
+    //     it with today's routing code is proving it with code that did not run.
+    //
+    // "Local" is the reassuring answer, and the reassuring answer is exactly
+    // the one this whole workstream forbids guessing.
     seedTurn(null, "route_local");
     render(MainScreen);
 
-    expect(await badgeZone()).toBe("Local");
+    expect(await badgeZone()).toBe("Unknown route");
+  });
+
+  it("still answers Cloud for a pre-stamp redact-and-send", async () => {
+    // The asymmetry is deliberate, and it is the rule: a routing decision may
+    // support the LESS reassuring claim only. The backend reaches `redact_send`
+    // exclusively under `if is_cloud`, so that turn provably egressed; being
+    // wrong in this direction can only over-warn.
+    seedTurn(null, "redact_send");
+    render(MainScreen);
+
+    expect(await badgeZone()).toBe("Cloud");
   });
 
   it("explains the unknown state instead of leaving a bare chip", async () => {
@@ -234,6 +258,63 @@ describe("route badge — trust zone comes from the backend", () => {
       document.body.querySelectorAll("[title]"),
     ).some((el) => /can't be confirmed/.test(el.getAttribute("title") ?? ""));
     expect(explained).toBe(true);
+  });
+});
+
+describe("the 'Kept on your device' event bar is gated on the stamp too", () => {
+  // The bar is the LOUDER of the two surfaces — a full-width green banner
+  // saying the content never left the machine. It was rendered off
+  // `routing_decision === "route_local"` alone, so a pre-stamp row got the
+  // reassurance the badge had already stopped giving. Two surfaces, one fact:
+  // both now read `served_by.zone`.
+
+  it("says 'Kept on your machine' when the backend stamped the turn local", async () => {
+    seedTurn(
+      {
+        provider_id: "local-llm",
+        provider_name: "Local Llama",
+        base_url: "http://127.0.0.1:11434/v1",
+        zone: "local",
+      },
+      "route_local",
+    );
+    render(MainScreen);
+
+    expect(await screen.findByText("Kept on your machine")).toBeInTheDocument();
+  });
+
+  it("will not claim a pre-stamp reroute stayed on the machine", async () => {
+    seedTurn(null, "route_local");
+    render(MainScreen);
+
+    // The reroute is still surfaced — the user should know the gate moved
+    // their turn — but without the claim we cannot back.
+    expect(
+      await screen.findByText("Rerouted — not confirmed local"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Kept on your machine")).toBeNull();
+    expect(document.body.textContent).toContain("can't be confirmed");
+  });
+
+  it("says the content left the machine when the stamp says cloud", async () => {
+    // `route_local` + a cloud stamp is the contradiction the backend's own
+    // `local_is_cloud` recomputation exists to catch. The stamp wins, and the
+    // bar says so in words rather than showing a green padlock.
+    seedTurn(
+      {
+        provider_id: "sidecar",
+        provider_name: "Sidecar",
+        base_url: "https://api.example.com/v1",
+        zone: "cloud",
+      },
+      "route_local",
+    );
+    render(MainScreen);
+
+    expect(
+      await screen.findByText("Rerouted — not confirmed local"),
+    ).toBeInTheDocument();
+    expect(document.body.textContent).toContain("still left it");
   });
 });
 

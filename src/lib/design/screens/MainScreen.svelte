@@ -616,23 +616,46 @@
     if (zone === "cloud") return "cloud";
     if (zone === "local") return "local";
 
-    // No stamped zone (a row older than the stamp). The only remaining
-    // evidence is the persisted routing decision — also a backend fact written
-    // with the row, not live state:
-    //   route_local / tool_reroute_local — the gate rerouted the turn, and
-    //     `enforce_local_routing` structurally proves the target was
-    //     is_local() && is_private().
-    //   redact_send — the safe remainder went to the cloud (sensitive spans
-    //     stayed local); the event bar explains the redaction.
-    if (
-      m.routing_decision === "route_local" ||
-      m.routing_decision === "tool_reroute_local"
-    )
-      return "local";
+    // No stamped zone — a row older than profile schema v12. The only other
+    // evidence is the persisted routing decision, and the rule for using it is:
+    //
+    //   **a decision may only ever support the LESS reassuring claim.**
+    //
+    // `redact_send` therefore still yields "cloud". The backend only reaches
+    // that branch under `if is_cloud`, so the turn provably egressed (the
+    // sensitive spans were blacked out first — the event bar says so). Being
+    // wrong here can only over-warn.
     if (m.routing_decision === "redact_send") return "cloud";
 
+    // `route_local` / `tool_reroute_local` deliberately do NOT yield "local".
+    // They used to, on the grounds that `enforce_local_routing` structurally
+    // proves the target was `is_local() && is_private()`. That argument does
+    // not survive contact with the code:
+    //
+    //   1. The backend itself does not make it. On the `RouteLocal` branch,
+    //      `process_message_inner` picks the endpoint and then computes
+    //      `local_is_cloud = !is_private_endpoint(&local.base_url)` and stamps
+    //      the row from THAT — because `find_or_start_local_provider` has a
+    //      second path (`models::runner::ensure_running`) that mints the
+    //      bundled sidecar's provider without going through the enforcer at
+    //      all. "We took the local route" and "that endpoint was private" are
+    //      two separate facts there. A reader cannot infer what the writer
+    //      declined to assume.
+    //   2. A zone-null row was written by a build OLDER than the stamp. The
+    //      proof would be a claim about today's routing code applied to a row
+    //      produced by code that is no longer in the tree — including builds
+    //      before `enforce_local_routing` refused `Unconstrained` (its old arm
+    //      returned `candidates.first()`, cloud included) and before the
+    //      pre-send indicators stopped keying off `kind`.
+    //
+    // So: unknown. Which is also the whole point — `messageRoute` already
+    // refuses to answer "local" for a zone-null row whose provider still
+    // resolves to a local endpoint. Answering "local" from a persisted string
+    // instead is the same inference walking in a different door, and it is the
+    // reassuring direction, which is the one that must never be guessed.
+    //
     // "allow" with no stamped zone tells us the gate permitted the turn, not
-    // where it went. Say so.
+    // where it went. Same answer.
     return "unknown";
   }
 
@@ -910,10 +933,24 @@
               <span class="whitespace-pre-wrap">{m.content}</span>
             </ChatMessage>
           {:else}
-            {#if m.routing_decision === "route_local"}
+            <!-- The reassuring bar is gated on the STAMPED zone, not on the
+                 routing decision. `route_local` says the gate rerouted the
+                 turn; only `served_by.zone` says where it landed. See
+                 `messageRoute` for why the decision cannot stand in for the
+                 zone on a pre-stamp row — this is the same conclusion applied
+                 to the louder of the two surfaces. -->
+            {#if m.routing_decision === "route_local" && m.served_by?.zone === "local"}
               <PrivacyEventBar kind="kept" title="Kept on your machine">
                 This turn was routed to a local model — the content looked
                 sensitive, or a cloud endpoint wasn't reachable.
+              </PrivacyEventBar>
+            {:else if m.routing_decision === "route_local"}
+              <PrivacyEventBar kind="unknown" title="Rerouted — not confirmed local">
+                The privacy gate sent this turn to a different endpoint than the
+                one you picked.
+                {m.served_by?.zone === "cloud"
+                  ? "That endpoint was reachable off this machine, so the content still left it."
+                  : "This turn was recorded before Lost Harness stamped the trust zone on each turn, so whether it stayed on this machine can't be confirmed."}
               </PrivacyEventBar>
             {:else if m.routing_decision === "redact_send"}
               <PrivacyEventBar kind="kept" title="Sent the safe parts only">
