@@ -177,10 +177,21 @@ pub(crate) fn observe_local_step<T>(
 /// Returns one entry per id, IN INPUT ORDER, each paired with its own id — so
 /// a failed fetch can still name the message it was for (a search result that
 /// says `"id": "?"` is useless to the agent and to the user).
+///
+/// Each row's error stays an `anyhow::Error`, NOT a `String`: these are real
+/// Google calls, so one of them can carry the typed 403 verdict, and
+/// stringifying it inside the spawned task destroyed that verdict before
+/// [`GoogleConnectionState::observe_failure`] could read it. The whole point of
+/// this workstream is that no connector call can fail with a connection-state
+/// error and leave the banner dark; a per-row `"couldn't fetch: …"` string was
+/// exactly that hole. The caller records the verdict, then renders the text.
+///
+/// [`GoogleConnectionState::observe_failure`]:
+///     crate::email::connection_state::GoogleConnectionState::observe_failure
 async fn fetch_previews(
     client: Arc<dyn GmailApi>,
     ids: Vec<String>,
-) -> Vec<(String, Result<crate::email::gmail::EmailMessage, String>)> {
+) -> Vec<(String, anyhow::Result<crate::email::gmail::EmailMessage>)> {
     let sem = Arc::new(Semaphore::new(SEARCH_CONCURRENCY));
     let mut tasks = Vec::with_capacity(ids.len());
     for id in ids.iter().cloned() {
@@ -188,11 +199,8 @@ async fn fetch_previews(
         let sem = Arc::clone(&sem);
         tasks.push(tokio::spawn(async move {
             match sem.acquire_owned().await {
-                Ok(_permit) => client
-                    .get_message_metadata(&id)
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(_) => Err("the search fetch pool closed unexpectedly".to_string()),
+                Ok(_permit) => client.get_message_metadata(&id).await,
+                Err(_) => Err(anyhow::anyhow!("the search fetch pool closed unexpectedly")),
             }
         }));
     }
@@ -202,7 +210,8 @@ async fn fetch_previews(
             Ok(res) => out.push((id, res)),
             // A join error means the fetch task panicked. Report it as a row
             // error (with its real id) rather than taking the search down.
-            Err(e) => out.push((id, Err(format!("preview fetch failed: {e}")))),
+            // It carries no Google verdict — nothing reached Google.
+            Err(e) => out.push((id, Err(anyhow::anyhow!("preview fetch failed: {e}")))),
         }
     }
     out
@@ -306,10 +315,20 @@ impl Tool for EmailSearchTool {
                     })),
                     // One bad message shouldn't sink the search — record it
                     // against its real id so the agent can retry that one.
-                    Err(e) => rows.push(serde_json::json!({
-                        "id": id,
-                        "error": format!("couldn't fetch: {e}"),
-                    })),
+                    //
+                    // The row is not fatal to the search, but it IS evidence
+                    // about the connection: a per-message fetch is a real Gmail
+                    // call, so it can come back "this API is switched off" or
+                    // "this grant is dead". Observe it before flattening it to
+                    // text, or that verdict dies here and the banner stays dark
+                    // while every row says "couldn't fetch".
+                    Err(e) => {
+                        self.deps.google.observe_failure(&ctx.profile, &e);
+                        rows.push(serde_json::json!({
+                            "id": id,
+                            "error": format!("couldn't fetch: {e}"),
+                        }));
+                    }
                 }
             }
             ToolResult::Ok(serde_json::json!({ "results": rows, "count": rows.len() }))
@@ -620,6 +639,12 @@ mod tests {
         }
     }
 
+    /// Google's real "this API is switched off in your project" 403 body.
+    const SERVICE_DISABLED_BODY: &str = r#"{"error":{"code":403,
+        "status":"PERMISSION_DENIED","details":[
+        {"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+         "reason":"SERVICE_DISABLED"}]}}"#;
+
     /// A mailbox where one id ("slow") takes far longer than the rest, and
     /// which records both the completion order and the high-water mark of
     /// concurrent in-flight fetches.
@@ -631,6 +656,9 @@ mod tests {
         in_flight: Mutex<usize>,
         peak_in_flight: Mutex<usize>,
         fail_id: Option<String>,
+        /// Fail `fail_id` the way Gmail really fails a switched-off API — with
+        /// the TYPED verdict — rather than with plain prose.
+        fail_typed: bool,
     }
 
     impl PacedMailbox {
@@ -643,6 +671,14 @@ mod tests {
                 in_flight: Mutex::new(0),
                 peak_in_flight: Mutex::new(0),
                 fail_id: fail_id.map(String::from),
+                fail_typed: false,
+            }
+        }
+
+        fn failing_typed(fail_id: &str) -> Self {
+            Self {
+                fail_typed: true,
+                ..Self::new(Some(fail_id))
             }
         }
     }
@@ -686,6 +722,14 @@ mod tests {
                 *self.in_flight.lock() -= 1;
                 self.completed.lock().push(id.to_string());
                 if self.fail_id.as_deref() == Some(id) {
+                    if self.fail_typed {
+                        return Err(crate::email::api_error::google_api_error(
+                            GoogleApi::Gmail,
+                            403,
+                            SERVICE_DISABLED_BODY,
+                            "snip",
+                        ));
+                    }
                     anyhow::bail!("Gmail API HTTP 404");
                 }
                 Ok(crate::email::gmail::EmailMessage {
@@ -776,6 +820,48 @@ mod tests {
         assert!(out[0].1.is_ok());
         assert_eq!(out[2].0, "f3");
         assert!(out[2].1.is_ok());
+    }
+
+    /// The finding this pins: the per-message preview fetch used to
+    /// `.map_err(|e| e.to_string())` INSIDE the spawned task, so a real Gmail
+    /// 403 arrived at the caller as prose. Every row then read
+    /// `"couldn't fetch: …"`, nothing was recordable, and the banner stayed
+    /// dark — the exact "a connector call fails with a connection-state error
+    /// and no banner lights" hole this workstream claims not to have.
+    ///
+    /// Both halves of what `email_search` now does are asserted: the row error
+    /// is still downcastable to the typed verdict, and handing that error to
+    /// the SHARED connection state (as the tool does) lights the disabled-API
+    /// state the screens read.
+    #[tokio::test]
+    async fn a_typed_403_on_a_preview_row_survives_to_the_connection_state() {
+        let mailbox = Arc::new(PacedMailbox::failing_typed("f2"));
+        let ids: Vec<String> = vec!["f1".into(), "f2".into(), "f3".into()];
+        let out = fetch_previews(mailbox, ids).await;
+
+        let (id, res) = &out[1];
+        assert_eq!(id, "f2");
+        let err = res.as_ref().expect_err("f2 was scripted to fail");
+        let verdict = crate::email::api_error::google_api_error_of(err)
+            .expect("the typed verdict must survive the spawned task, not be stringified");
+        assert_eq!(
+            verdict.failure,
+            crate::email::api_error::GoogleApiFailure::ApiNotEnabled { console_url: None }
+        );
+
+        // What the tool does with it: observe, then render the text.
+        let google = fresh_connection_state();
+        google.observe_failure("personal", err);
+        let disabled = google
+            .disabled_apis("personal")
+            .expect("a switched-off API must be recorded, not swallowed as a row string");
+        assert_eq!(
+            disabled.apis.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![GoogleApi::Gmail.wire()]
+        );
+
+        // The neighbours still succeed — observing does not sink the search.
+        assert!(out[0].1.is_ok() && out[2].1.is_ok());
     }
 
     /// The finding this pins: only the screen IPC path used to flip
