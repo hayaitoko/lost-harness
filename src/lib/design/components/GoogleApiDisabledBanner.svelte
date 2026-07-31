@@ -15,37 +15,58 @@
   // strip by SHAPE — a titled block with an icon and two actions, not a
   // one-line strip.
   import Button from "./Button.svelte";
+  import type { DisabledApiLink } from "$lib/design/googleConnection.svelte";
 
   interface Props {
-    /** Google's own activation link, validated backend-side. `null` when the
-     *  response carried none — we then point at the console generally rather
-     *  than inventing a per-API URL. */
-    consoleUrl: string | null;
-    /** Which APIs answered "switched off", by label. The backend records the
-     *  state per API, so the banner names them rather than making the user
-     *  guess which of the three it means. */
-    apis?: string[];
+    /** Which APIs answered "switched off", each with the activation link
+     *  Google gave FOR THAT API (validated backend-side; `null` when the
+     *  response carried none).
+     *
+     *  One entry per API, not a label list plus one shared link: with Calendar
+     *  and Tasks both off, Planner named two APIs and could only offer the
+     *  first one's page — so the second was unreachable from the banner that
+     *  named it. The backend has always sent them separately; the banner now
+     *  keeps them that way. */
+    apis?: DisabledApiLink[];
     /** "I've enabled it — check again": forget the state and retry. */
     oncheckagain: () => void;
     /** A retry is in flight. */
     checking?: boolean;
   }
 
-  let { consoleUrl, apis = [], oncheckagain, checking = false }: Props = $props();
+  let { apis = [], oncheckagain, checking = false }: Props = $props();
 
-  /** "Google Tasks", "Gmail and Google Tasks", "…, … and …". Falls back to the
-   *  vaguer phrasing only when we genuinely weren't told which. */
-  const named = $derived(
-    apis.length === 0
-      ? null
-      : apis.length === 1
-        ? apis[0]
-        : `${apis.slice(0, -1).join(", ")} and ${apis[apis.length - 1]}`,
+  /** "Google Tasks", "Gmail and Google Tasks", "…, … and …". */
+  function list(labels: string[]): string {
+    return labels.length === 1
+      ? labels[0]
+      : `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+  }
+
+  /** The APIs this banner names. Falls back to the vaguer phrasing only when
+   *  we genuinely weren't told which. */
+  const named = $derived(apis.length === 0 ? null : list(apis.map((a) => a.label)));
+
+  /** The ones Google pointed somewhere for — each gets its own button. */
+  const linked = $derived(
+    apis.flatMap((a) =>
+      a.console_url == null ? [] : [{ label: a.label, url: a.console_url }],
+    ),
   );
+  /** The ones it didn't — the API library covers all of them at once. */
+  const unlinked = $derived(apis.filter((a) => a.console_url == null));
+
+  /** Name the link's API whenever there is more than one destination on the
+   *  banner; with a single one there is nothing to disambiguate. */
+  const oneDestination = $derived(linked.length === 1 && unlinked.length === 0);
+
+  /** Show the generic library link when some API here has no link of its own —
+   *  and when we weren't told which APIs at all. */
+  const showLibrary = $derived(unlinked.length > 0 || apis.length === 0);
 
   // The same static pointer the setup wizard hands out at its "enable the
-  // APIs" step. Used ONLY when Google gave no link of its own — a known-good
-  // page of ours, never a URL guessed from the error text.
+  // APIs" step. Used ONLY for the APIs Google gave no link of its own for — a
+  // known-good page of ours, never a URL guessed from the error text.
   const API_LIBRARY = "https://console.cloud.google.com/apis/library";
 
   const linkBtn =
@@ -84,41 +105,56 @@
       switched off in your Google Cloud project.
       Reconnecting won't help: the switch lives in the console, not in the
       permission you granted. Turn it on there, then check again.
-      {#if consoleUrl == null}
-        Google didn't include a direct link this time — open the API library,
-        pick the project you made during setup, and enable the one you need.
+      {#if showLibrary}
+        Google didn't include a direct link
+        {#if unlinked.length > 0 && linked.length > 0}for {list(
+            unlinked.map((a) => a.label),
+          )}{:else}this time{/if} — open the API library, pick the project you
+        made during setup, and enable what you need.
       {/if}
     </p>
     <div class="mt-2 flex flex-wrap items-center gap-2">
-      <a
-        class={linkBtn}
-        href={consoleUrl ?? API_LIBRARY}
-        target="_blank"
-        rel="noopener noreferrer"
-        data-testid="google-api-console-link"
-      >
-        {consoleUrl == null
-          ? "Open the API library"
-          : "Open the page Google pointed to"}
-        <svg
-          width="12"
-          height="12"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          class="shrink-0"
-          aria-hidden="true"
-        >
-          <path d="M14 4h6v6M20 4l-9 9" />
-          <path
-            d="M10 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-4"
-          />
-        </svg>
-      </a>
+      <!-- One button per API Google gave a page for, plus at most one library
+           fallback covering the ones it didn't. -->
+      {#each linked as api (api.label)}
+        {@render consoleLink(
+          api.url,
+          oneDestination
+            ? "Open the page Google pointed to"
+            : `Open the page for ${api.label}`,
+        )}
+      {/each}
+      {#if showLibrary}
+        {@render consoleLink(API_LIBRARY, "Open the API library")}
+      {/if}
       <Button variant="ghost" disabled={checking} onclick={oncheckagain}>
         {checking ? "Checking…" : "I've enabled it — check again"}
       </Button>
     </div>
   </div>
 </div>
+
+{#snippet consoleLink(href: string, label: string)}
+  <a
+    class={linkBtn}
+    {href}
+    target="_blank"
+    rel="noopener noreferrer"
+    data-testid="google-api-console-link"
+  >
+    {label}
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      class="shrink-0"
+      aria-hidden="true"
+    >
+      <path d="M14 4h6v6M20 4l-9 9" />
+      <path d="M10 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-4" />
+    </svg>
+  </a>
+{/snippet}

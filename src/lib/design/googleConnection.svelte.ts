@@ -64,6 +64,10 @@ export function shouldAdopt(fresh: GmailSetupStatus, current: GmailSetupStatus |
   return current == null || connectionStateChanged(fresh, current);
 }
 
+/** One disabled API as the banner renders it: a name, and the link Google gave
+ *  for THAT API (or none). */
+export type DisabledApiLink = { label: string; console_url: string | null };
+
 /** What THIS screen should render of a profile-wide disabled-API state, or
  *  `null` when none of it is its business.
  *
@@ -73,20 +77,23 @@ export function shouldAdopt(fresh: GmailSetupStatus, current: GmailSetupStatus |
  *  screen actually calls. Rendering the whole profile's state therefore
  *  produced a banner whose button could not fix what it named: Email would
  *  announce "Google Calendar isn't switched on" and offer a re-check that
- *  clears and retries Gmail. Each screen renders its own APIs, and each entry
- *  brings its own console link, so the link can't come from an API the banner
- *  isn't naming either. */
+ *  clears and retries Gmail.
+ *
+ *  The entries stay SEPARATE all the way to the banner. Flattening them to one
+ *  link ("the first entry that has one") re-created the same mismatch inside a
+ *  single screen: Planner with both Calendar and Tasks off named two APIs and
+ *  offered only Calendar's activation page, so the user enabled one, retried,
+ *  and got the identical banner back with no way to reach the other page. */
 export function disabledFor(
   status: GmailSetupStatus | null,
   apis: GoogleApiId[],
-): { console_url: string | null; apis: string[] } | null {
+): { apis: DisabledApiLink[] } | null {
   const mine: DisabledApi[] = (status?.api_not_enabled?.apis ?? []).filter((api) =>
     apis.includes(api.id),
   );
   if (mine.length === 0) return null;
   return {
-    console_url: mine.find((api) => api.console_url != null)?.console_url ?? null,
-    apis: mine.map((api) => api.label),
+    apis: mine.map((api) => ({ label: api.label, console_url: api.console_url })),
   };
 }
 

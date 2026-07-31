@@ -62,10 +62,14 @@ function disabledState(
 describe("GoogleApiDisabledBanner", () => {
   afterEach(() => cleanup());
 
+  /** The banner's own prop shape: one entry per API, each with its own link. */
+  function entry(label: string, console_url: string | null = CONSOLE_URL) {
+    return { label, console_url };
+  }
+
   it("links to the page Google pointed to, and never offers a reconnect", () => {
     const { getByTestId, container } = render(GoogleApiDisabledBanner, {
-      consoleUrl: CONSOLE_URL,
-      apis: ["Google Tasks"],
+      apis: [entry("Google Tasks")],
       oncheckagain: () => {},
     });
 
@@ -89,26 +93,27 @@ describe("GoogleApiDisabledBanner", () => {
   it("names the APIs the backend recorded, and stays vague only when it must", async () => {
     const oncheckagain = () => {};
     const { container, rerender } = render(GoogleApiDisabledBanner, {
-      consoleUrl: null,
-      apis: ["Google Tasks"],
+      apis: [entry("Google Tasks", null)],
       oncheckagain,
     });
     // The backend knows exactly which API answered SERVICE_DISABLED, so making
     // the user guess between three would be throwing information away.
     expect(container.textContent).toMatch(/Google Tasks isn't switched on/i);
 
-    await rerender({ consoleUrl: null, apis: ["Gmail", "Google Tasks"], oncheckagain });
+    await rerender({
+      apis: [entry("Gmail", null), entry("Google Tasks", null)],
+      oncheckagain,
+    });
     expect(container.textContent).toMatch(/Gmail and Google Tasks/);
 
     // …and only when nothing was recorded does it fall back to the vaguer copy.
-    await rerender({ consoleUrl: null, apis: [], oncheckagain });
+    await rerender({ apis: [], oncheckagain });
     expect(container.textContent).toMatch(/A Google API isn't switched on/i);
   });
 
   it("falls back to the API library, and says so, when Google gave no link", () => {
     const { getByTestId, container } = render(GoogleApiDisabledBanner, {
-      consoleUrl: null,
-      apis: ["Google Tasks"],
+      apis: [entry("Google Tasks", null)],
       oncheckagain: () => {},
     });
 
@@ -119,11 +124,59 @@ describe("GoogleApiDisabledBanner", () => {
     expect(container.textContent).toMatch(/didn't include a direct link/i);
   });
 
+  /// The finding this pins: the banner used to take ONE link for the whole
+  /// state, chosen as "the first entry that has one". Planner with Calendar
+  /// and Tasks both off therefore named two APIs and offered only Calendar's
+  /// activation page — the user could enable that one, press "check again",
+  /// and get the identical banner back with no route to the other page.
+  it("with two APIs off on ONE screen, offers a link for each", () => {
+    const TASKS_URL = CONSOLE_URL;
+    const CALENDAR_URL =
+      "https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=42";
+    const { getAllByTestId, container } = render(GoogleApiDisabledBanner, {
+      apis: [entry("Google Calendar", CALENDAR_URL), entry("Google Tasks", TASKS_URL)],
+      oncheckagain: () => {},
+    });
+
+    const links = getAllByTestId("google-api-console-link");
+    expect(links.map((a) => a.getAttribute("href"))).toEqual([
+      CALENDAR_URL,
+      TASKS_URL,
+    ]);
+    // Each link says which API it is for, or two identical-looking buttons
+    // would be a coin flip.
+    expect(links[0].textContent).toMatch(/Google Calendar/);
+    expect(links[1].textContent).toMatch(/Google Tasks/);
+    // Both are named as off, and no library fallback is needed.
+    expect(container.textContent).toMatch(/Google Calendar and Google Tasks are/);
+    expect(container.textContent).not.toMatch(/didn't include a direct link/i);
+  });
+
+  /// Mixed: Google pointed somewhere for one of them and not the other. The
+  /// one it pointed at keeps its own link; the other is covered by the library
+  /// fallback, and the copy says which one that is rather than implying the
+  /// single link covers both.
+  it("names which APIs it has no link for when only some carry one", () => {
+    const { getAllByTestId, container } = render(GoogleApiDisabledBanner, {
+      apis: [entry("Google Calendar", CONSOLE_URL), entry("Google Tasks", null)],
+      oncheckagain: () => {},
+    });
+
+    const links = getAllByTestId("google-api-console-link");
+    expect(links.map((a) => a.getAttribute("href"))).toEqual([
+      CONSOLE_URL,
+      "https://console.cloud.google.com/apis/library",
+    ]);
+    expect(links[0].textContent).toMatch(/Google Calendar/);
+    expect(container.textContent).toMatch(
+      /didn't include a direct link for Google Tasks/i,
+    );
+  });
+
   it("offers an explicit re-check, disabled while one is in flight", async () => {
     const oncheckagain = vi.fn();
     const { getByText, rerender } = render(GoogleApiDisabledBanner, {
-      consoleUrl: CONSOLE_URL,
-      apis: ["Google Tasks"],
+      apis: [entry("Google Tasks")],
       oncheckagain,
     });
 
@@ -133,7 +186,7 @@ describe("GoogleApiDisabledBanner", () => {
     // The remedy happens outside the app, so this button is one of the two
     // ways out (a successful call is the other) — it must not be
     // double-fireable.
-    await rerender({ consoleUrl: CONSOLE_URL, apis: ["Google Tasks"], oncheckagain, checking: true });
+    await rerender({ apis: [entry("Google Tasks")], oncheckagain, checking: true });
     expect(getByText("Checking…")).toBeDisabled();
   });
 });
@@ -519,20 +572,41 @@ describe("the shared connection-state decision", () => {
     };
 
     // Gmail carried no link of its own, and must not borrow Calendar's — the
-    // banner then points at the API library in prose instead.
+    // banner then points at the API library instead.
     expect(disabledFor(twoOff, ["gmail"])).toEqual({
-      console_url: null,
-      apis: ["Gmail"],
+      apis: [{ label: "Gmail", console_url: null }],
     });
     expect(disabledFor(twoOff, ["calendar", "tasks"])).toEqual({
-      console_url: CONSOLE_URL,
-      apis: ["Google Calendar"],
+      apis: [{ label: "Google Calendar", console_url: CONSOLE_URL }],
     });
     // Nothing of this screen's is off → no banner at all, rather than one
     // whose button cannot fix what it names.
     expect(disabledFor(twoOff, ["tasks"])).toBeNull();
     expect(disabledFor(base, ["gmail"])).toBeNull();
     expect(disabledFor(null, ["gmail"])).toBeNull();
+  });
+
+  /// Both of a screen's OWN APIs off at once — the case that used to collapse
+  /// to one link. Each entry must survive with its own, or the banner names an
+  /// API it cannot send the user to.
+  it("keeps a link per API when a screen owns two disabled ones", () => {
+    const CALENDAR_URL =
+      "https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=42";
+    const bothPlanner: GmailSetupStatus = {
+      ...base,
+      api_not_enabled: {
+        apis: [
+          { id: "calendar", label: "Google Calendar", console_url: CALENDAR_URL },
+          { id: "tasks", label: "Google Tasks", console_url: CONSOLE_URL },
+        ],
+      },
+    };
+    expect(disabledFor(bothPlanner, ["calendar", "tasks"])).toEqual({
+      apis: [
+        { label: "Google Calendar", console_url: CALENDAR_URL },
+        { label: "Google Tasks", console_url: CONSOLE_URL },
+      ],
+    });
   });
 
   it("notices each state a banner depends on", () => {

@@ -267,7 +267,6 @@
 
     {#if apiDisabled}
       <GoogleApiDisabledBanner
-        consoleUrl={apiDisabled.console_url}
         apis={apiDisabled.apis}
         checking={recheckingApi}
         oncheckagain={() => void recheckApi()}
