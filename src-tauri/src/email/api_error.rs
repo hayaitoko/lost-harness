@@ -343,13 +343,26 @@ const MAX_CONSOLE_URL_LEN: usize = 400;
 const CONSOLE_HOSTS: [&str; 2] = ["console.developers.google.com", "console.cloud.google.com"];
 
 /// Accept a URL only if it is one we are willing to render as a clickable
-/// link: `https`, one of [`CONSOLE_HOSTS`], and bounded in length.
+/// link: `https`, one of [`CONSOLE_HOSTS`], no userinfo, the default port, and
+/// bounded in length.
 ///
 /// This body is UNTRUSTED input (it is whatever the endpoint we contacted
 /// sent back). Handing an unvalidated URL to the UI would turn a Google 403
 /// into an arbitrary-link surface, so the check is a real gate, not a
 /// formality — and the value it returns is the only path a console URL has to
 /// the UI, so the gate cannot be walked around.
+///
+/// USERINFO is refused because the host check alone does not stop it: in
+/// `https://evil.test@console.cloud.google.com/apis` the host IS the allowed
+/// one, and the URL would have been returned verbatim for the banner to render
+/// — a link whose visible head reads like a different site is the classic
+/// phishing display trick, and a real activation link never carries
+/// credentials.
+///
+/// A NON-DEFAULT PORT is refused for the same reason it is never needed: the
+/// real console answers on 443, and `console.cloud.google.com:8080` would only
+/// be useful for pointing the button at something other than the console the
+/// user thinks they are opening.
 pub fn sanitize_console_url(candidate: &str) -> Option<String> {
     let candidate = candidate.trim();
     if candidate.len() > MAX_CONSOLE_URL_LEN {
@@ -357,6 +370,15 @@ pub fn sanitize_console_url(candidate: &str) -> Option<String> {
     }
     let parsed = url::Url::parse(candidate).ok()?;
     if parsed.scheme() != "https" {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    // `port()` is None when the port is absent OR is the scheme default (443
+    // for https), so this accepts an explicit `:443` and refuses everything
+    // else.
+    if parsed.port().is_some() {
         return None;
     }
     let host = parsed.host_str()?.to_ascii_lowercase();
@@ -645,6 +667,51 @@ mod tests {
         assert!(sanitize_console_url("https://console.cloud.google.com/apis/library").is_some());
         // Host comparison is case-insensitive (and `url` lowercases it).
         assert!(sanitize_console_url("https://CONSOLE.CLOUD.GOOGLE.COM/apis").is_some());
+    }
+
+    /// Userinfo passes a host-only check — the host really IS the allowed one —
+    /// and the URL would be handed to the banner verbatim, so the rendered link
+    /// would read as `evil.test@…`. A real activation link never carries
+    /// credentials; refuse the whole shape.
+    #[test]
+    fn a_console_link_carrying_userinfo_is_refused() {
+        for bad in [
+            "https://evil.test@console.cloud.google.com/apis",
+            "https://user:pass@console.cloud.google.com/apis",
+            "https://:pass@console.developers.google.com/apis",
+            "https://console.cloud.google.com@evil.test/apis",
+        ] {
+            assert_eq!(sanitize_console_url(bad), None, "must be refused: {bad}");
+        }
+        // …and it cannot ride in through the prose scan either.
+        let body = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":
+            "disabled. Enable it by visiting https://evil.test@console.cloud.google.com/apis then retry.",
+            "details":[
+            {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SERVICE_DISABLED"}]}}"#;
+        assert_eq!(
+            classify_google_api_failure(403, body),
+            GoogleApiFailure::ApiNotEnabled { console_url: None }
+        );
+    }
+
+    /// The real console answers on 443. A port is never needed for an
+    /// activation link, and naming one is only useful for sending the button
+    /// somewhere other than the console the user believes they are opening —
+    /// so an explicit `:443` is fine and anything else is refused.
+    #[test]
+    fn a_console_link_on_a_non_default_port_is_refused() {
+        for bad in [
+            "https://console.cloud.google.com:8080/apis",
+            "https://console.developers.google.com:8443/apis",
+            "https://console.cloud.google.com:0/apis",
+        ] {
+            assert_eq!(sanitize_console_url(bad), None, "must be refused: {bad}");
+        }
+        // The scheme's own port is not a redirection, and `url` drops it.
+        assert_eq!(
+            sanitize_console_url("https://console.cloud.google.com:443/apis").as_deref(),
+            Some("https://console.cloud.google.com/apis")
+        );
     }
 
     /// A hostile body must not be able to smuggle a non-console link into the
