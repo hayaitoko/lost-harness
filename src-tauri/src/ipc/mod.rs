@@ -2273,6 +2273,14 @@ pub async fn check_for_update(app: AppHandle) -> Result<crate::updater::ManualCh
 /// inside `Update::download`: a payload whose bytes do not match the manifest's
 /// minisign signature under the compiled-in public key is refused there, and
 /// this returns the error rather than installing anything.
+///
+/// Signature verification answers "are these the right bytes?"; it does not
+/// answer "where did they come from?". The download host is therefore checked
+/// again here, immediately before the fetch, against
+/// `updater::is_permitted_download_url`. `check_now` already refused anything
+/// off-host before it staged the offer, so this is the belt to that pair of
+/// braces — the last statement before bytes move, so no future path that stages
+/// an `Update` some other way can skip it.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
     let state = tauri::Manager::try_state::<crate::updater::PendingUpdate>(&app)
@@ -2284,6 +2292,8 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     let pending = state
         .peek()
         .ok_or_else(|| "No update is staged — check for updates first.".to_string())?;
+
+    crate::updater::ensure_permitted_download_url(pending.download_url.as_str())?;
 
     tracing::info!(version = %pending.version, "egress: downloading the signed update bundle");
     pending

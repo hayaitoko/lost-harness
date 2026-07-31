@@ -24,6 +24,15 @@
 //! which a test binary has no business doing. `download()` is the step that
 //! verifies the signature (`updater.rs:712`), so the refusal path is fully
 //! covered; the accept path is covered up to "verified bytes in hand".
+//!
+//! These also drive the plugin's `check()`/`download()` **directly**, not
+//! through [`crate::updater::check_now`], which is why they can serve payloads
+//! from `127.0.0.1` at all: the download-host constraint
+//! (`updater::is_permitted_download_url`) lives in `check_now` and in the
+//! install command, and would refuse every URL used here. That constraint is a
+//! separate property with its own tests in `tests.rs` — signature verification
+//! answers "are these the right bytes?", the host constraint answers "where did
+//! the app connect?", and neither substitutes for the other.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

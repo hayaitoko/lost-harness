@@ -2001,3 +2001,41 @@ fn the_update_toggle_is_independent_of_skill_reflect() {
     assert!(g.update_check_enabled());
     assert!(!g.skill_reflect_enabled());
 }
+
+#[test]
+fn a_failed_read_of_the_update_toggle_reads_as_off() {
+    // The privacy-critical case. `update_check_enabled()` used to `.ok()` the
+    // read away, which made a FAILED read indistinguishable from an absent row
+    // and therefore returned the absent-row default of ON — egress on behalf of
+    // a user who may well have turned it off. It runs during startup, so a
+    // transient lock/IO failure there is not hypothetical.
+    //
+    // Dropping the table is a stand-in for any read error (SQLITE_BUSY, a
+    // corrupt page, a missing column after a bad migration): what it proves is
+    // that the Err arm, whatever produced it, cannot answer "yes, send".
+    let g = GlobalDb::open_in_memory().unwrap();
+    assert!(g.update_check_enabled(), "sanity: the default is ON");
+
+    // The guard is a temporary and is released before the next call locks.
+    g.raw().execute_batch("DROP TABLE app_settings;").unwrap();
+
+    assert!(
+        g.get_app_setting("update_check_enabled").is_err(),
+        "sanity: the read must now actually fail, not return None"
+    );
+    assert!(
+        !g.update_check_enabled(),
+        "an unreadable setting is not consent — a read error must never authorize egress"
+    );
+}
+
+#[test]
+fn a_failed_read_of_the_update_toggle_does_not_disturb_the_other_toggles() {
+    // The fail-closed arm is scoped to the update check. `skill_reflect_enabled`
+    // already defaults to false, and `active_profile` is not a privacy switch —
+    // neither should change behaviour because of this fix.
+    let g = GlobalDb::open_in_memory().unwrap();
+    g.raw().execute_batch("DROP TABLE app_settings;").unwrap();
+    assert!(!g.skill_reflect_enabled());
+    assert_eq!(g.active_profile(), None);
+}

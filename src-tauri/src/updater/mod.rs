@@ -159,6 +159,94 @@ pub fn is_strictly_newer(current: &str, candidate: &str) -> bool {
     cand > cur
 }
 
+// ── Where an update may be downloaded from ──────────────────────────────────
+
+/// The only host an update payload may be fetched from.
+///
+/// The manifest endpoint is pinned in `tauri.conf.json`, but the *download* URL
+/// is not: `latest.json` carries `platforms.<target>.url` and the plugin
+/// fetches whatever that says. So a manifest that was swapped, mirrored or
+/// tampered with could point the download at any host on the internet. The
+/// minisign check still protects INTEGRITY there — nothing unsigned installs
+/// either way — but it says nothing about *where the app connected*, and "one
+/// request to github.com" is a claim this app makes to the user in Settings.
+///
+/// This constant is what turns that claim into an enforced property.
+pub const RELEASE_HOST: &str = "github.com";
+
+/// The only path prefix under [`RELEASE_HOST`] a payload may come from —
+/// i.e. this project's own release assets, not some other repository's.
+///
+/// Kept in step with the manifest endpoint in `tauri.conf.json` by
+/// `constrained_host_matches_the_configured_manifest_endpoint` in `tests.rs`:
+/// repoint the endpoint at a different repo without editing this, and that test
+/// fails rather than the constraint silently blocking every real download.
+pub const RELEASE_DOWNLOAD_PREFIX: &str = "/hayaitoko/lost-harness/releases/download/";
+
+/// Is `raw` a URL this app is willing to download an update payload from?
+///
+/// Deliberately strict — scheme, credentials, host, port and path prefix all
+/// have to be right:
+///
+/// * `https` only. A plaintext download of a signed payload would still verify,
+///   but it is not what the app tells the user it does.
+/// * No userinfo. `https://github.com@evil.example/...` has host `evil.example`
+///   and would fail the host check anyway; rejecting it explicitly means the
+///   refusal reads as intentional rather than incidental.
+/// * The host is compared for **exact** equality, so `raw.github.com` and
+///   `github.com.evil.example` are both refused.
+/// * Default port only — `github.com:8443` is a different service.
+/// * The path must be under this project's release assets, and must not try to
+///   climb out of them (`url` normalises real `..` segments away at parse time;
+///   the percent-encoded spelling is rejected here).
+pub fn is_permitted_download_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    if url.host_str() != Some(RELEASE_HOST) {
+        return false;
+    }
+    if url.port_or_known_default() != Some(443) {
+        return false;
+    }
+    let path = url.path();
+    if !path.starts_with(RELEASE_DOWNLOAD_PREFIX) {
+        return false;
+    }
+    // `Url::parse` already collapsed literal `..` segments; this catches the
+    // encoded spelling, which it leaves alone.
+    if path.contains("%2e") || path.contains("%2E") {
+        return false;
+    }
+    true
+}
+
+/// [`is_permitted_download_url`] as a refusal with a message.
+///
+/// Returned to the caller rather than logged-and-ignored: a manual check should
+/// tell the user their manifest is pointing somewhere it should not, and an
+/// install must stop rather than fetch.
+pub fn ensure_permitted_download_url(raw: &str) -> Result<(), String> {
+    if is_permitted_download_url(raw) {
+        return Ok(());
+    }
+    tracing::error!(
+        url = %raw,
+        expected_host = RELEASE_HOST,
+        "refusing an update whose download URL is not this project's GitHub release asset"
+    );
+    Err(format!(
+        "This update's download link points somewhere unexpected, so it was refused. \
+         Updates may only be downloaded from https://{RELEASE_HOST}{RELEASE_DOWNLOAD_PREFIX}…"
+    ))
+}
+
 // ── Payloads ────────────────────────────────────────────────────────────────
 
 /// What the banner and the About pane show. Deliberately small: the version
@@ -244,6 +332,14 @@ impl PendingUpdate {
 ///
 /// Sends: a plain GET for `latest.json`, anonymous, no headers of ours, no app
 /// data. Receives: a version string, a download URL and a signature.
+///
+/// The manifest endpoint is pinned in `tauri.conf.json`; the download URL it
+/// names is remote input, so it is checked here against
+/// [`is_permitted_download_url`] before an update is ever offered. Between the
+/// two, every update-related connection this app opens is to
+/// `https://github.com/…` — which is what Settings → About tells the user.
+/// (GitHub itself answers an asset download with a redirect to its own object
+/// CDN; that hop is GitHub's, not a host this manifest chose.)
 pub async fn check_now<R: Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<Option<UpdateInfo>, String> {
@@ -272,6 +368,14 @@ pub async fn check_now<R: Runtime>(
         );
         return Ok(None);
     }
+
+    // Third gate — where the bytes would come from. `is_strictly_newer` said
+    // the manifest announced something worth offering; this says the payload
+    // may only be fetched from this project's own GitHub release assets. A
+    // refusal here is an error rather than "up to date": the user asked a
+    // question and the honest answer is that the manifest is pointing
+    // somewhere it should not, not that they are current.
+    ensure_permitted_download_url(update.download_url.as_str())?;
 
     let info = UpdateInfo {
         version: update.version.clone(),

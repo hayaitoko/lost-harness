@@ -136,6 +136,140 @@ fn an_unparseable_version_is_never_newer() {
     assert!(!is_strictly_newer("0.1.0", "0.1"));
 }
 
+// ── The download host ───────────────────────────────────────────────────────
+//
+// The manifest endpoint is pinned in tauri.conf.json, but `platforms.*.url` is
+// remote input. Without these, "one request to github.com" is a claim about the
+// manifest only, and a swapped manifest could send the (still signature-checked)
+// download anywhere.
+
+#[test]
+fn the_real_release_asset_url_shape_is_permitted() {
+    // Exactly what `.github/workflows/build.yml`'s `Stage the updater artifacts`
+    // step writes into latest.json. If this fails, tagged releases stop being
+    // installable — which is why the workflow now asserts the same thing.
+    assert!(is_permitted_download_url(
+        "https://github.com/hayaitoko/lost-harness/releases/download/v0.1.1/Lost-Harness_0.1.1_aarch64.app.tar.gz"
+    ));
+}
+
+#[test]
+fn another_host_is_refused_however_plausible() {
+    for url in [
+        // The bare swap.
+        "https://evil.example/lost-harness.app.tar.gz",
+        // A lookalike registrable domain.
+        "https://github.com.evil.example/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+        // A subdomain of the real host is still not the real host.
+        "https://raw.github.com/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+        "https://objects.githubusercontent.com/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+        // Userinfo that reads like the right host to a human skimming a log.
+        "https://github.com@evil.example/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+        // Right host, wrong service.
+        "https://github.com:8443/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+    ] {
+        assert!(
+            !is_permitted_download_url(url),
+            "must refuse an off-host download: {url}"
+        );
+    }
+}
+
+#[test]
+fn a_non_https_download_is_refused() {
+    for url in [
+        "http://github.com/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+        "file:///tmp/x.app.tar.gz",
+        "ftp://github.com/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+        // Not a URL at all.
+        "/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+        "",
+    ] {
+        assert!(!is_permitted_download_url(url), "must refuse: {url}");
+    }
+}
+
+#[test]
+fn the_right_host_but_the_wrong_repository_is_refused() {
+    // github.com hosts everyone's releases. Being on the right host is not the
+    // same as being this project's asset.
+    for url in [
+        "https://github.com/someone-else/lost-harness/releases/download/v9.9.9/x.app.tar.gz",
+        "https://github.com/hayaitoko/some-other-repo/releases/download/v9.9.9/x.app.tar.gz",
+        "https://github.com/hayaitoko/lost-harness/raw/main/x.app.tar.gz",
+        "https://github.com/",
+    ] {
+        assert!(!is_permitted_download_url(url), "must refuse: {url}");
+    }
+}
+
+#[test]
+fn a_path_that_climbs_out_of_the_release_assets_is_refused() {
+    // `Url::parse` normalises literal `..` away, so the first of these leaves
+    // the prefix by itself; the percent-encoded spelling survives parsing and
+    // is rejected explicitly.
+    assert!(!is_permitted_download_url(
+        "https://github.com/hayaitoko/lost-harness/releases/download/../../../../other/x.app.tar.gz"
+    ));
+    assert!(!is_permitted_download_url(
+        "https://github.com/hayaitoko/lost-harness/releases/download/%2e%2e/%2e%2e/x.app.tar.gz"
+    ));
+}
+
+#[test]
+fn a_refusal_names_the_expected_host_and_is_an_error_not_a_shrug() {
+    ensure_permitted_download_url(
+        "https://github.com/hayaitoko/lost-harness/releases/download/v0.1.1/x.app.tar.gz",
+    )
+    .expect("the real shape must pass");
+
+    let err = ensure_permitted_download_url("https://evil.example/x.app.tar.gz")
+        .expect_err("an off-host download must be refused");
+    assert!(
+        err.contains(RELEASE_HOST),
+        "the message should say where updates may come from, got: {err}"
+    );
+}
+
+#[test]
+fn constrained_host_matches_the_configured_manifest_endpoint() {
+    // The tripwire. `RELEASE_HOST` / `RELEASE_DOWNLOAD_PREFIX` are hand-written
+    // constants; the manifest endpoint lives in tauri.conf.json. If the repo is
+    // ever renamed or moved and only one of the two is updated, every download
+    // would be refused at runtime — silently, from the user's point of view.
+    // Fail here instead.
+    let conf: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json"),
+        )
+        .expect("tauri.conf.json"),
+    )
+    .expect("tauri.conf.json parses");
+
+    let endpoint = conf["plugins"]["updater"]["endpoints"][0]
+        .as_str()
+        .expect("plugins.updater.endpoints[0] is configured");
+    let endpoint = url::Url::parse(endpoint).expect("the configured endpoint is a URL");
+
+    assert_eq!(
+        endpoint.host_str(),
+        Some(RELEASE_HOST),
+        "the manifest endpoint and the permitted download host must be the same host"
+    );
+
+    // `.../<owner>/<repo>/releases/latest/download/latest.json` and
+    // `.../<owner>/<repo>/releases/download/<tag>/<asset>` share the
+    // `/<owner>/<repo>/releases/` stem.
+    let stem = RELEASE_DOWNLOAD_PREFIX
+        .strip_suffix("download/")
+        .expect("the prefix ends with the release-asset segment");
+    assert!(
+        endpoint.path().starts_with(stem),
+        "the manifest endpoint {} is not under {stem} — RELEASE_DOWNLOAD_PREFIX is stale",
+        endpoint.path()
+    );
+}
+
 // ── The pending-update slot ─────────────────────────────────────────────────
 
 #[test]

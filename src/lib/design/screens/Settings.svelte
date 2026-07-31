@@ -2521,8 +2521,10 @@
             <div class="mt-3 px-3 text-[11px] leading-[1.6] text-text-3">
               Updates are signed. The app checks the signature against a key built into
               this build before it installs anything — a download that doesn't match is
-              discarded, not run. Turning the setting off means no update request is
-              made at launch at all.
+              discarded, not run. The download itself is refused unless it comes from
+              this project's own GitHub releases, so an update can't send you somewhere
+              else even if the version list is tampered with. Turning the setting off
+              means no update request is made at launch at all.
             </div>
           {/if}
         </div>
