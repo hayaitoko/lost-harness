@@ -256,10 +256,31 @@ mod tests {
         // done, which is the moment the endpoint was "contacted".
         let _sock = TcpStream::connect(("127.0.0.1", server.port())).expect("connect");
 
-        assert!(
-            !server.requests().is_empty(),
-            "a completed connection must be visible immediately, not after the \
-             {DRAIN_QUIET_PERIOD:?} drain timeout"
+        // `connect` returning does NOT guarantee the peer's accept queue has
+        // the connection yet, so polling here is not a weakening of the test —
+        // asserting on the first sample raced the kernel and flaked under
+        // parallel load. What the test actually pins is the assertion below:
+        // the entry is the ACCEPT-TIME placeholder, which can only be there if
+        // the contact was recorded before any draining. Recording after the
+        // drain (the bug this guards) would leave the drained bytes instead —
+        // and would take at least DRAIN_QUIET_PERIOD to appear at all.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let recorded = loop {
+            let seen = server.requests();
+            if let Some(first) = seen.into_iter().next() {
+                break first;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a completed connection was never recorded"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            recorded, CONNECTION_ACCEPTED,
+            "the contact must be recorded when the connection is ACCEPTED, not \
+             after the {DRAIN_QUIET_PERIOD:?} drain timeout"
         );
     }
 
