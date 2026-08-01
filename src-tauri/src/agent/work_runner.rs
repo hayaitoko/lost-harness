@@ -785,6 +785,70 @@ mod tests {
     /// The per-round cost `BillingStreamer` books (see its doc comment).
     const ROUND_COST: f64 = 0.60;
 
+    /// A streamer that emits a fenced tool call for its first `tool_rounds`
+    /// rounds and then a plain "all done" — with a `usage` chunk EVERY round,
+    /// so each round books a ledger row. Paired with an UNPRICED model id,
+    /// every row is `cost_usd = NULL` (an unknown-cost call): the exact shape
+    /// that used to terminally halt a capped unattended run at round 1.
+    struct CountdownToolStreamer {
+        provider: Provider,
+        fences_remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountdownToolStreamer {
+        fn new(tool_rounds: usize) -> Self {
+            Self {
+                provider: cloud(),
+                fences_remaining: std::sync::atomic::AtomicUsize::new(tool_rounds),
+            }
+        }
+    }
+
+    impl ModelStreamer for CountdownToolStreamer {
+        fn provider(&self) -> &Provider {
+            &self.provider
+        }
+        fn stream<'a>(
+            &'a self,
+            _m: &'a str,
+            _msgs: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>>
+        {
+            // Decrement-if-positive: rounds with a fence remaining keep the
+            // tool loop going; the round after the last fence answers plainly.
+            let emit_fence = self
+                .fences_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok();
+            Box::pin(async move {
+                let content = if emit_fence {
+                    "working\n```tool\n{\"name\":\"no_such_tool\",\"arguments\":{}}\n```"
+                } else {
+                    "all done"
+                };
+                let delta = serde_json::json!({ "choices": [{ "delta": { "content": content } }] })
+                    .to_string();
+                let usage = serde_json::json!({
+                    "choices": [],
+                    "usage": { "prompt_tokens": 0, "completion_tokens": 60_000 }
+                })
+                .to_string();
+                let chunks: Vec<Vec<u8>> = vec![
+                    format!("data: {delta}\n").into_bytes(),
+                    format!("data: {usage}\n").into_bytes(),
+                    b"data: [DONE]\n".to_vec(),
+                ];
+                Ok(SseStream::from_byte_stream(tokio_stream::iter(
+                    chunks.into_iter().map(Ok::<Vec<u8>, reqwest::Error>),
+                )))
+            })
+        }
+    }
+
     fn cloud() -> Provider {
         Provider::new(
             "cloudco",
@@ -1160,6 +1224,136 @@ mod tests {
             summary.known_cost_usd <= 2.0 + ROUND_COST,
             "spend ${:.2} must stop within one round's cost of the $2.00 cap",
             summary.known_cost_usd
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ── The unpriced-model policy: untracked spend warns, never halts ────────
+
+    /// A capped profile on a model OUTSIDE the pricing table must complete a
+    /// 3-round tool task. Every round books an unknown-cost row
+    /// (`cost_usd = NULL`); the OLD per-round governor failed closed on
+    /// `unknown_cost_calls > 0` and killed the run at round 1, so a capped
+    /// multi-round task could never finish on most OpenRouter/unknown models.
+    #[tokio::test]
+    async fn a_capped_run_on_an_unpriced_model_completes_a_multi_round_tool_task() {
+        let (storage, root) = temp_storage();
+        let storage = Arc::new(storage);
+        let db = storage.open_profile("personal").unwrap();
+        db.set_budget_cap(Some(2.0)).unwrap();
+
+        let agent = agent_with(
+            Arc::new(CountdownToolStreamer::new(2)),
+            Arc::clone(&storage),
+        );
+        let run = agent
+            .run_subagent(
+                "you are a helper",
+                &[],
+                "cloudco",
+                "totally-unpriced-model",
+                "personal",
+                Binding::Public,
+                "do the thing",
+            )
+            .await
+            .expect("a capped run on an unpriced model must complete, not halt");
+        assert!(
+            run.text.contains("all done"),
+            "the final round's answer comes back, got: {}",
+            run.text
+        );
+
+        let since = budget::month_start_ts(chrono::Utc::now());
+        let summary = db.usage_summary_since(since).unwrap();
+        assert_eq!(
+            summary.unknown_cost_calls, 3,
+            "all 3 rounds (2 tool rounds + the final answer) must have booked \
+             unknown-cost rows, else this test isn't exercising the unpriced path"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A sink that records `budget_warning` calls, so the untracked-spend
+    /// warning is observable (`run_subagent` hardwires the no-op HeadlessSink).
+    #[derive(Default)]
+    struct RecordingSink {
+        warnings: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::agent::result_sink::ResultSink for RecordingSink {
+        fn token(&self, _c: &str, _m: &str, _t: &str) {}
+        fn local_reroute(&self, _c: &str, _r: &str, _f: &str, _t: &str, _b: bool) {}
+        fn memory_event(&self, _c: &str, _k: &'static str, _n: usize) {}
+        fn error(&self, _c: &str, _e: &str, _s: &'static str) {}
+        fn budget_warning(&self, _conversation_id: &str, message: &str) {
+            self.warnings.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    /// The warn half of the unpriced-model policy: the run proceeds, and the
+    /// EXISTING `stream:budget_warning` path carries the "spend is untracked"
+    /// notice — once per run, not once per round (rounds 1 AND 2 both observe
+    /// `unknown_cost_calls > 0` here).
+    #[tokio::test]
+    async fn untracked_spend_on_a_capped_unattended_run_fires_the_budget_warning_once() {
+        let (storage, root) = temp_storage();
+        let storage = Arc::new(storage);
+        let db = storage.open_profile("personal").unwrap();
+        db.set_budget_cap(Some(2.0)).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.create_conversation(&crate::storage::Conversation {
+            id: "conv-unpriced".into(),
+            name: "t".into(),
+            pinned: false,
+            binding: "public".into(),
+            folder_id: None,
+            color: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+        // `agent_with` builds on `ToolDispatcher::empty()` — no approver wired,
+        // so `is_attended()` is false and the per-round governor is live even
+        // though process_message is driven directly (necessary to inject an
+        // observable sink instead of run_subagent's hardwired HeadlessSink).
+        let agent = agent_with(
+            Arc::new(CountdownToolStreamer::new(2)),
+            Arc::clone(&storage),
+        );
+        let recording = Arc::new(RecordingSink::default());
+        let sink: Arc<dyn crate::agent::result_sink::ResultSink> =
+            Arc::clone(&recording) as Arc<dyn crate::agent::result_sink::ResultSink>;
+        agent
+            .process_message(
+                "do the thing".into(),
+                "conv-unpriced".into(),
+                Binding::Public,
+                "cloudco".into(),
+                "totally-unpriced-model".into(),
+                "personal".into(),
+                crate::hooks::SessionMode::Normal,
+                &sink,
+            )
+            .await
+            .expect("the capped unpriced run completes");
+
+        let warnings = recording.warnings.lock().unwrap();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one budget warning per run, got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("untracked"),
+            "the warning must say spend is untracked, got: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("totally-unpriced-model"),
+            "the warning must name the model, got: {}",
+            warnings[0]
         );
         let _ = std::fs::remove_dir_all(root);
     }
