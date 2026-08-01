@@ -1772,6 +1772,11 @@ pub struct McpServerInfo {
     pub running: bool,
     /// The namespaced tool names currently registered (empty when not running).
     pub tools: Vec<String>,
+    /// Why the H-07 pin gate refused this server's last bring-up, typed with
+    /// the approved-vs-actual identity — the Settings pane renders the exact
+    /// state and offers Re-approve. `None` while running, or when stopped for
+    /// a non-pin reason.
+    pub pin_refusal: Option<crate::tools::mcp_stdio::PinRefusal>,
 }
 
 /// Register an MCP server: SPAWN + handshake + `tools/list` FIRST (fail-closed
@@ -1883,18 +1888,26 @@ pub async fn register_mcp_server(
         enabled: row.enabled,
         running: true,
         tools,
+        pin_refusal: None,
     })
 }
 
 /// The persisted MCP servers, annotated with live status.
 #[tauri::command]
 pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>, String> {
+    list_mcp_servers_inner(&state)
+}
+
+/// Body split from the command so `ipc::tests` can drive it with a bare
+/// `AppState` (the `*_inner` pattern `test_state` exists for).
+fn list_mcp_servers_inner(state: &AppState) -> Result<Vec<McpServerInfo>, String> {
     let rows = state
         .storage
         .global()
         .list_mcp_servers()
         .map_err(|e| e.to_string())?;
     let live = state.mcp.servers.lock();
+    let refusals = state.mcp.pin_refusals.lock();
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -1902,6 +1915,7 @@ pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>
             McpServerInfo {
                 running: entry.is_some(),
                 tools: entry.map(|e| e.tool_names.clone()).unwrap_or_default(),
+                pin_refusal: refusals.get(&r.id).cloned(),
                 id: r.id,
                 name: r.name,
                 command: r.command,
@@ -1912,6 +1926,81 @@ pub fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>
             }
         })
         .collect())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReapproveMcpServerArgs {
+    pub id: String,
+    /// H-07: the same single-use consent token registration demands —
+    /// re-pinning is re-trusting an executable, so it gets the same gate.
+    pub nonce: String,
+}
+
+/// Re-approve a stdio MCP server the pin gate refuses to start: re-resolve and
+/// re-pin the invocation AS IT EXISTS ON DISK NOW, bring the server up, then
+/// persist the new pin. This is the recovery path for "binary changed since
+/// approval" and pre-pinning rows — an EXPLICIT user action, never called
+/// automatically. The fail-closed property survives intact: a changed binary
+/// still never auto-starts; the only thing that re-trusts it is this call, and
+/// this call demands a nonce only the confirmed Settings flow can mint.
+#[tauri::command]
+pub async fn reapprove_mcp_server(
+    state: State<'_, AppState>,
+    args: ReapproveMcpServerArgs,
+) -> Result<McpServerInfo, String> {
+    reapprove_mcp_server_inner(&state, args).await
+}
+
+async fn reapprove_mcp_server_inner(
+    state: &AppState,
+    args: ReapproveMcpServerArgs,
+) -> Result<McpServerInfo, String> {
+    // H-07: consent gate FIRST, exactly like register_mcp_server — before any
+    // lookup, resolution, or hashing.
+    consume_mcp_install_nonce(&state.pending_mcp_nonces, &args.nonce)?;
+    let row = state
+        .storage
+        .global()
+        .get_mcp_server(&args.id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no MCP server with id `{}`", args.id))?;
+    let is_http = row.command.trim_start().starts_with("https://")
+        || row.command.trim_start().starts_with("http://");
+    if is_http {
+        return Err(
+            "a Streamable HTTP MCP endpoint has no local executable to re-approve".to_string(),
+        );
+    }
+    // The click means "I trust the invocation as it is NOW": measure it fresh —
+    // the same resolution + pin registration performs, never a stored value.
+    let (path, hash) =
+        crate::tools::mcp_stdio::resolve_and_hash_executable(&row.command, &row.args)
+            .map_err(|e| format!("couldn't pin the MCP server executable: {e}"))?;
+    let row = crate::storage::McpServerRow {
+        executable_path: Some(path),
+        executable_hash: Some(hash),
+        ..row
+    };
+    // Never two children for one row: if one is somehow live, replace it.
+    crate::tools::mcp_stdio::tear_down_server(&row.id, &state.tools, &state.mcp).await;
+    // Same fail-closed ordering as registration: up BEFORE the pin persists.
+    let tools = crate::tools::mcp_stdio::bring_up_server(&row, &state.tools, &state.mcp).await?;
+    if let Err(e) = state.storage.global().insert_mcp_server(&row) {
+        crate::tools::mcp_stdio::tear_down_server(&row.id, &state.tools, &state.mcp).await;
+        return Err(format!("couldn't persist the re-approved MCP server: {e}"));
+    }
+    Ok(McpServerInfo {
+        id: row.id,
+        name: row.name,
+        command: row.command,
+        args: row.args,
+        tier: row.tier,
+        trusted_read_only: row.trusted_read_only,
+        enabled: row.enabled,
+        running: true,
+        tools,
+        pin_refusal: None,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4383,6 +4472,199 @@ mod tests {
         let parsed: RegisterMcpServerArgs =
             serde_json::from_value(with_nonce).expect("a payload carrying a nonce parses");
         assert_eq!(parsed.nonce, "n");
+    }
+
+    // ── PROGRESS-MAP open follow-up #2: pin-refusal surfacing + re-approve ──
+
+    /// A minimal stdio MCP fixture (plain `sh`): answers initialize (id 0),
+    /// swallows the initialized notification, then tools/list (id 1) — all a
+    /// bring-up needs. Mirrors `tools::mcp_stdio::tests::fixture_script`,
+    /// which is private to that module.
+    fn mcp_fixture_script() -> String {
+        let dir = std::env::temp_dir().join(format!("lhp-ipc-mcp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.sh");
+        std::fs::write(
+            &path,
+            concat!(
+                "read line\n",
+                "printf '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"fixture\",\"version\":\"0\"}}}\\n'\n",
+                "read line\n",
+                "read line\n",
+                "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"echo_upper\",\"description\":\"upper-cases text\",\"inputSchema\":{\"type\":\"object\"}}]}}\\n'\n",
+            ),
+        )
+        .unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// End to end at the IPC layer: a server whose pinned invocation no longer
+    /// matches (the Node-upgrade / package-update shape) (1) surfaces a TYPED
+    /// refusal with the approved-vs-actual pins through `list_mcp_servers`
+    /// instead of a bare "stopped", and (2) recovers via `reapprove_mcp_server`
+    /// — which re-pins the CURRENT identity only behind the same single-use
+    /// consent nonce registration uses. Fail-closed survives: without a valid
+    /// nonce nothing re-pins and nothing starts.
+    #[tokio::test]
+    async fn a_pin_refusal_surfaces_in_list_and_reapprove_recovers_it() {
+        let (state, _secrets) = test_state();
+
+        // Registration-time state: a row pinned over the ORIGINAL script.
+        let script = mcp_fixture_script();
+        let script_args = vec![script.clone()];
+        let (path, pin) =
+            crate::tools::mcp_stdio::resolve_and_hash_executable("sh", &script_args)
+                .expect("the shell must resolve on PATH");
+        let row = crate::storage::McpServerRow {
+            id: "srv-repin".into(),
+            name: "fixture".into(),
+            command: "sh".into(),
+            args: script_args.clone(),
+            tier: "remote".into(),
+            trusted_read_only: false,
+            capabilities: vec![],
+            enabled: true,
+            created_at: 1,
+            executable_path: Some(path),
+            executable_hash: Some(pin.clone()),
+        };
+        state.storage.global().insert_mcp_server(&row).unwrap();
+
+        // The upgrade: the script's contents change under the stored pin.
+        let original = std::fs::read_to_string(&script).unwrap();
+        std::fs::write(&script, format!("{original}# upgraded\n")).unwrap();
+
+        // Boot bring-up refuses — fail-closed, unchanged by this feature …
+        let err = crate::tools::mcp_stdio::bring_up_server(&row, &state.tools, &state.mcp)
+            .await
+            .expect_err("a changed script must not start under the old pin");
+        assert!(err.contains("changed since it was approved"), "got: {err}");
+
+        // … but the reason now reaches the IPC list, typed, with both pins.
+        let listed = list_mcp_servers_inner(&state).expect("list");
+        let s = listed
+            .iter()
+            .find(|s| s.id == "srv-repin")
+            .expect("the row is still listed");
+        assert!(!s.running, "a refused server is not running");
+        match &s.pin_refusal {
+            Some(crate::tools::mcp_stdio::PinRefusal::InvocationChanged {
+                approved_pin,
+                actual_pin,
+                ..
+            }) => {
+                assert_eq!(approved_pin, &pin, "the pane shows the approved pin");
+                assert_ne!(actual_pin, &pin, "…against the new on-disk identity");
+            }
+            other => panic!("expected a typed InvocationChanged refusal, got {other:?}"),
+        }
+
+        // A forged nonce cannot re-pin — the consent gate IS the property.
+        let forged = reapprove_mcp_server_inner(
+            &state,
+            ReapproveMcpServerArgs {
+                id: "srv-repin".into(),
+                nonce: "00000000-0000-0000-0000-000000000000".into(),
+            },
+        )
+        .await
+        .expect_err("re-approval without consent must be refused");
+        assert!(forged.contains("was not confirmed"), "got: {forged}");
+        let unchanged = state
+            .storage
+            .global()
+            .get_mcp_server("srv-repin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.executable_hash.as_deref(),
+            Some(pin.as_str()),
+            "a refused re-approval must not touch the stored pin"
+        );
+        assert!(
+            state.mcp.servers.lock().get("srv-repin").is_none(),
+            "…and must not start anything"
+        );
+
+        // The real click: an issued nonce re-pins the CURRENT identity and
+        // brings the server up through the normal registration machinery.
+        let nonce = issue_mcp_install_nonce(&state.pending_mcp_nonces);
+        let info = reapprove_mcp_server_inner(
+            &state,
+            ReapproveMcpServerArgs {
+                id: "srv-repin".into(),
+                nonce,
+            },
+        )
+        .await
+        .expect("re-approval with consent must succeed");
+        assert!(info.running);
+        assert_eq!(info.tools, vec!["mcp__fixture__echo_upper".to_string()]);
+        assert!(info.pin_refusal.is_none());
+
+        // The stored pin IS the current on-disk identity now …
+        let repinned = state
+            .storage
+            .global()
+            .get_mcp_server("srv-repin")
+            .unwrap()
+            .unwrap();
+        let (_, current_pin) =
+            crate::tools::mcp_stdio::resolve_and_hash_executable("sh", &script_args).unwrap();
+        assert_eq!(repinned.executable_hash.as_deref(), Some(current_pin.as_str()));
+        assert_ne!(current_pin, pin, "the pin really moved to the new identity");
+
+        // … and the list shows a running server with no refusal left over.
+        let listed = list_mcp_servers_inner(&state).expect("list again");
+        let s = listed.iter().find(|s| s.id == "srv-repin").unwrap();
+        assert!(s.running);
+        assert!(s.pin_refusal.is_none());
+    }
+
+    /// Re-approval is a stdio-only concept: an HTTP endpoint has no local
+    /// executable, and an unknown id is a clean error — both AFTER the nonce
+    /// gate, and neither touches any stored row.
+    #[tokio::test]
+    async fn reapprove_rejects_http_rows_and_unknown_ids() {
+        let (state, _secrets) = test_state();
+        let http_row = crate::storage::McpServerRow {
+            id: "srv-http".into(),
+            name: "remote".into(),
+            command: "https://example.com/mcp".into(),
+            args: vec![],
+            tier: "remote".into(),
+            trusted_read_only: false,
+            capabilities: vec![],
+            enabled: true,
+            created_at: 1,
+            executable_path: None,
+            executable_hash: None,
+        };
+        state.storage.global().insert_mcp_server(&http_row).unwrap();
+
+        let nonce = issue_mcp_install_nonce(&state.pending_mcp_nonces);
+        let err = reapprove_mcp_server_inner(
+            &state,
+            ReapproveMcpServerArgs {
+                id: "srv-http".into(),
+                nonce,
+            },
+        )
+        .await
+        .expect_err("an HTTP endpoint has nothing to re-pin");
+        assert!(err.contains("no local executable"), "got: {err}");
+
+        let nonce = issue_mcp_install_nonce(&state.pending_mcp_nonces);
+        let err = reapprove_mcp_server_inner(
+            &state,
+            ReapproveMcpServerArgs {
+                id: "srv-missing".into(),
+                nonce,
+            },
+        )
+        .await
+        .expect_err("an unknown id must be a clean error");
+        assert!(err.contains("no MCP server"), "got: {err}");
     }
 
     #[test]

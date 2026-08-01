@@ -138,6 +138,7 @@ fn test_app() -> App<MockRuntime> {
             ipc::register_mcp_server,
             ipc::list_mcp_servers,
             ipc::remove_mcp_server,
+            ipc::reapprove_mcp_server,
             // B8: the rest of the registered surface (every command except the
             // two that take a bare `AppHandle` — send_message, download_model —
             // which structurally can't register under MockRuntime).
@@ -1528,6 +1529,7 @@ fn every_args_taking_command_rejects_the_unwrapped_envelope() {
         "reset_budget_settings",
         "register_mcp_server",
         "remove_mcp_server",
+        "reapprove_mcp_server",
     ];
     for cmd in args_cmds {
         let res = call(&webview, cmd, flat.clone());
@@ -1750,6 +1752,55 @@ fn register_mcp_server_demands_a_backend_nonce() {
     assert!(
         msg.contains("couldn't pin the MCP server executable"),
         "expected the call to proceed as far as pinning, got: {msg}"
+    );
+}
+
+/// Re-approval re-trusts an executable exactly like first registration did, so
+/// it sits behind the SAME consent gate — proven at the real boundary. Without
+/// this, a compromised renderer could silently re-pin a swapped binary and
+/// defeat the whole fail-closed property the pin gate exists for.
+#[test]
+fn reapprove_mcp_server_demands_a_backend_nonce() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // (1) No `nonce` field at all — serde rejects the args before the body runs.
+    let msg = call_err(
+        &webview,
+        "reapprove_mcp_server",
+        json!({"args": {"id": "srv"}}),
+    );
+    assert!(
+        msg.contains("invalid args") && msg.contains("nonce"),
+        "a payload omitting nonce must be rejected at the IPC boundary, got: {msg}"
+    );
+
+    // (2) A forged nonce the backend never issued — the gate refuses.
+    let msg = call_err(
+        &webview,
+        "reapprove_mcp_server",
+        json!({"args": {"id": "srv", "nonce": "00000000-0000-0000-0000-000000000000"}}),
+    );
+    assert!(
+        msg.contains("was not confirmed"),
+        "a forged nonce must hit the consent gate, got: {msg}"
+    );
+
+    // (3) An issued nonce passes the gate and the call proceeds — it then dies
+    // on the unknown id, a *different* error, so "not confirmed" above is
+    // specifically the gate talking.
+    let msg = call_err(
+        &webview,
+        "reapprove_mcp_server",
+        json!({"args": {"id": "srv", "nonce": issued_nonce(&webview)}}),
+    );
+    assert!(
+        !msg.contains("was not confirmed"),
+        "an issued nonce must get past the gate, got: {msg}"
+    );
+    assert!(
+        msg.contains("no MCP server"),
+        "expected the call to proceed as far as the row lookup, got: {msg}"
     );
 }
 
