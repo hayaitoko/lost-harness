@@ -198,41 +198,105 @@ pub fn resolve_and_hash_executable(
     Ok((path.to_string_lossy().to_string(), pin))
 }
 
+/// Why the pin gate refused a bring-up — TYPED, so the Settings pane can render
+/// the exact state (old vs new identity) and offer Re-approve, instead of a
+/// bare "stopped". Before this existed the reason only ever reached the tracing
+/// log (PROGRESS-MAP open follow-up #2). Serialized into
+/// `McpServerInfo.pin_refusal` with a `kind` tag; the `McpPinRefusal` union in
+/// `src/lib/api/tauri.ts` mirrors it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PinRefusal {
+    /// The row has no pin at all — registered before migration v9 introduced
+    /// invocation pinning, so no identity was ever measured.
+    Unpinned,
+    /// The command now resolves to a different executable path than approved.
+    ExecutableMoved {
+        approved_path: String,
+        actual_path: String,
+    },
+    /// The invocation digest changed: the executable's contents, the argv
+    /// vector, or a script file argv names differs from what was approved
+    /// (a Node upgrade or package update lands here too).
+    InvocationChanged {
+        actual_path: String,
+        approved_pin: String,
+        actual_pin: String,
+    },
+    /// The invocation cannot be measured at all right now (command missing
+    /// from PATH, unreadable file, …) — with nothing to compare, stay closed.
+    Unverifiable { error: String },
+}
+
+impl PinRefusal {
+    /// The human-readable refusal for logs and `Err` strings. The recovery
+    /// wording points at the Settings Re-approve action (this type's UI
+    /// counterpart); removing and re-registering still works too.
+    pub fn message(&self, command: &str) -> String {
+        match self {
+            Self::Unpinned => format!(
+                "MCP server `{command}` has no pinned executable hash — it was registered before \
+                 executable pinning existed. Re-approve it in Settings → MCP servers to approve \
+                 its binary."
+            ),
+            Self::ExecutableMoved {
+                approved_path,
+                actual_path,
+            } => format!(
+                "refusing to start MCP server `{command}`: its executable moved (approved \
+                 `{approved_path}`, now resolves to `{actual_path}`). Re-approve it in Settings → \
+                 MCP servers if this is expected."
+            ),
+            Self::InvocationChanged {
+                actual_path,
+                approved_pin,
+                actual_pin,
+            } => format!(
+                "refusing to start MCP server `{command}`: its approved invocation — the \
+                 executable at `{actual_path}`, its arguments, and any script files they name — \
+                 changed since it was approved (pin {approved_pin} → {actual_pin}). Re-approve it \
+                 in Settings → MCP servers if this change is expected."
+            ),
+            Self::Unverifiable { error } => error.clone(),
+        }
+    }
+}
+
 /// Bring-up-time check. Fails CLOSED in all three bad cases:
 /// * the command now resolves somewhere else,
 /// * anything inside the pinned invocation differs from registration — the
 ///   executable's contents, the argv vector, or a script file argv names,
 /// * the row has no pin at all (registered before migration v9) — we cannot
-///   attest to an invocation we never measured, so the user must re-register.
+///   attest to an invocation we never measured, so the user must re-approve.
+///
+/// The `Err` is a typed [`PinRefusal`] so callers can surface WHY (and offer
+/// the re-approve recovery) rather than collapsing everything into a string.
 pub fn verify_pinned_executable(
     command: &str,
     args: &[String],
     pinned_path: Option<&str>,
     pinned_hash: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), PinRefusal> {
     let (Some(expected_path), Some(expected_hash)) = (pinned_path, pinned_hash) else {
-        return Err(format!(
-            "MCP server `{command}` has no pinned executable hash — it was registered before \
-             executable pinning existed. Remove and re-register it to approve its binary."
-        ));
+        return Err(PinRefusal::Unpinned);
     };
-    let actual_path = resolve_executable(command)?;
+    let actual_path =
+        resolve_executable(command).map_err(|error| PinRefusal::Unverifiable { error })?;
     let actual_path_display = actual_path.to_string_lossy().to_string();
     if actual_path_display != expected_path {
-        return Err(format!(
-            "refusing to start MCP server `{command}`: its executable moved (approved \
-             `{expected_path}`, now resolves to `{actual_path_display}`). Remove and re-register \
-             it."
-        ));
+        return Err(PinRefusal::ExecutableMoved {
+            approved_path: expected_path.to_string(),
+            actual_path: actual_path_display,
+        });
     }
-    let actual_hash = invocation_pin_digest(&actual_path, args)?;
+    let actual_hash = invocation_pin_digest(&actual_path, args)
+        .map_err(|error| PinRefusal::Unverifiable { error })?;
     if actual_hash != expected_hash {
-        return Err(format!(
-            "refusing to start MCP server `{command}`: its approved invocation — the executable \
-             at `{actual_path_display}`, its arguments, and any script files they name — changed \
-             since it was approved (pin {expected_hash} → {actual_hash}). Remove and re-register \
-             it."
-        ));
+        return Err(PinRefusal::InvocationChanged {
+            actual_path: actual_path_display,
+            approved_pin: expected_hash.to_string(),
+            actual_pin: actual_hash,
+        });
     }
     Ok(())
 }
@@ -520,6 +584,11 @@ pub struct McpRuntimeEntry {
 #[derive(Default)]
 pub struct McpRuntime {
     pub servers: parking_lot::Mutex<std::collections::HashMap<String, McpRuntimeEntry>>,
+    /// Why the last bring-up of a (not-running) server was refused by the H-07
+    /// pin gate, keyed by row id. Written by [`bring_up_server`], cleared by a
+    /// fresh attempt or a tear-down; `list_mcp_servers` reads it so the
+    /// Settings pane can say more than "stopped".
+    pub pin_refusals: parking_lot::Mutex<std::collections::HashMap<String, PinRefusal>>,
 }
 
 impl McpRuntime {
@@ -541,6 +610,9 @@ pub async fn bring_up_server(
 ) -> Result<Vec<String>, String> {
     use super::mcp::{McpServerConfig, McpTool, McpTrustTier};
     use crate::tools::Tool as _; // for McpTool::name()
+    // Each attempt owns the refusal slot: a stale reason from an earlier
+    // attempt must never outlive the attempt that would disprove it.
+    runtime.pin_refusals.lock().remove(&row.id);
     let is_http = row.command.trim_start().starts_with("https://")
         || row.command.trim_start().starts_with("http://");
     let transport = if is_http {
@@ -551,13 +623,19 @@ pub async fn bring_up_server(
         // H-07: the pinned invocation is the consent. Re-check it on EVERY
         // bring-up — including the unattended auto-start at boot — before we
         // spawn. `row.args` is the exact argv handed to `spawn` two lines down,
-        // so the thing verified is the thing executed.
-        verify_pinned_executable(
+        // so the thing verified is the thing executed. A refusal is RECORDED
+        // (typed) on the runtime so the Settings pane can render the exact
+        // state + a Re-approve action — before, the reason died in the log.
+        if let Err(refusal) = verify_pinned_executable(
             &row.command,
             &row.args,
             row.executable_path.as_deref(),
             row.executable_hash.as_deref(),
-        )?;
+        ) {
+            let message = refusal.message(&row.command);
+            runtime.pin_refusals.lock().insert(row.id.clone(), refusal);
+            return Err(message);
+        }
         McpRuntimeTransport::Stdio(std::sync::Arc::new(
             StdioMcpTransport::spawn(&row.command, &row.args).await?,
         ))
@@ -614,6 +692,9 @@ pub async fn tear_down_server(
     dispatcher: &crate::tools::ToolDispatcher,
     runtime: &McpRuntime,
 ) -> bool {
+    // A removed server takes its recorded pin refusal with it — a ghost
+    // warning must never outlive the row (or the replacement bring-up).
+    runtime.pin_refusals.lock().remove(id);
     let entry = runtime.servers.lock().remove(id);
     match entry {
         Some(entry) => {
@@ -905,8 +986,84 @@ mod tests {
             runtime.servers.lock().get("pin1").is_none(),
             "a refused bring-up must leave no live server behind"
         );
+        // The refusal is RECORDED, typed, for the Settings pane — this is what
+        // turns the silent "stopped" into a renderable state (follow-up #2).
+        match runtime.pin_refusals.lock().get("pin1") {
+            Some(PinRefusal::InvocationChanged { approved_pin, .. }) => {
+                assert_eq!(
+                    approved_pin,
+                    row.executable_hash.as_ref().unwrap(),
+                    "the recorded refusal must carry the approved pin"
+                );
+            }
+            other => panic!("expected a recorded InvocationChanged refusal, got {other:?}"),
+        }
+
+        // Recovery leg: restore the approved bytes — the next successful
+        // bring-up must CLEAR the recorded refusal (no ghost warning).
+        std::fs::write(&server, &original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bring_up_server(&row, &dispatcher, &runtime)
+            .await
+            .expect("the restored binary matches its pin again");
+        assert!(
+            runtime.pin_refusals.lock().get("pin1").is_none(),
+            "a successful bring-up must clear the recorded refusal"
+        );
+        assert!(tear_down_server("pin1", &dispatcher, &runtime).await);
 
         let _ = std::fs::remove_dir_all(server.parent().unwrap());
+    }
+
+    /// A pre-pinning row (NULL pin) records the `Unpinned` refusal on bring-up
+    /// — the "registered before verification existed" state the pane renders —
+    /// and tear-down (the remove path) wipes the record even with no live
+    /// child, so removal never leaves a ghost warning.
+    #[tokio::test]
+    async fn an_unpinned_row_records_a_typed_refusal_and_tear_down_clears_it() {
+        use crate::hooks::HookChain;
+        use crate::tools::{BodyEnv, Capability, ToolDispatcher, ToolRegistry};
+
+        let row = crate::storage::McpServerRow {
+            id: "legacy".into(),
+            name: "legacy".into(),
+            command: "sh".into(),
+            args: vec![fixture_script()],
+            tier: "remote".into(),
+            trusted_read_only: false,
+            capabilities: vec![],
+            enabled: true,
+            created_at: 1,
+            executable_path: None,
+            executable_hash: None,
+        };
+        let dispatcher = ToolDispatcher::new(
+            ToolRegistry::new(),
+            HookChain::new(),
+            BodyEnv::new([Capability::Network]),
+        );
+        let runtime = McpRuntime::new();
+
+        let err = bring_up_server(&row, &dispatcher, &runtime)
+            .await
+            .expect_err("an unmeasured binary must not start");
+        assert!(err.contains("no pinned executable hash"), "got: {err}");
+        assert_eq!(
+            runtime.pin_refusals.lock().get("legacy"),
+            Some(&PinRefusal::Unpinned),
+            "the pane needs the typed pre-pinning state"
+        );
+
+        // Remove path: no live entry (returns false), but the record still dies.
+        assert!(!tear_down_server("legacy", &dispatcher, &runtime).await);
+        assert!(
+            runtime.pin_refusals.lock().get("legacy").is_none(),
+            "removal must take the recorded refusal with it"
+        );
     }
 
     /// H-07, the headline attack on an interpreter-shaped registration
@@ -976,9 +1133,23 @@ mod tests {
             .expect("the freshly recorded pin must verify");
 
         std::fs::write(&script, "echo tampered\n").unwrap();
-        let err = verify_pinned_executable("sh", &args, Some(&path), Some(&pin))
+        let refusal = verify_pinned_executable("sh", &args, Some(&path), Some(&pin))
             .expect_err("a rewritten script must invalidate the pin");
-        assert!(err.contains("changed since it was approved"), "got: {err}");
+        // Typed, and it carries the identity pair the pane renders: the pin
+        // that WAS approved vs what the invocation measures as now.
+        match &refusal {
+            PinRefusal::InvocationChanged {
+                approved_pin,
+                actual_pin,
+                ..
+            } => {
+                assert_eq!(approved_pin, &pin);
+                assert_ne!(actual_pin, &pin);
+            }
+            other => panic!("expected InvocationChanged, got {other:?}"),
+        }
+        let msg = refusal.message("sh");
+        assert!(msg.contains("changed since it was approved"), "got: {msg}");
     }
 
     /// Argv is length-prefixed in the digest, so an attacker cannot re-split it
@@ -1002,14 +1173,16 @@ mod tests {
     /// we never measured that binary, so bring-up fails closed.
     #[test]
     fn an_unpinned_row_fails_closed() {
-        let err = verify_pinned_executable("sh", &[], None, None)
+        let refusal = verify_pinned_executable("sh", &[], None, None)
             .expect_err("an unmeasured binary must not be trusted");
-        assert!(err.contains("no pinned executable hash"), "got: {err}");
+        assert_eq!(refusal, PinRefusal::Unpinned);
+        let msg = refusal.message("sh");
+        assert!(msg.contains("no pinned executable hash"), "got: {msg}");
 
         let (path, _) = resolve_and_hash_executable("sh", &[]).unwrap();
-        let err2 = verify_pinned_executable("sh", &[], Some(&path), None)
+        let refusal2 = verify_pinned_executable("sh", &[], Some(&path), None)
             .expect_err("a path without a hash is still unmeasured");
-        assert!(err2.contains("no pinned executable hash"), "got: {err2}");
+        assert_eq!(refusal2, PinRefusal::Unpinned);
     }
 
     /// The same command resolving to a DIFFERENT file is a refusal too, even if
@@ -1017,10 +1190,22 @@ mod tests {
     #[test]
     fn a_moved_executable_fails_closed() {
         let (sh_path, sh_pin) = resolve_and_hash_executable("sh", &[]).unwrap();
-        let err =
+        let refusal =
             verify_pinned_executable("sh", &[], Some("/nonexistent/approved-sh"), Some(&sh_pin))
                 .expect_err("a relocated executable must not start");
-        assert!(err.contains("its executable moved"), "got: {err}");
+        // Typed, carrying BOTH paths — the pane shows approved vs actual.
+        match &refusal {
+            PinRefusal::ExecutableMoved {
+                approved_path,
+                actual_path,
+            } => {
+                assert_eq!(approved_path, "/nonexistent/approved-sh");
+                assert_eq!(actual_path, &sh_path);
+            }
+            other => panic!("expected ExecutableMoved, got {other:?}"),
+        }
+        let msg = refusal.message("sh");
+        assert!(msg.contains("its executable moved"), "got: {msg}");
         // Control: the true pin passes.
         verify_pinned_executable("sh", &[], Some(&sh_path), Some(&sh_pin))
             .expect("the recorded pin must still verify");
