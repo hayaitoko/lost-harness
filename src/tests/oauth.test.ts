@@ -12,8 +12,8 @@
  * (refresh token) is per-profile.
  */
 
-import { describe, it, expect } from "vitest";
-import { render, fireEvent } from "@testing-library/svelte";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { render, fireEvent, cleanup, waitFor } from "@testing-library/svelte";
 import {
   setGmailClient,
   gmailBeginConnect,
@@ -22,6 +22,43 @@ import {
   gmailSetupStatus,
   type GmailSetupStatus,
 } from "$lib/api/tauri";
+import { GoogleConnection } from "$lib/design/googleConnection.svelte";
+import GmailSetupWizard from "$lib/design/components/GmailSetupWizard.svelte";
+
+// The IPC layer under the two "real store/component" describe blocks below
+// (setup status data contract, per-profile isolation). Mocking at THIS level
+// — rather than mocking `$lib/api/tauri` itself — keeps `gmailSetupStatus`,
+// `gmailBeginConnect`, `gmailFinishConnect` etc. as the REAL functions from
+// tauri.ts, so their `isTauri()` branch and argument shape are exercised too.
+// It is also inert for the "IPC contracts" describe block above/below: those
+// tests never set `window.__TAURI_INTERNALS__`, so `isTauri()` stays false
+// and they keep hitting the real browser-fallback code paths regardless of
+// this mock existing.
+const tauri = vi.hoisted(() => ({
+  invoke: vi.fn<(cmd: string, args?: unknown) => Promise<unknown>>(),
+}));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: tauri.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: async () => () => {},
+}));
+
+/** A full, healthy `GmailSetupStatus`, overridable per test. */
+function status(over: Partial<GmailSetupStatus> = {}): GmailSetupStatus {
+  return {
+    client_configured: true,
+    connected: true,
+    account_email: "ada@example.com",
+    needs_reconnect: false,
+    api_not_enabled: null,
+    ...over,
+  };
+}
+
+afterEach(() => {
+  cleanup();
+  tauri.invoke.mockReset();
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+});
 
 describe("Gmail OAuth — IPC contracts", () => {
   it("gmailSetupStatus returns disconnected state in browser fallback", async () => {
@@ -79,71 +116,148 @@ describe("Gmail OAuth — IPC contracts", () => {
   });
 });
 
-describe("Gmail OAuth — setup status data contract", () => {
-  it("needs_reconnect is a normal state (not an error)", () => {
-    // Testing-status Google clients expire refresh tokens every ~7 days.
-    // needs_reconnect is a routine state, not an error.
-    const status: GmailSetupStatus = {
-      client_configured: true,
-      connected: false,
-      account_email: "user@example.com",
-      needs_reconnect: true,
-      api_not_enabled: null,
-    };
+// These two describe blocks used to build a `GmailSetupStatus` object
+// literal by hand inside the test and then assert its own fields back —
+// assertions that cannot fail no matter what the app does. Rewritten to
+// drive the REAL store (`GoogleConnection` in googleConnection.svelte.ts)
+// and the REAL wizard component (`GmailSetupWizard.svelte`) against a mocked
+// Tauri backend, so a regression in either actually fails these tests.
 
-    expect(status.needs_reconnect).toBe(true);
-    // The UI must render a calm Reconnect, not an error banner.
-    // This test verifies the data model supports that distinction.
+describe("Gmail OAuth — setup status data contract", () => {
+  it("needs_reconnect is a normal state: GoogleConnection.read() surfaces it on `status`, never `error`", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "gmail_setup_status") {
+        return status({ connected: false, needs_reconnect: true });
+      }
+      return null;
+    });
+
+    const conn = new GoogleConnection();
+    await conn.read("personal");
+
+    // Testing-status Google clients expire refresh tokens every ~7 days.
+    // needs_reconnect is a routine state, not an error — the UI's calm
+    // Reconnect strip reads off `status`, never off `error`.
+    expect(conn.status?.needs_reconnect).toBe(true);
+    expect(conn.error).toBeNull();
   });
 
-  it("account_email is null when unknown (never a fabricated address)", () => {
-    const status: GmailSetupStatus = {
-      client_configured: true,
-      connected: true,
-      account_email: null,
-      needs_reconnect: false,
-      api_not_enabled: null,
-    };
+  it("account_email is null when unknown: the wizard renders it as-is, never a fabricated address", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "gmail_begin_connect") return { auth_url: "https://accounts.google.com/o/oauth2/…" };
+      // The connect succeeded but the backend could not read the address —
+      // per `GmailConnected`'s own contract, that is `null`, never a guess.
+      if (cmd === "gmail_finish_connect") return { account_email: null };
+      return null;
+    });
 
-    // Per the backend contract: null when the connect succeeded but the
-    // profile address couldn't be read — never a fabricated address.
-    expect(status.account_email).toBeNull();
+    const { getByText } = render(GmailSetupWizard, {
+      profile: "personal",
+      status: status({ connected: false, client_configured: true }),
+      variant: "reconnect",
+    });
+
+    await fireEvent.click(getByText("Connect Gmail"));
+
+    const confirmed = await waitFor(() => getByText(/^Connected as/));
+    // The load-bearing absence: nothing after "Connected as" — a fabricated
+    // placeholder (e.g. "Connected as unknown@…") would fail this.
+    expect(confirmed.textContent?.trim()).toBe("Connected as");
+  });
+
+  it("account_email that the backend DID resolve reaches the wizard unchanged", async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "gmail_begin_connect") return { auth_url: "https://accounts.google.com/o/oauth2/…" };
+      if (cmd === "gmail_finish_connect") return { account_email: "ada@example.com" };
+      return null;
+    });
+
+    const { getByText } = render(GmailSetupWizard, {
+      profile: "personal",
+      status: status({ connected: false, client_configured: true }),
+      variant: "reconnect",
+    });
+
+    await fireEvent.click(getByText("Connect Gmail"));
+
+    const confirmed = await waitFor(() => getByText(/^Connected as/));
+    expect(confirmed.textContent?.trim()).toBe("Connected as ada@example.com");
   });
 });
 
 describe("Gmail OAuth — per-profile isolation", () => {
-  it("each profile has its own connection status", () => {
-    // Profile isolation: the connection (refresh token) is per-profile.
-    // The install-global client id/secret are shared; the OAuth token is not.
-    const personalStatus: GmailSetupStatus = {
-      client_configured: true,
-      connected: true,
-      account_email: "personal@example.com",
-      needs_reconnect: false,
-      api_not_enabled: null,
-    };
-    const workStatus: GmailSetupStatus = {
-      client_configured: true,
-      connected: false,
-      account_email: null,
-      needs_reconnect: true,
-      api_not_enabled: null,
-    };
+  it("switching profiles drops a stale in-flight read for the OLD profile", async () => {
+    // Mirrors Email.svelte's actual profile-switch handling: `conn.reset()`
+    // fires the moment the active profile changes, and any read already in
+    // flight for the profile being LEFT must not land afterwards — see
+    // googleConnection.svelte.ts's own sequence-token comment. This is the
+    // real mechanism "per-profile isolation" rests on, not two hand-built
+    // objects that were never connected to any profile at all.
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    let resolvePersonalRead!: (v: GmailSetupStatus) => void;
+    const personalRead = new Promise<GmailSetupStatus>((resolve) => {
+      resolvePersonalRead = resolve;
+    });
+    tauri.invoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd !== "gmail_setup_status") return Promise.resolve(null);
+      const profile = (args as { args: { profile: string } }).args.profile;
+      // "personal" hangs until released below; "work" resolves immediately —
+      // the two profiles' reads race, and "work" (the CURRENT profile) wins.
+      return profile === "personal"
+        ? personalRead
+        : Promise.resolve(status({ connected: false, needs_reconnect: true, account_email: null }));
+    });
 
-    expect(personalStatus.connected).toBe(true);
-    expect(workStatus.connected).toBe(false);
-    expect(workStatus.needs_reconnect).toBe(true);
+    const conn = new GoogleConnection();
+    const inFlight = conn.read("personal"); // the profile being LEFT
+    conn.reset(); // the app switches to "work" before the read above resolves
+    await conn.read("work"); // the new profile's own read completes first
+
+    // The late arrival of the stale "personal" read must be a no-op.
+    resolvePersonalRead(
+      status({ connected: true, account_email: "personal@example.com" }),
+    );
+    await inFlight;
+
+    expect(conn.status?.connected).toBe(false);
+    expect(conn.status?.needs_reconnect).toBe(true);
+    expect(conn.status?.account_email).not.toBe("personal@example.com");
   });
 });
 
 describe("Gmail OAuth — client id validation", () => {
-  it("client id must end with .apps.googleusercontent.com", () => {
-    // The component validates this format before allowing save.
-    const validId = "12345.apps.googleusercontent.com";
-    const invalidId = "not-a-google-client";
+  it("the wizard's save gate is driven by its real validation", async () => {
+    // Land directly on the client-paste step (step 4) via the wizard's own
+    // persisted-progress key, then drive the REAL inputs — the previous
+    // version of this test asserted String.endsWith against two literals
+    // and could never fail.
+    localStorage.setItem("lh.gmailWizard.furthest.v1", "4");
+    try {
+      const { container, getByText, queryByText } = render(GmailSetupWizard, {
+        profile: "personal",
+        status: status({ connected: false, client_configured: false }),
+      });
+      const id = container.querySelector("#gmail-client-id") as HTMLInputElement;
+      const secret = container.querySelector("#gmail-client-secret") as HTMLInputElement;
+      expect(id).not.toBeNull();
+      expect(secret).not.toBeNull();
 
-    expect(validId.endsWith(".apps.googleusercontent.com")).toBe(true);
-    expect(invalidId.endsWith(".apps.googleusercontent.com")).toBe(false);
+      const warning = "A Google OAuth client ID ends with .apps.googleusercontent.com";
+      await fireEvent.input(id, { target: { value: "not-a-google-client" } });
+      await fireEvent.input(secret, { target: { value: "GOCSPX-test" } });
+      getByText(warning);
+      const save = getByText("Save client").closest("button") as HTMLButtonElement;
+      expect(save.disabled).toBe(true);
+
+      await fireEvent.input(id, { target: { value: "12345.apps.googleusercontent.com" } });
+      expect(queryByText(warning)).toBeNull();
+      expect(save.disabled).toBe(false);
+    } finally {
+      localStorage.removeItem("lh.gmailWizard.furthest.v1");
+    }
   });
 
   it("backend re-validates the client id format on setGmailClient", async () => {
