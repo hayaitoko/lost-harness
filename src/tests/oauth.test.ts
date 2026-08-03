@@ -229,13 +229,35 @@ describe("Gmail OAuth — per-profile isolation", () => {
 });
 
 describe("Gmail OAuth — client id validation", () => {
-  it("client id must end with .apps.googleusercontent.com", () => {
-    // The component validates this format before allowing save.
-    const validId = "12345.apps.googleusercontent.com";
-    const invalidId = "not-a-google-client";
+  it("the wizard's save gate is driven by its real validation", async () => {
+    // Land directly on the client-paste step (step 4) via the wizard's own
+    // persisted-progress key, then drive the REAL inputs — the previous
+    // version of this test asserted String.endsWith against two literals
+    // and could never fail.
+    localStorage.setItem("lh.gmailWizard.furthest.v1", "4");
+    try {
+      const { container, getByText, queryByText } = render(GmailSetupWizard, {
+        profile: "personal",
+        status: status({ connected: false, client_configured: false }),
+      });
+      const id = container.querySelector("#gmail-client-id") as HTMLInputElement;
+      const secret = container.querySelector("#gmail-client-secret") as HTMLInputElement;
+      expect(id).not.toBeNull();
+      expect(secret).not.toBeNull();
 
-    expect(validId.endsWith(".apps.googleusercontent.com")).toBe(true);
-    expect(invalidId.endsWith(".apps.googleusercontent.com")).toBe(false);
+      const warning = "A Google OAuth client ID ends with .apps.googleusercontent.com";
+      await fireEvent.input(id, { target: { value: "not-a-google-client" } });
+      await fireEvent.input(secret, { target: { value: "GOCSPX-test" } });
+      getByText(warning);
+      const save = getByText("Save client").closest("button") as HTMLButtonElement;
+      expect(save.disabled).toBe(true);
+
+      await fireEvent.input(id, { target: { value: "12345.apps.googleusercontent.com" } });
+      expect(queryByText(warning)).toBeNull();
+      expect(save.disabled).toBe(false);
+    } finally {
+      localStorage.removeItem("lh.gmailWizard.furthest.v1");
+    }
   });
 
   it("backend re-validates the client id format on setGmailClient", async () => {
