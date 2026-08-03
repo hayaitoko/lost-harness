@@ -2234,3 +2234,385 @@ fn the_skill_drafter_refuses_a_local_tagged_provider_at_a_public_url() {
     assert!(drafter.available());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ── Round 4 (state pruning, follow-up #9): `stream_locks` + the dispatcher's
+// `run_states` are reclaimed once a conversation's run is over, but PROVABLY
+// never while it (or a queued successor) is still live. ───────────────────
+
+/// Like `sse_chunks_for`, but JSON-escapes `text` via `serde_json::to_string`
+/// instead of naive string interpolation. Needed here because `text` itself
+/// is a ```` ```tool ```` fenced JSON block (quotes, braces) that the naive
+/// helper would corrupt.
+fn sse_chunks_for_json(text: &str) -> Vec<Vec<u8>> {
+    let content = serde_json::to_string(text).expect("a &str always serializes");
+    let body = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{content}}}}}]}}\n\
+         data: [DONE]\n"
+    );
+    vec![body.into_bytes()]
+}
+
+/// A streamer that returns a DIFFERENT canned SSE response on each
+/// successive call — call 0 gets `responses[0]`, call 1 gets `responses[1]`,
+/// calls past the end repeat the last one. Lets a test drive ONE real
+/// tool-call round through `process_message` and then have the tool loop
+/// naturally end on the NEXT round (a plain final answer, no ```` ```tool
+/// ```` block), instead of the model re-emitting the identical call forever
+/// and running into HI-2's repeat-detection ring.
+struct RoundRobinStreamer {
+    provider: Provider,
+    responses: Vec<Vec<Vec<u8>>>,
+    call: std::sync::atomic::AtomicUsize,
+}
+
+impl RoundRobinStreamer {
+    fn new(provider: Provider, responses: Vec<Vec<Vec<u8>>>) -> Self {
+        Self {
+            provider,
+            responses,
+            call: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl crate::agent::loop_mod::ModelStreamer for RoundRobinStreamer {
+    fn provider(&self) -> &Provider {
+        &self.provider
+    }
+    fn stream<'a>(
+        &'a self,
+        _model: &'a str,
+        _messages: Vec<ChatMessage>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<SseStream>> + Send + 'a>>
+    {
+        let i = self.call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let chunks = self
+            .responses
+            .get(i)
+            .or_else(|| self.responses.last())
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move {
+            let byte_stream =
+                tokio_stream::iter(chunks.into_iter().map(Ok::<Vec<u8>, reqwest::Error>));
+            Ok(SseStream::from_byte_stream(byte_stream))
+        })
+    }
+}
+
+/// A tool whose `run()` parks until released — used to hold a REAL
+/// `process_message` call's stream-lock guard through an ACTUAL tool
+/// dispatch (not just a stalled SSE stream), so the live `run_states` entry
+/// the tests below inspect (dispatch count, nonce) reflects genuine work in
+/// flight, not an empty just-`begin_run`'d shell.
+struct ParkableTool {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl crate::tools::Tool for ParkableTool {
+    fn name(&self) -> &str {
+        "park"
+    }
+    fn risk(&self) -> crate::tools::RiskClass {
+        crate::tools::RiskClass::Write
+    }
+    fn requires(&self) -> &[crate::tools::Capability] {
+        &[]
+    }
+    fn run<'a>(
+        &'a self,
+        input: crate::tools::ToolInput,
+        _ctx: &'a crate::tools::ExecCtx,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolResult> + Send + 'a>>
+    {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            crate::tools::ToolResult::Ok(input.args)
+        })
+    }
+}
+
+/// A dispatcher with one `park` tool, pre-allowed, so gating passes without
+/// an interactive approver.
+fn parkable_dispatcher(
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> crate::tools::ToolDispatcher {
+    use crate::hooks::{
+        build_pretooluse_chain_with_confirmed, InMemoryPolicySource, PermissionMode,
+    };
+    use crate::tools::{BodyEnv, ToolDispatcher, ToolRegistry};
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ParkableTool { entered, release }));
+    let mut policy = InMemoryPolicySource::new();
+    policy.set_mode("park", PermissionMode::Allow);
+    let chain = build_pretooluse_chain_with_confirmed(
+        PrivacyGate::new(Arc::new(HeuristicClassifier::new())),
+        Box::new(policy),
+        &["park"],
+    );
+    ToolDispatcher::new(registry, chain, BodyEnv::empty())
+}
+
+/// A real `AgentLoop` wired with `dispatcher` and `streamer` — the round-4
+/// counterpart to `b7_loop`, which hard-codes `echo_allow_dispatcher`.
+fn round4_loop(
+    dispatcher: crate::tools::ToolDispatcher,
+    streamer: Arc<dyn crate::agent::loop_mod::ModelStreamer>,
+    provider: Provider,
+) -> (
+    crate::agent::loop_mod::AgentLoop,
+    Arc<Storage>,
+    std::path::PathBuf,
+) {
+    use crate::agent::loop_mod::AgentLoop;
+    use crate::models::ModelManager;
+    let dir = tempdir();
+    let storage = Arc::new(Storage::open(&dir).expect("open temp storage"));
+    let gate = PrivacyGate::new(Arc::new(HeuristicClassifier::new()));
+    let mm = Arc::new(ModelManager::new());
+    mm.add_provider(provider);
+    let agent = AgentLoop::new(gate, mm, Arc::clone(&storage), Arc::new(dispatcher))
+        .with_model_streamer_override(streamer);
+    (agent, storage, dir)
+}
+
+#[tokio::test]
+async fn process_message_reclaims_stream_lock_and_run_state_once_idle() {
+    // The base case: a single ordinary turn (no tool calls, no contention).
+    // Once it returns, BOTH the stream lock and the dispatcher's run_state
+    // for this conversation must be gone — not just reset, GONE — proving
+    // the process doesn't hold an entry forever for a conversation nobody
+    // is touching anymore.
+    let fake = Arc::new(FakeStreamer::new(
+        cloud_provider("cloudco"),
+        sse_chunks_for("just an ordinary answer, no tools involved"),
+    ));
+    let (agent, storage, dir) = b7_loop(Arc::clone(&fake));
+    let agent = Arc::new(agent);
+    b7_seed_conversation(&storage, "solo");
+
+    agent
+        .process_message(
+            "hi".into(),
+            "solo".into(),
+            Binding::Public,
+            "cloudco".into(),
+            "m".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .expect("a plain turn with no tool calls must succeed");
+
+    assert!(
+        !agent.has_stream_lock("solo"),
+        "an idle conversation's stream lock must be reclaimed"
+    );
+    assert!(
+        !agent.has_run_state("solo"),
+        "an idle conversation's run_state must be reclaimed"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_contended_stream_lock_and_run_state_survive_the_finishing_runs_prune() {
+    // THE important test. Conversation "shared" dispatches a REAL tool call
+    // (so run_states carries genuine, non-zero state: dispatch_count == 1
+    // and a live nonce) and then parks INSIDE that tool call — genuinely in
+    // flight, holding the stream-lock guard. While it's parked, a second
+    // caller takes a live clone of its stream lock (exactly what a queued
+    // concurrent `process_message` call for the SAME conversation does at
+    // its own top) — simulated deterministically via the test-only
+    // `clone_stream_lock` hook rather than racing a second real task's
+    // scheduling. THEN the first call is released and allowed to finish
+    // its OWN run (a plain final answer ends the tool loop cleanly).
+    //
+    // Its completion fires `prune_conversation_state`. The assertion that
+    // matters: because the second caller's clone is still alive, that prune
+    // MUST decline to evict — the survival of run_dispatch_count, the
+    // nonce, and the stream_locks entry itself is checked immediately
+    // after. A wrongful evict here would silently reset a still-needed
+    // conversation's budget and dedup ring — exactly the double-execution
+    // bug HI-2 exists to prevent, now via the NEW pruning code instead of
+    // the OLD single-shared-slot bug.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = parkable_dispatcher(Arc::clone(&entered), Arc::clone(&release));
+
+    let cloud = cloud_provider("cloudco");
+    let tool_call = "```tool\n{\"name\": \"park\", \"args\": {}}\n```\n";
+    let streamer = Arc::new(RoundRobinStreamer::new(
+        cloud.clone(),
+        vec![
+            sse_chunks_for_json(tool_call),
+            sse_chunks_for_json("all done, no more tools"),
+        ],
+    ));
+
+    let (agent, storage, dir) = round4_loop(
+        dispatcher,
+        streamer as Arc<dyn crate::agent::loop_mod::ModelStreamer>,
+        cloud,
+    );
+    let agent = Arc::new(agent);
+    b7_seed_conversation(&storage, "shared");
+
+    let agent_a = Arc::clone(&agent);
+    let handle_a = tokio::spawn(async move {
+        agent_a
+            .process_message(
+                "go".into(),
+                "shared".into(),
+                Binding::Public,
+                "cloudco".into(),
+                "m".into(),
+                "personal".into(),
+                crate::hooks::SessionMode::Normal,
+                &b7_sink(),
+            )
+            .await
+    });
+
+    // Wait until A is genuinely INSIDE the tool call (a real dispatch has
+    // happened — not just begin_run's zeroed shell).
+    entered.notified().await;
+    assert_eq!(
+        agent.run_dispatch_count("shared"),
+        1,
+        "A's real tool dispatch must have run before it parked"
+    );
+    let nonce_a = agent.run_nonce_of("shared");
+    assert!(!nonce_a.is_empty(), "begin_run must have stamped a nonce");
+
+    // A second caller takes a live clone of A's stream lock — deterministic
+    // stand-in for a queued concurrent `process_message("shared", ...)`.
+    let contender = agent
+        .clone_stream_lock("shared")
+        .expect("A must have already installed the stream lock by now");
+    assert_eq!(
+        agent.stream_lock_strong_count("shared"),
+        3,
+        "map + A's own clone (still on A's suspended stack) + the contender"
+    );
+
+    // Let A's tool call finish; A's turn then gets a plain final answer on
+    // the next round and returns.
+    release.notify_one();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle_a)
+        .await
+        .expect("A must not hang")
+        .expect("A's task joined")
+        .expect("A's process_message must return Ok");
+
+    // ── THE ASSERTION ── A just finished and attempted to prune "shared",
+    // but `contender` is still alive — nothing may be evicted.
+    assert!(
+        agent.has_stream_lock("shared"),
+        "a contended conversation's stream lock must survive the finishing run's prune"
+    );
+    assert_eq!(
+        agent.run_dispatch_count("shared"),
+        1,
+        "the dispatch budget A built up must survive a contended prune — \
+         wrongly resetting it is the exact HI-2 double-execution bug this \
+         fix must not reintroduce"
+    );
+    assert_eq!(
+        agent.run_nonce_of("shared"),
+        nonce_a,
+        "the durability-journal nonce must survive a contended prune"
+    );
+
+    // Drop the simulated contender and let a REAL, uncontended run finish —
+    // NOW it must actually be reclaimed.
+    drop(contender);
+    let agent_b = Arc::clone(&agent);
+    agent_b
+        .process_message(
+            "go again".into(),
+            "shared".into(),
+            Binding::Public,
+            "cloudco".into(),
+            "m".into(),
+            "personal".into(),
+            crate::hooks::SessionMode::Normal,
+            &b7_sink(),
+        )
+        .await
+        .expect("B's uncontended turn must succeed");
+
+    assert!(
+        !agent.has_stream_lock("shared"),
+        "once truly idle, the stream lock must be reclaimed"
+    );
+    assert!(
+        !agent.has_run_state("shared"),
+        "once truly idle, the run_state must be reclaimed"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn concurrent_finishes_across_different_conversations_never_evict_each_other() {
+    // "Pruning is safe under concurrency": N conversations run and finish
+    // fully concurrently against the ONE shared AgentLoop. Each one's own
+    // completion prunes ONLY its own entry — no cross-conversation eviction,
+    // no panic, no deadlock between the parking_lot stream_locks map lock
+    // and the dispatcher's own run_states lock (nested in that fixed order
+    // by `prune_conversation_state`).
+    let fake = Arc::new(FakeStreamer::new(
+        cloud_provider("cloudco"),
+        sse_chunks_for("no tools here either"),
+    ));
+    let (agent, storage, dir) = b7_loop(Arc::clone(&fake));
+    let agent = Arc::new(agent);
+
+    const N: usize = 8;
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let conv = format!("conv-{i}");
+        b7_seed_conversation(&storage, &conv);
+        let agent = Arc::clone(&agent);
+        handles.push(tokio::spawn(async move {
+            agent
+                .process_message(
+                    "hi".into(),
+                    conv.clone(),
+                    Binding::Public,
+                    "cloudco".into(),
+                    "m".into(),
+                    "personal".into(),
+                    crate::hooks::SessionMode::Normal,
+                    &b7_sink(),
+                )
+                .await
+                .map(|_| conv)
+        }));
+    }
+
+    for h in handles {
+        let conv = tokio::time::timeout(std::time::Duration::from_secs(5), h)
+            .await
+            .expect("must not hang")
+            .expect("task joined")
+            .expect("process_message must return Ok");
+        assert!(
+            !agent.has_stream_lock(&conv),
+            "{conv}'s stream lock must be reclaimed after it finishes"
+        );
+        assert!(
+            !agent.has_run_state(&conv),
+            "{conv}'s run_state must be reclaimed after it finishes"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
