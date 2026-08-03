@@ -1267,7 +1267,9 @@ mod tests {
                 }),
             ),
             (
-                PinRefusal::Unverifiable { error: "gone".into() },
+                PinRefusal::Unverifiable {
+                    error: "gone".into(),
+                },
                 serde_json::json!({ "kind": "unverifiable", "error": "gone" }),
             ),
         ];
