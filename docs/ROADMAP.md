@@ -21,7 +21,41 @@ the status board sitting on top of all of them.
 
 ## Stage
 
-> **📍 As of 2026-07-30 — ROUND 2 IS MERGED TO LOCAL `main`. NOTHING IS PUSHED. NO RELEASE IS PUBLISHED. THERE WAS NO LIVE-APP QA.**
+> **📍 As of 2026-08-03 — ROUND 3 MERGED · EVERYTHING PUSHED · v0.1.2 RELEASED · SELF-UPDATE PROVEN LIVE.**
+> `main` == `origin/main` == `015eacc`. Gates on the merged tree: **1021 Rust tests / 237 frontend tests**,
+> clippy-correctness + fmt + `cargo audit` + build all clean.
+>
+> **Round 3** closed the six confirmed follow-up defects from rounds 1–2, each adversarially verified
+> (one was caught claiming work it never did, rebuilt, then re-verified): **per-item budget reservation**
+> (a capped profile no longer serializes background helpers — four concurrent delegates under a
+> barely-touched cap all run, and the sum-of-reservations invariant is hand-traced plus test-pinned);
+> **unpriced models warn instead of halting** (a capped run on a model missing from the pricing table
+> used to die in round 1); **MCP re-approve UX** (a server whose binary changed now explains itself and
+> offers an explicit two-click re-approve — it still can never auto-trust a changed binary, mutation-proven);
+> and **three test-integrity holes** closed with mutation evidence (the SSRF proxy/DNS-pin regression now
+> executes the production client builder, the community-download consent gate has a real component test,
+> and six cannot-fail OAuth assertions were rewritten).
+>
+> **LIVE QA HAPPENED (2026-07-31, 08-03).** Two things are now proven by observation rather than inference:
+> (1) the round-2 **endpoint fix** — a logging fake OpenAI endpoint on `127.0.0.1:18081` received exactly
+> the turn the picker named, the composer refused to send with no model chosen, and the turn rendered
+> stamped `Local · QA Fake (127.0.0.1:18081)` while pre-stamp history renders `Unknown route`;
+> (2) **self-update** — a real released **v0.1.1** bundle discovered v0.1.2, verified its minisign
+> signature, downloaded, installed and relaunched as **v0.1.2**.
+>
+> **Releasing is a two-step gate:** the tag run builds/signs/attaches the payload and creates a **DRAFT**;
+> publishing (`gh release edit vX.Y.Z --draft=false`) is deliberately human, because a published release is
+> offered to every install immediately. Drafts are invisible to the updater. Full runbook: `docs/releasing.md`.
+>
+> **Still open, all Lukas's call:** the P09 **model-provenance key ceremony** (the app is fail-closed —
+> every model reads `community` and downloads are consent-gated — and the badge-inversion follow-up is
+> already fixed, so it is safe to perform now); **Apple codesigning/notarization** (declined for now, so
+> the `.app` is unsigned and other Macs need right-click→Open); **MCP child sandboxing** (P08's deferred
+> containment half); and two minor items (`run_states` is never pruned; a crash between the pack-install
+> SQLite commits can leave cron jobs without their skills).
+>
+> Historical entry (superseded, kept for the record):
+> **As of 2026-07-30 — ROUND 2 IS MERGED TO LOCAL `main`. NOTHING IS PUSHED. NO RELEASE IS PUBLISHED. THERE WAS NO LIVE-APP QA.**
 > Round 2 fixed a real endpoint-routing defect — the mechanism a static investigation identified behind
 > the bug Lukas hit in hands-on testing, though **that symptom was never reproduced live** (see "NOT
 > done" below) — made Google 403s recoverable, **built** app self-update, and corrected the provenance

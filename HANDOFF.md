@@ -1,7 +1,7 @@
 # Lost Harness Product — Agent Handoff
 
 **Repo**: `/Users/hayai/Desktop/lost-harness-product/` (Tauri 2.0 + Svelte 5 + Rust), branch `main`, working tree clean.
-**Push state (2026-07-30): local `main` is DELIBERATELY ahead of `origin/main` (`f6535d4`).** Round 1 (the 24-packet review-fix campaign) and round 2 (endpoint fix · Google 403 · self-update) are both merged locally and **unpushed by intent**, pending Lukas's review. This is not a problem to "fix" — do not push without him.
+**Push state (2026-08-03): everything is PUSHED. `main` == `origin/main` == `015eacc` (v0.1.2).** Rounds 1 (24-packet review-fix), 2 (endpoint fix · Google 403 · self-update) and 3 (budget semantics · MCP re-approve · test hardening) are all merged and on GitHub. The repo is PUBLIC. CI is macOS-arm64-only and green.
 **Electron prototype (reference only, abandoned)**: `/Users/hayai/Desktop/lost-harness-app/` — read-only UX reference. Do NOT build new features here.
 **Spec source**: `/Volumes/SSD-Nas/Obsidian/Obsidian/lab/Projects/lost-harness-product/` (architecture.md, planning.md, spec.md, milestones.md) — the original binding spec. Where it disagrees with `docs/PLAN.md`, **PLAN.md wins**.
 
