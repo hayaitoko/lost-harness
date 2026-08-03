@@ -1,6 +1,6 @@
 [package]
 name = "lost-harness-product"
-version = "0.1.1"
+version = "0.1.2"
 description = "Lost Harness — Rust + Tauri 2 + Svelte 5 desktop app"
 authors = ["Lukas Threlkeld"]
 edition = "2021"
