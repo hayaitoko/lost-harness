@@ -4512,9 +4512,8 @@ mod tests {
         // Registration-time state: a row pinned over the ORIGINAL script.
         let script = mcp_fixture_script();
         let script_args = vec![script.clone()];
-        let (path, pin) =
-            crate::tools::mcp_stdio::resolve_and_hash_executable("sh", &script_args)
-                .expect("the shell must resolve on PATH");
+        let (path, pin) = crate::tools::mcp_stdio::resolve_and_hash_executable("sh", &script_args)
+            .expect("the shell must resolve on PATH");
         let row = crate::storage::McpServerRow {
             id: "srv-repin".into(),
             name: "fixture".into(),
@@ -4611,7 +4610,10 @@ mod tests {
             .unwrap();
         let (_, current_pin) =
             crate::tools::mcp_stdio::resolve_and_hash_executable("sh", &script_args).unwrap();
-        assert_eq!(repinned.executable_hash.as_deref(), Some(current_pin.as_str()));
+        assert_eq!(
+            repinned.executable_hash.as_deref(),
+            Some(current_pin.as_str())
+        );
         assert_ne!(current_pin, pin, "the pin really moved to the new identity");
 
         // … and the list shows a running server with no refusal left over.

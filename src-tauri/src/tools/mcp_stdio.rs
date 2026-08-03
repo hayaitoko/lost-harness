@@ -610,8 +610,8 @@ pub async fn bring_up_server(
 ) -> Result<Vec<String>, String> {
     use super::mcp::{McpServerConfig, McpTool, McpTrustTier};
     use crate::tools::Tool as _; // for McpTool::name()
-    // Each attempt owns the refusal slot: a stale reason from an earlier
-    // attempt must never outlive the attempt that would disprove it.
+                                 // Each attempt owns the refusal slot: a stale reason from an earlier
+                                 // attempt must never outlive the attempt that would disprove it.
     runtime.pin_refusals.lock().remove(&row.id);
     let is_http = row.command.trim_start().starts_with("https://")
         || row.command.trim_start().starts_with("http://");
@@ -1229,5 +1229,50 @@ mod tests {
         std::fs::write(&a, b"hello!").unwrap();
         assert_ne!(h1, sha256_of_file(&a).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// The Settings pane branches on this exact JSON (`McpPinRefusal` in
+    /// `src/lib/api/tauri.ts`): a `kind` tag in snake_case plus inlined
+    /// fields. A serde-attribute refactor that changes the tag name or the
+    /// case convention silently desyncs the frontend — this pins the wire
+    /// shape itself, not the Rust enum.
+    #[test]
+    fn pin_refusal_wire_shape_matches_the_frontend_contract() {
+        let cases = [
+            (
+                PinRefusal::Unpinned,
+                serde_json::json!({ "kind": "unpinned" }),
+            ),
+            (
+                PinRefusal::ExecutableMoved {
+                    approved_path: "/old/bin".into(),
+                    actual_path: "/new/bin".into(),
+                },
+                serde_json::json!({
+                    "kind": "executable_moved",
+                    "approved_path": "/old/bin",
+                    "actual_path": "/new/bin",
+                }),
+            ),
+            (
+                PinRefusal::InvocationChanged {
+                    actual_path: "/bin/node".into(),
+                    approved_pin: "aa".into(),
+                    actual_pin: "bb".into(),
+                },
+                serde_json::json!({
+                    "kind": "invocation_changed",
+                    "actual_path": "/bin/node",
+                    "approved_pin": "aa",
+                    "actual_pin": "bb",
+                }),
+            ),
+            (
+                PinRefusal::Unverifiable { error: "gone".into() },
+                serde_json::json!({ "kind": "unverifiable", "error": "gone" }),
+            ),
+        ];
+        for (refusal, expected) in cases {
+            assert_eq!(serde_json::to_value(&refusal).unwrap(), expected);
+        }
     }
 }
