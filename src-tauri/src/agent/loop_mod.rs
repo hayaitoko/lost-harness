@@ -1721,6 +1721,12 @@ impl AgentLoop {
         // reroute may land on a fenced-dialect endpoint).
         let native_spec = self.tools.native_tools_spec();
 
+        // Unpriced-model accounting for the per-round governor below: rounds
+        // whose spend can't be tracked are COUNTED (for the log line), and the
+        // budget-warning event fires ONCE per run, not once per round.
+        let mut untracked_spend_rounds: usize = 0;
+        let mut warned_untracked_spend = false;
+
         for round in 0..=MAX_TOOL_ROUNDS {
             // M-09 (mid-run ceiling): an UNATTENDED run re-checks the cap at the
             // TOP OF EVERY ROUND, not just once before dispatch.
@@ -1741,6 +1747,15 @@ impl AgentLoop {
             // never hard-blocked mid-thought. Fail-closed on a ledger read error,
             // matching `work_runner::budget_check_and_reserve`'s direction — an
             // unattended run whose spend can't be verified stops.
+            //
+            // UNPRICED models (`evaluate` → `Warn`): a round that books
+            // `cost_usd = NULL` must NOT terminally halt the run — the pricing
+            // table is tiny, so the old fail-closed Halt here killed every
+            // capped multi-round task on most OpenRouter/unknown models after
+            // round 0. Policy (Lukas): halt ONLY when KNOWN spend reaches the
+            // cap; count untracked rounds and surface the existing
+            // `stream:budget_warning` path once per run, noting spend is
+            // untracked for this model.
             if !self.tools.is_attended() {
                 let since = crate::hooks::budget::month_start_ts(chrono::Utc::now());
                 let verdict = match (
@@ -1754,16 +1769,40 @@ impl AgentLoop {
                             .to_string(),
                     ),
                 };
-                if let crate::hooks::budget::BudgetVerdict::Halt(reason) = verdict {
-                    tracing::warn!(
-                        target: "lhp::budget",
-                        profile = %profile,
-                        conversation = %conversation_id,
-                        round,
-                        reason = %reason,
-                        "unattended run halted mid-loop by the budget governor"
-                    );
-                    anyhow::bail!("budget: {reason}");
+                match verdict {
+                    crate::hooks::budget::BudgetVerdict::Halt(reason) => {
+                        tracing::warn!(
+                            target: "lhp::budget",
+                            profile = %profile,
+                            conversation = %conversation_id,
+                            round,
+                            reason = %reason,
+                            "unattended run halted mid-loop by the budget governor"
+                        );
+                        anyhow::bail!("budget: {reason}");
+                    }
+                    crate::hooks::budget::BudgetVerdict::Warn(reason) => {
+                        untracked_spend_rounds += 1;
+                        if !warned_untracked_spend {
+                            warned_untracked_spend = true;
+                            sink.budget_warning(
+                                &conversation_id,
+                                &format!("{reason} (current model: \"{model}\")"),
+                            );
+                        }
+                        tracing::warn!(
+                            target: "lhp::budget",
+                            profile = %profile,
+                            conversation = %conversation_id,
+                            round,
+                            untracked_spend_rounds,
+                            model = %model,
+                            "unattended round proceeding with untracked spend \
+                             (model not in the pricing table); the cap is \
+                             enforced against known spend only"
+                        );
+                    }
+                    crate::hooks::budget::BudgetVerdict::Ok => {}
                 }
             }
             let assistant_id = Uuid::new_v4().to_string();
