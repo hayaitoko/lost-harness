@@ -145,20 +145,7 @@ async fn fetch_readable(raw: &str) -> Result<serde_json::Value, String> {
         // Fresh client per hop so DNS is pinned to the IPs that passed
         // ssrf_check — closes the DNS-rebind TOCTOU gap (each redirect
         // re-resolves and re-pins).
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(USER_AGENT)
-            .resolve_to_addrs(&hostname, &vetted)
-            // Without this the pin above is decorative: reqwest picks up
-            // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY at build time, and a proxied
-            // request is sent to the proxy, which resolves the hostname
-            // itself. The vetted address then receives nothing and the
-            // rebind TOCTOU is wide open. Proven by the regression test
-            // `a_configured_proxy_cannot_defeat_the_pinned_address`.
-            .no_proxy()
-            .build()
-            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+        let client = build_hop_client(&hostname, &vetted, None)?;
 
         let resp = client
             .get(current.clone())
@@ -247,6 +234,41 @@ async fn read_capped(resp: reqwest::Response) -> Result<String, String> {
     }
     // Lossy UTF-8: a stray non-UTF-8 byte shouldn't fail the whole read.
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Build the reqwest client used for one hop of `fetch_readable`. Pins DNS
+/// resolution of `hostname` to `vetted` (the addresses `ssrf_check` already
+/// classified as public) and disables all proxy usage — see the module doc
+/// for why: without `.no_proxy()`, reqwest picks up HTTP_PROXY/HTTPS_PROXY/
+/// ALL_PROXY at build time, and a proxied request goes to the proxy, which
+/// resolves the hostname itself. The vetted address then receives nothing and
+/// the DNS-rebind TOCTOU this pin exists to close is wide open.
+///
+/// `extra_proxy` is `None` on the production call site in `fetch_readable`.
+/// It exists so the regression test can hand this SAME builder an explicit
+/// proxy and prove `.no_proxy()` below wins — without this seam a test would
+/// have to build its own client, and a mutation that deletes `.no_proxy()`
+/// from production would survive the suite. Proven by the regression test
+/// `a_configured_proxy_cannot_defeat_the_pinned_address`.
+fn build_hop_client(
+    hostname: &str,
+    vetted: &[SocketAddr],
+    extra_proxy: Option<reqwest::Proxy>,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(USER_AGENT)
+        .resolve_to_addrs(hostname, vetted);
+    if let Some(proxy) = extra_proxy {
+        builder = builder.proxy(proxy);
+    }
+    // Order matters — reqwest's `no_proxy()` CLEARS the proxy list, so it must
+    // come after any `.proxy(..)` above.
+    builder
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
 
 /// Validate one hop: scheme, the string-level private-host check, and a DNS
@@ -689,13 +711,11 @@ mod tests {
             let _ = stream.write_all(response).await;
         });
 
-        // Build a client that pins "pinned-dns-test.local" to our local server.
-        // If the client resolved the hostname via real DNS it would never reach
-        // 127.0.0.1 — proving the override works.
-        let client = reqwest::Client::builder()
-            .resolve_to_addrs("pinned-dns-test.local", &[local])
-            .build()
-            .unwrap();
+        // Build a client via the PRODUCTION `build_hop_client` that pins
+        // "pinned-dns-test.local" to our local server. If the client resolved
+        // the hostname via real DNS it would never reach 127.0.0.1 — proving
+        // the override works, against the exact function `fetch_readable` calls.
+        let client = build_hop_client("pinned-dns-test.local", &[local], None).unwrap();
 
         let resp = client
             .get("http://pinned-dns-test.local/")
@@ -744,18 +764,19 @@ mod tests {
             }
         });
 
-        // The production client shape from `fetch_url` above, plus an explicit
-        // proxy standing in for HTTP_PROXY/ALL_PROXY in the environment (reqwest
-        // reads those at build time; an explicit proxy exercises the same path
-        // without mutating process-global env from a parallel test).
-        // `.no_proxy()` must win, or the SSRF pin is decorative.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs("pinned-proxy-probe.local", &[pinned_addr])
-            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
-            .no_proxy()
-            .build()
-            .unwrap();
+        // The PRODUCTION builder (`build_hop_client`, the same function
+        // `fetch_readable` calls for every hop), handed an explicit proxy. An
+        // explicit `.proxy(..)` exercises exactly the path HTTP_PROXY/ALL_PROXY
+        // take (reqwest reads those at build time) without mutating
+        // process-global env from a test that runs in parallel with others.
+        // `build_hop_client`'s `.no_proxy()` must win, or the SSRF pin is
+        // decorative.
+        let client = build_hop_client(
+            "pinned-proxy-probe.local",
+            &[pinned_addr],
+            Some(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap()),
+        )
+        .unwrap();
 
         let body = client
             .get("http://pinned-proxy-probe.local/x")
