@@ -24,6 +24,18 @@
 //! that residue is reviewable in Settings, never armed. Note that a failing
 //! [`install_pack`] returns `Err` and no [`InstallReport`] — there is no
 //! partial-report path.
+//!
+//! PRODUCT DECISION (2026-08-03): that transaction design stays exactly as it
+//! is — closing the window needs a distributed commit protocol across two
+//! SQLite files, which nothing here attempts. Instead, `install_pack` stamps
+//! every row it inserts with a `pack_install_id` (see the `# Atomicity` note
+//! and `storage::migrations` global v10 / profile v13), and [`reconcile`]
+//! runs a conservative boot sweep across every profile that deletes a
+//! crash-orphaned cron job — and ONLY one that is provably a crash artifact,
+//! never anything a user has touched — see `reconcile`'s module doc for the
+//! exact rule.
+
+pub mod reconcile;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -339,7 +351,11 @@ fn check_list(
 /// distributed commit protocol across the two files; it is not closed here. The
 /// window is one `commit()` call wide, and everything a pack installs is inert
 /// (skills/agent types `Pending`, cron jobs disabled), so the worst outcome is
-/// orphaned disabled cron jobs the user can delete in Settings.
+/// orphaned disabled cron jobs — which never even get a chance to be armed
+/// AND get swept away at the next boot by [`reconcile::run_boot_pass`], so the
+/// user does not have to find and delete them in Settings by hand. Every row
+/// this function inserts (either database) is stamped with `install_id` for
+/// exactly that sweep to use.
 ///
 /// Lock note: this is the only place that holds a `global.raw()` guard and a
 /// profile `raw()` guard at the same time, and it always takes global first, so
@@ -354,6 +370,15 @@ pub fn install_pack(
     validate_pack(pack)?;
 
     let source = format!("pack:{}", pack.name);
+    // One id per CALL (not per pack name — a pack can be installed more than
+    // once, e.g. the export/reinstall round-trip test below), stamped on
+    // every row this call inserts in EITHER database. This is the
+    // fix4/pack-reconcile provenance: it lets the boot sweep
+    // (`packs::reconcile`) correlate a cron job back to the skills/agent
+    // types its SAME install wrote, and tell a crash-orphaned install apart
+    // from a same-named pack's earlier, healthy one. See global v10 / profile
+    // v13 in `storage::migrations` and `packs::reconcile`'s module doc.
+    let install_id = uuid::Uuid::new_v4().to_string();
 
     // Open profile DB early (before global mutation) so a missing/invalid
     // profile is caught before any insert.
@@ -392,8 +417,8 @@ pub fn install_pack(
             tx.execute(
                 "INSERT INTO skills
                  (id, name, description, content, capabilities_required,
-                  approval_status, path, version, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  approval_status, path, version, created_at, pack_install_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     s.name,
@@ -404,6 +429,7 @@ pub fn install_pack(
                     "",
                     version,
                     now,
+                    install_id,
                 ],
             )?;
         }
@@ -416,8 +442,8 @@ pub fn install_pack(
             tx.execute(
                 "INSERT INTO agent_types
                  (id, name, description, system_prompt, tools_allowlist,
-                  seat, trigger_examples, approval_status, source, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  seat, trigger_examples, approval_status, source, created_at, pack_install_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     a.name,
@@ -429,10 +455,19 @@ pub fn install_pack(
                     AgentTypeApproval::Pending.as_str(),
                     source,
                     now,
+                    install_id,
                 ],
             )?;
         }
     }
+
+    // The cron rows' provenance: how many global rows THIS call was writing,
+    // frozen at insert time. 0 for a skills/agent-types-free pack — the
+    // global transaction above was never opened for it (see `global_tx`
+    // above), so there is no atomicity window for the sweep to reconcile and
+    // it must never treat these cron jobs as candidates. See profile v13 in
+    // `storage::migrations` and `packs::reconcile`.
+    let expected_global_rows = (skills_count + agent_types_count) as i64;
 
     // ── Profile DB (cron jobs) — its own atomic transaction ──────────────────
     // A separate SQLite file, so this cannot join the global transaction, which
@@ -448,8 +483,9 @@ pub fn install_pack(
                 tx.execute(
                     "INSERT INTO cron_jobs
                      (id, name, prompt, schedule, enabled, last_run_at,
-                      last_status, target_conversation_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                      last_status, target_conversation_id, pack_install_id,
+                      pack_expected_global_rows)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     rusqlite::params![
                         uuid::Uuid::new_v4().to_string(),
                         c.name,
@@ -460,6 +496,8 @@ pub fn install_pack(
                         None::<i64>,
                         None::<String>,
                         None::<String>,
+                        install_id,
+                        expected_global_rows,
                     ],
                 )?;
             }

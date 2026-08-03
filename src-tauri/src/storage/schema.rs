@@ -9,7 +9,7 @@
 
 /// Returns the current schema version for the GLOBAL database.
 /// Bump when adding a new global migration.
-pub const GLOBAL_SCHEMA_VERSION: i32 = 9;
+pub const GLOBAL_SCHEMA_VERSION: i32 = 10;
 
 /// Returns the current schema version for each PROFILE database.
 /// Bump when adding a new per-profile migration. Profile and global
@@ -18,7 +18,7 @@ pub const GLOBAL_SCHEMA_VERSION: i32 = 9;
 /// `classifier_settings` in the classifier settings round,
 /// `memory_settings` in Wave 1 memory) bumps `PROFILE_SCHEMA_VERSION`
 /// without touching `GLOBAL_SCHEMA_VERSION`.
-pub const PROFILE_SCHEMA_VERSION: i32 = 12;
+pub const PROFILE_SCHEMA_VERSION: i32 = 13;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global tables (global.db)

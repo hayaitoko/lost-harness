@@ -160,6 +160,39 @@ pub fn run() {
                 Err(e) => tracing::error!(error = %e, "crash-recovery boot pass failed; continuing startup"),
             }
 
+            // Pack-install reconciliation boot pass (fix4/pack-reconcile):
+            // `packs::install_pack` cannot atomically commit skills + agent
+            // types (global.db) and cron jobs (the profile DB) together — see
+            // its `# Atomicity` note — so a crash between the two commits can
+            // leave a cron job durable with no matching global row. Sweep
+            // every profile and remove only the ones PROVABLY that crash
+            // artifact (see `packs::reconcile`'s module doc for the exact,
+            // conservative rule). Deliberately NOT `?`-propagated — same
+            // discipline as crash-recovery above, a reconciliation failure
+            // must not brick app boot.
+            match crate::packs::reconcile::run_boot_pass(&storage) {
+                Ok(report) => {
+                    if !report.removed.is_empty() {
+                        tracing::warn!(
+                            count = report.removed.len(),
+                            jobs = ?report.removed,
+                            "pack-reconcile: removed crash-orphaned pack cron job(s)"
+                        );
+                    }
+                    if !report.skipped.is_empty() {
+                        tracing::warn!(
+                            count = report.skipped.len(),
+                            jobs = ?report.skipped,
+                            "pack-reconcile: found orphan-shaped pack cron job(s) that were touched \
+                             since install; left in place for manual review"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "pack-reconcile boot pass failed; continuing startup")
+                }
+            }
+
             // Seed the built-in agent-type personas (Wave 4.3), idempotently.
             // Best-effort: a seed failure must not brick boot.
             if let Err(e) = storage

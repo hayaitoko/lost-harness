@@ -232,6 +232,37 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
         sql: "ALTER TABLE mcp_servers ADD COLUMN executable_path TEXT;
               ALTER TABLE mcp_servers ADD COLUMN executable_hash TEXT;",
     },
+    Migration {
+        version: 10,
+        // fix4/pack-reconcile — the global.db half of pack-install provenance,
+        // paired with profile v13's `cron_jobs.pack_install_id`. `install_pack`
+        // (packs::mod) cannot put skills/agent-types (here) and cron jobs (the
+        // profile DB) in one transaction — two separate SQLite files — so it
+        // holds both open and commits the profile one first (see its
+        // `# Atomicity` note). A crash in the window between the two commits
+        // can leave cron jobs durable with no matching row here. Before this,
+        // nothing recorded which pack installed a row at all, so a boot sweep
+        // had no way to correlate the two sides.
+        //
+        // `pack_install_id` is one UUID minted per `install_pack` call and
+        // stamped on every skill/agent-type row THAT call inserts; NULL means
+        // "not installed by a pack" (built-in seeds, user-authored skills/
+        // types) and is never touched by the sweep. Because `install_pack`'s
+        // global transaction is atomic, either every row from a given call is
+        // here or none are — a sweep never has to worry about a PARTIAL set.
+        //
+        // ADD COLUMN has no IF-NOT-EXISTS, so these live ONLY here (not in
+        // GLOBAL_SCHEMA_SQL): a fresh DB runs v1 (skills/agent_types without
+        // them) then v10 adds them, matching an existing DB's upgrade path —
+        // same convention as v9's `mcp_servers` pinning columns.
+        name: "pack_install_provenance",
+        sql: "ALTER TABLE skills ADD COLUMN pack_install_id TEXT;
+              ALTER TABLE agent_types ADD COLUMN pack_install_id TEXT;
+              CREATE INDEX IF NOT EXISTS idx_skills_pack_install
+                  ON skills(pack_install_id) WHERE pack_install_id IS NOT NULL;
+              CREATE INDEX IF NOT EXISTS idx_agent_types_pack_install
+                  ON agent_types(pack_install_id) WHERE pack_install_id IS NOT NULL;",
+    },
 ];
 
 /// All per-profile DB migrations, in order.
@@ -452,6 +483,35 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
         name: "messages_endpoint_zone",
         sql: "ALTER TABLE messages ADD COLUMN endpoint_zone TEXT;",
     },
+    Migration {
+        version: 13,
+        // fix4/pack-reconcile — the profile-DB half of pack-install provenance,
+        // paired with global v10's `skills.pack_install_id` /
+        // `agent_types.pack_install_id`. `pack_install_id` correlates a cron
+        // job back to the `install_pack` call that created it (NULL = user-
+        // created, never touched by the sweep).
+        //
+        // `pack_expected_global_rows` freezes how many skill+agent-type rows
+        // that SAME call was writing to `global.db` — 0 for a cron-only pack,
+        // where `install_pack` never even opens a global transaction and so
+        // has no atomicity window to reconcile at all. A row with
+        // `pack_expected_global_rows > 0` and zero matching rows in
+        // `global.db` (`GlobalDb::count_pack_install_rows`) is the crash
+        // artifact described in packs::mod's `# Atomicity` note — the global
+        // transaction is all-or-nothing, so "zero rows" can only mean "never
+        // committed", never "partially committed". See `packs::reconcile` for
+        // the sweep and its conservative deletion rule.
+        //
+        // ADD COLUMN has no IF-NOT-EXISTS, so these live ONLY here (not in
+        // PROFILE_SCHEMA_SQL): a fresh DB runs v1 (cron_jobs without them)
+        // then v13 adds them, matching an existing DB's upgrade path — same
+        // convention as v12's `messages.endpoint_zone`.
+        name: "cron_pack_provenance",
+        sql: "ALTER TABLE cron_jobs ADD COLUMN pack_install_id TEXT;
+              ALTER TABLE cron_jobs ADD COLUMN pack_expected_global_rows INTEGER NOT NULL DEFAULT 0;
+              CREATE INDEX IF NOT EXISTS idx_cron_jobs_pack_install
+                  ON cron_jobs(pack_install_id) WHERE pack_install_id IS NOT NULL;",
+    },
 ];
 
 /// Apply all pending global migrations to a freshly opened connection.
@@ -613,6 +673,122 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider, "cloudco");
+    }
+
+    #[test]
+    fn upgrading_an_existing_global_db_adds_pack_install_id_without_disturbing_existing_rows() {
+        // v10 is two ALTER TABLEs (fix4/pack-reconcile), so it must work on a
+        // DB that already holds skills + agent types written by pre-v10 code
+        // (no `pack_install_id` column existed at all) — and it must leave
+        // those rows with a NULL `pack_install_id`, exactly the "not
+        // installed by a pack" reading the reconciliation sweep relies on.
+        let conn = Connection::open_in_memory().unwrap();
+        let v9 = &GLOBAL_MIGRATIONS[..9];
+        assert_eq!(v9.last().unwrap().version, 9, "slice must stop at v9");
+        run_migrations(&conn, v9, "global-v9").unwrap();
+
+        conn.execute(
+            "INSERT INTO skills
+             (id, name, description, content, capabilities_required,
+              approval_status, path, version, created_at)
+             VALUES ('s1', 'old skill', 'd', 'c', '[]', 'approved', '', '0.1.0', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_types
+             (id, name, description, system_prompt, tools_allowlist, seat,
+              trigger_examples, approval_status, source, created_at)
+             VALUES ('a1', 'old type', 'd', 'p', '[]', 'inherit', '[]',
+                     'approved', 'user', 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate_global(&conn).unwrap();
+
+        let v: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, GLOBAL_SCHEMA_VERSION);
+
+        let skill_pack_id: Option<String> = conn
+            .query_row(
+                "SELECT pack_install_id FROM skills WHERE id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            skill_pack_id, None,
+            "a pre-v10 skill must read back with NO pack correlation, never a manufactured one"
+        );
+        let at_pack_id: Option<String> = conn
+            .query_row(
+                "SELECT pack_install_id FROM agent_types WHERE id = 'a1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(at_pack_id, None);
+
+        // The rows themselves are otherwise untouched.
+        let skill_name: String = conn
+            .query_row("SELECT name FROM skills WHERE id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(skill_name, "old skill");
+    }
+
+    #[test]
+    fn upgrading_an_existing_profile_db_adds_cron_pack_provenance_without_disturbing_existing_rows()
+    {
+        // v13 is two ALTER TABLEs (fix4/pack-reconcile), so it must work on a
+        // DB that already holds cron jobs written by pre-v13 code (no
+        // `pack_install_id` / `pack_expected_global_rows` columns existed at
+        // all) — and it must leave a pre-existing job with a NULL
+        // `pack_install_id` (never a pack job the reconciliation sweep might
+        // touch) and `pack_expected_global_rows = 0` (the column's DEFAULT,
+        // which also happens to be the correct "not a candidate" value).
+        let conn = Connection::open_in_memory().unwrap();
+        let v12 = &PROFILE_MIGRATIONS[..12];
+        assert_eq!(v12.last().unwrap().version, 12, "slice must stop at v12");
+        run_migrations(&conn, v12, "profile-v12").unwrap();
+
+        conn.execute(
+            "INSERT INTO cron_jobs
+             (id, name, prompt, schedule, enabled, last_run_at, last_status,
+              target_conversation_id)
+             VALUES ('j1', 'my reminder', 'remind me', '0 9 * * *', 1, NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+
+        migrate_profile(&conn).unwrap();
+
+        let v: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, PROFILE_SCHEMA_VERSION);
+
+        let (pack_install_id, expected_rows, enabled, name): (Option<String>, i64, i64, String) =
+            conn.query_row(
+                "SELECT pack_install_id, pack_expected_global_rows, enabled, name
+                 FROM cron_jobs WHERE id = 'j1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            pack_install_id, None,
+            "a pre-v13 cron job must read back with NO pack correlation"
+        );
+        assert_eq!(
+            expected_rows, 0,
+            "a pre-v13 cron job must never look like a pack-install candidate"
+        );
+        // The row itself is otherwise untouched.
+        assert_eq!(enabled, 1);
+        assert_eq!(name, "my reminder");
     }
 
     #[test]
