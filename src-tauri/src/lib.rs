@@ -656,6 +656,7 @@ pub fn run() {
             ipc::register_mcp_server,
             ipc::list_mcp_servers,
             ipc::remove_mcp_server,
+            ipc::reapprove_mcp_server,
             ipc::download_model,
             ipc::list_local_models,
             ipc::remove_local_model,

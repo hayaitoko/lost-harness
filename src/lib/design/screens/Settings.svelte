@@ -81,6 +81,8 @@
     listMcpServers,
     registerMcpServer,
     removeMcpServer,
+    reapproveMcpServer,
+    type McpPinRefusal,
     type McpServer,
     getAppVersion,
     getUpdateCheckEnabled,
@@ -609,6 +611,51 @@
       mcpServers = mcpServers.filter((s) => s.id !== id);
     } catch (err) {
       mcpError = String(err);
+    }
+  }
+
+  // Pin-refusal recovery (PROGRESS-MAP open follow-up #2). The pin gate
+  // fail-closes a server whose executable identity no longer matches what was
+  // approved; these render WHY and offer the explicit Re-approve click that
+  // re-trusts the binary as it is now. Never invoked automatically.
+  let confirmReapproveMcpId: string | null = $state(null);
+  let mcpReapprovingId: string | null = $state(null);
+
+  /** Human copy per typed refusal state (mirrors `PinRefusal` in
+   *  src-tauri/src/tools/mcp_stdio.rs). */
+  function describePinRefusal(r: McpPinRefusal): string {
+    switch (r.kind) {
+      case "unpinned":
+        return "This server was registered before executable verification existed, so its binary was never approved.";
+      case "executable_moved":
+        return `Its command now resolves to a different executable — approved ${r.approved_path}, now ${r.actual_path}.`;
+      case "invocation_changed":
+        return `Its executable, arguments, or a script file they name changed since approval (pin ${r.approved_pin.slice(0, 12)}… → ${r.actual_pin.slice(0, 12)}…) — a runtime or package update looks like this too.`;
+      case "unverifiable":
+        return `Its executable can't be verified right now: ${r.error}`;
+    }
+  }
+
+  async function handleReapproveMcp(id: string) {
+    // Two-click confirm, mirroring register: re-approval re-trusts a binary
+    // the pin gate refused, so the first click only arms the exact target.
+    if (confirmReapproveMcpId !== id) {
+      confirmReapproveMcpId = id;
+      setTimeout(() => {
+        if (confirmReapproveMcpId === id) confirmReapproveMcpId = null;
+      }, 4000);
+      return;
+    }
+    confirmReapproveMcpId = null;
+    mcpReapprovingId = id;
+    mcpError = null;
+    try {
+      const server = await reapproveMcpServer(id);
+      if (server) mcpServers = mcpServers.map((s) => (s.id === id ? server : s));
+    } catch (err) {
+      mcpError = String(err);
+    } finally {
+      mcpReapprovingId = null;
     }
   }
 
@@ -2288,20 +2335,63 @@
                 <SettingRow
                   title={s.name}
                   desc={`${s.command}${s.args.length ? " " + s.args.join(" ") : ""} · ${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}`}
-                  dotColor={s.running ? "var(--local)" : "var(--text-3)"}
+                  dotColor={s.running
+                    ? "var(--local)"
+                    : s.pin_refusal
+                      ? "var(--warn)"
+                      : "var(--text-3)"}
                   tag={s.tier === "remote"
                     ? { label: "remote", bg: "var(--cloud-soft)", color: "var(--cloud)" }
                     : { label: "local", bg: "var(--local-soft)", color: "var(--local)" }}
                 >
                   {#snippet control()}
                     <div class="flex flex-shrink-0 items-center gap-1.5">
-                      <span class="text-[11px] text-text-3">{s.running ? "running" : "stopped"}</span>
+                      <span
+                        class="text-[11px] {!s.running && s.pin_refusal
+                          ? 'text-warn'
+                          : 'text-text-3'}"
+                        >{s.running ? "running" : s.pin_refusal ? "blocked" : "stopped"}</span>
+                      {#if s.pin_refusal}
+                        <Button
+                          variant="ghost"
+                          onclick={() => void handleReapproveMcp(s.id)}
+                          disabled={mcpReapprovingId === s.id}
+                        >
+                          {mcpReapprovingId === s.id
+                            ? "Re-approving…"
+                            : confirmReapproveMcpId === s.id
+                              ? `Trust ${s.command} as it is now?`
+                              : "Re-approve"}
+                        </Button>
+                      {/if}
                       <Button variant="ghost" onclick={() => handleRemoveMcp(s.id)}>
                         {confirmRemoveMcpId === s.id ? "Confirm?" : "Remove"}
                       </Button>
                     </div>
                   {/snippet}
                 </SettingRow>
+                {#if s.pin_refusal}
+                  <!-- The pin gate fail-closed this server: say exactly why
+                       (approved vs actual identity) and offer the explicit
+                       re-trust. A changed binary NEVER auto-starts — only the
+                       Re-approve click above re-pins it. -->
+                  <div
+                    class="mb-1.5 rounded-r-[var(--r)] border-l-2 border-l-warn bg-warn-soft px-[13px] py-[8px] text-[11.5px] leading-[1.5] text-text-2"
+                  >
+                    <span class="font-medium text-warn">
+                      {s.pin_refusal.kind === "unpinned"
+                        ? "Never verified."
+                        : s.pin_refusal.kind === "unverifiable"
+                          ? "Cannot verify."
+                          : "Binary changed since approval."}
+                    </span>
+                    {describePinRefusal(s.pin_refusal)}
+                    {#if s.pin_refusal.kind !== "unverifiable"}
+                      Its tools stay offline until you re-approve — Re-approve trusts the
+                      executable exactly as it is on disk right now.
+                    {/if}
+                  </div>
+                {/if}
               {/each}
             {:else}
               <p

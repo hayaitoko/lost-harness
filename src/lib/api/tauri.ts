@@ -1053,6 +1053,22 @@ export async function listWorkspaceFiles(
 
 // ── MCP servers (C3 — stdio wire transport) ────────────────────────────────
 
+/** Why the H-07 pin gate refused a server's last bring-up. Mirrors the
+ *  serde-tagged `PinRefusal` enum in `src-tauri/src/tools/mcp_stdio.rs`:
+ *  the executable identity approved at registration no longer matches what is
+ *  on disk (or was never measured), so the server fail-closes until the user
+ *  explicitly re-approves it. */
+export type McpPinRefusal =
+  | { kind: "unpinned" }
+  | { kind: "executable_moved"; approved_path: string; actual_path: string }
+  | {
+      kind: "invocation_changed";
+      actual_path: string;
+      approved_pin: string;
+      actual_pin: string;
+    }
+  | { kind: "unverifiable"; error: string };
+
 /** One registered MCP server + its live status. Mirrors `McpServerInfo`. */
 export interface McpServer {
   id: string;
@@ -1066,6 +1082,9 @@ export interface McpServer {
   running: boolean;
   /** The namespaced tool names currently registered (mcp__server__tool). */
   tools: string[];
+  /** Why the pin gate refused the last bring-up (null while running, or when
+   *  stopped for a non-pin reason). Drives the Re-approve recovery UI. */
+  pin_refusal: McpPinRefusal | null;
 }
 
 /** Register an MCP server (spawn + handshake first — fail-closed; persisted on
@@ -1097,6 +1116,17 @@ export async function listMcpServers(): Promise<McpServer[]> {
 export async function removeMcpServer(id: string): Promise<boolean> {
   if (isTauri()) return tauriInvoke<boolean>("remove_mcp_server", { args: { id } });
   return false;
+}
+
+/** Re-approve a stdio server the pin gate refuses to start: the backend
+ *  re-resolves + re-pins its executable AS IT IS ON DISK NOW, then restarts it.
+ *  Behind the same single-use install nonce as registration — this is an
+ *  explicit re-trust of a changed binary and must only ever run from a
+ *  user-confirmed click, never automatically. */
+export async function reapproveMcpServer(id: string): Promise<McpServer | null> {
+  if (!isTauri()) return null;
+  const nonce = await tauriInvoke<string>("generate_mcp_install_nonce", {});
+  return tauriInvoke<McpServer>("reapprove_mcp_server", { args: { id, nonce } });
 }
 
 /** A downloaded local model. Mirrors `LocalModelInfo` in `ipc/mod.rs`. */
