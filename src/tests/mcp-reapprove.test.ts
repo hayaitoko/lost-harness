@@ -51,6 +51,9 @@ const HEALTHY: McpServer = {
   running: true,
   tools: ["mcp__github__search"],
   pin_refusal: null,
+  network_access: false,
+  read_paths: [],
+  write_paths: [],
 };
 
 // The Node-upgrade / package-update shape: interpreter or script content
@@ -71,6 +74,9 @@ const CHANGED: McpServer = {
     approved_pin: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     actual_pin: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   },
+  network_access: false,
+  read_paths: [],
+  write_paths: [],
 };
 
 // A row registered before the hash-pinning build existed.
@@ -85,6 +91,9 @@ const UNPINNED: McpServer = {
   running: false,
   tools: [],
   pin_refusal: { kind: "unpinned" },
+  network_access: false,
+  read_paths: [],
+  write_paths: [],
 };
 
 const REAPPROVED: McpServer = {

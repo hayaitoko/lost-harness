@@ -87,7 +87,9 @@ fn test_app() -> App<MockRuntime> {
         gate,
         embedder: None,
         tools,
-        mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new()),
+        mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new(
+            std::env::temp_dir().join(format!("lhp-ct-mcp-sandbox-{}", uuid::Uuid::new_v4())),
+        )),
         // Default profile (total_ram 0) — the calculator contract test only
         // checks the command dispatches + returns a CalcOutput shape, not fit.
         hardware: Arc::new(Default::default()),
@@ -1752,6 +1754,65 @@ fn register_mcp_server_demands_a_backend_nonce() {
     assert!(
         msg.contains("couldn't pin the MCP server executable"),
         "expected the call to proceed as far as pinning, got: {msg}"
+    );
+}
+
+/// Round-4, at the real boundary: sandbox grants are validated BEFORE anything
+/// is spawned or pinned, and they are refused outright for an HTTP endpoint
+/// (which has no local child to confine). Both legs use a backend-issued nonce
+/// so the consent gate is not what is being observed.
+#[test]
+fn register_mcp_server_validates_sandbox_grants_before_spawning() {
+    let app = test_app();
+    let webview = test_webview(&app);
+
+    // A relative grant path has no fixed meaning — refused, and refused BEFORE
+    // the unresolvable command would have failed pinning.
+    let msg = call_err(
+        &webview,
+        "register_mcp_server",
+        json!({"args": {
+            "name": "srv",
+            "command": "/nonexistent/lhp-mcp-server",
+            "read_paths": ["relative/path"],
+            "nonce": issued_nonce(&webview),
+        }}),
+    );
+    assert!(
+        msg.contains("must be absolute"),
+        "a relative grant must be refused, got: {msg}"
+    );
+
+    // An absolute path that does not exist cannot be granted either.
+    let msg = call_err(
+        &webview,
+        "register_mcp_server",
+        json!({"args": {
+            "name": "srv",
+            "command": "/nonexistent/lhp-mcp-server",
+            "write_paths": ["/nonexistent/lhp-grant-target"],
+            "nonce": issued_nonce(&webview),
+        }}),
+    );
+    assert!(
+        msg.contains("cannot be granted"),
+        "a missing grant target must be refused, got: {msg}"
+    );
+
+    // An HTTP endpoint has no child — grants there would be a UI lie.
+    let msg = call_err(
+        &webview,
+        "register_mcp_server",
+        json!({"args": {
+            "name": "srv",
+            "command": "https://example.com/mcp",
+            "network_access": true,
+            "nonce": issued_nonce(&webview),
+        }}),
+    );
+    assert!(
+        msg.contains("no local child to sandbox"),
+        "grants on an HTTP endpoint must be refused, got: {msg}"
     );
 }
 

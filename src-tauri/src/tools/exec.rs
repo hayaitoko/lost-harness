@@ -751,8 +751,11 @@ impl SandboxedSpawn for MacSeatbeltSpawn {
 /// inside a double-quoted Scheme string; we escape them and fail-closed on
 /// any control character (NUL, newlines, etc.) because a canonicalised real
 /// path cannot contain one, and a malicious input must not reach the parser.
+///
+/// `pub(crate)` so [`super::mcp_sandbox`] embeds paths through the SAME escaper
+/// — a second copy of this logic is a second place for a quoting bug to hide.
 #[cfg(target_os = "macos")]
-fn seatbelt_escape_path(path: &Path) -> Result<String, ExecError> {
+pub(crate) fn seatbelt_escape_path(path: &Path) -> Result<String, ExecError> {
     let s = path.to_str().ok_or_else(|| {
         ExecError::SandboxApply(
             "sandbox path is not valid UTF-8 — refusing to embed in profile".to_string(),
@@ -784,6 +787,24 @@ fn seatbelt_escape_path(path: &Path) -> Result<String, ExecError> {
     Ok(out)
 }
 
+/// The read-only system paths every sandboxed child gets: the OS runtime a
+/// process needs to load and behave (loader caches, `libSystem`, timezone data,
+/// terminfo, `/dev`) and nothing that belongs to the user.
+///
+/// `pub(crate)` because [`super::mcp_sandbox`] grants the SAME set to an MCP
+/// stdio child — one definition, so a future tightening lands on both.
+#[cfg(target_os = "macos")]
+pub(crate) const SYSTEM_READ_SUBPATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/private/etc",
+    "/private/var/select",
+    "/dev",
+    "/Library/Preferences",
+];
+
 /// Build the Seatbelt profile. Verified on macOS 15 — see the module spec for
 /// the `import system.sb` gotcha and the tested deny/allow set.
 ///
@@ -797,6 +818,10 @@ fn build_seatbelt_profile(
 ) -> Result<String, ExecError> {
     let ws = seatbelt_escape_path(workspace)?;
     let tmp = seatbelt_escape_path(tmp)?;
+    let system_reads = SYSTEM_READ_SUBPATHS
+        .iter()
+        .map(|s| format!("\x20   (subpath \"{s}\")\n"))
+        .collect::<String>();
     let mut p = format!(
         "(version 1)\n\
          (deny default)\n\
@@ -805,14 +830,7 @@ fn build_seatbelt_profile(
          (allow process-fork)\n\
          (allow signal (target self))\n\
          (allow file-read*\n\
-         \x20   (subpath \"/usr\")\n\
-         \x20   (subpath \"/bin\")\n\
-         \x20   (subpath \"/sbin\")\n\
-         \x20   (subpath \"/System\")\n\
-         \x20   (subpath \"/private/etc\")\n\
-         \x20   (subpath \"/private/var/select\")\n\
-         \x20   (subpath \"/dev\")\n\
-         \x20   (subpath \"/Library/Preferences\"))\n\
+         {system_reads})\n\
          (allow file-write-data (literal \"/dev/null\") (literal \"/dev/tty\"))\n\
          (allow file-read* file-write*\n\
          \x20   (subpath \"{ws}\")\n\

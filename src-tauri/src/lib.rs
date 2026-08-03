@@ -380,7 +380,11 @@ pub fn run() {
             }
 
             // C3: the live MCP runtime (spawned children, derived session state).
-            let mcp_runtime = Arc::new(crate::tools::mcp_stdio::McpRuntime::new());
+            // Round-4: each stdio child is confined to a private scratch island
+            // under `<storage>/mcp-sandbox/<row id>`, which is also its HOME.
+            let mcp_runtime = Arc::new(crate::tools::mcp_stdio::McpRuntime::new(
+                storage.base_path().join("mcp-sandbox"),
+            ));
 
             // Clone BEFORE the loop takes ownership — `PrivacyGate::clone` shares
             // the health flag and the confirmation store, so `AppState.gate` and

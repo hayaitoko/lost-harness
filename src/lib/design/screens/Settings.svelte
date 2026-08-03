@@ -532,7 +532,44 @@
     argsText: "",
     transport: "stdio" as "stdio" | "http",
     tier: "remote" as "local" | "remote",
+    // Round-4 sandbox grants. A newly registered stdio server is confined
+    // deny-default (no network, none of the user's files); these three are the
+    // only way out of that box, so they start empty and are ticked here.
+    networkAccess: false,
+    readPathsText: "",
+    writePathsText: "",
   });
+
+  /** One absolute path per line — the shape the backend validates (it refuses
+   *  anything relative or missing before a single process is spawned). */
+  function parseGrantPaths(text: string): string[] {
+    return text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  }
+
+  /** The one-line summary of what a registered server's child can reach beyond
+   *  its own program and scratch folder. "confined" is the deny-default. */
+  function describeGrants(s: McpServer): string {
+    const parts: string[] = [];
+    if (s.network_access) parts.push("network");
+    const paths = s.read_paths.length + s.write_paths.length;
+    if (paths > 0) parts.push(`${paths} path${paths === 1 ? "" : "s"}`);
+    return parts.length === 0 ? "confined" : parts.join(" + ");
+  }
+
+  /** The same summary for the not-yet-registered form, so the confirm click
+   *  names the grants the user is about to hand over. */
+  function describeFormGrants(): string {
+    const parts: string[] = [];
+    if (mcpForm.networkAccess) parts.push("network");
+    const paths =
+      parseGrantPaths(mcpForm.readPathsText).length +
+      parseGrantPaths(mcpForm.writePathsText).length;
+    if (paths > 0) parts.push(`${paths} path${paths === 1 ? "" : "s"}`);
+    return parts.length === 0 ? "no network, no files" : `grants: ${parts.join(" + ")}`;
+  }
   let mcpRegistering = $state(false);
   // Registration always needs an explicit confirmation: it either spawns a
   // local executable or grants a remote server a live tool connection.
@@ -581,14 +618,29 @@
     mcpRegistering = true;
     mcpError = null;
     try {
+      const isHttp = mcpForm.transport === "http";
       const server = await registerMcpServer({
         name,
         command,
-        args: mcpForm.transport === "http" || mcpForm.argsText.trim() === "" ? [] : mcpForm.argsText.trim().split(/\s+/),
-        tier: mcpForm.transport === "http" ? "remote" : mcpForm.tier,
+        args: isHttp || mcpForm.argsText.trim() === "" ? [] : mcpForm.argsText.trim().split(/\s+/),
+        tier: isHttp ? "remote" : mcpForm.tier,
+        // Grants describe a LOCAL child; an HTTP endpoint has none, and the
+        // backend refuses grants on one outright.
+        network_access: !isHttp && mcpForm.networkAccess,
+        read_paths: isHttp ? [] : parseGrantPaths(mcpForm.readPathsText),
+        write_paths: isHttp ? [] : parseGrantPaths(mcpForm.writePathsText),
       });
       if (server) mcpServers = [...mcpServers, server];
-      mcpForm = { name: "", command: "", argsText: "", transport: "stdio", tier: "remote" };
+      mcpForm = {
+        name: "",
+        command: "",
+        argsText: "",
+        transport: "stdio",
+        tier: "remote",
+        networkAccess: false,
+        readPathsText: "",
+        writePathsText: "",
+      };
     } catch (err) {
       mcpError = String(err);
     } finally {
@@ -2319,10 +2371,12 @@
               class="mb-4 rounded-r-[var(--r)] border-l-2 border-l-warn bg-warn-soft px-[13px] py-[10px] text-[12px] text-text-2"
             >
               <span class="font-medium text-warn">MCP is a trust boundary.</span> A local
-              stdio server runs as an unsandboxed program with your user privileges and
-              restarts at launch. A Streamable HTTP server receives off-box tool calls.
-              Only add targets you trust; every individual tool still passes Lost
-              Harness's approval gate.
+              stdio server is a third-party program that restarts at launch. It runs
+              <span class="font-medium">sandboxed</span>: it can read what it needs to run
+              plus its own private scratch folder, and nothing else — no network and none
+              of your files unless you grant them below. A Streamable HTTP server receives
+              off-box tool calls. Only add targets you trust; every individual tool still
+              passes Lost Harness's approval gate.
             </div>
 
             {#if mcpError}
@@ -2346,6 +2400,10 @@
                 >
                   {#snippet control()}
                     <div class="flex flex-shrink-0 items-center gap-1.5">
+                      <!-- What this child can actually touch. A grant the user
+                           cannot see is a grant they cannot revoke. -->
+                      <span class="text-[11px] {s.network_access ? 'text-warn' : 'text-text-3'}"
+                        >{describeGrants(s)}</span>
                       <span
                         class="text-[11px] {!s.running && s.pin_refusal
                           ? 'text-warn'
@@ -2435,6 +2493,48 @@
                     class="rounded-[var(--r)] border border-border bg-surface px-2.5 py-1.5 text-[12.5px] text-text outline-none placeholder:text-text-3 focus:border-border-strong"
                   />
                 {/if}
+                {#if mcpForm.transport === "stdio"}
+                  <!-- Round-4: the sandbox grants. Everything here is OFF by
+                       default — the child already gets its interpreter, its own
+                       install tree and a private scratch folder without any of
+                       it. These boxes are the only holes in that wall. -->
+                  <div class="flex flex-col gap-2 rounded-[var(--r-lg)] border border-border p-2.5">
+                    <div class="flex items-center justify-between">
+                      <div class="text-[12px] text-text-2">
+                        Allow network access
+                        <div class="text-[11px] text-text-3">
+                          Off by default. Needed by servers that call an API — or that
+                          fetch themselves at start-up, like <code>npx -y …</code>.
+                        </div>
+                      </div>
+                      <Toggle
+                        label="Allow network access"
+                        checked={mcpForm.networkAccess}
+                        onchange={(v) => (mcpForm.networkAccess = v)}
+                      />
+                    </div>
+                    <label class="flex flex-col gap-1 text-[12px] text-text-2">
+                      <span>Readable folders <span class="text-text-3">(one absolute path per line)</span></span>
+                      <textarea
+                        bind:value={mcpForm.readPathsText}
+                        placeholder="/Users/you/Documents/notes"
+                        rows="2"
+                        class="w-full resize-y rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] font-mono text-[11.5px]
+                          text-text outline-none placeholder:text-text-3 focus:border-accent"
+                      ></textarea>
+                    </label>
+                    <label class="flex flex-col gap-1 text-[12px] text-text-2">
+                      <span>Writable folders <span class="text-text-3">(read + write)</span></span>
+                      <textarea
+                        bind:value={mcpForm.writePathsText}
+                        placeholder="/Users/you/Documents/scratch"
+                        rows="2"
+                        class="w-full resize-y rounded-[var(--r)] border border-border bg-surface-2 px-[9px] py-[6px] font-mono text-[11.5px]
+                          text-text outline-none placeholder:text-text-3 focus:border-accent"
+                      ></textarea>
+                    </label>
+                  </div>
+                {/if}
                 <div class="flex items-center justify-between">
                   {#if mcpForm.transport === "stdio"}
                     <label class="flex items-center gap-2 text-[12px] text-text-2">
@@ -2454,15 +2554,17 @@
                     {mcpRegistering
                       ? "Starting…"
                       : confirmRegisterMcp
-                        ? `${mcpForm.transport === "http" ? "Connect" : "Run"} ${mcpForm.command.trim()}${mcpForm.transport === "stdio" && mcpForm.argsText.trim() ? ` ${mcpForm.argsText.trim()}` : ""}? Confirm`
+                        ? `${mcpForm.transport === "http" ? "Connect" : "Run"} ${mcpForm.command.trim()}${mcpForm.transport === "stdio" && mcpForm.argsText.trim() ? ` ${mcpForm.argsText.trim()}` : ""}${mcpForm.transport === "stdio" ? ` (${describeFormGrants()})` : ""}? Confirm`
                         : "Register"}
                   </Button>
                 </div>
                 <p class="text-[11px] text-text-3">
                   The server is initialized and lists its tools before it is saved — a
-                  target that cannot come up is never persisted. Streamable HTTP must
-                  use HTTPS (except localhost development endpoints) and may return
-                  JSON or SSE responses.
+                  target that cannot come up is never persisted. A stdio server starts
+                  confined: it can read its own program and its install folder, and read
+                  and write one private scratch folder that it also sees as its home.
+                  Streamable HTTP must use HTTPS (except localhost development endpoints)
+                  and may return JSON or SSE responses.
                 </p>
               </div>
             </div>

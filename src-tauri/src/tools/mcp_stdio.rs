@@ -86,9 +86,22 @@ fn is_executable_file(p: &Path) -> bool {
 /// Resolve `command` to an absolute, symlink-free path the same way the spawned
 /// child would. A command containing a separator is a path; a bare name is
 /// looked up along `PATH` — the same `PATH` the child inherits (see the
-/// allowlist in [`StdioMcpTransport::spawn`]), so resolution and execution
-/// agree.
+/// allowlist in [`super::mcp_sandbox::scrubbed_env`]), so resolution and
+/// execution agree.
 pub fn resolve_executable(command: &str) -> Result<PathBuf, String> {
+    Ok(resolve_executable_pair(command)?.1)
+}
+
+/// Resolve `command` to **both** the path it was found at and that path
+/// canonicalized.
+///
+/// The pin only ever needs the canonical half. Containment needs both: a
+/// Homebrew-style install is a symlink farm — `<prefix>/bin/node` canonicalizes
+/// into `<prefix>/Cellar/node/<ver>/bin/node`, whose install tree does NOT
+/// contain the `<prefix>/opt/...` dylibs the binary actually loads. Granting
+/// only the canonical tree makes a real `node` server die in `dyld` before it
+/// says a word, so [`super::mcp_sandbox`] grants the tree around each.
+pub fn resolve_executable_pair(command: &str) -> Result<(PathBuf, PathBuf), String> {
     let candidate = if command.contains('/') || command.contains('\\') {
         PathBuf::from(command)
     } else {
@@ -99,12 +112,13 @@ pub fn resolve_executable(command: &str) -> Result<PathBuf, String> {
             .find(|p| is_executable_file(p))
             .ok_or_else(|| format!("MCP server command `{command}` not found on PATH"))?
     };
-    std::fs::canonicalize(&candidate).map_err(|e| {
+    let canonical = std::fs::canonicalize(&candidate).map_err(|e| {
         format!(
             "cannot resolve MCP server command `{}`: {e}",
             candidate.display()
         )
-    })
+    })?;
+    Ok((candidate, canonical))
 }
 
 /// Hex-encoded SHA-256 of the file at `path`, read in chunks (a server binary
@@ -313,31 +327,55 @@ pub struct StdioMcpTransport {
     child: tokio::sync::Mutex<Child>,
     io: tokio::sync::Mutex<Io>,
     next_id: AtomicI64,
+    /// The Seatbelt profile file backing this child. `sandbox-exec` read it at
+    /// startup; [`Self::shutdown`] deletes it once the child is gone (deleting
+    /// it at spawn time would race that read).
+    profile_path: PathBuf,
 }
 
 impl StdioMcpTransport {
-    /// Spawn `command args…` and run the MCP `initialize` handshake. Any
-    /// failure kills the child and returns `Err` — never a half-initialized
-    /// transport.
-    pub async fn spawn(command: &str, args: &[String]) -> Result<Self, String> {
-        // Treat a registered MCP server like third-party software: never hand
-        // it the desktop app's full environment (provider keys, tracing
-        // credentials, CI tokens, etc.). Re-introduce only the small process
-        // environment needed to find executables and behave normally.
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args).env_clear();
-        for key in ["PATH", "HOME", "TMPDIR", "USER", "LANG"] {
-            if let Some(value) = std::env::var_os(key) {
-                cmd.env(key, value);
-            }
-        }
+    /// Spawn `command args…` **inside the per-server sandbox** and run the MCP
+    /// `initialize` handshake. Any failure kills the child and returns `Err` —
+    /// never a half-initialized transport.
+    ///
+    /// `scratch_dir` is this server's private read-write island (and its `HOME`);
+    /// `grants` is what the user ticked at registration. The child is confined
+    /// by [`super::mcp_sandbox`] before it runs a single instruction: on macOS
+    /// through Seatbelt, and on every other platform by refusing to spawn at all.
+    /// There is deliberately no argument that turns the containment off.
+    pub async fn spawn(
+        command: &str,
+        args: &[String],
+        scratch_dir: &Path,
+        grants: &super::mcp_sandbox::McpGrants,
+    ) -> Result<Self, String> {
+        // Resolve the invocation the same way the pin gate just did, and exec
+        // the CANONICAL path — so the binary that runs is the binary H-07
+        // measured, and the sandbox grants are derived from that same identity.
+        let (as_written, canonical) = resolve_executable_pair(command)?;
+        let spec = super::mcp_sandbox::McpSandboxSpec::derive(
+            &canonical,
+            &as_written,
+            args,
+            scratch_dir,
+            grants,
+        )?;
+        // The environment scrub lives in the sandbox module now: a registered
+        // MCP server is third-party software and never sees the desktop app's
+        // provider keys, and its HOME/TMPDIR point into the scratch island.
+        let sandboxed = super::mcp_sandbox::sandboxed_command(&spec)?;
+        let profile_path = sandboxed.profile_path;
+        let mut cmd = sandboxed.command;
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("couldn't spawn MCP server `{command}`: {e}"))?;
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&profile_path);
+                format!("couldn't spawn MCP server `{command}`: {e}")
+            })?;
         let stdin = child.stdin.take().ok_or("no stdin pipe on the MCP child")?;
         let stdout = child
             .stdout
@@ -350,6 +388,7 @@ impl StdioMcpTransport {
                 stdout: BufReader::new(stdout),
             }),
             next_id: AtomicI64::new(0),
+            profile_path,
         };
 
         // MCP lifecycle: initialize (request/response) → initialized (notification).
@@ -499,11 +538,13 @@ impl StdioMcpTransport {
     }
 
     /// Kill the child promptly (the remove-server path; drop-order via Arcs
-    /// would eventually reap it, but explicit is better for UX).
+    /// would eventually reap it, but explicit is better for UX), then drop its
+    /// Seatbelt profile — safe only now that nothing can re-read it.
     pub async fn shutdown(&self) {
         let mut child = self.child.lock().await;
         let _ = child.start_kill();
         let _ = child.wait().await;
+        let _ = std::fs::remove_file(&self.profile_path);
     }
 }
 
@@ -581,7 +622,6 @@ pub struct McpRuntimeEntry {
 /// The in-process registry of LIVE MCP servers, keyed by the persisted row id.
 /// The persisted config (`storage::McpServerRow`) is the durable truth; this is
 /// derived session state (spawned children die with the app).
-#[derive(Default)]
 pub struct McpRuntime {
     pub servers: parking_lot::Mutex<std::collections::HashMap<String, McpRuntimeEntry>>,
     /// Why the last bring-up of a (not-running) server was refused by the H-07
@@ -589,11 +629,26 @@ pub struct McpRuntime {
     /// fresh attempt or a tear-down; `list_mcp_servers` reads it so the
     /// Settings pane can say more than "stopped".
     pub pin_refusals: parking_lot::Mutex<std::collections::HashMap<String, PinRefusal>>,
+    /// Round-4: the directory each server's private scratch island is created
+    /// under (`<storage base>/mcp-sandbox/<row id>`). Carried on the runtime
+    /// rather than threaded through every `bring_up_server` call site, because
+    /// it is the same for the whole app run.
+    sandbox_root: PathBuf,
 }
 
 impl McpRuntime {
-    pub fn new() -> Self {
-        Self::default()
+    /// `sandbox_root` is created on demand, one subdirectory per server.
+    pub fn new(sandbox_root: impl Into<PathBuf>) -> Self {
+        Self {
+            servers: Default::default(),
+            pin_refusals: Default::default(),
+            sandbox_root: sandbox_root.into(),
+        }
+    }
+
+    /// Where this server's private read-write island lives.
+    pub fn sandbox_root(&self) -> &Path {
+        &self.sandbox_root
     }
 }
 
@@ -636,8 +691,19 @@ pub async fn bring_up_server(
             runtime.pin_refusals.lock().insert(row.id.clone(), refusal);
             return Err(message);
         }
+        // Round-4 containment: the child gets a private scratch island and
+        // exactly the grants on its row — nothing else. Both halves fail closed
+        // (an uncreatable scratch dir, or a platform with no backend, is an
+        // `Err` here, never a fallback to an unconfined spawn).
+        let scratch_dir = super::mcp_sandbox::ensure_scratch_dir(runtime.sandbox_root(), &row.id)?;
         McpRuntimeTransport::Stdio(std::sync::Arc::new(
-            StdioMcpTransport::spawn(&row.command, &row.args).await?,
+            StdioMcpTransport::spawn(
+                &row.command,
+                &row.args,
+                &scratch_dir,
+                &super::mcp_sandbox::McpGrants::from_row(row),
+            )
+            .await?,
         ))
     };
     let descriptors = match transport.list_tools().await {
@@ -711,6 +777,23 @@ pub async fn tear_down_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::mcp_sandbox::McpGrants;
+
+    /// A throwaway sandbox root + a server's scratch island inside it. Every
+    /// spawn in these tests goes through the real containment layer — there is
+    /// no unsandboxed test path, by design.
+    fn scratch(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("lhp-mcp-sbroot-{tag}-{}", uuid::Uuid::new_v4()));
+        crate::tools::mcp_sandbox::ensure_scratch_dir(&root, "srv").unwrap()
+    }
+
+    /// A runtime whose scratch islands land in a throwaway root.
+    fn test_runtime(tag: &str) -> McpRuntime {
+        McpRuntime::new(
+            std::env::temp_dir().join(format!("lhp-mcp-sbroot-{tag}-{}", uuid::Uuid::new_v4())),
+        )
+    }
 
     /// A deterministic local stdio fixture server (plain `sh`): answers our
     /// exact call sequence — initialize (id 0), swallow the initialized
@@ -758,9 +841,14 @@ mod tests {
     #[tokio::test]
     async fn live_fixture_handshake_list_call_and_error_paths() {
         let script = fixture_script();
-        let t = StdioMcpTransport::spawn("sh", &[script])
-            .await
-            .expect("fixture handshake succeeds");
+        let t = StdioMcpTransport::spawn(
+            "sh",
+            &[script],
+            &scratch("handshake"),
+            &McpGrants::default(),
+        )
+        .await
+        .expect("fixture handshake succeeds");
 
         // tools/list → the descriptor, annotations parsed.
         let tools = t.list_tools().await.expect("tools/list");
@@ -790,7 +878,7 @@ mod tests {
         let marker = "LHP_MCP_SECRET_SHOULD_NOT_LEAK";
         std::env::set_var(marker, "super-secret");
         let script = environment_fixture_script();
-        let t = StdioMcpTransport::spawn("sh", &[script])
+        let t = StdioMcpTransport::spawn("sh", &[script], &scratch("env"), &McpGrants::default())
             .await
             .expect("allowlisted PATH must still resolve the shell fixture");
         let tools = t
@@ -830,6 +918,9 @@ mod tests {
             created_at: 1,
             executable_path: Some(sh_path),
             executable_hash: Some(sh_hash),
+            network_access: false,
+            read_paths: vec![],
+            write_paths: vec![],
         };
         // Remote tier forces the Network capability — the env must grant it.
         let dispatcher = ToolDispatcher::new(
@@ -837,7 +928,7 @@ mod tests {
             HookChain::new(),
             BodyEnv::new([Capability::Network]),
         );
-        let runtime = McpRuntime::new();
+        let runtime = test_runtime("t");
 
         // Bring-up: spawn + handshake + tools/list + hot-register through the
         // untouched trust spine (namespaced name proves it went through).
@@ -887,14 +978,234 @@ mod tests {
     async fn a_dead_server_fails_closed_at_spawn_or_call() {
         // A command that exits immediately: the handshake read hits EOF → Err,
         // never a half-initialized transport.
-        let r = StdioMcpTransport::spawn("true", &[]).await;
+        let r =
+            StdioMcpTransport::spawn("true", &[], &scratch("dead"), &McpGrants::default()).await;
         assert!(
             r.is_err(),
             "an exiting child can never hand back a transport"
         );
         // A nonexistent binary fails at spawn.
-        let r2 = StdioMcpTransport::spawn("/nonexistent/lhp-mcp-server", &[]).await;
+        let r2 = StdioMcpTransport::spawn(
+            "/nonexistent/lhp-mcp-server",
+            &[],
+            &scratch("missing"),
+            &McpGrants::default(),
+        )
+        .await;
         assert!(r2.is_err());
+    }
+
+    // ── round-4: containment (LIVE — every assert is a real spawn) ───────────
+
+    /// A fixture whose `tools/list` reports the result of one shell `probe`
+    /// command as the tool's description. That is the only channel a stdio
+    /// server has back to us, and it is enough to observe what the OS let the
+    /// child do — no instrumentation inside the sandbox.
+    #[cfg(target_os = "macos")]
+    fn probe_fixture_script(probe: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("lhp-mcp-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "read line\n\
+                 printf '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{}}}}\\n'\n\
+                 read line\n\
+                 read line\n\
+                 probe=$({probe})\n\
+                 printf '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"tools\":[{{\"name\":\"probe\",\"description\":\"%s\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}\\n' \"$probe\"\n"
+            ),
+        )
+        .unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// Run `probe` inside a child spawned with `grants` and return what the
+    /// probe printed.
+    #[cfg(target_os = "macos")]
+    async fn probe_under_sandbox(probe: &str, grants: &McpGrants, tag: &str) -> String {
+        let script = probe_fixture_script(probe);
+        let t = StdioMcpTransport::spawn("sh", &[script], &scratch(tag), grants)
+            .await
+            .expect("the probe fixture must start under the sandbox");
+        let tools = t.list_tools().await.expect("probe fixture lists tools");
+        let out = tools[0].description.clone();
+        t.shutdown().await;
+        out
+    }
+
+    /// THE defect this round closes: a registered MCP server used to run with
+    /// the app's full privileges and could read anything the user could. Now a
+    /// file outside its grants is unreadable — and the SAME file becomes
+    /// readable the moment the user grants it, so the test proves confinement
+    /// rather than a broken fixture.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_child_cannot_read_outside_its_grants_but_can_read_a_granted_path() {
+        let secret_dir =
+            std::env::temp_dir().join(format!("lhp-mcp-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let secret = secret_dir.join("secret.txt");
+        std::fs::write(&secret, "TOPSECRET").unwrap();
+        let probe = format!("cat '{}' 2>/dev/null || echo denied", secret.display());
+
+        let denied = probe_under_sandbox(&probe, &McpGrants::default(), "denied").await;
+        assert_eq!(
+            denied, "denied",
+            "deny-default: a child must not read a file it was never granted"
+        );
+
+        let granted = probe_under_sandbox(
+            &probe,
+            &McpGrants {
+                network: false,
+                read_paths: vec![secret_dir.clone()],
+                write_paths: vec![],
+            },
+            "granted",
+        )
+        .await;
+        assert_eq!(
+            granted, "TOPSECRET",
+            "a granted read path must be reachable"
+        );
+
+        // A read grant is READ-only: the same path stays unwritable.
+        let write_probe = format!(
+            "(echo x > '{}/pwned.txt' && echo wrote) 2>/dev/null || echo denied",
+            secret_dir.display()
+        );
+        let read_only = probe_under_sandbox(
+            &write_probe,
+            &McpGrants {
+                network: false,
+                read_paths: vec![secret_dir.clone()],
+                write_paths: vec![],
+            },
+            "readonly",
+        )
+        .await;
+        assert_eq!(read_only, "denied", "a READ grant must not permit writes");
+        assert!(!secret_dir.join("pwned.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&secret_dir);
+    }
+
+    /// The private island: HOME points into it, and it is the one place the
+    /// child may write without any grant at all.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_child_gets_a_writable_private_scratch_dir_as_its_home() {
+        let out = probe_under_sandbox(
+            "(echo hello > \"$HOME/note.txt\" && cat \"$HOME/note.txt\") 2>/dev/null || echo denied",
+            &McpGrants::default(),
+            "scratch",
+        )
+        .await;
+        assert_eq!(out, "hello", "the scratch island must be read-write");
+    }
+
+    /// Network is off unless granted — asserted against a REAL listener, so
+    /// "blocked" means the connection never arrived, not that a DNS lookup
+    /// happened to fail.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn network_is_denied_by_default_and_reachable_only_when_granted() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // curl against a literal IP: no DNS in the picture, and exit 0 or 52
+        // ("empty reply") both mean the TCP connect SUCCEEDED.
+        let probe = format!("curl -s -m 3 -o /dev/null http://127.0.0.1:{port}/ ; echo rc=$?");
+
+        let saw_connection = |listener: &std::net::TcpListener| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if listener.accept().is_ok() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+
+        let blocked = probe_under_sandbox(&probe, &McpGrants::default(), "nonet").await;
+        assert_ne!(blocked, "rc=0", "no network by default; got {blocked}");
+        assert!(
+            !saw_connection(&listener),
+            "a child with no network grant must not reach a socket at all"
+        );
+
+        let allowed = probe_under_sandbox(
+            &probe,
+            &McpGrants {
+                network: true,
+                read_paths: vec![],
+                write_paths: vec![],
+            },
+            "net",
+        )
+        .await;
+        assert!(
+            saw_connection(&listener),
+            "a granted child must reach the network; probe said {allowed}"
+        );
+    }
+
+    /// The real-world shape: a Node MCP server must actually START inside the
+    /// profile — its interpreter, its dylibs, and its own script all readable.
+    /// This is what fails if the install-tree grant (or the ancestor
+    /// `file-read-metadata` traversal) is dropped. Skipped when Node is absent.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_real_node_server_starts_and_handshakes_under_the_sandbox() {
+        let Ok((_, node)) = resolve_executable_pair("node") else {
+            eprintln!("node not installed — skipping the real-interpreter sandbox test");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("lhp-mcp-node-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server.js");
+        // A minimal MCP stdio server: answers initialize, swallows the
+        // notification, answers tools/list. Deliberately uses `require` and
+        // `process.cwd()` so a broken module-resolution sandbox shows up.
+        std::fs::write(
+            &script,
+            r#"const readline = require("readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  let msg; try { msg = JSON.parse(line); } catch { return; }
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\n");
+  } else if (msg.method === "tools/list") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [
+      { name: "cwd", description: process.cwd(), inputSchema: { type: "object" } },
+    ] } }) + "\n");
+  }
+});
+"#,
+        )
+        .unwrap();
+
+        let scratch_dir = scratch("node");
+        let t = StdioMcpTransport::spawn(
+            node.to_str().unwrap(),
+            &[script.to_string_lossy().to_string()],
+            &scratch_dir,
+            &McpGrants::default(),
+        )
+        .await
+        .expect("a real node server must start inside the sandbox");
+        let tools = t.list_tools().await.expect("node fixture lists tools");
+        assert_eq!(tools[0].name, "cwd");
+        assert_eq!(
+            std::fs::canonicalize(&tools[0].description).unwrap(),
+            scratch_dir,
+            "a contained child runs in its own scratch island"
+        );
+        t.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── H-07: executable pinning ────────────────────────────────────────────
@@ -929,6 +1240,9 @@ mod tests {
             created_at: 1,
             executable_path: Some(path),
             executable_hash: Some(hash),
+            network_access: false,
+            read_paths: vec![],
+            write_paths: vec![],
         }
     }
 
@@ -949,7 +1263,7 @@ mod tests {
             HookChain::new(),
             BodyEnv::new([Capability::Network]),
         );
-        let runtime = McpRuntime::new();
+        let runtime = test_runtime("t");
 
         // Control: the untouched binary matches its pin and comes up fine.
         let names = bring_up_server(&row, &dispatcher, &runtime)
@@ -1040,13 +1354,16 @@ mod tests {
             created_at: 1,
             executable_path: None,
             executable_hash: None,
+            network_access: false,
+            read_paths: vec![],
+            write_paths: vec![],
         };
         let dispatcher = ToolDispatcher::new(
             ToolRegistry::new(),
             HookChain::new(),
             BodyEnv::new([Capability::Network]),
         );
-        let runtime = McpRuntime::new();
+        let runtime = test_runtime("t");
 
         let err = bring_up_server(&row, &dispatcher, &runtime)
             .await
@@ -1085,7 +1402,7 @@ mod tests {
             HookChain::new(),
             BodyEnv::new([Capability::Network]),
         );
-        let runtime = McpRuntime::new();
+        let runtime = test_runtime("t");
 
         // Control: the approved argv comes up fine.
         let names = bring_up_server(&row, &dispatcher, &runtime)

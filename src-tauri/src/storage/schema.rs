@@ -9,7 +9,7 @@
 
 /// Returns the current schema version for the GLOBAL database.
 /// Bump when adding a new global migration.
-pub const GLOBAL_SCHEMA_VERSION: i32 = 9;
+pub const GLOBAL_SCHEMA_VERSION: i32 = 10;
 
 /// Returns the current schema version for each PROFILE database.
 /// Bump when adding a new per-profile migration. Profile and global
@@ -139,6 +139,10 @@ CREATE TABLE IF NOT EXISTS agent_types (
 -- has no IF-NOT-EXISTS. A fresh DB runs v1 (this CREATE, without them) then v9
 -- (which adds them), exactly matching an existing DB's upgrade path. Same
 -- convention as `memory_facts.pinned` in v2.
+--
+-- Round-4 note: `network_access` / `read_paths` / `write_paths` (the per-server
+-- sandbox grants) are absent here for the same reason — migration v10 adds
+-- them, each defaulting to the deny-default posture.
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id                TEXT PRIMARY KEY,
     name              TEXT NOT NULL,

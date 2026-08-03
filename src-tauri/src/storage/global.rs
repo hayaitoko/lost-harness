@@ -101,6 +101,18 @@ pub struct McpServerRow {
     /// `None` on rows written before migration v9; bring-up refuses to spawn
     /// without it.
     pub executable_hash: Option<String>,
+    /// Round-4 containment grant: may this server's child open sockets? `false`
+    /// is the deny-default — the child is spawned into a Seatbelt profile with
+    /// no `(allow network*)` at all (`tools::mcp_sandbox`).
+    pub network_access: bool,
+    /// Round-4 containment grant: absolute paths the user let this server READ,
+    /// beyond what it needs to run. Empty by default — a server sees none of the
+    /// user's files unless a path is listed here.
+    pub read_paths: Vec<String>,
+    /// Round-4 containment grant: absolute paths the user let this server READ
+    /// AND WRITE. Empty by default; its private scratch dir is always writable
+    /// and is not listed here.
+    pub write_paths: Vec<String>,
 }
 
 fn row_to_mcp_server(r: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerRow> {
@@ -118,6 +130,11 @@ fn row_to_mcp_server(r: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerRow> {
         created_at: r.get(8)?,
         executable_path: r.get(9)?,
         executable_hash: r.get(10)?,
+        network_access: r.get::<_, i64>(11)? != 0,
+        // A corrupt grant JSON decodes to EMPTY, i.e. no grant — the same
+        // fail-closed direction `capabilities` uses above.
+        read_paths: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
+        write_paths: serde_json::from_str(&r.get::<_, String>(13)?).unwrap_or_default(),
     })
 }
 
@@ -660,8 +677,8 @@ impl GlobalDb {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO mcp_servers
              (id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at,
-              executable_path, executable_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              executable_path, executable_hash, network_access, read_paths, write_paths)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 s.id,
                 s.name,
@@ -674,6 +691,9 @@ impl GlobalDb {
                 s.created_at,
                 s.executable_path,
                 s.executable_hash,
+                s.network_access as i64,
+                serde_json::to_string(&s.read_paths).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&s.write_paths).unwrap_or_else(|_| "[]".into()),
             ],
         )?;
         Ok(())
@@ -683,7 +703,7 @@ impl GlobalDb {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at,
-                    executable_path, executable_hash
+                    executable_path, executable_hash, network_access, read_paths, write_paths
              FROM mcp_servers ORDER BY created_at ASC",
         )?;
         let rows = stmt
@@ -698,7 +718,7 @@ impl GlobalDb {
             .lock()
             .query_row(
                 "SELECT id, name, command, args, tier, trusted_read_only, capabilities, enabled, created_at,
-                        executable_path, executable_hash
+                        executable_path, executable_hash, network_access, read_paths, write_paths
                  FROM mcp_servers WHERE id = ?1",
                 params![id],
                 row_to_mcp_server,
