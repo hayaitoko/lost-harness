@@ -183,21 +183,21 @@ fn agent_types_crud_and_builtin_seed() {
 }
 
 #[test]
-fn schema_version_is_thirteen_after_init_profile() {
+fn schema_version_is_fourteen_after_init_profile() {
     // Profile schema version (v2 tool_audit, v3 tool_rules, v4
     // classifier_settings, v5 the classifier_settings.redaction_enabled column,
     // v6 memory_settings, v7 usage_events, v8 work_items, v9 seat_bindings,
     // v10 sandbox_config, v11 budget_settings, v12 the messages.endpoint_zone
-    // column, v13 cron_jobs.pack_install_id + .pack_expected_global_rows —
-    // fix4/pack-reconcile); global stays at its own version. Tracked
-    // independently.
+    // column, v13 cron_jobs.pack_install_id + .pack_expected_global_rows, v14
+    // pack_install_pending (the crash-intent marker) — all fix4/pack-reconcile);
+    // global stays at its own version. Tracked independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 13); // fix4/pack-reconcile added cron pack-install provenance (v13)
+    assert_eq!(v, 14); // fix4/pack-reconcile round 2 added the pending marker (v14)
 
     // sandbox_config round-trips (M7 Tier-K Slice 2): unset → None; set → Some.
     use crate::hooks::{SandboxConfig, SandboxNetworkConfig};

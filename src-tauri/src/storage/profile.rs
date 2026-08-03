@@ -984,6 +984,36 @@ impl ProfileDb {
         Ok(rows)
     }
 
+    /// Is `install_id`'s crash-intent marker STILL pending (`pack_install_pending`,
+    /// profile v14)? `install_pack` writes this row in the same transaction
+    /// as the cron-job inserts and clears it right after its global
+    /// transaction commits — a `true` here means that clear has not (yet, or
+    /// ever) happened, which is the ONLY thing that can prove a cron job's
+    /// missing global rows are a crash artifact rather than a later,
+    /// legitimate deletion. See `packs::reconcile`'s module doc.
+    pub fn pack_install_is_pending(&self, install_id: &str) -> Result<bool> {
+        let n: i64 = self.conn.lock().query_row(
+            "SELECT COUNT(*) FROM pack_install_pending WHERE pack_install_id = ?1",
+            params![install_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Clear `install_id`'s crash-intent marker. Idempotent — a second call
+    /// (or a call for an id with no row) is a harmless no-op. Called both by
+    /// `install_pack` right after its global transaction commits, and by the
+    /// boot sweep to self-heal a marker left pending because THAT call never
+    /// ran (a crash between the global commit and the clear) once the sweep
+    /// has confirmed the global rows are actually present.
+    pub fn clear_pack_install_pending(&self, install_id: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "DELETE FROM pack_install_pending WHERE pack_install_id = ?1",
+            params![install_id],
+        )?;
+        Ok(())
+    }
+
     // ── usage_events (Wave 3.2 — the model-call cost ledger, PLAN §3) ─────────
 
     /// Book one model call to the ledger. `cost_usd` is `None` for an

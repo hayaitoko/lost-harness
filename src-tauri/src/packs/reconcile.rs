@@ -26,31 +26,52 @@
 //! cron-only pack, which never even opens a global transaction and so has no
 //! atomicity window at all).
 //!
-//! # The deletion rule — read this before touching it
-//! A cron job is removed if and only if ALL of:
-//! 1. it was installed by a pack (`pack_install_id IS NOT NULL`);
-//! 2. that install ALSO wrote to `global.db` (`pack_expected_global_rows >
-//!    0`) — a cron-only pack has nothing to reconcile against, and is never a
-//!    candidate (`ProfileDb::pack_cron_orphan_candidates` filters it out);
-//! 3. NONE of that install's rows exist in `global.db`
-//!    (`GlobalDb::count_pack_install_rows` == 0). `install_pack`'s global
-//!    transaction is atomic, so "zero rows" can only mean "never
-//!    committed" — never "partially committed" — which is exactly the crash
-//!    this sweep targets;
-//! 4. the job is still DISABLED (`enabled = false`) — the state
-//!    `install_pack` always leaves a fresh cron row in;
-//! 5. the job has NEVER fired (`last_run_at IS NULL`).
+//! # Round 2: row counts alone are NOT proof (read this before touching it)
+//! An earlier version of this sweep deleted a cron job whenever its pack's
+//! `global.db` rows were entirely absent, reasoning that `install_pack`'s
+//! global transaction is atomic so "absent" could only mean "never
+//! committed". Adversarial review found the flaw: "absent" is EQUALLY what a
+//! perfectly healthy install looks like after the user deletes its skill or
+//! agent type by hand in Settings (`GlobalDb::delete_skill` /
+//! `delete_agent_type` — ordinary, unconditional deletes with zero
+//! relationship to `pack_install_id`). A row count, taken later, cannot tell
+//! those two histories apart — so nothing derived only from `global.db`'s
+//! CURRENT state can ever be sufficient here, no matter how the row-state
+//! checks below are tightened.
 //!
-//! (4) and (5) are the conservative guardrail. A row that satisfies (1)-(3)
-//! but fails either one LOOKS orphaned to this sweep, but the fact that it is
-//! enabled or has already run proves a human (or the cron runner) already
-//! interacted with it — the sweep cannot tell from here whether that is a
-//! false positive (its global rows were legitimately removed later, e.g. the
-//! user rejected + deleted the skill by hand) or something else entirely.
-//! Deleting user-touched state on an inference is worse than leaving an
-//! inert, already-disabled row around, so those are left in place and
-//! reported as [`SkippedOrphan`] instead of removed — logged at `warn`, never
-//! silently dropped.
+//! The fix is to stop inferring intent from state and record it directly.
+//! Profile v14 adds `pack_install_pending`: `install_pack` writes a row keyed
+//! by `install_id` in the SAME transaction as the cron-job inserts (so it is
+//! exactly as durable as they are — see [`super`]'s module doc), and clears
+//! it in a separate write immediately after its global transaction commits.
+//! A row STILL being there is the one fact that only a genuine crash between
+//! those two commits can produce; a later, unrelated deletion never
+//! recreates it.
+//!
+//! # The deletion rule
+//! For each distinct `pack_install_id` found on candidate cron jobs
+//! (`ProfileDb::pack_cron_orphan_candidates` — pack-installed AND
+//! `pack_expected_global_rows > 0`; a cron-only pack has nothing to
+//! reconcile and is filtered out there, not here):
+//!
+//! | pending marker | global.db rows | meaning                                   | action                                  |
+//! |-----------------|-----------------|--------------------------------------------|------------------------------------------|
+//! | absent          | present         | healthy install                            | untouched                               |
+//! | absent          | absent          | healthy install, rows deleted LATER by hand | untouched — **this is the round-2 fix** |
+//! | present         | present         | crash between the global commit and the marker's own clear | self-heal: clear the marker, delete nothing |
+//! | present         | absent          | crash between the cron commit and the global commit — the ACTUAL artifact | candidate for deletion                  |
+//!
+//! Only the last row is even a candidate; on it, the existing row-level
+//! guardrail still applies as defense in depth: the job is removed if and
+//! only if it is ALSO still DISABLED (`enabled = false` — the state
+//! `install_pack` always leaves a fresh row in) and has NEVER fired
+//! (`last_run_at IS NULL`). A row that fails either one LOOKS orphaned by the
+//! table above but proves a human (or the cron runner) already interacted
+//! with it since — the sweep cannot rule out a second, independent
+//! explanation from here, so it is left in place and reported as
+//! [`SkippedOrphan`] (logged at `warn`) instead of removed. Deleting
+//! user-touched state on an inference is worse than leaving an inert,
+//! already-disabled row around.
 
 use anyhow::{Context, Result};
 
@@ -66,7 +87,7 @@ pub struct RemovedOrphan {
 }
 
 /// One orphan-SHAPED cron job the sweep found but did NOT delete, and why —
-/// see the module doc's deletion rule, points (4)/(5).
+/// see the module doc's deletion-rule table and its row-level guardrail.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkippedOrphan {
     pub profile: String,
@@ -104,32 +125,60 @@ pub(crate) fn reconcile_profile(
     let mut skipped = Vec::new();
     // Memoize per pack_install_id: a single pack install can register several
     // cron jobs, and every one of them would otherwise re-run the same
-    // global.db lookup.
-    let mut global_has_rows: std::collections::HashMap<String, bool> =
+    // global.db + marker lookups.
+    let mut has_global_rows: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
+    let mut is_pending: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
     for c in candidates {
-        let has_rows = match global_has_rows.get(&c.pack_install_id) {
-            Some(v) => *v,
-            None => {
-                let n = global
-                    .count_pack_install_rows(&c.pack_install_id)
-                    .context("pack-reconcile: checking global.db for the pack's rows")?;
-                let has_rows = n > 0;
-                global_has_rows.insert(c.pack_install_id.clone(), has_rows);
-                has_rows
+        if !has_global_rows.contains_key(&c.pack_install_id) {
+            let rows = global
+                .count_pack_install_rows(&c.pack_install_id)
+                .context("pack-reconcile: checking global.db for the pack's rows")?;
+            let pending = db
+                .pack_install_is_pending(&c.pack_install_id)
+                .context("pack-reconcile: checking the pack-install-pending marker")?;
+            // pending + global rows PRESENT: a crash between the global
+            // commit and the marker's own clear (see `install_pack`) — the
+            // install is fine, only that tiny cleanup write didn't land.
+            // Self-heal it here; this was never an orphan.
+            if pending && rows > 0 {
+                db.clear_pack_install_pending(&c.pack_install_id)
+                    .context("pack-reconcile: self-healing a stuck pending marker")?;
             }
-        };
+            has_global_rows.insert(c.pack_install_id.clone(), rows > 0);
+            is_pending.insert(c.pack_install_id.clone(), pending);
+        }
+        let has_rows = has_global_rows[&c.pack_install_id];
+        let pending = is_pending[&c.pack_install_id];
+
         if has_rows {
             // This install's global transaction committed — healthy, untouched.
             continue;
         }
+        if !pending {
+            // No global rows AND no pending marker: this install's global
+            // transaction committed just fine — the marker was cleared right
+            // after — and the rows are gone NOW for a completely unrelated
+            // reason (the user deleted the skill/agent type by hand in
+            // Settings). Ordinary, supported behavior; never infer a crash
+            // from it. THIS is the check the round-2 fix adds — see the
+            // module doc's table.
+            continue;
+        }
 
-        // THE DELETION RULE (module doc): only a row PROVABLY the crash
-        // artifact — never enabled, never run — is removed.
+        // Only rows that reach here are PROVEN crash artifacts (pending +
+        // absent). The row-level guardrail still applies as defense in
+        // depth: only a job PROVABLY untouched since install — never
+        // enabled, never run — is removed.
         if !c.enabled && c.last_run_at.is_none() {
             db.delete_cron_job(&c.id)
                 .context("pack-reconcile: deleting orphaned cron job")?;
+            // The marker's job is done along with the row it was protecting;
+            // idempotent, so redundant calls for sibling jobs of the same
+            // install are harmless no-ops.
+            db.clear_pack_install_pending(&c.pack_install_id)
+                .context("pack-reconcile: clearing the marker for a deleted orphan")?;
             removed.push(RemovedOrphan {
                 profile: profile.to_string(),
                 cron_job_id: c.id,
@@ -239,9 +288,10 @@ mod tests {
     }
 
     /// Simulate the exact crash window `install_pack`'s `# Atomicity` note
-    /// describes: the cron transaction commits, the global one never does.
-    /// Returns the install id the crashed install used, so a test can assert
-    /// on it directly.
+    /// describes: the cron transaction (INCLUDING the pending marker it
+    /// writes in the SAME transaction — see `install_pack`) commits, the
+    /// global one never does. Returns the install id the crashed install
+    /// used, so a test can assert on it directly.
     fn simulate_crash_after_cron_commit(
         storage: &Storage,
         profile: &str,
@@ -254,6 +304,16 @@ mod tests {
         {
             let mut conn = db.raw();
             let tx = conn.transaction().unwrap();
+            // Same transaction as the cron inserts, exactly like `install_pack`
+            // — this is the fact a real crash right after this commit leaves
+            // behind on purpose: proof the global half had not landed yet.
+            if expected_global_rows > 0 {
+                tx.execute(
+                    "INSERT INTO pack_install_pending (pack_install_id, created_at) VALUES (?1, ?2)",
+                    rusqlite::params![install_id, now],
+                )
+                .unwrap();
+            }
             for c in &pack.cron_jobs {
                 tx.execute(
                     "INSERT INTO cron_jobs
@@ -282,9 +342,38 @@ mod tests {
         // crash killed the process before step 1 of `install_pack`'s
         // `# Atomicity` sequence had a chance to run, matching the state a
         // real crash right after the cron commit (step 3) leaves behind: no
-        // global row was ever written for this pack, but `now` is otherwise
-        // unused here — accept it for symmetry with `install_pack`'s signature.
-        let _ = now;
+        // global row was ever written for this pack.
+        install_id
+    }
+
+    /// Simulate a crash AFTER the global transaction commits but BEFORE
+    /// `install_pack`'s own follow-up write clears the pending marker: a
+    /// REAL, fully successful install (both commits landed — skills, agent
+    /// types, cron jobs all present and correct), with the marker manually
+    /// re-inserted afterward to stand in for that missing last write.
+    fn simulate_crash_after_global_commit_before_marker_clear(
+        storage: &Storage,
+        profile: &str,
+        pack: &Pack,
+        now: i64,
+    ) -> String {
+        install_pack(storage, profile, pack, now).unwrap();
+        let db = storage.open_profile(profile).unwrap();
+        let install_id: String = db
+            .raw()
+            .query_row(
+                "SELECT pack_install_id FROM cron_jobs WHERE pack_install_id IS NOT NULL \
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.raw()
+            .execute(
+                "INSERT INTO pack_install_pending (pack_install_id, created_at) VALUES (?1, ?2)",
+                rusqlite::params![install_id, now],
+            )
+            .unwrap();
         install_id
     }
 
@@ -482,6 +571,184 @@ mod tests {
             db.list_cron_jobs().unwrap().len(),
             1,
             "only the healthy pack's job remains"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ── round 2: the adversarial-review fix ─────────────────────────────────
+
+    #[test]
+    fn sweep_does_not_touch_a_healthy_install_whose_skill_was_later_deleted_by_hand() {
+        // THE BUG the round-1 sweep had: a healthy install (both transactions
+        // commit fine) whose skill + agent type the user deletes by hand in
+        // Settings, months later, via the real unconditional delete methods —
+        // no relationship to `pack_install_id` at all. That leaves the cron
+        // job pack-installed + disabled + never-run + zero matching global
+        // rows: identical, by row count alone, to a genuine crash artifact.
+        // The pending marker is what tells them apart — it was cleared right
+        // after the original install succeeded, so it can never come back.
+        let (storage, root) = temp_storage();
+        let pack = pack_with_everything("Deploy Kit");
+        install_pack(&storage, "personal", &pack, 100).unwrap();
+
+        let g = storage.global();
+        let skill_id = g.list_skills().unwrap()[0].id.clone();
+        let at_id = g.list_agent_types().unwrap()[0].id.clone();
+        assert!(
+            g.delete_skill(&skill_id).unwrap(),
+            "the skill existed to delete"
+        );
+        assert!(
+            g.delete_agent_type(&at_id).unwrap(),
+            "the agent type existed to delete"
+        );
+        assert_eq!(g.list_skills().unwrap().len(), 0);
+        assert_eq!(g.list_agent_types().unwrap().len(), 0);
+
+        let db = storage.open_profile("personal").unwrap();
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            1,
+            "the cron job is untouched by the Settings deletes"
+        );
+
+        let report = run_boot_pass(&storage).unwrap();
+        assert!(
+            report.removed.is_empty(),
+            "a later, unrelated deletion must NEVER be mistaken for a crash: {:?}",
+            report
+        );
+        assert!(
+            report.skipped.is_empty(),
+            "this isn't even orphan-SHAPED to the sweep — no pending marker, so it's \
+             not a candidate at all: {:?}",
+            report
+        );
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            1,
+            "the cron job survives — this is the data-loss bug the marker fixes"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sweep_clears_a_marker_stuck_pending_after_a_successful_global_commit() {
+        // Crash between the global commit landing and `install_pack`'s own
+        // follow-up write to clear the marker: the install is completely
+        // healthy (skills, agent types, cron job — all present and correct),
+        // only that last tiny cleanup write never ran. The sweep must self-heal
+        // by clearing the marker and touch NOTHING else.
+        let (storage, root) = temp_storage();
+        let pack = pack_with_everything("Deploy Kit");
+        let install_id = simulate_crash_after_global_commit_before_marker_clear(
+            &storage, "personal", &pack, 100,
+        );
+
+        let db = storage.open_profile("personal").unwrap();
+        assert!(
+            db.pack_install_is_pending(&install_id).unwrap(),
+            "the marker is stuck pending before the sweep runs"
+        );
+
+        let report = run_boot_pass(&storage).unwrap();
+        assert!(
+            report.removed.is_empty(),
+            "global rows are present — nothing here is an orphan: {:?}",
+            report
+        );
+        assert!(report.skipped.is_empty());
+
+        assert!(
+            !db.pack_install_is_pending(&install_id).unwrap(),
+            "the sweep must self-heal the stuck marker"
+        );
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            1,
+            "the healthy job is untouched"
+        );
+        let g = storage.global();
+        assert_eq!(
+            g.list_skills().unwrap().len(),
+            1,
+            "the healthy skill is untouched"
+        );
+        assert_eq!(
+            g.list_agent_types().unwrap().len(),
+            1,
+            "the healthy agent type is untouched"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round_2_scenarios_are_idempotent_across_two_boots() {
+        let (storage, root) = temp_storage();
+
+        // Scenario 1: a healthy install later hand-edited in Settings.
+        let edited_pack = pack_with_everything("Edited Later");
+        install_pack(&storage, "personal", &edited_pack, 100).unwrap();
+        let g = storage.global();
+        let edited_skill_id = g
+            .list_skills()
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "A skill")
+            .unwrap()
+            .id
+            .clone();
+        g.delete_skill(&edited_skill_id).unwrap();
+
+        // Scenario 2: a genuine crash artifact.
+        let crashed_pack = pack_with_everything("Crashed");
+        let crashed_install_id =
+            simulate_crash_after_cron_commit(&storage, "personal", &crashed_pack, 200);
+
+        // Scenario 3: a marker stuck pending after a successful commit.
+        let stuck_pack = pack_with_everything("Stuck Marker");
+        let stuck_install_id = simulate_crash_after_global_commit_before_marker_clear(
+            &storage,
+            "personal",
+            &stuck_pack,
+            300,
+        );
+
+        let db = storage.open_profile("personal").unwrap();
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            3,
+            "all three jobs exist pre-sweep"
+        );
+
+        let first = run_boot_pass(&storage).unwrap();
+        assert_eq!(
+            first.removed.len(),
+            1,
+            "only the genuine crash artifact is removed on the first boot: {:?}",
+            first
+        );
+        assert_eq!(first.removed[0].pack_install_id, crashed_install_id);
+        assert!(!db.pack_install_is_pending(&stuck_install_id).unwrap());
+
+        let jobs_after_first = db.list_cron_jobs().unwrap();
+        assert_eq!(
+            jobs_after_first.len(),
+            2,
+            "the edited-later job and the stuck-marker job both survive"
+        );
+
+        let second = run_boot_pass(&storage).unwrap();
+        assert!(
+            second.removed.is_empty(),
+            "nothing left to remove on the second boot: {:?}",
+            second
+        );
+        assert!(second.skipped.is_empty());
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            2,
+            "the second boot is a pure no-op"
         );
         let _ = std::fs::remove_dir_all(root);
     }

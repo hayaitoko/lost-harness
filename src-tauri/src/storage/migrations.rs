@@ -496,11 +496,14 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
         // where `install_pack` never even opens a global transaction and so
         // has no atomicity window to reconcile at all. A row with
         // `pack_expected_global_rows > 0` and zero matching rows in
-        // `global.db` (`GlobalDb::count_pack_install_rows`) is the crash
-        // artifact described in packs::mod's `# Atomicity` note — the global
-        // transaction is all-or-nothing, so "zero rows" can only mean "never
-        // committed", never "partially committed". See `packs::reconcile` for
-        // the sweep and its conservative deletion rule.
+        // `global.db` (`GlobalDb::count_pack_install_rows`) is CONSISTENT
+        // with the crash artifact described in packs::mod's `# Atomicity`
+        // note, but — as the adversarial review that added v14 found — row
+        // counts alone cannot prove it: "zero rows" is equally what a
+        // HEALTHY install looks like after its skill/agent type is later
+        // deleted by hand in Settings. See v14's `pack_install_pending`
+        // marker for the piece that actually disambiguates the two, and
+        // `packs::reconcile` for the sweep and its deletion rule.
         //
         // ADD COLUMN has no IF-NOT-EXISTS, so these live ONLY here (not in
         // PROFILE_SCHEMA_SQL): a fresh DB runs v1 (cron_jobs without them)
@@ -511,6 +514,42 @@ pub const PROFILE_MIGRATIONS: &[Migration] = &[
               ALTER TABLE cron_jobs ADD COLUMN pack_expected_global_rows INTEGER NOT NULL DEFAULT 0;
               CREATE INDEX IF NOT EXISTS idx_cron_jobs_pack_install
                   ON cron_jobs(pack_install_id) WHERE pack_install_id IS NOT NULL;",
+    },
+    Migration {
+        version: 14,
+        // fix4/pack-reconcile round 2 (adversarial-review fix) — the
+        // crash-INTENT marker that makes the boot sweep's deletion provably
+        // correct, instead of merely plausible.
+        //
+        // The bug this closes: "pack-installed + disabled + never-run + zero
+        // matching global.db rows" is NOT a crash signature. It is also the
+        // state of a HEALTHY install whose skill/agent type the user later
+        // deleted by hand in Settings (`GlobalDb::delete_skill` /
+        // `delete_agent_type` — ordinary, unconditional deletes with no
+        // relationship to `pack_install_id` at all). Row counts cannot tell
+        // "this install's global transaction never committed" apart from
+        // "it committed fine, and the rows were legitimately removed months
+        // later" — both look identical from `global.db` alone.
+        //
+        // `pack_install_pending` records INTENT instead of inferring it from
+        // row counts: `install_pack` inserts a row keyed by that call's
+        // `install_id` in the SAME transaction as the cron-job inserts (so
+        // it is exactly as durable as they are), and deletes it in a
+        // separate write immediately after the global transaction commits.
+        // The sweep now requires a row to STILL be here — proof the global
+        // half had not landed as of the cron commit — before it will even
+        // consider a cron job for deletion. A user's later, unrelated
+        // deletion never re-creates this row, so their job is untouchable no
+        // matter how orphaned it looks by row-count alone. See
+        // `packs::reconcile`'s module doc for the full state table.
+        //
+        // New table (not an ALTER), and profile-only: the marker exists to
+        // protect cron-job rows, which only ever live in the profile DB.
+        name: "pack_install_pending_marker",
+        sql: "CREATE TABLE IF NOT EXISTS pack_install_pending (
+            pack_install_id TEXT PRIMARY KEY,
+            created_at      INTEGER NOT NULL
+        );",
     },
 ];
 

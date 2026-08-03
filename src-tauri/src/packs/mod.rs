@@ -34,6 +34,20 @@
 //! crash-orphaned cron job — and ONLY one that is provably a crash artifact,
 //! never anything a user has touched — see `reconcile`'s module doc for the
 //! exact rule.
+//!
+//! ROUND 2 (adversarial review, same day): row counts alone — "this call's
+//! `pack_install_id` has zero matching rows in `global.db`" — turned out NOT
+//! to prove a crash. A perfectly healthy install looks identical after the
+//! user deletes its skill/agent type by hand in Settings months later; that
+//! is ordinary, supported behavior with no relationship to `pack_install_id`
+//! at all, and the first version of the sweep deleted the cron job anyway.
+//! Fixed by recording INTENT, not just inferring it from state: profile v14
+//! adds `pack_install_pending`, a marker `install_pack` writes (in the SAME
+//! transaction as the cron-job inserts, so it is exactly as durable as they
+//! are) and clears right after its global transaction commits. The sweep now
+//! requires that marker to STILL be present — proof the global half had not
+//! landed as of the cron commit — before it will even consider deleting
+//! anything; see [`reconcile`]'s module doc for the full state table.
 
 pub mod reconcile;
 
@@ -469,16 +483,37 @@ pub fn install_pack(
     // `storage::migrations` and `packs::reconcile`.
     let expected_global_rows = (skills_count + agent_types_count) as i64;
 
+    // Whether this call needs the crash-INTENT marker (profile v14,
+    // `pack_install_pending`) at all: only if it is about to insert cron
+    // jobs (`profile_db` is `Some`) that would otherwise be indistinguishable
+    // from a crash artifact once their global rows are gone for ANY reason —
+    // which requires there to BE global rows expected in the first place.
+    // See `packs::reconcile`'s module doc for why row counts alone can never
+    // make that call.
+    let track_intent = profile_db.is_some() && expected_global_rows > 0;
+
     // ── Profile DB (cron jobs) — its own atomic transaction ──────────────────
     // A separate SQLite file, so this cannot join the global transaction, which
     // is still OPEN and unflushed at this point. If anything below fails, `?`
     // returns and `global_tx` rolls back on drop — nothing lands anywhere. Raw
     // SQL (rather than `insert_cron_job`) because the guard from `raw()` holds
     // the connection mutex — calling another locking method here would deadlock.
-    if let Some(db) = profile_db {
+    if let Some(db) = profile_db.as_ref() {
         if !pack.cron_jobs.is_empty() {
             let mut conn = db.raw();
             let tx = conn.transaction()?;
+            // Record INTENT before the cron jobs it protects — same
+            // transaction, so it is exactly as durable as they are. A crash
+            // right after this commits (and before the global commit below)
+            // leaves this row behind ON PURPOSE: it is the sweep's proof
+            // that this install's global half had not landed yet.
+            if track_intent {
+                tx.execute(
+                    "INSERT INTO pack_install_pending (pack_install_id, created_at)
+                     VALUES (?1, ?2)",
+                    rusqlite::params![install_id, now],
+                )?;
+            }
             for c in &pack.cron_jobs {
                 tx.execute(
                     "INSERT INTO cron_jobs
@@ -509,6 +544,28 @@ pub fn install_pack(
     // rolled back, so this is the only remaining failure point.
     if let Some(tx) = global_tx.take() {
         tx.commit()?;
+    }
+
+    // The marker's job ends the instant the commit above returns `Ok`: clear
+    // it in its own tiny write, now that the global half is PROVEN present.
+    // Best-effort on purpose — if this write itself fails, or the process
+    // dies before it runs, the marker is left dangling "pending" even though
+    // the install fully succeeded. That is not data loss and must never fail
+    // `install_pack` (the pack IS correctly installed at this point): the
+    // boot sweep detects exactly this shape — pending marker, global rows
+    // present — and self-heals it by clearing the marker itself, touching
+    // nothing else. See `packs::reconcile`'s module doc.
+    if track_intent {
+        if let Some(db) = profile_db.as_ref() {
+            if let Err(e) = db.clear_pack_install_pending(&install_id) {
+                tracing::warn!(
+                    error = %e,
+                    install_id = %install_id,
+                    "install_pack: could not clear the pack-install-pending marker \
+                     after a successful install; the boot sweep will self-heal it"
+                );
+            }
+        }
     }
 
     Ok(InstallReport {
