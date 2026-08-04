@@ -51,8 +51,11 @@ the status board sitting on top of all of them.
 > every model reads `community` and downloads are consent-gated — and the badge-inversion follow-up is
 > already fixed, so it is safe to perform now); **Apple codesigning/notarization** (declined for now, so
 > the `.app` is unsigned and other Macs need right-click→Open); **MCP child sandboxing** (P08's deferred
-> containment half); and two minor items (`run_states` is never pruned; a crash between the pack-install
-> SQLite commits can leave cron jobs without their skills).
+> containment half); and one minor item (a crash between the pack-install SQLite commits can leave cron
+> jobs without their skills). `run_states` pruning shipped on `fix4/state-pruning`: `AgentLoop` now
+> reclaims `stream_locks` + the dispatcher's `run_states` entries once a conversation's run finishes,
+> gated on an `Arc` strong-count proof that no other run for that conversation is in flight or queued —
+> `AgentLoop::prune_conversation_state` / `ToolDispatcher::forget_run_state`.
 >
 > Historical entry (superseded, kept for the record):
 > **As of 2026-07-30 — ROUND 2 IS MERGED TO LOCAL `main`. NOTHING IS PUSHED. NO RELEASE IS PUBLISHED. THERE WAS NO LIVE-APP QA.**

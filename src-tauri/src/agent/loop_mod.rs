@@ -274,6 +274,18 @@ pub struct AgentLoop {
     /// exactly the pre-S4 behavior. `lib.rs` sets it.
     #[cfg(feature = "local-runner")]
     local_runner: Option<Arc<crate::models::runner::LocalRunnerContext>>,
+    /// M-08 (P14): one per-conversation lock, so several `process_message`
+    /// runs can be in flight concurrently against the ONE shared `AgentLoop`
+    /// while still serializing runs WITHIN a conversation.
+    ///
+    /// Round 4 (state pruning, follow-up #9): before this round, an entry
+    /// was never removed — one `Arc<Mutex<()>>` per conversation id EVER
+    /// touched, for the process's whole life. `process_message` now reclaims
+    /// it via `prune_conversation_state` right after its own run finishes —
+    /// see that method's doc for the eviction-safety proof (in short: an
+    /// entry is removed ONLY when the finishing call can prove, via this
+    /// same map's lock plus the entry's own `Arc` strong count, that nobody
+    /// else holds or is waiting on it).
     stream_locks:
         Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// B7: a test-only injectable model streamer. `None` in production (one
@@ -288,6 +300,18 @@ pub struct AgentLoop {
     /// observes it cooperatively and breaks. Same `parking_lot::Mutex<HashMap>`
     /// idiom as `summary_cache`; touched only via the two tiny methods below,
     /// never `stream_locks`, so a cancel can never deadlock the turn it interrupts.
+    ///
+    /// Round 4 (state pruning, follow-up #9): audited alongside `run_states`/
+    /// `stream_locks` and found NOT to need the same treatment — unlike
+    /// those two, an entry here is already scoped to exactly one in-flight
+    /// call: `begin_cancellable` inserts it right after `process_message`
+    /// acquires this conversation's `stream_locks` guard, and it is
+    /// unconditionally removed below before that SAME guard is released, on
+    /// every exit path (`Ok` or `Err` — there is no early return in
+    /// between). So this map's size is already bounded by "conversations
+    /// with a call currently in flight," never "every conversation ever
+    /// seen" — no pruning needed, just documented here so the next reader
+    /// doesn't have to re-derive it.
     cancellations:
         parking_lot::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
 }
@@ -494,7 +518,141 @@ impl AgentLoop {
             )
             .await;
         self.cancellations.lock().remove(&conversation_id);
+        // Round 4 (state pruning, follow-up #9): release the guard, THEN try
+        // to reclaim this conversation's `stream_locks` + dispatcher
+        // `run_states` entries now that the run is over. Must happen AFTER
+        // the cancellations removal above (which relies on the guard still
+        // being held to keep a contender from racing it — see the
+        // `cancellations` field doc) and requires an explicit drop here
+        // because `prune_conversation_state` needs to move `conv_lock` out,
+        // which the still-live guard borrows.
+        drop(_stream_guard);
+        self.prune_conversation_state(&conversation_id, conv_lock);
         result
+    }
+
+    /// Round 4 (state pruning, follow-up #9): reclaim `stream_locks` and the
+    /// dispatcher's `run_states` for `conversation_id` once THIS call's run
+    /// has finished — but PROVABLY only when nothing else is running or
+    /// about to run for the same conversation.
+    ///
+    /// Both maps were insert-and-keep before this round: an entry was
+    /// created the first time a conversation was touched and never removed,
+    /// so a long-lived process accumulated one `Arc<Mutex<()>>` (here) and
+    /// one `RunState` (`ToolDispatcher::run_states`) per conversation id
+    /// EVER seen, forever. Neither entry is large, but both grew without
+    /// bound over a process's lifetime.
+    ///
+    /// A blind size-cap or LRU can't safely shrink either map: `run_states`
+    /// carries the P14/HI-2 per-conversation dispatch budget and repeat-
+    /// detection ring, and `stream_locks` is what serializes concurrent
+    /// `process_message` runs per conversation — evicting a LIVE
+    /// conversation's entry would reset its budget/dedup mid-run (the exact
+    /// double-execution bug HI-2 fixed) or let two runs for one conversation
+    /// interleave (the exact bug P14 fixed). So this only ever prunes the
+    /// ONE conversation whose run just ended, and only after PROVING no one
+    /// else needs its entry:
+    ///
+    ///  - `conv_lock` is the `Arc<tokio::sync::Mutex<()>>` this call minted
+    ///    or reused at the top of `process_message`; its guard has already
+    ///    been dropped (the turn is over).
+    ///  - Take the `stream_locks` map lock — the SAME lock every
+    ///    `process_message` call must acquire before it can clone or wait on
+    ///    this conversation's lock (`.entry(id).or_insert_with(..).clone()`
+    ///    at the top of `process_message`). While we hold it, no new
+    ///    contender can appear.
+    ///  - Remove the entry only if it is LITERALLY `conv_lock`
+    ///    (`Arc::ptr_eq` — guards against a stale reference from a prior
+    ///    prune-then-recreate cycle) AND its strong count is exactly 2: the
+    ///    map's own clone plus the one in our hand. That means nobody else
+    ///    ever cloned it — no concurrent `process_message` for this
+    ///    conversation is running or parked waiting for the guard. A task
+    ///    can't manufacture a clone of this exact `Arc` without going
+    ///    through the very map lock we're holding, so this check can only
+    ///    ever be MORE conservative than reality, never less: any real
+    ///    contender's clone (taken at ITS OWN call's start, before it could
+    ///    possibly be waiting) is already counted.
+    ///  - Any other count means a real contender holds a clone — leave the
+    ///    entry; ITS finishing run gets the next chance to prune it. Losing
+    ///    this race costs nothing but a delayed reclaim.
+    ///  - `run_states` is pruned in the SAME critical section (nested
+    ///    inside the `stream_locks` lock, never the reverse — no lock-order
+    ///    cycle is possible since `ToolDispatcher` never touches
+    ///    `AgentLoop::stream_locks`). This is what makes it safe: per
+    ///    `ToolDispatcher::forget_run_state`'s doc, `run_states` for a
+    ///    conversation is written ONLY from inside `process_message_inner`,
+    ///    which always runs strictly between acquiring and dropping THIS
+    ///    conversation's stream-lock guard. So "no contender for the stream
+    ///    lock" also proves "no in-flight or about-to-start writer of
+    ///    `run_states`" — pruning it here can never race a live budget or
+    ///    dedup ring. And per that same doc, skipping it in the contended
+    ///    case loses nothing either: the next run calls `begin_run()` again
+    ///    regardless, which fully reinitializes the entry.
+    fn prune_conversation_state(
+        &self,
+        conversation_id: &str,
+        conv_lock: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let mut locks = self.stream_locks.lock();
+        let is_uncontended = matches!(
+            locks.get(conversation_id),
+            Some(entry) if Arc::ptr_eq(entry, &conv_lock) && Arc::strong_count(entry) == 2
+        );
+        if is_uncontended {
+            locks.remove(conversation_id);
+            self.tools.forget_run_state(conversation_id);
+        }
+    }
+
+    /// Round 4 test hook: whether `stream_locks` currently has an entry for
+    /// this conversation.
+    #[cfg(test)]
+    pub(crate) fn has_stream_lock(&self, conversation_id: &str) -> bool {
+        self.stream_locks.lock().contains_key(conversation_id)
+    }
+
+    /// Round 4 test hook: the strong count of this conversation's
+    /// `stream_locks` `Arc` (0 if it has no entry). Lets a test prove a
+    /// second caller genuinely holds a live clone (contention) BEFORE
+    /// exercising `prune_conversation_state`, without racing a real second
+    /// `process_message` call's scheduling.
+    #[cfg(test)]
+    pub(crate) fn stream_lock_strong_count(&self, conversation_id: &str) -> usize {
+        self.stream_locks
+            .lock()
+            .get(conversation_id)
+            .map(Arc::strong_count)
+            .unwrap_or(0)
+    }
+
+    /// Round 4 test hook: a clone of this conversation's `stream_locks`
+    /// `Arc`, simulating a second caller having taken one (exactly what a
+    /// real concurrent `process_message` call does at its own top) without
+    /// needing to orchestrate that call's scheduling deterministically.
+    #[cfg(test)]
+    pub(crate) fn clone_stream_lock(
+        &self,
+        conversation_id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.stream_locks.lock().get(conversation_id).cloned()
+    }
+
+    /// Round 4 test hooks: forward to the matching `ToolDispatcher` method on
+    /// this loop's dispatcher. `AgentLoop::tools` is private, so tests in
+    /// the sibling `loop_tests` module need these thin pass-throughs.
+    #[cfg(test)]
+    pub(crate) fn has_run_state(&self, conversation_id: &str) -> bool {
+        self.tools.has_run_state(conversation_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_dispatch_count(&self, conversation_id: &str) -> usize {
+        self.tools.run_dispatch_count(conversation_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_nonce_of(&self, conversation_id: &str) -> String {
+        self.tools.run_nonce_of(conversation_id)
     }
 
     #[allow(clippy::too_many_arguments)]

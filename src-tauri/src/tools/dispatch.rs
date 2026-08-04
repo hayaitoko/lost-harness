@@ -187,9 +187,18 @@ pub struct ToolDispatcher {
     /// entry covers.
     ///
     /// One small entry per conversation that has begun a run (a counter, ≤
-    /// `PER_RUN_DISPATCH_CEILING` hex fingerprints, and a nonce), with the same
-    /// lifetime discipline as `AgentLoop::stream_locks`: keyed by conversation
-    /// id and reused, never accumulating per run.
+    /// `PER_RUN_DISPATCH_CEILING` hex fingerprints, and a nonce), reused
+    /// (never grown) across the turns of one run.
+    ///
+    /// Round 4 (state pruning, follow-up #9): before this round, an entry
+    /// was never removed after its conversation's run ended — one per
+    /// conversation id EVER touched, for the process's whole life. Now
+    /// `AgentLoop::process_message` reclaims it via `forget_run_state` right
+    /// after a run finishes, but ONLY once it has proven (through its own
+    /// `stream_locks` bookkeeping) that no run for this conversation is in
+    /// flight or queued — see `forget_run_state`'s doc for the safety
+    /// argument. Same lifetime discipline as `AgentLoop::stream_locks`,
+    /// pruned by the same caller, by the same proof, at the same moment.
     run_states: Mutex<HashMap<String, RunState>>,
     /// Q5 do-now: append-only post-tool-use audit writer. Fired once per
     /// `dispatch()` call (every return path), AFTER the outcome exists.
@@ -600,6 +609,48 @@ impl ToolDispatcher {
             .get(conversation_id)
             .map(|s| s.run_nonce.clone())
             .unwrap_or_default()
+    }
+
+    /// Round 4 (state pruning, follow-up #9): reclaim `conversation_id`'s
+    /// `RunState` once its run is over. Memory reclamation ONLY — never a
+    /// correctness dependency, because the next run for this conversation
+    /// calls `begin_run()` again regardless, which fully reinitializes the
+    /// entry (`dispatch_count = 0`, fingerprint ring cleared, a fresh
+    /// nonce). So a caller that DOESN'T call this (e.g. because it can't
+    /// prove the run is truly over) loses nothing but a few bytes.
+    ///
+    /// Safety this relies on, and that the caller must uphold: `run_states`
+    /// for a given conversation is written to ONLY from inside a
+    /// `process_message_inner` call (`begin_run`, then every
+    /// `dispatch()`/`run_journaled()` during that SAME run) — and that call
+    /// always executes strictly between that conversation's `stream_locks`
+    /// guard being acquired and dropped (see `AgentLoop::process_message`).
+    /// So the ONLY correct caller is `AgentLoop::prune_conversation_state`,
+    /// which has already proven, under its own `stream_locks` map lock,
+    /// that no other `process_message` call for this conversation is
+    /// running or queued — which by the above also proves no in-flight or
+    /// about-to-start writer of this entry. Calling this from anywhere else
+    /// (mid-run, without that proof) would reproduce the exact HI-2 bug
+    /// this dispatcher exists to prevent: a wiped budget/dedup ring for a
+    /// conversation that is still actively dispatching.
+    pub(crate) fn forget_run_state(&self, conversation_id: &str) {
+        self.run_states
+            .lock()
+            .expect("run_states mutex poisoned")
+            .remove(conversation_id);
+    }
+
+    /// Round 4 test hook: whether this conversation currently has a
+    /// `run_states` entry at all. Distinct from `run_nonce_of`/
+    /// `run_dispatch_count`, which both return the same "empty" default for
+    /// "no entry" as for "entry present but freshly zeroed" — a pruning test
+    /// needs to tell those apart.
+    #[cfg(test)]
+    pub(crate) fn has_run_state(&self, conversation_id: &str) -> bool {
+        self.run_states
+            .lock()
+            .expect("run_states mutex poisoned")
+            .contains_key(conversation_id)
     }
 
     /// The system-prompt fragment teaching the fenced dialect and listing
@@ -3063,6 +3114,61 @@ mod tests {
             dispatcher.run_dispatch_count("conv-B"),
             0,
             "conv-B starts its own run at zero"
+        );
+    }
+
+    // ── Round 4 (state pruning, follow-up #9): `forget_run_state` ──────────
+
+    #[tokio::test]
+    async fn forget_run_state_removes_an_existing_entry() {
+        let dispatcher = echo_dispatcher();
+        dispatcher.begin_run("conv-A");
+        assert!(
+            dispatcher.has_run_state("conv-A"),
+            "begin_run must create an entry"
+        );
+
+        dispatcher.forget_run_state("conv-A");
+
+        assert!(
+            !dispatcher.has_run_state("conv-A"),
+            "forget_run_state must remove the entry"
+        );
+        // The budget/nonce accessors degrade to their "no entry" defaults —
+        // NOT a panic, and not a leftover stale value.
+        assert_eq!(dispatcher.run_dispatch_count("conv-A"), 0);
+        assert_eq!(dispatcher.run_nonce_of("conv-A"), "");
+    }
+
+    #[tokio::test]
+    async fn forget_run_state_on_a_conversation_that_never_ran_is_a_no_op() {
+        let dispatcher = echo_dispatcher();
+        assert!(!dispatcher.has_run_state("never-touched"));
+
+        // Must not panic on a missing key.
+        dispatcher.forget_run_state("never-touched");
+
+        assert!(!dispatcher.has_run_state("never-touched"));
+    }
+
+    #[tokio::test]
+    async fn forget_run_state_only_touches_the_named_conversation() {
+        let dispatcher = echo_dispatcher();
+        dispatcher.begin_run("conv-A");
+        dispatcher.begin_run("conv-B");
+        let nonce_b = dispatcher.run_nonce_of("conv-B");
+
+        dispatcher.forget_run_state("conv-A");
+
+        assert!(!dispatcher.has_run_state("conv-A"));
+        assert!(
+            dispatcher.has_run_state("conv-B"),
+            "forgetting conv-A must not touch conv-B's entry"
+        );
+        assert_eq!(
+            dispatcher.run_nonce_of("conv-B"),
+            nonce_b,
+            "conv-B's nonce must be untouched by conv-A's eviction"
         );
     }
 
