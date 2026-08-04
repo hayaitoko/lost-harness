@@ -1709,10 +1709,41 @@ pub struct RegisterMcpServerArgs {
     pub trusted_read_only: bool,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Round-4 sandbox grant: let this stdio server's child reach the network.
+    /// Absent ⇒ `false` — the deny-default.
+    #[serde(default)]
+    pub network_access: bool,
+    /// Round-4 sandbox grant: absolute paths the child may READ. Absent ⇒ none.
+    #[serde(default)]
+    pub read_paths: Vec<String>,
+    /// Round-4 sandbox grant: absolute paths the child may READ AND WRITE.
+    /// Absent ⇒ none.
+    #[serde(default)]
+    pub write_paths: Vec<String>,
     /// H-07: a single-use install nonce from `generate_mcp_install_nonce`.
     /// Required — a `register_mcp_server` call that never went through the
     /// consent step has no nonce to present and is rejected before any spawn.
     pub nonce: String,
+}
+
+/// Validate one user-supplied sandbox grant path. A grant is a hole in the
+/// deny-default, so it must be unambiguous: absolute, existing, and free of the
+/// `..` that would make what it actually covers depend on symlink layout.
+/// Returns the path in its canonical form — the form the profile will carry.
+fn validate_grant_path(raw: &str, what: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("an empty {what} path is not a grant"));
+    }
+    let p = std::path::Path::new(trimmed);
+    if !p.is_absolute() {
+        return Err(format!(
+            "the {what} path `{trimmed}` must be absolute — a relative grant has no fixed meaning"
+        ));
+    }
+    let canonical = std::fs::canonicalize(p)
+        .map_err(|e| format!("the {what} path `{trimmed}` cannot be granted: {e}"))?;
+    Ok(canonical.to_string_lossy().to_string())
 }
 
 /// How long an issued MCP install nonce stays usable.
@@ -1777,6 +1808,13 @@ pub struct McpServerInfo {
     /// state and offers Re-approve. `None` while running, or when stopped for
     /// a non-pin reason.
     pub pin_refusal: Option<crate::tools::mcp_stdio::PinRefusal>,
+    /// Round-4: the sandbox grants in force for this server, so the pane can
+    /// show exactly what the child can reach (a grant the user cannot see is a
+    /// grant they cannot revoke). Always `false`/empty for an HTTP endpoint,
+    /// which has no local child.
+    pub network_access: bool,
+    pub read_paths: Vec<String>,
+    pub write_paths: Vec<String>,
 }
 
 /// Register an MCP server: SPAWN + handshake + `tools/list` FIRST (fail-closed
@@ -1806,6 +1844,30 @@ pub async fn register_mcp_server(
     if is_http && !args.args.is_empty() {
         return Err("a Streamable HTTP MCP endpoint does not take process arguments".to_string());
     }
+    // Round-4: sandbox grants describe a LOCAL child. An HTTP endpoint has no
+    // child to confine, so accepting grants for one would be a lie in the UI.
+    if is_http
+        && (args.network_access || !args.read_paths.is_empty() || !args.write_paths.is_empty())
+    {
+        return Err(
+            "a Streamable HTTP MCP endpoint has no local child to sandbox — filesystem and \
+             network grants apply to stdio servers only"
+                .to_string(),
+        );
+    }
+    // Grants are validated BEFORE the spawn: a bad path must fail registration,
+    // never silently drop out of the profile and leave the user believing the
+    // server has access it does not have (or vice versa).
+    let read_paths = args
+        .read_paths
+        .iter()
+        .map(|p| validate_grant_path(p, "read"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let write_paths = args
+        .write_paths
+        .iter()
+        .map(|p| validate_grant_path(p, "write"))
+        .collect::<Result<Vec<_>, _>>()?;
     // Review fix (#2): reject a sanitized-NAMESPACE collision with an existing
     // server. The `mcp__{server}__{tool}` separator is collision-free per
     // (server, tool) — so the only cross-server collision domain is the server
@@ -1870,6 +1932,9 @@ pub async fn register_mcp_server(
         created_at: chrono::Utc::now().timestamp(),
         executable_path,
         executable_hash,
+        network_access: args.network_access && !is_http,
+        read_paths,
+        write_paths,
     };
     // Fail-closed ordering: bring the server up BEFORE persisting anything.
     let tools = crate::tools::mcp_stdio::bring_up_server(&row, &state.tools, &state.mcp).await?;
@@ -1889,6 +1954,9 @@ pub async fn register_mcp_server(
         running: true,
         tools,
         pin_refusal: None,
+        network_access: row.network_access,
+        read_paths: row.read_paths,
+        write_paths: row.write_paths,
     })
 }
 
@@ -1916,6 +1984,9 @@ fn list_mcp_servers_inner(state: &AppState) -> Result<Vec<McpServerInfo>, String
                 running: entry.is_some(),
                 tools: entry.map(|e| e.tool_names.clone()).unwrap_or_default(),
                 pin_refusal: refusals.get(&r.id).cloned(),
+                network_access: r.network_access,
+                read_paths: r.read_paths,
+                write_paths: r.write_paths,
                 id: r.id,
                 name: r.name,
                 command: r.command,
@@ -2000,6 +2071,9 @@ async fn reapprove_mcp_server_inner(
         running: true,
         tools,
         pin_refusal: None,
+        network_access: row.network_access,
+        read_paths: row.read_paths,
+        write_paths: row.write_paths,
     })
 }
 
@@ -4526,6 +4600,9 @@ mod tests {
             created_at: 1,
             executable_path: Some(path),
             executable_hash: Some(pin.clone()),
+            network_access: false,
+            read_paths: vec![],
+            write_paths: vec![],
         };
         state.storage.global().insert_mcp_server(&row).unwrap();
 
@@ -4641,6 +4718,9 @@ mod tests {
             created_at: 1,
             executable_path: None,
             executable_hash: None,
+            network_access: false,
+            read_paths: vec![],
+            write_paths: vec![],
         };
         state.storage.global().insert_mcp_server(&http_row).unwrap();
 
@@ -5358,7 +5438,9 @@ mod tests {
             gate,
             embedder: None,
             tools,
-            mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new()),
+            mcp: Arc::new(crate::tools::mcp_stdio::McpRuntime::new(
+                std::env::temp_dir().join(format!("lhp-test-mcp-sandbox-{}", Uuid::new_v4())),
+            )),
             hardware: Arc::new(Default::default()),
             #[cfg(feature = "local-runner")]
             local_runner: None,

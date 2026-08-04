@@ -1085,6 +1085,14 @@ export interface McpServer {
   /** Why the pin gate refused the last bring-up (null while running, or when
    *  stopped for a non-pin reason). Drives the Re-approve recovery UI. */
   pin_refusal: McpPinRefusal | null;
+  /** Round-4 sandbox grant: may this stdio server's child reach the network?
+   *  False is the deny-default; always false for an HTTP endpoint. */
+  network_access: boolean;
+  /** Round-4 sandbox grants: absolute paths the child may read / read+write,
+   *  beyond the install tree and its own private scratch dir. Empty by
+   *  default — a server sees none of the user's files. */
+  read_paths: string[];
+  write_paths: string[];
 }
 
 /** Register an MCP server (spawn + handshake first — fail-closed; persisted on
@@ -1100,6 +1108,12 @@ export async function registerMcpServer(server: {
   tier?: "local" | "remote";
   trusted_read_only?: boolean;
   capabilities?: string[];
+  /** Round-4 sandbox grants (stdio only). Omitted ⇒ the deny-default: the
+   *  child gets no network and none of the user's files. Every path must be
+   *  absolute and exist, or registration is refused before anything spawns. */
+  network_access?: boolean;
+  read_paths?: string[];
+  write_paths?: string[];
 }): Promise<McpServer | null> {
   if (!isTauri()) return null;
   const nonce = await tauriInvoke<string>("generate_mcp_install_nonce", {});

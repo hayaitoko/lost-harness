@@ -67,14 +67,15 @@ fn schema_version_is_current_after_init_global() {
     // v5 skills metadata columns — Wave 4.1; v6 agent_types — Wave 4.3;
     // v7 model_catalog.sha256+status — Wave 5.3 / M8; v8 mcp_servers — C3;
     // v9 mcp_servers.executable_path/_hash — H-07 binary pinning; v10
-    // skills.pack_install_id + agent_types.pack_install_id — fix4/pack-reconcile).
+    // skills.pack_install_id + agent_types.pack_install_id — fix4/pack-reconcile;
+    // v11 mcp_servers sandbox grants — round-4 MCP child containment).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 10); // fix4/pack-reconcile added pack-install provenance (v10)
+    assert_eq!(v, 11); // v10 pack-install provenance, v11 MCP sandbox grants
 }
 
 /// H-07 / migration v9: a FRESH database must end up with the pin columns.
@@ -96,6 +97,68 @@ fn fresh_global_db_has_the_mcp_executable_pin_columns() {
     assert!(cols.contains(&"executable_hash".to_string()), "{cols:?}");
 }
 
+/// Round-4 / migration v10: a FRESH database gets the sandbox-grant columns,
+/// and a row inserted through the pre-v10 column list (the shape an upgraded DB
+/// carries) reads back in the DENY-DEFAULT posture — no network, no paths.
+/// This is the guard against a future "just default it to what it used to do".
+#[test]
+fn mcp_sandbox_grants_default_closed_and_round_trip() {
+    use crate::storage::McpServerRow;
+    let db = GlobalDb::open_in_memory().unwrap();
+    let cols: Vec<String> = db
+        .raw()
+        .prepare("PRAGMA table_info(mcp_servers)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for c in ["network_access", "read_paths", "write_paths"] {
+        assert!(cols.contains(&c.to_string()), "missing {c} in {cols:?}");
+    }
+
+    // Insert WITHOUT the grant columns — exactly what a row written before v10
+    // looks like once the ALTERs have run.
+    db.raw()
+        .execute(
+            "INSERT INTO mcp_servers (id, name, command, args, tier, trusted_read_only,
+                                      capabilities, enabled, created_at)
+             VALUES ('old', 'legacy', 'sh', '[]', 'remote', 0, '[]', 1, 1)",
+            [],
+        )
+        .unwrap();
+    let legacy = db.get_mcp_server("old").unwrap().expect("legacy row");
+    assert!(
+        !legacy.network_access,
+        "an upgraded row must get NO network"
+    );
+    assert!(legacy.read_paths.is_empty(), "…and no readable user paths");
+    assert!(legacy.write_paths.is_empty(), "…and no writable user paths");
+
+    // A granted row round-trips verbatim.
+    let granted = McpServerRow {
+        id: "granted".into(),
+        name: "granted".into(),
+        command: "sh".into(),
+        args: vec![],
+        tier: "local".into(),
+        trusted_read_only: false,
+        capabilities: vec![],
+        enabled: true,
+        created_at: 2,
+        executable_path: Some("/bin/sh".into()),
+        executable_hash: Some("cafe".into()),
+        network_access: true,
+        read_paths: vec!["/tmp/readable".into()],
+        write_paths: vec!["/tmp/writable".into()],
+    };
+    db.insert_mcp_server(&granted).unwrap();
+    let back = db.get_mcp_server("granted").unwrap().expect("granted row");
+    assert!(back.network_access);
+    assert_eq!(back.read_paths, vec!["/tmp/readable".to_string()]);
+    assert_eq!(back.write_paths, vec!["/tmp/writable".to_string()]);
+}
+
 /// H-07: the pins survive a persist -> read round-trip, and a row written
 /// without them reads back as `None` (the pre-v9 shape bring-up refuses).
 #[test]
@@ -114,6 +177,9 @@ fn mcp_server_executable_pins_round_trip() {
         created_at: 1,
         executable_path: Some("/bin/sh".into()),
         executable_hash: Some("deadbeef".into()),
+        network_access: false,
+        read_paths: vec![],
+        write_paths: vec![],
     };
     db.insert_mcp_server(&row).unwrap();
     let back = db.get_mcp_server("s1").unwrap().expect("row persisted");

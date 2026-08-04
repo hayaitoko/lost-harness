@@ -263,6 +263,29 @@ pub const GLOBAL_MIGRATIONS: &[Migration] = &[
               CREATE INDEX IF NOT EXISTS idx_agent_types_pack_install
                   ON agent_types(pack_install_id) WHERE pack_install_id IS NOT NULL;",
     },
+    Migration {
+        version: 11,
+        // Round-4: the CONTAINMENT half H-07 deliberately deferred. A stdio
+        // server's child is now spawned deny-default (`tools::mcp_sandbox`) — it
+        // may read what it needs to RUN plus its own private scratch dir, and
+        // nothing else. These three columns are the only way out of that box,
+        // and every one of them defaults to the CLOSED position: no network, no
+        // user-readable paths, no user-writable paths.
+        //
+        // An existing row therefore ADOPTS the new posture on upgrade instead of
+        // being grandfathered into its old full-privilege one. That is the
+        // intended direction (a pre-sandbox row was never *granted* anything —
+        // it simply predates the question) and it is cost-free today: no MCP
+        // server has been registered yet, so there is nothing to grandfather and
+        // no grandfathering has been invented.
+        //
+        // Same dual-definition convention as v9: ALTER-added columns live ONLY
+        // here, never in GLOBAL_SCHEMA_SQL's `mcp_servers` CREATE.
+        name: "mcp_servers_sandbox_grants",
+        sql: "ALTER TABLE mcp_servers ADD COLUMN network_access INTEGER NOT NULL DEFAULT 0;
+              ALTER TABLE mcp_servers ADD COLUMN read_paths TEXT NOT NULL DEFAULT '[]';
+              ALTER TABLE mcp_servers ADD COLUMN write_paths TEXT NOT NULL DEFAULT '[]';",
+    },
 ];
 
 /// All per-profile DB migrations, in order.

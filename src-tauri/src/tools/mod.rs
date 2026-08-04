@@ -38,6 +38,7 @@ pub mod fetch;
 pub mod fs;
 pub mod mcp;
 pub mod mcp_http;
+pub mod mcp_sandbox;
 pub mod mcp_stdio;
 pub mod memory;
 pub mod productivity;
