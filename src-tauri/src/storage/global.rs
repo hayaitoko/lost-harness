@@ -1561,6 +1561,32 @@ impl GlobalDb {
         Ok(())
     }
 
+    // ── pack-install provenance (fix4/pack-reconcile) ────────────────────────
+
+    /// Total rows (skills + agent types) stamped with `pack_install_id` —
+    /// used by the boot reconciliation sweep (`packs::reconcile`) to answer
+    /// "did this `install_pack` call's global transaction commit?"
+    ///
+    /// `install_pack` inserts every skill + agent type for one call inside a
+    /// SINGLE transaction (see its `# Atomicity` note), so this is either 0
+    /// (the transaction never committed — the crash window the sweep exists
+    /// for) or the full count from that call. There is no partial case to
+    /// worry about: any row found here proves the whole commit landed.
+    pub fn count_pack_install_rows(&self, install_id: &str) -> Result<i64> {
+        let conn = self.conn.lock();
+        let skills: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM skills WHERE pack_install_id = ?1",
+            params![install_id],
+            |r| r.get(0),
+        )?;
+        let agent_types: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_types WHERE pack_install_id = ?1",
+            params![install_id],
+            |r| r.get(0),
+        )?;
+        Ok(skills + agent_types)
+    }
+
     // ── app_settings ────────────────────────────────────────────────────────
 
     pub fn set_app_setting(&self, key: &str, value: &str) -> Result<()> {

@@ -66,14 +66,15 @@ fn schema_version_is_current_after_init_global() {
     // vector table for the meaning lane; v4 endpoints.supports_native_tools;
     // v5 skills metadata columns — Wave 4.1; v6 agent_types — Wave 4.3;
     // v7 model_catalog.sha256+status — Wave 5.3 / M8; v8 mcp_servers — C3;
-    // v9 mcp_servers.executable_path/_hash — H-07 binary pinning).
+    // v9 mcp_servers.executable_path/_hash — H-07 binary pinning; v10
+    // skills.pack_install_id + agent_types.pack_install_id — fix4/pack-reconcile).
     let db = GlobalDb::open_in_memory().unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, GLOBAL_SCHEMA_VERSION);
-    assert_eq!(v, 9); // H-07 added the MCP executable pins (v9)
+    assert_eq!(v, 10); // fix4/pack-reconcile added pack-install provenance (v10)
 }
 
 /// H-07 / migration v9: a FRESH database must end up with the pin columns.
@@ -182,19 +183,21 @@ fn agent_types_crud_and_builtin_seed() {
 }
 
 #[test]
-fn schema_version_is_twelve_after_init_profile() {
+fn schema_version_is_fourteen_after_init_profile() {
     // Profile schema version (v2 tool_audit, v3 tool_rules, v4
     // classifier_settings, v5 the classifier_settings.redaction_enabled column,
     // v6 memory_settings, v7 usage_events, v8 work_items, v9 seat_bindings,
     // v10 sandbox_config, v11 budget_settings, v12 the messages.endpoint_zone
-    // column); global stays at its own version. Tracked independently.
+    // column, v13 cron_jobs.pack_install_id + .pack_expected_global_rows, v14
+    // pack_install_pending (the crash-intent marker) — all fix4/pack-reconcile);
+    // global stays at its own version. Tracked independently.
     let db = ProfileDb::open_in_memory("personal").unwrap();
     let v: i32 = db
         .raw()
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, PROFILE_SCHEMA_VERSION);
-    assert_eq!(v, 12); // per-turn trust zone on messages (v12)
+    assert_eq!(v, 14); // fix4/pack-reconcile round 2 added the pending marker (v14)
 
     // sandbox_config round-trips (M7 Tier-K Slice 2): unset → None; set → Some.
     use crate::hooks::{SandboxConfig, SandboxNetworkConfig};
