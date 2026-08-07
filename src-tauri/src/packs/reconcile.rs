@@ -200,6 +200,11 @@ pub(crate) fn reconcile_profile(
             });
         }
     }
+    // GLM review LOW-13: mop up any stranded markers whose cron jobs are gone
+    // (an orphan was already deleted above, or the user cleaned up in Settings).
+    if let Err(e) = db.clear_stranded_pending_markers() {
+        tracing::warn!(profile = %profile, error = %e, "pack-reconcile: could not GC stranded markers");
+    }
     Ok((removed, skipped))
 }
 

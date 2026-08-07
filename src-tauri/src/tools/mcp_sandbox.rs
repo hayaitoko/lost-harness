@@ -469,10 +469,11 @@ pub struct SandboxedCommand {
 #[cfg(target_os = "macos")]
 pub fn sandboxed_command(spec: &McpSandboxSpec) -> Result<SandboxedCommand, String> {
     let profile = build_mcp_seatbelt_profile(spec)?;
-    // The profile lives OUTSIDE every sandboxed dir — sandbox-exec reads it
-    // before the restriction takes effect, so its location is unconstrained.
-    let profile_path =
-        std::env::temp_dir().join(format!("lhp-mcp-sandbox-{}.sb", uuid::Uuid::new_v4()));
+    // The profile lives inside the private per-server scratch dir (GLM LOW-1: avoids
+    // a TOCTOU swap in shared /tmp). sandbox-exec reads it before the sandbox takes effect.
+    let profile_path = spec
+        .scratch_dir
+        .join(format!("lhp-mcp-sandbox-{}.sb", uuid::Uuid::new_v4()));
     std::fs::write(&profile_path, profile.as_bytes())
         .map_err(|e| format!("writing the MCP sandbox profile: {e}"))?;
 

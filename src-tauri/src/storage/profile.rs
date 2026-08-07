@@ -1014,6 +1014,22 @@ impl ProfileDb {
         Ok(())
     }
 
+    /// GLM review LOW-13: clear stranded `pack_install_pending` markers whose
+    /// cron jobs no longer exist (the orphan sweep already handled real orphans;
+    /// this mops up markers that outlive their rows). Called at the end of the
+    /// boot reconciliation pass so stale markers never accumulate.
+    pub fn clear_stranded_pending_markers(&self) -> Result<usize> {
+        let n = self.conn.lock().execute(
+            "DELETE FROM pack_install_pending
+             WHERE pack_install_id NOT IN (
+                 SELECT DISTINCT pack_install_id FROM cron_jobs
+                 WHERE pack_install_id IS NOT NULL
+             )",
+            [],
+        )?;
+        Ok(n)
+    }
+
     // ── usage_events (Wave 3.2 — the model-call cost ledger, PLAN §3) ─────────
 
     /// Book one model call to the ledger. `cost_usd` is `None` for an
